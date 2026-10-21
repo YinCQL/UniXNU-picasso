@@ -1,0 +1,112 @@
+# Board description of the Redmi K30 5G (picasso, SM7250), read by the unixnu build driver.
+# Minimal skeleton to build the UniXNU UEFI firmware. Kernel/IPSW/UserData sections are
+# placeholders to be filled during kernel bring-up.
+
+[board]
+name = "picasso"
+soc = "SM7250"
+description = "Redmi K30 5G"
+kit = "picasso"
+
+# Target OS image. PLACEHOLDER   select an IPSW whose ARM version is compatible with
+# SM7250 (ARMv8.2 / Cortex-A76). Only needed for the kernel step, not for firmware.
+[ipsw]
+url = ""
+product = ""
+version = ""
+build = ""
+device_class = ""
+chip_id = 0x0
+board_id = 0
+fetch = ["KernelCache", "DeviceTree"]
+
+[ipsw.sha256]
+
+# UserData partition geometry (GPT entry "userdata" of LUN 0). PLACEHOLDER.
+[userdata]
+first_lba = 0x0
+last_lba = 0x0
+lba_bytes = 4096
+windows = [
+  { name = "OS", component = "OS" },
+  { name = "SystemOS", component = "Cryptex1,SystemOS" },
+]
+
+# Kernel configuration. PLACEHOLDER for kernel bring-up.
+[kernel]
+defconfig = "picasso_defconfig"
+archives = [
+  "build-corecrypto-14.py",
+  "build-arm-driver.py ArmDTPlatform",
+  "build-arm-driver.py ArmCpu",
+  "build-arm-driver.py NativeUfs",
+  "build-arm-driver.py NativeRamBlock",
+  "build-arm-driver.py NativeVirtioBlock",
+  "build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block",
+  "build-native-virtio-bindings.py --component NativeVirtioBlock",
+]
+
+[kernel.prelink]
+tool = "kits/NativePrelink/emit_prelink.py"
+kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
+kernelcache_sha256 = ""
+slide = "-0x1000000"
+early_security_init = ""
+roots = [
+  "com.apple.driver.AppleARMPlatform",
+  "com.apple.driver.AppleARMWatchdogTimer",
+  "com.apple.driver.AppleMobileFileIntegrity",
+  "com.apple.driver.ApplePMGR",
+  "com.apple.filesystems.apfs",
+  "com.apple.iokit.IOHIDFamily",
+  "com.apple.iokit.IOStorageFamily",
+  "com.apple.kec.Libm",
+  "com.apple.kec.corecrypto",
+  "com.apple.kext.CoreTrust",
+  "com.apple.security.AppleImage4",
+]
+
+# Firmware step: build the picasso Mu-Silicium UEFI firmware via unixnu.
+[firmware]
+config = "picasso"                   # Resources/Configs/picasso.toml in the Mu-Silicium checkout (--uefi)
+dsc = "Platforms/Xiaomi/picassoPkg/picasso.dsc"
+fd = "Build/picassoPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+preflight = []
+submodules = []
+patches = []
+packages = [
+  "{uefi}",
+  "{uefi}/Platforms/Xiaomi",
+  "{tree}/package",
+  "{tree}/drivers/DarwinBoot",
+  "{edk2}",
+  "{uefi}/Silicon/Qualcomm",
+  "{uefi}/Silicon/Silicium",
+  "{uefi}/Silicium-ACPI",
+  "{uefi}/Silicium-ACPI/Platforms/Xiaomi",
+  "{uefi}/Silicium-ACPI/Silicon/Qualcomm",
+]
+
+[firmware.defines]
+DEVICE_MODEL = "picasso"
+BUILDID_STRING = "picasso-research"
+
+# Payload: a FAT volume with UniXNU config + kernel + ADT. Loader (DarwinBoot) is in the firmware.
+[payload]
+volume = "PICASSOESP"
+size_mib = 128
+loader = "firmware"
+title = "picasso first boot: source XNU to console"
+dram_size = "0x80000000"
+kernel_args = [
+  "-v",
+  "serial=3",
+  "debug=0x14e",
+]
+
+[payload.adt]
+tool = "scripts/make-picasso-adt.py"
+chip_id = "0"
+owned_memory_size = "0x100000000"
+cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
+unique_chip_id = "required"
