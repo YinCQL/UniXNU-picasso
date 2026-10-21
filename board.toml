@@ -80,6 +80,8 @@ packages = [
   "{tree}/package",
   "{tree}/drivers/DarwinBoot",
   "{edk2}",
+  "{uefi}/Common/Mu",
+  "{uefi}/Common/Mu_OEM_Sample",
   "{uefi}/Silicon/Qualcomm",
   "{uefi}/Silicon/Silicium",
   "{uefi}/Silicium-ACPI",
