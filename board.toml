@@ -72,7 +72,9 @@ config = "picasso"                   # Resources/Configs/picasso.toml in the Mu-
 dsc = "Platforms/Xiaomi/picassoPkg/picasso.dsc"
 fd = "Build/picassoPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
 preflight = []
-submodules = []
+# Openssl submodule is required by Silicon/Silicium OpensslPkg (same as sheng and the
+# stock picasso DeviceBuild.py RequiredSubmodules).
+submodules = ["Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl"]
 patches = []
 packages = [
   "{uefi}",
@@ -90,7 +92,12 @@ packages = [
 ]
 
 [firmware.defines]
+# Full set aligned with sheng so SecureBootHandler.c and other #if-gated code compile
+# (ENABLE_SECUREBOOT must be 0/1, not empty, or '#if ENABLE_SECUREBOOT == 1' is a syntax error).
+ENABLE_SECUREBOOT = "1"
 DEVICE_MODEL = "picasso"
+MEMORY_PROTECTION = "TRUE"
+SHIP_MODE = "FALSE"
 BUILDID_STRING = "picasso-research"
 
 # Payload: a FAT volume with UniXNU config + kernel + ADT. Loader (DarwinBoot) is in the firmware.
