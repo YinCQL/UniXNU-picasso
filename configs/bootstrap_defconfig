@@ -1,0 +1,19 @@
+# Bootstrap pass: build the base 4 KiB XNU and a prelinked candidate with
+# no device archives. This produces the compile records and the original-class
+# candidate the device archives are built against.
+CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
+# CONFIG_XNU_SOURCE_CORECRYPTO14 is not set
+# CONFIG_XNU_SOURCE_PTHREAD is not set
+# CONFIG_XNU_ARM_DT_PLATFORM is not set
+# CONFIG_XNU_ARMCPU is not set
+CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
+CONFIG_XNU_ARMVIRT_PLATFORM=n
+# CONFIG_XNU_NATIVE_UFS is not set
+# CONFIG_XNU_NATIVE_AES is not set
+# CONFIG_XNU_NATIVE_VIRTIO_BLOCK is not set
+# CONFIG_XNU_NATIVE_RAM_BLOCK is not set
+# CONFIG_XNU_NATIVE_LEGACY_DISPLAY is not set
+# CONFIG_XNU_NATIVE_ADRENO is not set
+# CONFIG_XNU_SOURCE_MOCKFS is not set
+# CONFIG_XNU_BOOT_PROGRESS is not set
+# CONFIG_XNU_VERIFIED_ROOT_PROBE is not set

@@ -35,15 +35,14 @@ windows = [
 # Kernel configuration. PLACEHOLDER for kernel bring-up.
 [kernel]
 defconfig = "picasso_defconfig"
+# First-console archives: only what the minimal picasso_defconfig selects
+# (corecrypto, ArmDTPlatform, ArmCpu, arch timer). UFS / VirtIO / display /
+# Adreno are added in later stages once the platform reaches the console.
 archives = [
   "build-corecrypto-14.py",
+  "build-corecrypto-14.py --namespace",
   "build-arm-driver.py ArmDTPlatform",
   "build-arm-driver.py ArmCpu",
-  "build-arm-driver.py NativeUfs",
-  "build-arm-driver.py NativeRamBlock",
-  "build-arm-driver.py NativeVirtioBlock",
-  "build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block",
-  "build-native-virtio-bindings.py --component NativeVirtioBlock",
 ]
 
 [kernel.prelink]
