@@ -1,13 +1,13 @@
-name: picasso XNU (Redmi K30 5G)
+name: picasso XNU kernel
 
-# Self-contained device-repo build, mirroring the Sun_SM8750 (OnePlus 13T) workflow.
-# The repo's own ./unixnu wrapper clones the pinned upstream UniXNU revision
-# (upstream.rev), applies patches/unixnu-source-kernel.patch, and execs the real
-# unixnu. The kernel step needs macOS (xcodebuild + iPhoneOS SDK + MIG).
+# Self-contained device-repo build. The repo's own ./unixnu wrapper clones the pinned
+# upstream UniXNU revision (upstream.rev), applies patches/unixnu-source-kernel.patch,
+# and execs the real build driver. The kernel step needs macOS (xcodebuild + iPhoneOS
+# SDK + MIG).
 #
-#   build kernel payload   bootstrap (compile records + prelinked candidate), then
-#                          the first-console kernel and the FAT payload (kernel +
-#                          ADT + unixnu.toml), ready for bootimg.
+#   build kernel payload   bootstrap (compile records + prelinked candidate), then the
+#                          first-console kernel and the FAT payload (kernel + ADT +
+#                          unixnu.toml), ready for bootimg.
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-latest
     timeout-minutes: 360
     defaults:
       run:
@@ -38,9 +38,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Prepare the isolated UniXNU source
+      - name: Prepare the isolated upstream source
         run: |
-          TREE=$(./unixnu --prepare)
+          TREE=$(python3 ./unixnu --prepare)
           echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
 
       - name: Install host tools and check the SDK
@@ -55,9 +55,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          ./unixnu defconfig picasso_defconfig
-          ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
-          ./unixnu build kernel payload -j 3 2>&1 | tee out/picasso/logs/actions-build.log
+          python3 ./unixnu defconfig picasso_defconfig
+          python3 ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
+          python3 ./unixnu build kernel payload -j 3 2>&1 | tee out/picasso/logs/actions-build.log
 
       - name: Upload the kernel, payload and logs
         if: always()
