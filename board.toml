@@ -11,14 +11,16 @@ kit = "picasso"
 # Target OS image. PLACEHOLDER   select an IPSW whose ARM version is compatible with
 # SM7250 (ARMv8.2 / Cortex-A76). Only needed for the kernel step, not for firmware.
 [ipsw]
-url = ""
-product = ""
-version = ""
-build = ""
-device_class = ""
-chip_id = 0x0
-board_id = 0
-fetch = ["KernelCache", "DeviceTree"]
+# Same unchanged iPad7,1 iPadOS 17.7.11 image uke (SM7675) and sheng (SM8550) use.
+# SM7250 (ARMv8.2 / Cortex-A76) is instruction-compatible with this kernel source.
+url = "https://updates.cdn.apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
+product = "iPad7,1"
+version = "17.7.11"
+build = "21H461"
+device_class = "j120ap"
+chip_id = 0x8011
+board_id = 12
+fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache"]
 
 [ipsw.sha256]
 

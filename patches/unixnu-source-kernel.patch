@@ -1,0 +1,10 @@
+diff --git a/patches/PICASSO-KERNEL-NOTES.md b/patches/PICASSO-KERNEL-NOTES.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/patches/PICASSO-KERNEL-NOTES.md
+@@ -0,0 +1,4 @@
++# picasso (SM7250) kernel patch placeholder
++
++The real SM7250 XNU adaptation patch set replaces this file. It is applied on top of
++the pinned upstream UniXNU revision in ../upstream.rev.

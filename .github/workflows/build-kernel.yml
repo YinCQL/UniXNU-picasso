@@ -1,143 +1,73 @@
-name: build-picasso-kernel
+name: picasso XNU (Redmi K30 5G)
 
-# Builds the XNU kernel for the Redmi K30 5G (picasso, SM7250) on a macOS runner.
-# The kernel step needs macOS: xnu's own makefiles are driven with xcodebuild and
-# the iPhoneOS SDK, and MIG ships only inside Xcode. Linux stops at the missing MIG.
+# Self-contained device-repo build, mirroring the Sun_SM8750 (OnePlus 13T) workflow.
+# The repo's own ./unixnu wrapper clones the pinned upstream UniXNU revision
+# (upstream.rev), applies patches/unixnu-source-kernel.patch, and execs the real
+# unixnu. The kernel step needs macOS (xcodebuild + iPhoneOS SDK + MIG).
 #
-#   bootstrap      build the base 4 KiB XNU and a prelinked candidate with no device
-#                  archives; produces the compile records the first-console kernel
-#                  is prelinked against.
-#   first-console  the minimal kernel that reaches the video/serial console and
-#                  reports the genuine missing-driver panic (ArmDTPlatform, ArmCpu,
-#                  arch timer, PAN, DT panic region).
-#
-# Runner note (from the uke/piano ports): macos-14 / Xcode 15.4 is too old
-# ('-mach_msg2' is unknown and MIG has no SubSystem declaration). Use macos-latest.
-#
-# Dispatch-only: the expensive macOS build is never started by a push.
+#   build kernel payload   bootstrap (compile records + prelinked candidate), then
+#                          the first-console kernel and the FAT payload (kernel +
+#                          ADT + unixnu.toml), ready for bootimg.
 
 on:
   workflow_dispatch:
-    inputs:
-      defconfig:
-        description: 'Device defconfig to build'
-        required: false
-        default: 'picasso_defconfig'
-
-concurrency:
-  group: build-picasso-kernel-${{ github.ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: read
 
-env:
-  HOMEBREW_NO_AUTO_UPDATE: 1
-  HOMEBREW_NO_INSTALL_CLEANUP: 1
+concurrency:
+  group: picasso-xnu-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  kernel:
-    runs-on: macos-latest
-    timeout-minutes: 240
-
+  build:
+    runs-on: macos-15
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+        working-directory: device
     steps:
-      - name: Check out the device repository
+      - name: Check out the picasso configuration
         uses: actions/checkout@v4
         with:
-          path: UniXNU-picasso
+          path: device
+          persist-credentials: false
 
-      - name: Check out UniXNU
-        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          repository: UniXNU/UniXNU
-          path: UniXNU
+          python-version: "3.12"
 
-      - name: Record the UniXNU revision
-        id: base
-        working-directory: UniXNU
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore the Homebrew downloads
-        uses: actions/cache@v4
-        with:
-          path: ~/Library/Caches/Homebrew
-          key: brew-${{ runner.os }}-${{ hashFiles('UniXNU-picasso/.github/workflows/build-kernel.yml') }}
-          restore-keys: brew-${{ runner.os }}-
-
-      - name: Restore the build tree
-        uses: actions/cache@v4
-        with:
-          path: |
-            UniXNU/out
-            UniXNU-picasso/.cache
-          key: unixnu-kernel-picasso-${{ steps.base.outputs.sha }}-${{ hashFiles('UniXNU-picasso/board.toml', 'UniXNU-picasso/unixnu.lock', 'UniXNU-picasso/configs/**', 'UniXNU-picasso/scripts/**', 'UniXNU-picasso/patches/**', 'UniXNU-picasso/package/**', 'UniXNU-picasso/drivers/**', 'UniXNU-picasso/kits/**') }}
-
-      - name: Report the runner toolchain
+      - name: Prepare the isolated UniXNU source
         run: |
-          sw_vers
-          uname -m
-          xcodebuild -version
-          xcode-select -p
-          xcrun -sdk iphoneos -find mig || echo 'mig not found for iphoneos'
+          TREE=$(./unixnu --prepare)
+          echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
 
-      - name: Install the host tools
+      - name: Install host tools and check the SDK
         run: |
           brew install cmake ninja unifdef llvm mtools dtc
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
-          echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          df -h .
 
-      - name: Verify the tools unixnu checks for
+      - name: Fetch the kernel sources and build the kernel + payload
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          for tool in git make clang cmake ninja unifdef mtools dtc xcodebuild; do
-            printf '%-10s %s\n' "$tool" "$(command -v "$tool" || echo MISSING)"
-          done
+          ./unixnu defconfig picasso_defconfig
+          ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
+          ./unixnu build kernel payload -j 3 2>&1 | tee out/picasso/logs/actions-build.log
 
-      - name: Fetch the Apple references
-        working-directory: UniXNU
-        run: |
-          ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread \
-                          corecrypto-2023 IOStorageFamily -D ../UniXNU-picasso
-
-      - name: Fetch the target IPSW members
-        working-directory: UniXNU
-        run: ./unixnu ipsw fetch -D ../UniXNU-picasso
-
-      - name: Bootstrap kernel and prelinked candidate
-        working-directory: UniXNU
-        # bootstrap_defconfig disables every device archive, so this pass only
-        # produces the compile records and the prelinked candidate.
-        run: |
-          ./unixnu defconfig bootstrap_defconfig -D ../UniXNU-picasso
-          ./unixnu build kernel -D ../UniXNU-picasso
-          test -f out/picasso/kernel/kernel.macho
-          test -f out/picasso/kernel/kernel.json
-
-      - name: Build and prelink the first-console kernel
-        working-directory: UniXNU
-        run: |
-          ./unixnu defconfig "${{ github.event.inputs.defconfig || 'picasso_defconfig' }}" -D ../UniXNU-picasso
-          ./unixnu build kernel -D ../UniXNU-picasso
-
-      - name: Record the result
-        working-directory: UniXNU
-        if: always()
-        run: |
-          mkdir -p ../artifacts
-          if [ -f out/picasso/kernel/kernel.macho ]; then
-            cp out/picasso/kernel/kernel.macho ../artifacts/
-            cp out/picasso/kernel/kernel.json ../artifacts/ 2>/dev/null || true
-            shasum -a 256 out/picasso/kernel/kernel.macho | tee ../artifacts/kernel.macho.sha256
-          else
-            echo "kernel.macho was not produced" | tee ../artifacts/MISSING.txt
-          fi
-          cp -r out/picasso/logs ../artifacts/logs 2>/dev/null || true
-          ls -l ../artifacts
-
-      - name: Upload the kernel
+      - name: Upload the kernel, payload and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: picasso-kernel
-          path: artifacts/
+          name: picasso-xnu-${{ github.run_number }}
+          path: |
+            device/out/picasso/kernel/**
+            device/out/picasso/payload/**
+            device/out/picasso/logs/**
+            device/out/picasso/unixnu.lock
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 7
