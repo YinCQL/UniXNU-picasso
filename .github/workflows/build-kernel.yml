@@ -88,6 +88,7 @@ jobs:
         run: |
           python3 ./unixnu defconfig picasso_defconfig
           python3 ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
+          mkdir -p out/picasso/logs
           python3 ./unixnu build kernel payload -j 3 2>&1 | tee out/picasso/logs/actions-build.log
 
       - name: Upload the kernel, payload and logs
