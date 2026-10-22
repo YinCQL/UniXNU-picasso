@@ -38,13 +38,14 @@ windows = [
 [kernel]
 defconfig = "picasso_defconfig"
 # First-console archives: only what the minimal picasso_defconfig selects
-# (corecrypto, ArmDTPlatform, ArmCpu, arch timer). UFS / VirtIO / display /
+# (corecrypto, ArmDTPlatform, ArmCpu, arch timer, libpthread). UFS / VirtIO / display /
 # Adreno are added in later stages once the platform reaches the console.
 archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
   "build-arm-driver.py ArmDTPlatform",
   "build-arm-driver.py ArmCpu",
+  "build-libpthread-kernel.py",
 ]
 
 [kernel.prelink]
@@ -108,10 +109,14 @@ size_mib = 128
 loader = "firmware"
 title = "picasso first boot: source XNU to console"
 dram_size = "0x80000000"
+panic_screen = false
 kernel_args = [
   "-v",
   "serial=3",
   "debug=0x14e",
+  "kt_fixed_zones=120",
+  "cpus=1",
+  "armcpu-self-ipi=1",
 ]
 
 [payload.adt]
