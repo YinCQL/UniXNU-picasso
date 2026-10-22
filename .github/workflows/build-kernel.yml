@@ -52,7 +52,8 @@ jobs:
           df -h .
 
       # The python urllib range-request reader in the unixnu driver cannot resolve
-      # updates.cdn.apple.com on the macos runner (DNS returns no name). Download the
+      # updates.cdn-apple.com; the board.toml URL previously had a stray dot
+      # (updates.cdn.apple.com) that has no DNS record. Download the
       # IPSW with curl first (which resolves it fine) and point the driver at the local
       # file via UNIXNU_IPSW, so prelink never opens a remote connection.
       # The unixnu driver's remote reader cannot resolve Apple's CDN on the runner,
