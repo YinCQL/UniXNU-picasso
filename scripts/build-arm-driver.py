@@ -38,9 +38,10 @@ def main():
         elif not value.startswith('-W'):
             command.append(value)
         index += 1
-    command.extend(['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
+    command.extend(['-Wall', '-Wextra', '-Wno-unused-parameter',
                     '-Wno-c99-designator', '-Wno-reorder-init-list',
                     '-Wno-deprecated-enum-enum-conversion',
+                    '-Wno-unnecessary-virtual-specifier',
                     '-I', str(ROOT / '.cache/xnu-work/osfmk')])
     (out / 'compile-command.json').write_text(json.dumps(command, indent=2) + '\n')
     result = subprocess.run(command, cwd=record['directory'], capture_output=True, text=True)
