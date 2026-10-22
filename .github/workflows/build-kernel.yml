@@ -54,6 +54,10 @@ jobs:
       - name: Fetch the kernel sources and build the kernel + payload
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # The platform seed is not stored in the repository. CI uses this fixed
+          # non-unique seed; for a real device boot, rebuild the payload locally
+          # with a random --unique-chip-id.
+          UNIXNU_UNIQUE_CHIP_ID: "c1a551c0dec0de01"
         run: |
           python3 ./unixnu defconfig picasso_defconfig
           python3 ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily

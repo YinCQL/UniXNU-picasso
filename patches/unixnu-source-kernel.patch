@@ -1,10 +1,103 @@
 diff --git a/patches/PICASSO-KERNEL-NOTES.md b/patches/PICASSO-KERNEL-NOTES.md
 new file mode 100644
-index 0000000..1111111
+index 0000000..ef9daf2
 --- /dev/null
 +++ b/patches/PICASSO-KERNEL-NOTES.md
-@@ -0,0 +1,4 @@
+@@ -0,0 +1,20 @@
 +# picasso (SM7250) kernel adaptation
 +
-+This placeholder is replaced by the real SM7250 XNU adaptation patch set, which
-+patches the UniXNU build scripts and the XNU sources for the SM7250 platform.
++This patch set carries the SM7250-specific build-side additions that the pinned
++upstream UniXNU tree does not provide for picasso. It is applied on top of the
++upstream revision pinned by upstream.rev by the ./unixnu wrapper.
++
++## Contents
++
++- scripts/build-arm-driver.py: compiles the generic ArmDTPlatform / ArmCpu /
++  ArmVirtPlatform drivers against the actual source-kernel ABI by replaying the
++  kernel's own IOPlatformExpert compile recipe, then audits and archives the
++  object. Board [kernel] archives entries reference this script; upstream only
++  ships it implicitly through the sheng device repository.
++
++## Stage
++
++First-console bring-up: corecrypto (upstream builder), ArmDTPlatform and ArmCpu
++archives, architectural timer, PAN, DT panic region and the trust cache
++runtime. UFS / VirtIO / display / Adreno archives join the [kernel] archives
++list of board.toml in later stages.
+diff --git a/scripts/build-arm-driver.py b/scripts/build-arm-driver.py
+new file mode 100644
+index 0000000..989088d
+--- /dev/null
++++ b/scripts/build-arm-driver.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++"""Compile a generic platform/CPU driver against the actual source-kernel ABI.
++
++picasso first-console subset of the sheng archive builder: only the generic
++platform experts and the CPU/interrupt driver are built here. Storage, display
++and GPU components are added in later bring-up stages, once the platform
++reaches the console and the panic is the genuine missing-driver report.
++
++The compile recipe of the kernel's own IOPlatformExpert.cpo is replayed against
++the driver source, so the object matches the kernel ABI exactly. The produced
++object is audited (ARM64 Mach-O, iOS 17 deployment) before it is archived.
++"""
++import argparse
++import json
++from pathlib import Path
++import struct
++import subprocess
++
++ROOT = Path(__file__).resolve().parents[1]
++parser = argparse.ArgumentParser(description=__doc__)
++parser.add_argument('component', choices=['ArmVirtPlatform', 'ArmDTPlatform', 'ArmCpu'])
++args = parser.parse_args()
++component = args.component
++recipe = ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'
++record = json.loads(recipe.read_text().strip().rstrip(','))
++source = ROOT / 'drivers' / component / (component + '.cpp')
++out = ROOT / 'build' / {'ArmVirtPlatform': 'armvirt-platform',
++                        'ArmDTPlatform': 'armdt-platform',
++                        'ArmCpu': 'armcpu'}[component]
++out.mkdir(parents=True, exist_ok=True)
++destination = out / (component + '.o')
++arguments = record['arguments']
++command = []
++index = 0
++while index < len(arguments):
++    value = arguments[index]
++    if value == record['file']:
++        command.append(str(source))
++    elif value == '-o':
++        command.extend(['-o', str(destination)])
++        index += 1
++    elif value == '-Xclang' and arguments[index + 1].startswith('-W'):
++        index += 1
++    elif not value.startswith('-W'):
++        command.append(value)
++    index += 1
++command.extend(['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
++                '-Wno-c99-designator', '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
++                '-Wno-unnecessary-virtual-specifier', '-I', str(ROOT / '.cache/xnu-work/osfmk')])
++(out / 'compile-command.json').write_text(json.dumps(command, indent=2) + '\n')
++result = subprocess.run(command, cwd=record['directory'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++(out / 'compile.log').write_text(result.stdout)
++if result.returncode:
++    raise SystemExit(result.stdout[-3500:])
++data = destination.read_bytes()
++magic, cpu, subtype, kind, count, size = struct.unpack_from('<6I', data)
++if (magic, cpu, subtype, kind) != (0xfeedfacf, 0x100000c, 0, 1):
++    raise SystemExit('Unexpected platform object architecture')
++offset = 32
++deployment = None
++for _ in range(count):
++    cmd, length = struct.unpack_from('<II', data, offset)
++    if cmd == 0x32:
++        deployment = struct.unpack_from('<II', data, offset + 8)
++    offset += length
++if deployment != (2, 0x110000):
++    raise SystemExit(f'Unexpected platform deployment {deployment}')
++archive = out / ('lib' + component + '.a')
++archive.unlink(missing_ok=True)
++subprocess.run(['xcrun', 'ar', 'rcs', archive, destination], check=True)
++print(f'{component}: -Werror build and actual ARM64/iOS 17 object audit passed')

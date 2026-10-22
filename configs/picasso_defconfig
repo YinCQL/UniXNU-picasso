@@ -4,6 +4,7 @@
 # Minimal native drivers; UFS / AES / VirtIO / display / Adreno are brought up in
 # later stages once the platform boots.
 
+CONFIG_XNU_BUILD_ARCHIVES=y
 CONFIG_XNU_SOURCE_CORECRYPTO14=y
 CONFIG_XNU_ARM_DT_PLATFORM=y
 CONFIG_XNU_ARMCPU=y
