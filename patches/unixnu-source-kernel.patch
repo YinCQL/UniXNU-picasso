@@ -60,12 +60,10 @@ index 0000000..bf562509a79fb22e46d715308cd60ba4496e6c5b
 ++#endif
 diff --git a/scripts/build-arm-driver.py b/scripts/build-arm-driver.py
 new file mode 100644
-index 0000000..ffedbcdcf107189f800d159132fd6dcd1910ff82
+index 0000000..989088d8a3b505fb7e26daa265e71cb941e18c8e
 --- /dev/null
 +++ b/scripts/build-arm-driver.py
-@@ -0,0 +1,73 @@
-+++ b/scripts/build-arm-driver.py
-+++ b/scripts/build-arm-driver.py
+@@ -0,0 +1,71 @@
 +#!/usr/bin/env python3
 +"""Compile a generic platform/CPU driver against the actual source-kernel ABI.
 +
