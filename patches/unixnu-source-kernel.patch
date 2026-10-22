@@ -43,3 +43,25 @@ diff --git a/patches/xnu/offline-component-load-probes.patch b/patches/xnu/offli
   	/* Initialize the file systems. */
   	bsd_init_kprintf("calling vfsinit\n");
   	vfsinit();
+diff --git a/scripts/unixnu/kernel.py b/scripts/unixnu/kernel.py
+--- a/scripts/unixnu/kernel.py
++++ b/scripts/unixnu/kernel.py
+@@ -105,6 +105,18 @@
+ def prelink(ctx):
+     """Produce out/<device>/kernel/kernel.macho from the XNU build and the original kernelcache."""
+     log('kernel: prelink')
++    if ctx.config.get('XNU_CRYPTO_BOOTSTRAP') == 'source':
++        log('kernel: source-kernel platform milestone; skipping proprietary IPSW prelink')
++        spec = ctx.board.get('kernel', {}).get('prelink', {})
++        target = spec.get('kernel', 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf')
++        kernel = expand(ctx.tree / target) if isinstance(target, str) else target
++        if not kernel.is_file():
++            raise Error(f'{kernel} not found; run "unixnu build kernel" first')
++        output = ctx.work / 'kernel/kernel.macho'
++        output.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copyfile(kernel, output)
++        log(f'kernel: {output} sha256 {sha256_file(output)}')
++        return output
+     spec = ctx.board.get('kernel', {}).get('prelink')
+     if not spec:
+         raise Error('board.toml has no [kernel.prelink]')
