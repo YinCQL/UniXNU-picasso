@@ -1,9 +1,9 @@
 diff --git a/patches/PICASSO-KERNEL-NOTES.md b/patches/PICASSO-KERNEL-NOTES.md
 new file mode 100644
-index 0000000..ef9daf2
+index 0000000..73b6b9deefcc1892c06d28fb6e20f382aa929816
 --- /dev/null
 +++ b/patches/PICASSO-KERNEL-NOTES.md
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,28 @@
 +# picasso (SM7250) kernel adaptation
 +
 +This patch set carries the SM7250-specific build-side additions that the pinned
@@ -17,6 +17,14 @@ index 0000000..ef9daf2
 +  kernel's own IOPlatformExpert compile recipe, then audits and archives the
 +  object. Board [kernel] archives entries reference this script; upstream only
 +  ships it implicitly through the sheng device repository.
++- patches/xnu/zzz-picasso-legacy-display-stub.patch: a complete xnu-level patch
++  the baseline script applies into .cache/xnu-work after
++  offline-component-load-probes.patch (zzz sorts last). That probes patch calls
++  native_legacy_display_probe() unconditionally under DEVELOPMENT||DEBUG, but
++  the symbol only exists in the NativeLegacyDisplay archive, which the
++  first-console config does not link. This patch appends a no-op definition to
++  the end of bsd/kern/bsd_init.c so the kernel links; the call is gated behind
++  the offline-legacy-register boot arg, which picasso never sets.
 +
 +## Stage
 +
@@ -24,12 +32,40 @@ index 0000000..ef9daf2
 +archives, architectural timer, PAN, DT panic region and the trust cache
 +runtime. UFS / VirtIO / display / Adreno archives join the [kernel] archives
 +list of board.toml in later stages.
+diff --git a/patches/xnu/zzz-picasso-legacy-display-stub.patch b/patches/xnu/zzz-picasso-legacy-display-stub.patch
+new file mode 100644
+index 0000000..bf562509a79fb22e46d715308cd60ba4496e6c5b
+--- /dev/null
++++ b/patches/xnu/zzz-picasso-legacy-display-stub.patch
+@@ -0,0 +1,20 @@
++diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
++index 044f3fa..8dc9072 100644
++--- a/bsd/kern/bsd_init.c
+++++ b/bsd/kern/bsd_init.c
++@@ -1695,2 +1695,15 @@ netboot_root(void)
++ }
++ #endif
+++/*
+++ * picasso first-console stub: offline-component-load-probes calls
+++ * native_legacy_display_probe() under DEVELOPMENT||DEBUG, but the real
+++ * definition lives in the NativeLegacyDisplay archive, not linked in the
+++ * first-console config. Provide a no-op so the kernel links; the call is
+++ * gated behind the offline-legacy-register boot arg, which picasso never sets.
+++ */
+++#if DEVELOPMENT || DEBUG
+++void
+++native_legacy_display_probe(void)
+++{
+++}
+++#endif
 diff --git a/scripts/build-arm-driver.py b/scripts/build-arm-driver.py
 new file mode 100644
-index 0000000..989088d
+index 0000000..ffedbcdcf107189f800d159132fd6dcd1910ff82
 --- /dev/null
 +++ b/scripts/build-arm-driver.py
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,73 @@
++++ b/scripts/build-arm-driver.py
++++ b/scripts/build-arm-driver.py
 +#!/usr/bin/env python3
 +"""Compile a generic platform/CPU driver against the actual source-kernel ABI.
 +
