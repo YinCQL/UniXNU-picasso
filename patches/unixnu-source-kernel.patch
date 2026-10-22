@@ -135,3 +135,49 @@ index 0000000..989088d8a3b505fb7e26daa265e71cb941e18c8e
 +archive.unlink(missing_ok=True)
 +subprocess.run(['xcrun', 'ar', 'rcs', archive, destination], check=True)
 +print(f'{component}: -Werror build and actual ARM64/iOS 17 object audit passed')
+diff --git a/scripts/prepare-xnu-source.py b/scripts/prepare-xnu-source.py
+index 3c19f4d..62b0f88 100644
+--- a/scripts/prepare-xnu-source.py
++++ b/scripts/prepare-xnu-source.py
+@@ -15,6 +15,17 @@ CACHE = Path(f'.cache/sources/xnu-driverkit-{TAG.removeprefix("xnu-")}.json')
+ URL = f'https://api.github.com/repos/apple-oss-distributions/xnu/contents/iokit/DriverKit?ref={TAG}'
+ 
+ 
++def _api(url):
++    """Fetch a GitHub API URL, authenticating when a token is available so the
++    shared CI egress IP does not hit the anonymous rate limit (403)."""
++    request = urllib.request.Request(url)
++    token = os.environ.get('GITHUB_API_TOKEN') or os.environ.get('GITHUB_TOKEN')
++    if token:
++        request.add_header('Authorization', f'Bearer {token}')
++    request.add_header('Accept', 'application/vnd.github+json')
++    return urllib.request.urlopen(request, timeout=30).read()
++
++
+ def restore(entry, destination=DESTINATION, tag=TAG):
+     if entry['type'] != 'file' or not entry['name'].endswith('.h'):
+         return None
+@@ -37,12 +48,12 @@ if __name__ == '__main__':
+         raise SystemExit('Create the local XNU work source before preparing headers')
+     if not CACHE.exists():
+         CACHE.parent.mkdir(parents=True, exist_ok=True)
+-        CACHE.write_bytes(urllib.request.urlopen(URL, timeout=30).read())
++        CACHE.write_bytes(_api(URL))
+     entries = json.loads(CACHE.read_text())
+     crypto_cache = CACHE.with_name(f'xnu-driverkit-crypto-{TAG.removeprefix("xnu-")}.json')
+     if not crypto_cache.exists():
+         crypto_url = URL.replace('/DriverKit?', '/DriverKit/crypto?')
+-        crypto_cache.write_bytes(urllib.request.urlopen(crypto_url, timeout=30).read())
++        crypto_cache.write_bytes(_api(crypto_url))
+     for entry in json.loads(crypto_cache.read_text()):
+         entry['relative'] = 'crypto/' + entry['name']
+         entries.append(entry)
+@@ -53,7 +64,7 @@ if __name__ == '__main__':
+         if not trust_cache.exists():
+             url = ('https://api.github.com/repos/apple-oss-distributions/xnu/'
+                    f'contents/EXTERNAL_HEADERS/TrustCache?ref={trust_tag}')
+-            trust_cache.write_bytes(urllib.request.urlopen(url, timeout=30).read())
++            trust_cache.write_bytes(_api(url))
+         trust_destination = Path('.cache/xnu-work/EXTERNAL_HEADERS/TrustCache')
+         def restore_trust(entry):
+             return restore(entry, trust_destination, trust_tag)
