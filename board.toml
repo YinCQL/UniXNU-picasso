@@ -13,7 +13,7 @@ kit = "picasso"
 [ipsw]
 # Same unchanged iPad7,1 iPadOS 17.7.11 image uke (SM7675) and sheng (SM8550) use.
 # SM7250 (ARMv8.2 / Cortex-A76) is instruction-compatible with this kernel source.
-url = "https://updates.cdn.apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
+url = "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
 product = "iPad7,1"
 version = "17.7.11"
 build = "21H461"

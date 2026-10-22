@@ -55,14 +55,24 @@ jobs:
       # updates.cdn.apple.com on the macos runner (DNS returns no name). Download the
       # IPSW with curl first (which resolves it fine) and point the driver at the local
       # file via UNIXNU_IPSW, so prelink never opens a remote connection.
+      # The unixnu driver's remote reader cannot resolve Apple's CDN on the runner,
+      # so download the IPSW with curl and hand the driver the local path. Resolve
+      # the host through DNS-over-HTTPS and pin it with --resolve as a fallback when
+      # the runner DNS has no record for the CDN name.
       - name: Download the target IPSW
         run: |
           mkdir -p device/out/ipsw
           IPSW=device/out/ipsw/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw
+          HOST=updates.cdn-apple.com
+          URL="https://$HOST/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
           if [ ! -s "$IPSW" ]; then
-            curl --fail --retry 5 --retry-all-errors --connect-timeout 30 \
-              -o "$IPSW" \
-              "https://updates.cdn.apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
+            if ! curl --fail --retry 3 --retry-all-errors --connect-timeout 30 -o "$IPSW" "$URL"; then
+              IP=$(curl -s -H 'accept: application/dns-json' "https://cloudflare-dns.com/dns-query?name=$HOST&type=A" \
+                    | python3 -c "import sys,json; d=json.load(sys.stdin); print(next(a['data'] for a in d.get('Answer',[]) if a['type']==1))")
+              echo "runner DNS failed; pinning $HOST to $IP"
+              curl --fail --retry 5 --retry-all-errors --connect-timeout 30 \
+                --resolve "$HOST:443:$IP" -o "$IPSW" "$URL"
+            fi
           fi
           ls -lh "$IPSW"
           echo "UNIXNU_IPSW=$PWD/$IPSW" >> "$GITHUB_ENV"
