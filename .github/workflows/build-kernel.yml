@@ -55,7 +55,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          python3 ./unixnu defconfig picasso_defconfig
+          python3 ./unixnu defconfig picasso_platform_defconfig
           python3 ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
           python3 ./unixnu build kernel payload -j 3 2>&1 | tee out/picasso/logs/actions-build.log
 
