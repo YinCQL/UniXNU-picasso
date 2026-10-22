@@ -46,12 +46,13 @@ diff --git a/patches/xnu/offline-component-load-probes.patch b/patches/xnu/offli
 diff --git a/scripts/unixnu/kernel.py b/scripts/unixnu/kernel.py
 --- a/scripts/unixnu/kernel.py
 +++ b/scripts/unixnu/kernel.py
-@@ -105,6 +105,18 @@
+@@ -105,6 +105,19 @@
  def prelink(ctx):
      """Produce out/<device>/kernel/kernel.macho from the XNU build and the original kernelcache."""
      log('kernel: prelink')
 +    if ctx.config.get('XNU_CRYPTO_BOOTSTRAP') == 'source':
 +        log('kernel: source-kernel platform milestone; skipping proprietary IPSW prelink')
++        import shutil
 +        spec = ctx.board.get('kernel', {}).get('prelink', {})
 +        target = spec.get('kernel', 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf')
 +        kernel = expand(ctx.tree / target) if isinstance(target, str) else target
