@@ -13,7 +13,7 @@ kit = "picasso"
 [ipsw]
 # Same unchanged iPad7,1 iPadOS 17.7.11 image uke (SM7675) and sheng (SM8550) use.
 # SM7250 (ARMv8.2 / Cortex-A76) is instruction-compatible with this kernel source.
-url = "https://updates.cdn.apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
+url = "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
 product = "iPad7,1"
 version = "17.7.11"
 build = "21H461"
@@ -26,32 +26,31 @@ fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustC
 
 # UserData partition geometry (GPT entry "userdata" of LUN 0). PLACEHOLDER.
 [userdata]
-first_lba = 0x0
-last_lba = 0x0
+first_lba = 0x200000
+last_lba = 0x3a00000
 lba_bytes = 4096
 windows = [
   { name = "OS", component = "OS" },
   { name = "SystemOS", component = "Cryptex1,SystemOS" },
 ]
 
-# Kernel configuration. PLACEHOLDER for kernel bring-up.
+# Kernel configuration for picasso.
 [kernel]
-defconfig = "picasso_defconfig"
-# First-console archives: only what the minimal picasso_defconfig selects
-# (corecrypto, ArmDTPlatform, ArmCpu, arch timer, libpthread). UFS / VirtIO / display /
-# Adreno are added in later stages once the platform reaches the console.
+defconfig = "picasso_platform_defconfig"
 archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
   "build-arm-driver.py ArmDTPlatform",
   "build-arm-driver.py ArmCpu",
   "build-libpthread-kernel.py",
+  "build-arm-driver.py NativeUfs",
+  "build-arm-driver.py NativeAdreno",
 ]
 
 [kernel.prelink]
 tool = "kits/NativePrelink/emit_prelink.py"
 kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
-kernelcache_sha256 = ""
+kernelcache_sha256 = "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7"
 slide = "-0x1000000"
 early_security_init = ""
 roots = [
@@ -105,10 +104,10 @@ BUILDID_STRING = "picasso-research"
 # Payload: a FAT volume with UniXNU config + kernel + ADT. Loader (DarwinBoot) is in the firmware.
 [payload]
 volume = "PICASSOESP"
-size_mib = 128
+size_mib = 192
 loader = "firmware"
-title = "picasso first boot: source XNU to console"
-dram_size = "0x80000000"
+title = "picasso Route B: UFS physical root with Adreno 620 GPU"
+dram_size = "0x180000000"
 panic_screen = false
 kernel_args = [
   "-v",
@@ -117,6 +116,9 @@ kernel_args = [
   "kt_fixed_zones=120",
   "cpus=1",
   "armcpu-self-ipi=1",
+  "native-ufs-root=1",
+  "sheng-gpu-bringup=1",
+  "sheng-gpu-addon=1",
 ]
 
 [payload.adt]
