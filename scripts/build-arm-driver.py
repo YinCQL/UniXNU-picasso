@@ -11,17 +11,29 @@ import struct
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
+if not (ROOT / 'build/xnu').is_dir() and (ROOT / 'out/picasso/tree/build/xnu').is_dir():
+    ROOT = ROOT / 'out/picasso/tree'
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('component', choices=['ArmDTPlatform', 'ArmCpu'])
+    parser.add_argument('component', choices=['ArmDTPlatform', 'ArmCpu', 'NativeRamBlock'])
     args = parser.parse_args()
-    out = ROOT / 'build' / {'ArmCpu': 'armcpu', 'ArmDTPlatform': 'armdt-platform'}[args.component]
+
+    out_map = {
+        'ArmCpu': ('armcpu', 'ArmCpu', 'ArmCpu.cpp', []),
+        'ArmDTPlatform': ('armdt-platform', 'ArmDTPlatform', 'ArmDTPlatform.cpp', []),
+        'NativeRamBlock': ('native-ram-block', 'NativeRamBlock', 'NativeRamBlock.cpp', [
+            '-I', str(ROOT / 'build/storage-abi/include'),
+            '-I', str(ROOT / 'drivers/NativeRamBlock'),
+        ]),
+    }
+    dir_name, sub_dir, src_file, extra_flags = out_map[args.component]
+    out = ROOT / 'build' / dir_name
     recipe = ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'
     record = json.loads(recipe.read_text().strip().rstrip(','))
-    source = ROOT / 'drivers' / args.component / (args.component + '.cpp')
-    destination = out / (args.component + '.o')
+    source = ROOT / 'drivers' / sub_dir / src_file
+    destination = out / f'{args.component}.o'
     out.mkdir(parents=True, exist_ok=True)
     command = []
     arguments = record['arguments']
@@ -43,6 +55,7 @@ def main():
                     '-Wno-deprecated-enum-enum-conversion',
                     '-Wno-unnecessary-virtual-specifier',
                     '-I', str(ROOT / '.cache/xnu-work/osfmk')])
+    command.extend(extra_flags)
     (out / 'compile-command.json').write_text(json.dumps(command, indent=2) + '\n')
     result = subprocess.run(command, cwd=record['directory'], capture_output=True, text=True)
     (out / 'compile.log').write_text(result.stdout + result.stderr)
