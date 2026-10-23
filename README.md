@@ -3,6 +3,10 @@
 > **Status: XNU boots from UEFI.** The UEFI firmware boots the UniXNU menu and the
 > xnu entry starts the XNU kernel through DarwinBoot.
 >
+> Booting the kernel is all that works today: only the XNU kernel start is
+> supported, and XNU still needs substantial fixes before it reaches a
+> usable system.
+>
 > UEFI firmware: https://github.com/YinCQL/uefi_picasso
 
 ## Progress
