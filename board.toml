@@ -68,6 +68,20 @@ roots = [
 ]
 
 # Firmware step: build the picasso Mu-Silicium UEFI firmware via unixnu.
+[bootimg.image]
+base = 0x0
+kernel_offset = 0x8000
+tags_offset = 0x1e00000
+pagesize = 4096
+header_version = 1
+# The ABL loads kernel + ramdisk into one buffer that starts at abl_base
+# (0xB4513000 on this device, derived from the observed initrd address) and ends
+# at 0xB7E00000, so the whole payload window is about 57 MiB. With the default
+# ramdisk_offset of 0x1000000 the ramdisk starts at 0xB5513000 and only 42.6 MiB
+# fit, which truncated the 120 MiB payload: the FAT volume claimed 120 MiB while
+# only the first 42.9 MiB were in memory, and FatPkg faulted at 0xB7BFE000.
+# 0x200000 puts the ramdisk right after the ~2.1 MiB kernel slot, leaving 54.8 MiB.
+ramdisk_offset = 0x200000
 [firmware]
 config = "picasso"                   # Resources/Configs/picasso.toml in the Mu-Silicium checkout (--uefi)
 dsc = "Platforms/Xiaomi/picassoPkg/picasso.dsc"
@@ -104,7 +118,7 @@ BUILDID_STRING = "picasso-research"
 # Payload: a FAT volume with UniXNU config + kernel + ADT. Loader (DarwinBoot) is in the firmware.
 [payload]
 volume = "PICASSOESP"
-size_mib = 128
+size_mib = 54
 loader = "firmware"
 title = "picasso first boot: source XNU to console"
 dram_size = "0x80000000"

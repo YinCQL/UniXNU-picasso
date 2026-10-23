@@ -1,0 +1,136 @@
+name: Compose picasso boot image (FD + kernel + payload)
+
+# Composes a flashable boot image from:
+#   - the firmware volume committed in uefi/SILICIUM_UEFI.fd (built by the
+#     Mu-Silicium "Build and upload picasso FD" workflow, copied here manually)
+#   - the XNU kernel + ADT payload built here (macOS, xcodebuild)
+#   - BootShim / mkbootimg / DTB / FD config from uefi/mu-silicium (committed here)
+#
+# Produces boot.img ready for "fastboot boot" (or "fastboot flash boot" when the
+# payload is sized to fit the boot partition).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: picasso-bootimg-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+        working-directory: device
+    steps:
+      - name: Check out the picasso device repo (test branch, carries uefi/)
+        uses: actions/checkout@v4
+        with:
+          path: device
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify firmware volume and DTB are present
+        run: |
+          test -s uefi/SILICIUM_UEFI.fd || { echo "uefi/SILICIUM_UEFI.fd missing"; exit 1; }
+          test -s uefi/mu-silicium/Resources/DTBs/picasso.dtb || { echo "picasso.dtb missing"; exit 1; }
+          test -s uefi/mu-silicium/BootShim/BootShim.S || { echo "BootShim.S missing"; exit 1; }
+          test -s uefi/mu-silicium/Resources/Scripts/mkbootimg.py || { echo "mkbootimg.py missing"; exit 1; }
+          ls -l uefi/SILICIUM_UEFI.fd uefi/mu-silicium/Resources/DTBs/picasso.dtb
+
+      - name: Prepare the isolated upstream source
+        run: |
+          TREE=$(python3 ./unixnu --prepare)
+          echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
+
+      - name: Install host tools and check the SDK
+        run: |
+          brew install cmake ninja unifdef llvm mtools dtc
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Download the target IPSW
+        run: |
+          mkdir -p out/ipsw
+          IPSW=out/ipsw/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw
+          HOST=updates.cdn-apple.com
+          URL="https://$HOST/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
+          if [ ! -s "$IPSW" ]; then
+            if ! curl --fail --retry 3 --retry-all-errors --connect-timeout 30 -o "$IPSW" "$URL"; then
+              IP=$(curl -s -H 'accept: application/dns-json' "https://cloudflare-dns.com/dns-query?name=$HOST&type=A" \
+                    | python3 -c "import sys,json; d=json.load(sys.stdin); print(next(a['data'] for a in d.get('Answer',[]) if a['type']==1))")
+              echo "runner DNS failed; pinning $HOST to $IP"
+              curl --fail --retry 5 --retry-all-errors --connect-timeout 30 \
+                --resolve "$HOST:443:$IP" -o "$IPSW" "$URL"
+            fi
+          fi
+          ls -lh "$IPSW"
+          echo "UNIXNU_IPSW=$PWD/$IPSW" >> "$GITHUB_ENV"
+
+      - name: Build kernel + payload
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          UNIXNU_UNIQUE_CHIP_ID: "41a551c0dec0de01"
+        run: |
+          python3 ./unixnu defconfig picasso_defconfig
+          python3 ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
+          mkdir -p out/picasso/logs
+          python3 ./unixnu build kernel payload -j 3 2>&1 | tee out/picasso/logs/actions-build.log
+
+      - name: Report kernel/payload sizes
+        run: |
+          ls -l out/picasso/kernel/kernel.macho out/picasso/payload/payload.img
+          python3 - <<'EOF'
+          import struct
+          from pathlib import Path
+          k = Path('out/picasso/kernel/kernel.macho')
+          if k.is_file():
+              d = k.read_bytes()
+              print('kernel.macho', len(d), 'bytes')
+              # count segments and find __LINKEDIT size (symbols)
+              ncmds = struct.unpack_from('<I', d, 16)[0]
+              off = 32
+              for _ in range(ncmds):
+                  cmd, size = struct.unpack_from('<II', d, off)
+                  if cmd == 0x19:
+                      name = d[off+8:off+24].rstrip(b'\0').decode('latin1', 'replace')
+                      vmaddr, vmsize, fileoff, filesize = struct.unpack_from('<QQQQ', d, off+24)
+                      print(f'  seg {name:20s} filesize={filesize}')
+                  off += size
+          p = Path('out/picasso/payload/payload.img')
+          if p.is_file():
+              print('payload.img', len(p), 'bytes')
+          EOF
+
+      - name: Compose boot image (BootShim + repo FD + payload as ramdisk)
+        run: |
+          python3 ./unixnu bootimg \
+            --uefi "$GITHUB_WORKSPACE/device/uefi/mu-silicium" \
+            --fd "$GITHUB_WORKSPACE/device/uefi/SILICIUM_UEFI.fd" \
+            --dtb "$GITHUB_WORKSPACE/device/uefi/mu-silicium/Resources/DTBs/picasso.dtb" \
+            --ramdisk "$GITHUB_WORKSPACE/device/out/picasso/payload/payload.img" \
+            -o "$GITHUB_WORKSPACE/device/out/picasso/boot/boot.img" \
+            2>&1 | tee out/picasso/logs/bootimg.log
+          ls -lh out/picasso/boot/boot.img
+
+      - name: Upload boot image + kernel + payload + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: picasso-bootimg-${{ github.run_number }}
+          path: |
+            device/out/picasso/boot/**
+            device/out/picasso/kernel/**
+            device/out/picasso/payload/**
+            device/out/picasso/logs/**
+          if-no-files-found: warn
+          retention-days: 7
