@@ -24,6 +24,11 @@ import zlib
 ROOT = Path(__file__).resolve().parents[1]
 
 DRAM_BASE = 0x80000000
+# APSS peripheral window that the /arm-io bus node exposes. Child reg values are
+# offsets inside this window (docs/zh/porting/device-tree.md: "ranges 映射总线窗口。
+# 子节点 reg 使用窗口内偏移。低于窗口基址的设备无法作为子节点表达，驱动改用板级
+# 常量中的物理地址"), which is how make-sheng-adt.py builds the same node.
+ARMIO_BASE = 0x17A00000
 GIC_DIST = 0x17A00000
 GIC_DIST_SIZE = 0x10000
 GIC_REDIST = 0x17A60000
@@ -35,7 +40,28 @@ UFS_PHY = 0x1d80000
 UFS_PHY_SIZE = 0x2000
 UART_BASE = 0x00988000
 UART_SIZE = 0x4000
-PANIC_LOG_PADDR = 0x8FE00000
+# Panic log region for XNU's check_for_panic_log(): /pram/reg plus
+# /chosen/embedded-panic-log-size. The address must be DRAM that the firmware
+# already maps as normal system memory, because the kernel reaches it with
+# ml_io_map_wcomb() and then bzero()s the whole region.
+#
+# 0x8FE00000 (what the upstream branch used) sits inside
+# modem_wlan_region@8c000000 (0x8C000000..0x9B800000, 248 MiB, compatible
+# "removed-dma-pool", no-map). Mapping it writable and zeroing 1 MiB there
+# overwrites a modem/WLAN DMA pool, so it was never usable on this board.
+#
+# 0xB7F00000 is inside the "Boot Ramdisk Gap" that picassoPkg's MemoryMapLib
+# already declares as SYS_MEM / WRITE_BACK_XN (0xAD000000..0xBCC00000), which is
+# also how the payload ramdisk is reachable. It clears every other claim on that
+# DRAM:
+#   - outside the ABL kernel+ramdisk window (0xB4513000..0xB7E00000, derived
+#     from the device DT: linux,initrd-start/end = 0xB5513000/0xB7DFE66D),
+#     starting 1 MiB past its upper edge;
+#   - outside every /reserved-memory node in the device DT;
+#   - outside the firmware's own DXE Heap / Sched Heap / FD / SEC heap /
+#     page tables / stack / log buffer / info block;
+#   - inside /memory/reg, so it is real DRAM.
+PANIC_LOG_PADDR = 0xB7F00000
 PANIC_LOG_SIZE = 0x100000
 
 GPU_BASE = 0x05000000
@@ -128,7 +154,9 @@ def main():
             or any(reg < 0 or reg > 0xffff or reg & 0xff for reg in cpu_regs)):
         parser.error('--cpu-regs: up to eight distinct Affinity1-numbered cores, boot CPU 0 first')
     cpus = [node('cpu%d' % index, [('state', b'running\0' if index == 0 else b'waiting\0'),
-                                   ('reg', struct.pack('<I', reg)),
+                                   # /cpus is #address-cells = 2 (as in the device DT), so
+                                   # the MPIDR affinity goes out as a 64-bit cell.
+                                   ('reg', struct.pack('<Q', reg)),
                                    ('device_type', b'cpu\0'), ('compatible', b'arm,cortex-a76\0'),
                                    ('timebase-frequency', struct.pack('<I', TIMEBASE))])
             for index, reg in enumerate(cpu_regs)]
@@ -169,7 +197,11 @@ def main():
                                  ([('GpuAddon', bytes(16))] if args.gpu_addon else [])),
               # Read by the original AppleImage4 at start-up; present and empty here.
               node('manifest-properties')]),
-        node('cpus', children=cpus),
+        # The device DT declares /cpus #address-cells = 2, #size-cells = 0, so each
+        # cpuN reg is a 64-bit cell. IODTPlatformExpert reads reg with those cells;
+        # without them it falls back to the root node's cells and misreads the MPIDR.
+        node('cpus', [('#address-cells', struct.pack('<I', 2)),
+                      ('#size-cells', struct.pack('<I', 0))], children=cpus),
         *([node('psci', [('compatible', b'arm,psci-1.0\0'), ('method', args.psci_method.encode() + b'\0')])] if len(cpus) > 1 else []),
         # Suspend/resume is not implemented for this board. Block CPU parking.
         node('defaults', [('sleep-disabled', struct.pack('<I', 1))]),
@@ -181,34 +213,28 @@ def main():
         node('arm-io', [('device_type', b'arm-io\0'),
                         ('#address-cells', struct.pack('<I', 2)),
                         ('#size-cells', struct.pack('<I', 2)),
-                        ('ranges', struct.pack('<QQQ', 0, 0, DRAM_BASE))],
+                        ('ranges', struct.pack('<QQQ', 0, ARMIO_BASE, 0x08000000))],
              [node('intc', [('compatible', b'arm,gic-v3\0'),
                             ('reg', struct.pack('<4Q',
-                                                GIC_DIST, GIC_DIST_SIZE,
-                                                GIC_REDIST, GIC_REDIST_SIZE)),
+                                                GIC_DIST - ARMIO_BASE, GIC_DIST_SIZE,
+                                                GIC_REDIST - ARMIO_BASE, GIC_REDIST_SIZE)),
                             ('redistributor-stride', struct.pack('<Q', 0x40000))]),
+              # The GENI UART (0x988000) also sits below the APSS window, so a bus-offset
+              # reg would be negative. Like ufshc below, the node is for class matching
+              # only; the driver takes the physical base from the board constants.
               node('serial', [('compatible', b'qcom,geni-debug-uart\0qcom,geni-uart\0'),
-                              ('reg', struct.pack('<2Q', UART_BASE, UART_SIZE)),
                               ('boot-console', b'')]),
-              node('ufshc', [('compatible', b'qcom,sm7250-ufshc\0'),
-                             ('reg', struct.pack('<2Q', UFS_HC, UFS_HC_SIZE))]),
-              node('ufsphy', [('compatible', b'qcom,sm7250-ufs-phy\0'),
-                              ('reg', struct.pack('<2Q', UFS_PHY, UFS_PHY_SIZE))]),
+              # UFS (0x1d84000), the GPU blocks (0x5000000..) and the GPU SMMU all sit
+              # below the APSS window base, so none of them can carry a bus-offset reg.
+              # They exist for class matching only; the drivers read the physical
+              # windows from the board constants. This is the same shape
+              # make-sheng-adt.py uses for ufshc.
+              node('ufshc', [('compatible', b'qcom,sm7250-ufshc\0')]),
+              node('ufsphy', [('compatible', b'qcom,sm7250-ufs-phy\0')]),
               node('gpu', [('compatible', b'qcom,adreno-620.0\0qcom,adreno\0'),
-                           ('reg', struct.pack('<4Q', GPU_BASE, GPU_SIZE, GPU_CX_BASE, GPU_CX_SIZE)),
-                           ('#address-cells', struct.pack('<I', 2)),
-                           ('#size-cells', struct.pack('<I', 2)),
                            ('iommus', struct.pack('<II', 0x10, 0x0))]),
-              node('gmu', [('compatible', b'qcom,adreno-gmu-620.0\0qcom,adreno-gmu\0'),
-                           ('reg', struct.pack('<6Q', GMU_BASE, GMU_SIZE,
-                                               GMU_PDC_CFG, GMU_PDC_CFG_SIZE,
-                                               GMU_PDC_SEQ, GMU_PDC_SEQ_SIZE)),
-                           ('#address-cells', struct.pack('<I', 2)),
-                           ('#size-cells', struct.pack('<I', 2))]),
+              node('gmu', [('compatible', b'qcom,adreno-gmu-620.0\0qcom,adreno-gmu\0')]),
               node('adreno-smmu', [('compatible', b'qcom,adreno-smmu\0qcom,smmu-v2\0'),
-                                   ('reg', struct.pack('<2Q', SMMU_GPU_BASE, SMMU_GPU_SIZE)),
-                                   ('#address-cells', struct.pack('<I', 2)),
-                                   ('#size-cells', struct.pack('<I', 2)),
                                    ('#iommu-cells', struct.pack('<I', 1)),
                                    ('phandle', struct.pack('<I', 0x10))])]),
     ])

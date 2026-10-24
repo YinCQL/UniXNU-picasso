@@ -126,17 +126,43 @@ BUILDID_STRING = "picasso-research"
 volume = "PICASSOESP"
 size_mib = 54
 loader = "firmware"
-title = "picasso first boot: source XNU to console"
+title = "Boot"
 dram_size = "0x80000000"
+# serial=3 was dead weight here and could stall early boot: pe_serial.c only
+# registers PI3_UART, APPLE_UART, DOCKCHANNEL_UART and VMAPPLE_UART. SM7250 is a
+# Qualcomm GENI UART, so serial_init() returns 0 and PE_kputc falls back to
+# console_write_unbuffered -> vcputc_options, which is a no-op until the IOKit
+# video console binds the framebuffer. Asking for serial output therefore bought
+# nothing and left the boot without a console. debug=0x14e keeps DB_KPRT (0x8),
+# so kprintf is still enabled; the flags are 0x2 and 0x4 (NMI) plus 0x40 (ARP)
+# and 0x100 (obsolete), none of which halt early.
+# Also pin the platform explicitly: cpus=1 avoids spinning up seven secondary
+# cores before the platform expert has an interrupt controller.
 kernel_args = [
   "-v",
-  "serial=3",
   "debug=0x14e",
+  "cpus=1",
 ]
 
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"
 chip_id = "7250"
-owned_memory_size = "0x100000000"
+# DarwinBoot requests one contiguous window of this size from the firmware and
+# hands it to the kernel as boot_args.memSize. The kernel then builds its physmap
+# over exactly that range, so the window has to fit inside a single
+# conventional-memory run.
+#
+# 0x100000000 (4 GiB) cannot fit here. The first DRAM bank is
+# 0x80000000..0xBCC00000 (972 MiB) per the device DT, and picassoPkg's
+# MemoryMapLib exposes only the "Boot Ramdisk Gap" 0xAD000000..0xBCC00000 as
+# SYS_MEM (252 MiB). DarwinBoot still reports success at 4 GiB because
+# AllocatePages only records the range as owned, but arm_vm_init() then builds a
+# 4 GiB physmap starting at the window base 0xC007C000, which runs past the end
+# of real DRAM to 0x1C007C000. Touching that faults with the MMU already on and
+# no console bound yet -- the silent hang after the green bar.
+#
+# 256 MiB is DarwinWindowSizeValid()'s minimum (0x10000000..0x200000000 in 2 MiB
+# steps) and fits inside the 252 MiB SYS_MEM run.
+owned_memory_size = "0x10000000"
 cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
 unique_chip_id = "required"

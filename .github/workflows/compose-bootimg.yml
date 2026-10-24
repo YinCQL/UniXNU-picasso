@@ -1,4 +1,4 @@
-name: Compose picasso boot image (FD + kernel + payload)
+name: Compose Boot Image (FD + kernel + payload)
 
 # Composes a flashable boot image from:
 #   - the firmware volume committed in uefi/SILICIUM_UEFI.fd (built by the
@@ -96,7 +96,7 @@ jobs:
           if k.is_file():
               d = k.read_bytes()
               print('kernel.macho', len(d), 'bytes')
-              # count segments and find __LINKEDIT size (symbols)
+              # Count segments and report the file size of each one.
               ncmds = struct.unpack_from('<I', d, 16)[0]
               off = 32
               for _ in range(ncmds):
@@ -108,7 +108,7 @@ jobs:
                   off += size
           p = Path('out/picasso/payload/payload.img')
           if p.is_file():
-              print('payload.img', len(p), 'bytes')
+              print('payload.img', p.stat().st_size, 'bytes')
           EOF
 
       - name: Compose boot image (BootShim + repo FD + payload as ramdisk)
