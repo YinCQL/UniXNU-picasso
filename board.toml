@@ -162,17 +162,34 @@ kernel_args = [
 #         "pe_init.c:418 Assertion failed: PE_state.initialized". The text
 #         itself proves PE_create_console/PE_init_printf/cpu_machine_idle_init
 #         all completed (those calls were untouched).
-#   run 5  same target, caves now 16-aligned (lld aligns .text to 16; an
-#         unaligned cave shifts every defsym branch 4 bytes early): ~6 s
-#         reboot = the real second PE_init_platform (GIC MMIO) completed;
-#         hang/panic = it dies inside it. The panic screen now also reports
-#         lr= (the panic call site), PEini= (PE_state.initialized) and fb=,
-#         and mirrors the message to the /pram panic region: read it after a
-#         reset with scripts/dump-picasso-panic.py --fastboot --paddr 0xB7F00000.
+#   run 5  same target, caves 16-aligned -> ~6 s reboot: the real second
+#         PE_init_platform (pe_arm_init_interrupts, GIC MMIO 0x17A00000)
+#         completed. Transitively proves arm_vm_init, PE_create_console,
+#         PE_init_printf (runs 2/3 were void; the flow covers them).
+#         panic screen now reports lr=/PEini=/fb= and mirrors the message
+#         to the /pram region: dump-picasso-panic.py --fastboot --paddr 0xB7F00000.
+#   run 6  _fiq_context_init #1 -> ~6 s reboot: ml_map_cpu_pio, cpu_timebase_init,
+#         kptimer_curcpu_up, PE_init_cpu all complete; arm_init is at its tail.
+#   run 7  _vm_mem_bootstrap in _kernel_bootstrap -> ~6 s reboot, no text:
+#         kernel_bootstrap runs and vm_mem_bootstrap completes. The missing
+#         version line is BY DESIGN: printf goes to vcputc_options, which is
+#         gated on gc_enabled, and the screen is only acquired at
+#         kPEAcquireScreen (startup.c) -- in _kernel_bootstrap_thread, after
+#         PE_init_iokit, the EARLY_BOOT startup phase and spllo(). Early boot
+#         is console-less on a board without the display driver, exactly as
+#         the earlier note about pe_serial predicted.
+#   run 8  _initialize_screen in _kernel_bootstrap_thread -> ~6 s reboot, no
+#         wipe: PE_init_iokit (prelinked kexts), EARLY_BOOT and spllo() all
+#         passed. No wipe is by design: v_display=1 puts the boot in graphics
+#         mode, so kPEAcquireScreen calls gc_enable(FALSE) and the console
+#         stays off -- fixed by the vendored DarwinBoot in UniXNU-picasso
+#         (drivers/DarwinBoot, v_display = 0 = text console from acquire on).
+#   run 9  FREE RUN: no reset probe (panic screen only). Expected: bars ->
+#         screen wiped with a cursor at kPEAcquireScreen -> scrolling kernel
+#         log (kprintf, debug=0x14e) -> "Still waiting for root device" or a
+#         visible panic once the root filesystem is missing. Any panic text
+#         also lands in the /pram region (dump-picasso-panic.py).
 panic_screen = true
-entry_probe_reset_delay = 6
-entry_probe_reset_after = "_PE_init_platform"
-entry_probe_reset_occurrence = 2
 
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"
