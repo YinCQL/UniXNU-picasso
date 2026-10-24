@@ -51,6 +51,9 @@ archives = [
   "build-corecrypto-14.py --namespace",
   "build-arm-driver.py ArmDTPlatform",
   "build-arm-driver.py ArmCpu",
+  # Stage 6: the UFS controller driver. Its board constants (GccUfs.h) carry
+  # the SM7250 physical windows; the ADT ufshc/ufsphy nodes only match classes.
+  "build-arm-driver.py NativeUfs",
 ]
 
 [kernel.prelink]
