@@ -130,12 +130,10 @@ new file mode 100644
 index 0000000..usb0001
 --- /dev/null
 +++ b/patches/xnu/zzz-picasso-usb-console.patch
-@@ -0,0 +1,626 @@
-+diff --git a/bsd/conf/files b/bsd/conf/files
-+index 19b4065..b22147f 100644
+@@ -0,0 +1,625 @@
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
-+@@ -107,6 +107,7 @@ bsd/dev/random/randomdev.c		standard
++@@ -107,6 +107,7 @@
 + 
 + bsd/dev/memdev.c			standard
 + bsd/dev/mem.c				standard
@@ -143,12 +141,40 @@ index 0000000..usb0001
 + bsd/dev/munge.c 			optional config_requires_u32_munging
 + bsd/dev/unix_startup.c			standard
 + 
-+diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
-+new file mode 100644
-+index 0000000..46c4f7d
++
++--- a/bsd/kern/bsd_init.c
+++++ b/bsd/kern/bsd_init.c
++@@ -506,6 +506,10 @@
++ 	throttle_init();
++ 
++ 	printf(copyright);
+++	{
+++		extern void picasso_usb_console_start(void);
+++		picasso_usb_console_start();
+++	}
++ 
++ #if CONFIG_DEV_KMEM
++ 	bsd_init_kprintf("calling dev_kmem_init\n");
++
++--- a/osfmk/console/serial_console.c
+++++ b/osfmk/console/serial_console.c
++@@ -258,6 +258,12 @@
++ 	if (c == '\n') {
++ 		_cnputc('\r', poll);
++ 	}
+++	{
+++		extern void picasso_usb_log_char(char);
+++		/* stored once per character, after the CR expansion,
+++		 * recursive '\r' also lands here and is stored exactly once. */
+++		picasso_usb_log_char(c);
+++	}
++ 
++ 	cons_ops[idx].putc(c, poll);
++ }
++
 +--- /dev/null
 ++++ b/bsd/dev/picasso_usb.c
-+@@ -0,0 +1,575 @@
++@@ -0,0 +1,581 @@
 ++/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 ++ *
 ++ * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -177,6 +203,7 @@ index 0000000..usb0001
 ++
 ++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 ++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+++extern pmap_paddr_t kvtophys(vm_offset_t va);
 ++
 ++/* ------------------------------------------------------------------ */
 ++/* Console mirror ring: any context, best effort, never waits.        */
@@ -634,11 +661,16 @@ index 0000000..usb0001
 ++		printf("PICASSO USB: no DMA memory\n");
 ++		return;
 ++	}
+++	/* pmap_find_phys can return 0 for freshly kmem-allocated pages on this
+++	 * kernel; kvtophys is the canonical VA-to-PA walk. Fail loudly either way. */
 ++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
-++	if (!pn) {
+++	uint64_t pa = pn ? ptoa_64(pn) : (uint64_t)kvtophys(ud.dma);
+++	if (!pa) {
+++		printf("PICASSO USB: cannot resolve DMA physical address at %p\n", (void *)ud.dma);
 ++		return;
 ++	}
-++	ud.dma_pa = ptoa_64(pn);
+++	ud.dma_pa = pa;
+++	printf("PICASSO USB: DMA %d pages at va %p pa 0x%llx\n", (int)(UD_SIZE / PAGE_SIZE), (void *)ud.dma, ud.dma_pa);
 ++
 ++	/* Device controller soft reset (PHY and global setup stay as ABL/UEFI left them). */
 ++	dwc_wr(DCTL, DCTL_CSFTRST);
@@ -724,36 +756,3 @@ index 0000000..usb0001
 ++		picasso_usb_gadget_start(dwc);
 ++	}
 ++}
-+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-+index bb558ee..82e3e51 100644
-+--- a/bsd/kern/bsd_init.c
-++++ b/bsd/kern/bsd_init.c
-+@@ -506,6 +506,10 @@ bsd_init(void)
-+ 	throttle_init();
-+ 
-+ 	printf(copyright);
-++	{
-++		extern void picasso_usb_console_start(void);
-++		picasso_usb_console_start();
-++	}
-+ 
-+ #if CONFIG_DEV_KMEM
-+ 	bsd_init_kprintf("calling dev_kmem_init\n");
-+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
-+index e6d38d3..42d1912 100644
-+--- a/osfmk/console/serial_console.c
-++++ b/osfmk/console/serial_console.c
-+@@ -261,6 +261,13 @@ _cnputc(char c, bool poll)
-+ 	}
-+ 
-+ 	cons_ops[idx].putc(c, poll);
-++	{
-++		extern void picasso_usb_log_char(char);
-++		/* stored once per character, after the CR expansion, so the
-++		 * mirror keeps the console CR-LF order. */
-++		picasso_usb_log_char(c);
-++	}
-++
-+ }
-+ 
-+ /**
