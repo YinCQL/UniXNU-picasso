@@ -125,13 +125,12 @@ index 0000000..3333333
 + 
 + 	/* Check if a shared memory console is running in the panic buffer */
 + 	if (panic_info->eph_magic == 'SHMC') {
-
 diff --git a/patches/xnu/zzz-picasso-usb-console.patch b/patches/xnu/zzz-picasso-usb-console.patch
 new file mode 100644
 index 0000000..usb0001
 --- /dev/null
 +++ b/patches/xnu/zzz-picasso-usb-console.patch
-@@ -0,0 +1,624 @@
+@@ -0,0 +1,626 @@
 +diff --git a/bsd/conf/files b/bsd/conf/files
 +index 19b4065..b22147f 100644
 +--- a/bsd/conf/files
@@ -146,10 +145,10 @@ index 0000000..usb0001
 + 
 +diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
 +new file mode 100644
-+index 0000000..651afc3
++index 0000000..46c4f7d
 +--- /dev/null
 ++++ b/bsd/dev/picasso_usb.c
-+@@ -0,0 +1,573 @@
++@@ -0,0 +1,575 @@
 ++/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 ++ *
 ++ * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -175,6 +174,9 @@ index 0000000..usb0001
 ++#include <vm/pmap.h>
 ++#include <vm/vm_kern.h>
 ++#include <pexpert/pexpert.h>
+++
+++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 ++
 ++/* ------------------------------------------------------------------ */
 ++/* Console mirror ring: any context, best effort, never waits.        */
@@ -594,7 +596,6 @@ index 0000000..usb0001
 ++		if (ud.state == EP0_WAIT_STATUS2 || ud.state == EP0_WAIT_STATUS3) {
 ++			uint32_t ctl = ud.state == EP0_WAIT_STATUS3 ? TRBCTL_STATUS3 : TRBCTL_STATUS2;
 ++			ud.state = EP0_STATUS;
-++			/* the status phase runs on the endpoint opposite to the data stage */
 ++			ud_start_trb(ep, ep ? UD_TRB_IN : UD_TRB_OUT, UD_DATA, 0, ctl);
 ++		}
 ++	}
