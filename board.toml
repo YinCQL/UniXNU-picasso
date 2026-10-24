@@ -155,6 +155,13 @@ kernel_args = [
   # then panics "No PMGR", the shim port becomes the next task.
   "native-ufs-probe=12",
   "native-ufs-diagnostics=1",
+  # IOKit matching trace: kIOLogMatch(0x10) | kIOLogProbe(0x2) |
+  # kIOLogConfig(0x20) | kIOLogCatalogue(0x200). Three silent runs in a row
+  # (root, probe=12 variants) mean start() is never reached; this shows
+  # whether the personalities registered, whether ArmDTPlatform matched the
+  # root nub, and whether NativeUfs::probe was called at all. The log is
+  # long -- capture it in screen photos in sequence.
+  "io=0x232",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
