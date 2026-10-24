@@ -130,7 +130,7 @@ new file mode 100644
 index 0000000..usb0001
 --- /dev/null
 +++ b/patches/xnu/zzz-picasso-usb-console.patch
-@@ -0,0 +1,662 @@
+@@ -0,0 +1,681 @@
 +diff --git a/bsd/conf/files b/bsd/conf/files
 +index 19b4065..b22147f 100644
 +--- a/bsd/conf/files
@@ -148,7 +148,7 @@ index 0000000..usb0001
 +index 0000000..4825dd5
 +--- /dev/null
 ++++ b/bsd/dev/picasso_usb.c
-+@@ -0,0 +1,612 @@
++@@ -0,0 +1,631 @@
 ++/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 ++ *
 ++ * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -355,6 +355,11 @@ index 0000000..usb0001
 ++	 * while the USB2 PHY suspend bits are set; clear, command, restore. */
 ++	uint32_t physave = dwc_rd(GUSB2PHYCFG) & (PHY_SUSPHY | PHY_ENBLSLPM);
 ++	if (physave) {
+++		static bool phywarned;
+++		if (!phywarned) {
+++			phywarned = true;
+++			printf("PICASSO USB: PHY suspend bits 0x%x cleared for cmds\n", physave);
+++		}
 ++		dwc_wr(GUSB2PHYCFG, dwc_rd(GUSB2PHYCFG) & ~physave);
 ++	}
 ++	dwc_wr(DEPCMDPAR0(ep), p0);
@@ -648,10 +653,18 @@ index 0000000..usb0001
 ++	thread_t thread;
 ++
 ++	ud.dwc = dwc;
-++	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+++	/* Cap the buffer below 0xB0000000: ABL's fastboot proved the USB master
+++	 * reaches low DRAM (its download buffer lived at 0xB4-0xB7), while the
+++	 * first STARTTRANSFER from a bank-2 (0xC4xx) TRB warm-resets the SoC. */
+++	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK,
+++	    (ppnum_t)(0xB0000000u >> PAGE_SHIFT), 0,
 ++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-++		printf("PICASSO USB: no DMA memory\n");
-++		return;
+++		printf("PICASSO USB: bank-1 DMA alloc failed\n");
+++		if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+++			printf("PICASSO USB: no DMA memory\n");
+++			return;
+++		}
 ++	}
 ++	/* pmap_find_phys can return 0 for freshly kmem-allocated pages on this
 ++	 * kernel; kvtophys is the canonical VA-to-PA walk. Fail loudly either way. */
@@ -666,6 +679,7 @@ index 0000000..usb0001
 ++
 ++	uint32_t gctl = dwc_rd(GCTL);
 ++	printf("PICASSO USB: GCTL 0x%08x PrtCapDir %u\n", gctl, (gctl >> 12) & 7);
+++	printf("PICASSO USB: GUSB2PHYCFG 0x%08x\n", dwc_rd(GUSB2PHYCFG));
 ++	gctl = (gctl & ~(7u << 12)) | (2u << 12);   /* already device mode; keep it */
 ++	dwc_wr(GCTL, gctl);
 ++	printf("PICASSO USB: asserting soft reset\n");
@@ -704,9 +718,12 @@ index 0000000..usb0001
 ++	if (ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) { return; }
 ++	printf("PICASSO USB: ep0 fifos ok\n");
 ++	dwc_wr(DALEPENA, 0x3);
-++	printf("PICASSO USB: DALEPENA 0x%08x, arming setup\n", dwc_rd(DALEPENA));
-++	ud_start_setup();
+++	printf("PICASSO USB: DALEPENA 0x%08x\n", dwc_rd(DALEPENA));
 ++
+++	/* VBUS session and RUN_STOP come before arming the setup TRB: the first
+++	 * STARTTRANSFER (the controller's first DMA fetch) warm-resets the SoC
+++	 * when the TRB lives in bank 2, so bring the controller up first and
+++	 * arm the setup transfer last, where a reset points at the fetch. */
 ++	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
 ++	printf("PICASSO USB: QSCRATCH map %p\n", (void *)qs);
 ++	if (qs != 0) {
@@ -723,6 +740,8 @@ index 0000000..usb0001
 ++	}
 ++	printf("PICASSO USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n",
 ++	    dwc_rd(DSTS), i, ud.dma_pa);
+++	ud_start_setup();
+++	printf("PICASSO USB: setup armed\n");
 ++	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
 ++		thread_deallocate(thread);
 ++		pur_live = true;
