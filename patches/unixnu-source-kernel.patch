@@ -203,7 +203,7 @@ index 0000000..usb0001
 ++
 ++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 ++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
-++extern pmap_paddr_t kvtophys(vm_offset_t va);
+++extern uint64_t kvtophys(vm_offset_t va);
 ++
 ++/* ------------------------------------------------------------------ */
 ++/* Console mirror ring: any context, best effort, never waits.        */
