@@ -69,6 +69,7 @@ roots = [
   "com.apple.iokit.IOStorageFamily",
   "com.apple.kec.Libm",
   "com.apple.kec.corecrypto",
+  "com.apple.kec.libpthread",
   "com.apple.kext.CoreTrust",
   "com.apple.security.AppleImage4",
 ]
@@ -194,6 +195,15 @@ kernel_args = [
 #         (0xFFFFFFF005AB4AE0, prelink/kext region below the kernel text);
 #         emit_prelink slides it into our coalesced segments (-0x1000000,
 #         uniform) and the runtime adds vm_kernel_slide (0 on picasso).
+#         (First attempt put the key in [payload] where nothing read it --
+#         the panic repeated; fixed in a4a1162 and the panic advanced.)
+#   run 11 result: trust_cache_init PASSED (AMFI registered) -- the kernel
+#         advanced to pthread_shims.c:318 "pthread kernel extension not
+#         loaded". picasso_defconfig keeps CONFIG_XNU_SOURCE_PTHREAD unset,
+#         so the pthread shims need the libpthread KEXT from the kernelcache
+#         (sheng instead builds pthread from source). Fixed by adding
+#         com.apple.kec.libpthread to the prelink roots; its function table
+#         gets bound by emit_prelink's kernel-side pointer rebinding.
 panic_screen = true
 
 [payload.adt]
