@@ -143,6 +143,36 @@ kernel_args = [
   "debug=0x14e",
   "cpus=1",
 ]
+# Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
+# scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
+# to this kernel via the symbol table) paints a blue bar at the kernel entry,
+# a magenta bar just before the MMU comes on, and reboots the device via PSCI
+# SYSTEM_RESET entry_probe_reset_delay seconds after the MMU is enabled --
+# a spontaneous reboot after that delay is the signal that start.s completed.
+# panic_screen redirects panic() to a renderer that draws on the kernel's own
+# framebuffer mapping, so any panic after PE_create_console becomes readable.
+# Bisect deeper with entry_probe_reset_after (one call per run; payload.py keys
+# map to the script's --reset-after/--in/--occurrence options).
+# Bisect log (2026-10-24), one probe per run; ~6 s reboot = the call completed:
+#   run 1  after-MMU        -> reboot : start.s complete (genuine: cave 16-aligned)
+#   run 2  _arm_vm_init     -> VOID   : tight-packing bug (below) made cave4 bl
+#   run 3  _PE_create_console -> VOID   : land at callee-4 (previous function tail)
+#   run 4  _PE_init_platform #2 -> hang + panic text: the miswired bl landed on
+#         PE_slide_devicetree's `bl .cold` tail = exactly the observed
+#         "pe_init.c:418 Assertion failed: PE_state.initialized". The text
+#         itself proves PE_create_console/PE_init_printf/cpu_machine_idle_init
+#         all completed (those calls were untouched).
+#   run 5  same target, caves now 16-aligned (lld aligns .text to 16; an
+#         unaligned cave shifts every defsym branch 4 bytes early): ~6 s
+#         reboot = the real second PE_init_platform (GIC MMIO) completed;
+#         hang/panic = it dies inside it. The panic screen now also reports
+#         lr= (the panic call site), PEini= (PE_state.initialized) and fb=,
+#         and mirrors the message to the /pram panic region: read it after a
+#         reset with scripts/dump-picasso-panic.py --fastboot --paddr 0xB7F00000.
+panic_screen = true
+entry_probe_reset_delay = 6
+entry_probe_reset_after = "_PE_init_platform"
+entry_probe_reset_occurrence = 2
 
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"
