@@ -148,7 +148,7 @@ index 0000000..usb0001
 +index 0000000..e6caf7f
 +--- /dev/null
 ++++ b/bsd/dev/picasso_usb.c
-+@@ -0,0 +1,590 @@
++@@ -0,0 +1,587 @@
 ++/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 ++ *
 ++ * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -648,15 +648,12 @@ index 0000000..usb0001
 ++
 ++	/* Device controller soft reset (PHY and global setup stay as ABL/UEFI left them). */
 ++	uint32_t gctl = dwc_rd(GCTL);
-++	printf("PICASSO USB: GCTL 0x%08x PrtCapDir %u
-++", gctl, (gctl >> 12) & 7);
+++	printf("PICASSO USB: GCTL 0x%08x PrtCapDir %u\n++", gctl, (gctl >> 12) & 7);
 ++	gctl = (gctl & ~(7u << 12)) | (2u << 12);   /* force device capability */
 ++	dwc_wr(GCTL, gctl);
-++	printf("PICASSO USB: asserting soft reset
-++");
+++	printf("PICASSO USB: asserting soft reset\n++");
 ++	dwc_wr(DCTL, DCTL_CSFTRST);
-++	printf("PICASSO USB: reset asserted, DCTL 0x%08x
-++", dwc_rd(DCTL));
+++	printf("PICASSO USB: reset asserted, DCTL 0x%08x\n++", dwc_rd(DCTL));
 ++	int i;
 ++	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
 ++		delay(1000);
