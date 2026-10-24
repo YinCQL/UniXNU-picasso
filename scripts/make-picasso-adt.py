@@ -24,7 +24,6 @@ import zlib
 ROOT = Path(__file__).resolve().parents[1]
 
 DRAM_BASE = 0x80000000
-ARMIO_BASE = 0x17A00000          # APSS peripheral block containing the GIC
 GIC_DIST = 0x17A00000
 GIC_DIST_SIZE = 0x10000
 GIC_REDIST = 0x17A60000
@@ -34,6 +33,25 @@ UFS_HC = 0x1d84000
 UFS_HC_SIZE = 0x3000
 UFS_PHY = 0x1d80000
 UFS_PHY_SIZE = 0x2000
+UART_BASE = 0x00988000
+UART_SIZE = 0x4000
+PANIC_LOG_PADDR = 0x8FE00000
+PANIC_LOG_SIZE = 0x100000
+
+GPU_BASE = 0x05000000
+GPU_SIZE = 0x40000
+GPU_CX_BASE = 0x0509E000
+GPU_CX_SIZE = 0x1000
+
+GMU_BASE = 0x0506A000
+GMU_SIZE = 0x32000
+GMU_PDC_CFG = 0x0B280000
+GMU_PDC_CFG_SIZE = 0x10000
+GMU_PDC_SEQ = 0x0B480000
+GMU_PDC_SEQ_SIZE = 0x10000
+
+SMMU_GPU_BASE = 0x05040000
+SMMU_GPU_SIZE = 0x10000
 
 
 def node(name, properties=(), children=()):
@@ -91,6 +109,7 @@ def main():
     parser.add_argument('--data-ramdisk', action='store_true',
                         help='/chosen/memory-map RAMDisk placeholder; the loader fills in the real range for a scratch Data seed')
     parser.add_argument('--trust-cache', action='store_true', help='Zeroed TrustCache sidecar handoff placeholder')
+    parser.add_argument('--gpu-addon', action='store_true', help='Zeroed GpuAddon sidecar handoff placeholder')
     args = parser.parse_args()
     if (args.unique_chip_id is None) != (args.chip_id is None):
         parser.error('--unique-chip-id and --chip-id must be supplied together')
@@ -143,9 +162,11 @@ def main():
                            if args.root_match_volume_uuid else [] ),
                         # Strict policy for the original AMFI: platform code only.
                         ('amfi-only-platform-code', struct.pack('<I', 1)),
+                        ('embedded-panic-log-size', struct.pack('<I', PANIC_LOG_SIZE)),
                         *empty_nvram_proxy()],
              [node('memory-map', ([("PackedRAMDisk" if args.packed_data_ramdisk else "RAMDisk", bytes(16))] if (args.data_ramdisk or args.packed_data_ramdisk) else []) +
-                                 ([('TrustCache', bytes(16))] if args.trust_cache else [])),
+                                 ([('TrustCache', bytes(16))] if args.trust_cache else []) +
+                                 ([('GpuAddon', bytes(16))] if args.gpu_addon else [])),
               # Read by the original AppleImage4 at start-up; present and empty here.
               node('manifest-properties')]),
         node('cpus', children=cpus),
@@ -156,19 +177,40 @@ def main():
         # The original AppleImage4 panics without a product node.
         node('product', [('product-name', b'Redmi K30 5G\0'),
                          ('model', b'xiaomi,picasso\0')]),
+        node('pram', [('reg', struct.pack('<2Q', PANIC_LOG_PADDR, PANIC_LOG_SIZE))]),
         node('arm-io', [('device_type', b'arm-io\0'),
                         ('#address-cells', struct.pack('<I', 2)),
                         ('#size-cells', struct.pack('<I', 2)),
-                        ('ranges', struct.pack('<QQQ', 0, ARMIO_BASE, 0x08000000))],
+                        ('ranges', struct.pack('<QQQ', 0, 0, DRAM_BASE))],
              [node('intc', [('compatible', b'arm,gic-v3\0'),
                             ('reg', struct.pack('<4Q',
-                                                GIC_DIST - ARMIO_BASE, GIC_DIST_SIZE,
-                                                GIC_REDIST - ARMIO_BASE, GIC_REDIST_SIZE)),
+                                                GIC_DIST, GIC_DIST_SIZE,
+                                                GIC_REDIST, GIC_REDIST_SIZE)),
                             ('redistributor-stride', struct.pack('<Q', 0x40000))]),
-              # UFS (0x1d84000) lies below the arm-io window, so a child reg offset would be
-              # negative. The node exists only for class matching; NativeUfs takes its
-              # physical windows from the board DT constants.
-              node('ufshc', [('compatible', b'qcom,sm7250-ufshc\0')])]),
+              node('serial', [('compatible', b'qcom,geni-debug-uart\0qcom,geni-uart\0'),
+                              ('reg', struct.pack('<2Q', UART_BASE, UART_SIZE)),
+                              ('boot-console', b'')]),
+              node('ufshc', [('compatible', b'qcom,sm7250-ufshc\0'),
+                             ('reg', struct.pack('<2Q', UFS_HC, UFS_HC_SIZE))]),
+              node('ufsphy', [('compatible', b'qcom,sm7250-ufs-phy\0'),
+                              ('reg', struct.pack('<2Q', UFS_PHY, UFS_PHY_SIZE))]),
+              node('gpu', [('compatible', b'qcom,adreno-620.0\0qcom,adreno\0'),
+                           ('reg', struct.pack('<4Q', GPU_BASE, GPU_SIZE, GPU_CX_BASE, GPU_CX_SIZE)),
+                           ('#address-cells', struct.pack('<I', 2)),
+                           ('#size-cells', struct.pack('<I', 2)),
+                           ('iommus', struct.pack('<II', 0x10, 0x0))]),
+              node('gmu', [('compatible', b'qcom,adreno-gmu-620.0\0qcom,adreno-gmu\0'),
+                           ('reg', struct.pack('<6Q', GMU_BASE, GMU_SIZE,
+                                               GMU_PDC_CFG, GMU_PDC_CFG_SIZE,
+                                               GMU_PDC_SEQ, GMU_PDC_SEQ_SIZE)),
+                           ('#address-cells', struct.pack('<I', 2)),
+                           ('#size-cells', struct.pack('<I', 2))]),
+              node('adreno-smmu', [('compatible', b'qcom,adreno-smmu\0qcom,smmu-v2\0'),
+                                   ('reg', struct.pack('<2Q', SMMU_GPU_BASE, SMMU_GPU_SIZE)),
+                                   ('#address-cells', struct.pack('<I', 2)),
+                                   ('#size-cells', struct.pack('<I', 2)),
+                                   ('#iommu-cells', struct.pack('<I', 1)),
+                                   ('phandle', struct.pack('<I', 0x10))])]),
     ])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(tree)

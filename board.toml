@@ -25,6 +25,9 @@ fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustC
 [ipsw.sha256]
 
 # UserData partition geometry (GPT entry "userdata" of LUN 0). PLACEHOLDER.
+# The silenzio111 branch measured first_lba = 0x200000, last_lba = 0x3A00000 on this
+# board; those values stay unverified here and the kernel/payload steps do not read
+# them, so the safe placeholder is kept until "unixnu build userdata" is brought up.
 [userdata]
 first_lba = 0x0
 last_lba = 0x0
@@ -39,7 +42,10 @@ windows = [
 defconfig = "picasso_defconfig"
 # First-console archives: only what the minimal picasso_defconfig selects
 # (corecrypto, ArmDTPlatform, ArmCpu, arch timer). UFS / VirtIO / display /
-# Adreno are added in later stages once the platform reaches the console.
+# Adreno are added in later stages once the platform reaches the console:
+# configs/picasso_platform_defconfig lists the stage-6 draft, and its archives
+# would be "build-libpthread-kernel.py", "build-arm-driver.py NativeUfs" and
+# "build-arm-driver.py NativeAdreno" appended below.
 archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
