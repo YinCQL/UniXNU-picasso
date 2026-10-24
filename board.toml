@@ -58,7 +58,7 @@ tool = "kits/NativePrelink/emit_prelink.py"
 kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
 kernelcache_sha256 = ""
 slide = "-0x1000000"
-early_security_init = ""
+early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
 roots = [
   "com.apple.driver.AppleARMPlatform",
   "com.apple.driver.AppleARMWatchdogTimer",
@@ -195,7 +195,6 @@ kernel_args = [
 #         emit_prelink slides it into our coalesced segments (-0x1000000,
 #         uniform) and the runtime adds vm_kernel_slide (0 on picasso).
 panic_screen = true
-early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
 
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"
