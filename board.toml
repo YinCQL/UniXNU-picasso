@@ -146,6 +146,11 @@ kernel_args = [
   "-v",
   "debug=0x14e",
   "cpus=1",
+  # Drive the UFS controller: NativeUfs::start refuses to touch hardware
+  # without this (match-for-observability only by design; sheng does the
+  # same). native-ufs-probe=2/8 additionally inspect registers via the
+  # ufshc nub personality, whose compatible now accepts sm7250 too.
+  "native-ufs-root=1",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself

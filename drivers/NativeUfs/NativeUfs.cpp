@@ -125,10 +125,12 @@ IOService *NativeUfs::probe (IOService *provider, SInt32 *score)
   bool match = false;
   if (data) {
     const char *text = static_cast<const char *> (data->getBytesNoCopy ());
-    match = text && contains (text, data->getLength (), "qcom,sm8550-ufshc");
+    match = text && (contains (text, data->getLength (), "qcom,sm8550-ufshc") ||
+                     contains (text, data->getLength (), "qcom,sm7250-ufshc"));
   } else if (string) {
     const char *text = string->getCStringNoCopy ();
-    match = text && contains (text, string->getLength (), "qcom,sm8550-ufshc");
+    match = text && (contains (text, string->getLength (), "qcom,sm8550-ufshc") ||
+                     contains (text, string->getLength (), "qcom,sm7250-ufshc"));
   }
   if (!match) {
     return nullptr;
