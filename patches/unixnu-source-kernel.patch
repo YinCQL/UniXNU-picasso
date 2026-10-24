@@ -130,7 +130,7 @@ new file mode 100644
 index 0000000..usb0001
 --- /dev/null
 +++ b/patches/xnu/zzz-picasso-usb-console.patch
-@@ -0,0 +1,675 @@
+@@ -0,0 +1,735 @@
 +diff --git a/bsd/conf/files b/bsd/conf/files
 +index 19b4065..b22147f 100644
 +--- a/bsd/conf/files
@@ -148,7 +148,7 @@ index 0000000..usb0001
 +index 0000000..4825dd5
 +--- /dev/null
 ++++ b/bsd/dev/picasso_usb.c
-+@@ -0,0 +1,625 @@
++@@ -0,0 +1,685 @@
 ++/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 ++ *
 ++ * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -241,6 +241,18 @@ index 0000000..usb0001
 ++#define   SW_SESSVLD_SEL        (1u << 28)
 ++#define QSCRATCH_SS_PHY_CTRL    0x30u
 ++#define   LANE0_PWR_PRESENT     (1u << 24)
+++
+++/* Qualcomm apps_smmu (qcom,qsmmu-v500 @ 0x15000000). ABL tears the USB
+++ * translation down before booting: every controller DMA then faults (into
+++ * bank 2 it warm-resets the SoC, into bank 1 it wedges the DBI). Route
+++ * stream 0xE0 (ssusb@a600000 in the stock DT) to bypass so the master
+++ * addresses DRAM physically. */
+++#define SMMU_PA                 0x15000000u
+++#define SMMU_SMR(n)             (0x800u + 4u * (n))
+++#define SMMU_S2CR(n)            (0xc00u + 4u * (n))
+++#define SMR_VALID               (1u << 31)
+++#define S2CR_BYPASS             (1u << 16)
+++#define USB_SID                 0x0e0u
 ++
 ++#define GCTL            0xc110u
 ++#define GEVNTADRLO      0xc400u
@@ -339,6 +351,53 @@ index 0000000..usb0001
 ++	/* The ring is device-mapped (uncached): CPU stores are visible to the
 ++	 * controller without cache maintenance, and a by-PA flush would go
 ++	 * through physmap, which does not cover the carved bank-1 page. */
+++}
+++
+++static void
+++ud_smmu_bypass(void)
+++{
+++	vm_offset_t s = ml_io_map(SMMU_PA, 0x8000);
+++	if (s == 0) {
+++		printf("PICASSO USB: SMMU map failed\n");
+++		return;
+++	}
+++	uint32_t idr0 = usb_rd(s, 0x0);
+++	int nsmr = 1 << (idr0 & 0xff);
+++	printf("PICASSO USB: SMMU IDR0 0x%08x (%d SMRs) sCR0 0x%08x\n",
+++	    idr0, nsmr, usb_rd(s, 0x0));
+++	int slot = -1, free_slot = -1;
+++	int lim = nsmr < 128 ? nsmr : 128;
+++	for (int n = 0; n < lim; n++) {
+++		uint32_t smr = usb_rd(s, SMMU_SMR(n));
+++		if (!(smr & SMR_VALID)) {
+++			if (free_slot < 0) {
+++				free_slot = n;
+++			}
+++		} else if ((smr & 0xffffu) == USB_SID) {
+++			slot = n;
+++			break;
+++		}
+++	}
+++	if (slot < 0) {
+++		slot = free_slot;
+++	}
+++	if (slot < 0) {
+++		printf("PICASSO USB: SMMU no slot for sid 0x%x\n", USB_SID);
+++		return;
+++	}
+++	uint32_t old = usb_rd(s, SMMU_S2CR(slot));
+++	*(volatile uint32_t *)(s + SMMU_S2CR(slot)) = S2CR_BYPASS;
+++	*(volatile uint32_t *)(s + SMMU_SMR(slot)) = SMR_VALID | USB_SID;
+++	__asm__ volatile ("dsb sy" ::: "memory");
+++	*(volatile uint32_t *)(s + 0x618) = 0;      /* TLBIALLNSNH */
+++	for (int i = 0; i < 1000; i++) {
+++		if (!(usb_rd(s, 0x7f4) & 1)) {   /* TLBSTATUS.SACTIVE clear */
+++			break;
+++		}
+++		delay(1);
+++	}
+++	printf("PICASSO USB: SMMU sid 0x%x -> slot %d, S2CR 0x%08x (was 0x%08x)\n",
+++	    USB_SID, slot, usb_rd(s, SMMU_S2CR(slot)), old);
 ++}
 ++
 ++static void
@@ -691,6 +750,7 @@ index 0000000..usb0001
 ++	/* DCTL.CSFTRST can drop GCTL.PrtCapDir; re-assert device mode. */
 ++	gctl = (dwc_rd(GCTL) & ~(7u << 12)) | (2u << 12);
 ++	dwc_wr(GCTL, gctl);
+++	ud_smmu_bypass();
 ++
 ++	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
 ++	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
