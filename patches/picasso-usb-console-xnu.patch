@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..4825dd5
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,589 @@
+@@ -0,0 +1,612 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -114,6 +114,9 @@ index 0000000..4825dd5
 +#define GEVNTADRHI      0xc404u
 +#define GEVNTSIZ        0xc408u
 +#define GEVNTCOUNT      0xc40cu
++#define GUSB2PHYCFG     0xc200u
++#define   PHY_SUSPHY    (1u << 6)   /* must be clear while issuing DEPCMDs */
++#define   PHY_ENBLSLPM  (1u << 8)
 +#define DCFG            0xc700u
 +#define DCTL            0xc704u
 +#define DEVTEN          0xc708u
@@ -214,6 +217,13 @@ index 0000000..4825dd5
 +static int
 +ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
 +{
++	int ret = 0;
++	/* DWC_usb3 3.30a programming guide 3.2.2: endpoint commands hang
++	 * while the USB2 PHY suspend bits are set; clear, command, restore. */
++	uint32_t physave = dwc_rd(GUSB2PHYCFG) & (PHY_SUSPHY | PHY_ENBLSLPM);
++	if (physave) {
++		dwc_wr(GUSB2PHYCFG, dwc_rd(GUSB2PHYCFG) & ~physave);
++	}
 +	dwc_wr(DEPCMDPAR0(ep), p0);
 +	dwc_wr(DEPCMDPAR1(ep), p1);
 +	dwc_wr(DEPCMDPAR2(ep), p2);
@@ -224,14 +234,19 @@ index 0000000..4825dd5
 +			uint32_t status = (v >> 12) & 0xf;
 +			if (status) {
 +				printf("PICASSO USB: ep%u cmd %u status %u\n", ep, cmd, status);
-+				return -1;
++				ret = -1;
 +			}
-+			return 0;
++			goto out;
 +		}
 +		delay(1);
 +	}
 +	printf("PICASSO USB: ep%u cmd %u timeout\n", ep, cmd);
-+	return -1;
++	ret = -1;
++out:
++	if (physave) {
++		dwc_wr(GUSB2PHYCFG, dwc_rd(GUSB2PHYCFG) | physave);
++	}
++	return ret;
 +}
 +
 +/* One TRB (at DMA offset trb) on physical endpoint ep. */
@@ -250,6 +265,9 @@ index 0000000..4825dd5
 +		ud_sync(buf, len);
 +	}
 +	uint64_t tpa = ud.dma_pa + trb;
++	if (!ud.configured) {
++		printf("PICASSO USB: start xfer ep%u trb pa 0x%llx\n", ep, tpa);
++	}
 +	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
 +}
 +
@@ -514,12 +532,12 @@ index 0000000..4825dd5
 +	printf("PICASSO USB: DMA %d pages at va %p pa 0x%llx\n", (int)(UD_SIZE / PAGE_SIZE), (void *)ud.dma, ud.dma_pa);
 +
 +	uint32_t gctl = dwc_rd(GCTL);
-+	printf("PICASSO USB: GCTL 0x%08x PrtCapDir %u[NL]", gctl, (gctl >> 12) & 7);
++	printf("PICASSO USB: GCTL 0x%08x PrtCapDir %u\n", gctl, (gctl >> 12) & 7);
 +	gctl = (gctl & ~(7u << 12)) | (2u << 12);   /* already device mode; keep it */
 +	dwc_wr(GCTL, gctl);
-+	printf("PICASSO USB: asserting soft reset[NL]");
++	printf("PICASSO USB: asserting soft reset\n");
 +	dwc_wr(DCTL, DCTL_CSFTRST);
-+	printf("PICASSO USB: reset asserted, DCTL 0x%08x[NL]", dwc_rd(DCTL));
++	printf("PICASSO USB: reset asserted, DCTL 0x%08x\n", dwc_rd(DCTL));
 +	int i;
 +	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
 +		delay(1000);
@@ -529,6 +547,9 @@ index 0000000..4825dd5
 +	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
 +		return;
 +	}
++	/* DCTL.CSFTRST can drop GCTL.PrtCapDir; re-assert device mode. */
++	gctl = (dwc_rd(GCTL) & ~(7u << 12)) | (2u << 12);
++	dwc_wr(GCTL, gctl);
 +
 +	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
 +	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
@@ -538,21 +559,23 @@ index 0000000..4825dd5
 +	dwc_wr(DCFG, dwc_rd(DCFG) & ~(7u | (0x7fu << 3)));
 +	dwc_wr(DEVTEN, 0x7);
 +
-+	printf("PICASSO USB: ep0 DEPSTARTCFG[NL]");
++	printf("PICASSO USB: ep0 DEPSTARTCFG\n");
 +	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0)) { return; }
-+	printf("PICASSO USB: ep0 out config[NL]");
++	printf("PICASSO USB: ep0 out config\n");
 +	if (ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0)) { return; }
-+	printf("PICASSO USB: ep0 out fifo[NL]");
++	printf("PICASSO USB: ep0 out fifo\n");
 +	if (ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) { return; }
-+	printf("PICASSO USB: ep0 in config[NL]");
++	printf("PICASSO USB: ep0 in config\n");
 +	if (ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0)) { return; }
-+	printf("PICASSO USB: ep0 in fifo[NL]");
++	printf("PICASSO USB: ep0 in fifo\n");
 +	if (ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) { return; }
++	printf("PICASSO USB: ep0 fifos ok\n");
 +	dwc_wr(DALEPENA, 0x3);
++	printf("PICASSO USB: DALEPENA 0x%08x, arming setup\n", dwc_rd(DALEPENA));
 +	ud_start_setup();
 +
 +	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
-+	printf("PICASSO USB: QSCRATCH map %p[NL]", (void *)qs);
++	printf("PICASSO USB: QSCRATCH map %p\n", (void *)qs);
 +	if (qs != 0) {
 +		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
 +		printf("PICASSO USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x\n", hs, ss);
