@@ -184,12 +184,18 @@ kernel_args = [
 #         mode, so kPEAcquireScreen calls gc_enable(FALSE) and the console
 #         stays off -- fixed by the vendored DarwinBoot in UniXNU-picasso
 #         (drivers/DarwinBoot, v_display = 0 = text console from acquire on).
-#   run 9  FREE RUN: no reset probe (panic screen only). Expected: bars ->
-#         screen wiped with a cursor at kPEAcquireScreen -> scrolling kernel
-#         log (kprintf, debug=0x14e) -> "Still waiting for root device" or a
-#         visible panic once the root filesystem is missing. Any panic text
-#         also lands in the /pram region (dump-picasso-panic.py).
+#   run 9  FREE RUN -> the text console came up and the kernel log scrolled;
+#         first visible panic: kern_trustcache.c:477 "amfi interface not
+#         available" (lr=_trust_cache_runtime_init.cold.3). The AMFI
+#         interface is registered by the early security initializer that
+#         emit_prelink records per board; picasso left it empty.
+#   run 10 early_security_init: the same pinned iPad7,1 kernelcache as sheng,
+#         so the ORIGINAL_VA of AMFI's initializer is identical
+#         (0xFFFFFFF005AB4AE0, prelink/kext region below the kernel text);
+#         emit_prelink slides it into our coalesced segments (-0x1000000,
+#         uniform) and the runtime adds vm_kernel_slide (0 on picasso).
 panic_screen = true
+early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
 
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"
