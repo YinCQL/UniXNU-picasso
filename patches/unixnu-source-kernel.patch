@@ -130,10 +130,12 @@ new file mode 100644
 index 0000000..usb0001
 --- /dev/null
 +++ b/patches/xnu/zzz-picasso-usb-console.patch
-@@ -0,0 +1,625 @@
+@@ -0,0 +1,640 @@
++diff --git a/bsd/conf/files b/bsd/conf/files
++index 19b4065..b22147f 100644
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
-+@@ -107,6 +107,7 @@
++@@ -107,6 +107,7 @@ bsd/dev/random/randomdev.c		standard
 + 
 + bsd/dev/memdev.c			standard
 + bsd/dev/mem.c				standard
@@ -141,40 +143,12 @@ index 0000000..usb0001
 + bsd/dev/munge.c 			optional config_requires_u32_munging
 + bsd/dev/unix_startup.c			standard
 + 
-+
-+--- a/bsd/kern/bsd_init.c
-++++ b/bsd/kern/bsd_init.c
-+@@ -506,6 +506,10 @@
-+ 	throttle_init();
-+ 
-+ 	printf(copyright);
-++	{
-++		extern void picasso_usb_console_start(void);
-++		picasso_usb_console_start();
-++	}
-+ 
-+ #if CONFIG_DEV_KMEM
-+ 	bsd_init_kprintf("calling dev_kmem_init\n");
-+
-+--- a/osfmk/console/serial_console.c
-++++ b/osfmk/console/serial_console.c
-+@@ -258,6 +258,12 @@
-+ 	if (c == '\n') {
-+ 		_cnputc('\r', poll);
-+ 	}
-++	{
-++		extern void picasso_usb_log_char(char);
-++		/* stored once per character, after the CR expansion,
-++		 * recursive '\r' also lands here and is stored exactly once. */
-++		picasso_usb_log_char(c);
-++	}
-+ 
-+ 	cons_ops[idx].putc(c, poll);
-+ }
-+
++diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
++new file mode 100644
++index 0000000..e6caf7f
 +--- /dev/null
 ++++ b/bsd/dev/picasso_usb.c
-+@@ -0,0 +1,581 @@
++@@ -0,0 +1,590 @@
 ++/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 ++ *
 ++ * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -673,7 +647,16 @@ index 0000000..usb0001
 ++	printf("PICASSO USB: DMA %d pages at va %p pa 0x%llx\n", (int)(UD_SIZE / PAGE_SIZE), (void *)ud.dma, ud.dma_pa);
 ++
 ++	/* Device controller soft reset (PHY and global setup stay as ABL/UEFI left them). */
+++	uint32_t gctl = dwc_rd(GCTL);
+++	printf("PICASSO USB: GCTL 0x%08x PrtCapDir %u
+++", gctl, (gctl >> 12) & 7);
+++	gctl = (gctl & ~(7u << 12)) | (2u << 12);   /* force device capability */
+++	dwc_wr(GCTL, gctl);
+++	printf("PICASSO USB: asserting soft reset
+++");
 ++	dwc_wr(DCTL, DCTL_CSFTRST);
+++	printf("PICASSO USB: reset asserted, DCTL 0x%08x
+++", dwc_rd(DCTL));
 ++	int i;
 ++	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
 ++		delay(1000);
@@ -756,3 +739,35 @@ index 0000000..usb0001
 ++		picasso_usb_gadget_start(dwc);
 ++	}
 ++}
++diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
++index bb558ee..82e3e51 100644
++--- a/bsd/kern/bsd_init.c
+++++ b/bsd/kern/bsd_init.c
++@@ -506,6 +506,10 @@ bsd_init(void)
++ 	throttle_init();
++ 
++ 	printf(copyright);
+++	{
+++		extern void picasso_usb_console_start(void);
+++		picasso_usb_console_start();
+++	}
++ 
++ #if CONFIG_DEV_KMEM
++ 	bsd_init_kprintf("calling dev_kmem_init\n");
++diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
++index e6d38d3..3a02700 100644
++--- a/osfmk/console/serial_console.c
+++++ b/osfmk/console/serial_console.c
++@@ -259,6 +259,12 @@ _cnputc(char c, bool poll)
++ 	if (c == '\n') {
++ 		_cnputc('\r', poll);
++ 	}
+++	{
+++		extern void picasso_usb_log_char(char);
+++		/* stored once per character, after the CR expansion,
+++		 * recursive '\r' also lands here and is stored exactly once. */
+++		picasso_usb_log_char(c);
+++	}
++ 
++ 	cons_ops[idx].putc(c, poll);
++ }
