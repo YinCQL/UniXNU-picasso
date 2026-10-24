@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..4825dd5
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,631 @@
+@@ -0,0 +1,625 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -163,6 +163,7 @@ index 0000000..4825dd5
 +#define UD_TX           0x2000u         /* bulk IN log chunk, 4 KiB */
 +#define UD_TX_SIZE      0x1000u
 +#define UD_SIZE         0x4000u
++#define UD_DMA_PA       0xB7D00000ull   /* bank-1 fastboot-download tail; see gadget_start */
 +
 +static struct {
 +	vm_offset_t dwc;
@@ -200,9 +201,11 @@ index 0000000..4825dd5
 +}
 +
 +static void
-+ud_sync(uint32_t off, uint32_t len)
++ud_sync(uint32_t off __unused, uint32_t len __unused)
 +{
-+	flush_dcache64((addr64_t)(ud.dma_pa + off), len, TRUE);
++	/* The ring is device-mapped (uncached): CPU stores are visible to the
++	 * controller without cache maintenance, and a by-PA flush would go
++	 * through physmap, which does not cover the carved bank-1 page. */
 +}
 +
 +static void
@@ -520,29 +523,20 @@ index 0000000..4825dd5
 +	thread_t thread;
 +
 +	ud.dwc = dwc;
-+	/* Cap the buffer below 0xB0000000: ABL's fastboot proved the USB master
-+	 * reaches low DRAM (its download buffer lived at 0xB4-0xB7), while the
-+	 * first STARTTRANSFER from a bank-2 (0xC4xx) TRB warm-resets the SoC. */
-+	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK,
-+	    (ppnum_t)(0xB0000000u >> PAGE_SHIFT), 0,
-+	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-+		printf("PICASSO USB: bank-1 DMA alloc failed\n");
-+		if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
-+		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-+			printf("PICASSO USB: no DMA memory\n");
-+			return;
-+		}
-+	}
-+	/* pmap_find_phys can return 0 for freshly kmem-allocated pages on this
-+	 * kernel; kvtophys is the canonical VA-to-PA walk. Fail loudly either way. */
-+	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
-+	uint64_t pa = pn ? ptoa_64(pn) : (uint64_t)kvtophys(ud.dma);
-+	if (!pa) {
-+		printf("PICASSO USB: cannot resolve DMA physical address at %p\n", (void *)ud.dma);
++	/* The kernel's physical pool is the DarwinBoot window in bank 2, and
++	 * every controller DMA into bank 2 warm-resets the SoC (proven twice:
++	 * the TRB fetch and the enumeration-time event/setup writes). The
++	 * allocator owns no bank-1 pages (vm_page_find_contiguous scanned two
++	 * below 0xB0000000), so carve the ring from the dead fastboot-download
++	 * buffer instead: ABL DMA-wrote this whole range from the host, and
++	 * the payload FAT it holds is never read again once XNU runs. */
++	ud.dma = ml_io_map((vm_offset_t)UD_DMA_PA, UD_SIZE);
++	if (ud.dma == 0) {
++		printf("PICASSO USB: bank-1 carve map failed\n");
 +		return;
 +	}
-+	ud.dma_pa = pa;
-+	printf("PICASSO USB: DMA %d pages at va %p pa 0x%llx\n", (int)(UD_SIZE / PAGE_SIZE), (void *)ud.dma, ud.dma_pa);
++	ud.dma_pa = UD_DMA_PA;
++	printf("PICASSO USB: ring carved at pa 0x%llx va %p\n", ud.dma_pa, (void *)ud.dma);
 +
 +	uint32_t gctl = dwc_rd(GCTL);
 +	printf("PICASSO USB: GCTL 0x%08x PrtCapDir %u\n", gctl, (gctl >> 12) & 7);
