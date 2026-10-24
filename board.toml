@@ -146,11 +146,15 @@ kernel_args = [
   "-v",
   "debug=0x14e",
   "cpus=1",
-  # Drive the UFS controller: NativeUfs::start refuses to touch hardware
-  # without this (match-for-observability only by design; sheng does the
-  # same). native-ufs-probe=2/8 additionally inspect registers via the
-  # ufshc nub personality, whose compatible now accepts sm7250 too.
-  "native-ufs-root=1",
+  # Drive the UFS controller. native-ufs-root=1 is the sheng production
+  # path but upstream's payload guard demands the sheng PMGR shim
+  # (sheng-pmgr=2 + _sheng_pmgr_run linked). native-ufs-probe=12 runs the
+  # SAME startRoot() hardware bring-up from the root-device personality and
+  # panics with the full media report (GPT/userdata geometry) after a
+  # short delay -- the stage-6 data we need, without the shim. If AMFI
+  # then panics "No PMGR", the shim port becomes the next task.
+  "native-ufs-probe=12",
+  "native-ufs-diagnostics=1",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
