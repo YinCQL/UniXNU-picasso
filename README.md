@@ -23,6 +23,11 @@
   NativeUfs driver are linked in; the verbose boot log scrolls live on the
   framebuffer and ends at the IOMedia/root wait. UFS bring-up (stage 6) is in
   progress.
+- **USB kernel console: working.** The kernel exposes a CDC-ACM device named
+  `picasso XNU USB console` and streams the buffered/live console over DWC3.
+  Capture it with `scripts/capture-picasso-usb-console.py`; see
+  `docs/usb-console-bringup.md` for hardware results and safeguards.
+
 
 ## Build
 
