@@ -163,7 +163,7 @@ kernel_args = [
   # long -- capture it in screen photos in sequence.
   "io=0x232",
   # USB console (usb branch): 1 = state probe only, 2 = run the CDC-ACM
-  # console streaming (DWC3 device mode; the PC sees a serial COM port with
+  # console streaming (DWC3 device mode; the PC sees a serial port carrying
   # the last 256 KiB of console text and then live output).
   "picasso_usb=2",
 ]

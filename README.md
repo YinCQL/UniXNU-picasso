@@ -17,6 +17,10 @@
 - **XNU kernel: boots from UEFI.** Build workflow, first-console config and the
   SM7250 ADT generator are in place, and the SM7250 kernel patch set
   (`patches/unixnu-source-kernel.patch`) builds the kernel that DarwinBoot starts.
+- **USB kernel console: working.** The kernel exposes a CDC-ACM device named
+  `picasso XNU USB console` and streams the buffered/live console over DWC3.
+  Capture it with `scripts/capture-picasso-usb-console.py`; see
+  `docs/usb-console-bringup.md` for hardware results and safeguards.
 
 ## Build
 
