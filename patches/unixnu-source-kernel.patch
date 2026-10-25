@@ -78,10 +78,10 @@ index 94bf523..69d5e48 100644
   	vfsinit();
 diff --git a/patches/xnu/zzz-picasso-usb-console.patch b/patches/xnu/zzz-picasso-usb-console.patch
 new file mode 100644
-index 0000000..72f962d
+index 0000000..8449d72
 --- /dev/null
 +++ b/patches/xnu/zzz-picasso-usb-console.patch
-@@ -0,0 +1,1438 @@
+@@ -0,0 +1,1459 @@
 +diff --git a/bsd/conf/files b/bsd/conf/files
 +index 19b4065..b22147f 100644
 +--- a/bsd/conf/files
@@ -96,10 +96,10 @@ index 0000000..72f962d
 + 
 +diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
 +new file mode 100644
-+index 0000000..003a740
++index 0000000..bfe7ccc
 +--- /dev/null
 ++++ b/bsd/dev/picasso_usb.c
-+@@ -0,0 +1,1388 @@
++@@ -0,0 +1,1409 @@
 ++/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 ++ *
 ++ * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -292,6 +292,7 @@ index 0000000..72f962d
 ++	bool        trace_commands;
 ++	bool        smmu_guard;
 ++	bool        live;
+++	bool        hold;
 ++	uint64_t    tx_pos;                  /* ring reader position */
 ++	uint64_t    events, chars;
 ++} ud;
@@ -1136,6 +1137,15 @@ index 0000000..72f962d
 ++}
 ++
 ++static void
+++ud_thread(void *arg __unused, wait_result_t wr __unused)
+++{
+++	for (;;) {
+++		ud_poll();
+++		ud_sleep_ms(2);
+++	}
+++}
+++
+++static void
 ++picasso_usb_park(int hold)
 ++{
 ++	if (!hold) {
@@ -1360,6 +1370,16 @@ index 0000000..72f962d
 ++		}
 ++		previous = state;
 ++	}
+++	if (!ud.hold) {
+++		thread_t thread;
+++		kern_return_t result = kernel_thread_start(ud_thread, NULL, &thread);
+++		if (result == KERN_SUCCESS) {
+++			thread_deallocate(thread);
+++			printf("PICASSO USB: background poller started\n");
+++		} else {
+++			printf("PICASSO USB: background poller failed (%d)\n", result);
+++		}
+++	}
 ++}
 ++
 ++void
@@ -1372,6 +1392,7 @@ index 0000000..72f962d
 ++	PE_parse_boot_argn("picasso_usb", &enabled, sizeof(enabled));
 ++	PE_parse_boot_argn("picasso_usb_hold", &hold, sizeof(hold));
 ++	PE_parse_boot_argn("picasso_usb_smmu", &bind_smmu, sizeof(bind_smmu));
+++	ud.hold = hold != 0;
 ++	if (!enabled) {
 ++		return;
 ++	}
