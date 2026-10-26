@@ -119,14 +119,24 @@ def build_storage_bindings(out: Path):
 # it under policy/verified-root-picasso so a clean CI checkout links exactly the
 # tree that was qualified on hardware. build/ stays the generator's scratch
 # output and is tried second, so a local regeneration still wins for a developer.
-POLICY_COMMITTED = ROOT / 'policy/verified-root-picasso'
-POLICY_GENERATED = ROOT / 'build/verified-root-picasso'
+# The tree roots scripts/ from the device repository but links only drivers/,
+# kits/, patches/ and refer/ from it, so a committed policy/ tree stays behind in
+# the device checkout. Look for it there first via UNIXNU_DEVICE (the same
+# handle prelink_slide() already uses for board.toml), then in the tree.
+def policy_candidates():
+    candidates = []
+    device = os.environ.get('UNIXNU_DEVICE')
+    if device:
+        candidates.append(Path(device) / 'policy/verified-root-picasso')
+    candidates.append(ROOT / 'policy/verified-root-picasso')
+    candidates.append(ROOT / 'build/verified-root-picasso')
+    return candidates
 
 
 def build_verified_root_policy(record: dict, out: Path, extra_flags: list):
-    policy = POLICY_COMMITTED
-    if not (policy / 'policy.S').is_file() or not (policy / 'attestation.json').is_file():
-        policy = POLICY_GENERATED
+    policy = next((c for c in policy_candidates()
+                   if (c / 'policy.S').is_file() and (c / 'attestation.json').is_file()),
+                  ROOT / 'policy/verified-root-picasso')
     kit = ROOT / 'kits/VerifiedRoot'
     attestation = policy / 'attestation.json'
     assembly = policy / 'policy.S'
