@@ -113,15 +113,28 @@ def build_storage_bindings(out: Path):
     return object_path
 
 
+# The policy tree is a build input now, not a per-build product: it is 4.4 MiB
+# of hashes plus signatures, it is bound to one exact root image, and
+# regenerating it needs that image and a fresh owner key. devices/picasso keeps
+# it under policy/verified-root-picasso so a clean CI checkout links exactly the
+# tree that was qualified on hardware. build/ stays the generator's scratch
+# output and is tried second, so a local regeneration still wins for a developer.
+POLICY_COMMITTED = ROOT / 'policy/verified-root-picasso'
+POLICY_GENERATED = ROOT / 'build/verified-root-picasso'
+
+
 def build_verified_root_policy(record: dict, out: Path, extra_flags: list):
-    policy = ROOT / 'build/verified-root-picasso'
+    policy = POLICY_COMMITTED
+    if not (policy / 'policy.S').is_file() or not (policy / 'attestation.json').is_file():
+        policy = POLICY_GENERATED
     kit = ROOT / 'kits/VerifiedRoot'
     attestation = policy / 'attestation.json'
     assembly = policy / 'policy.S'
     if not attestation.is_file() or not assembly.is_file():
         raise SystemExit(
             'NativeUfs requires a generated header-only VerifiedRoot policy; run '
-            'scripts/build-picasso-verified-policy.py first'
+            'scripts/build-picasso-verified-policy.py first, or commit the '
+            'qualified tree under policy/verified-root-picasso/'
         )
     audit = json.loads(attestation.read_text())
     embedded = audit.get('kernel_embedded', {})
@@ -154,10 +167,13 @@ def build_verified_root_policy(record: dict, out: Path, extra_flags: list):
         compile_file(source, destination, record, extra_flags, is_c=True)
         objects.append(destination)
     policy_object = out / 'verified-root-policy.o'
+    # policy.S carries relative .incbin operands, so the assembler must run with
+    # the policy directory as its working directory; an absolute operand would
+    # have tied the committed artifact to the machine that generated it.
     subprocess.run(
         ['xcrun', 'clang', '-target', 'arm64-apple-ios17.0',
-         '-c', str(assembly), '-o', str(policy_object)],
-        check=True,
+         '-c', assembly.name, '-o', str(policy_object)],
+        cwd=str(assembly.parent), check=True,
     )
     objects.append(policy_object)
     return objects

@@ -24,13 +24,20 @@ fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustC
 
 [ipsw.sha256]
 
-# UserData partition geometry (GPT entry "userdata" of LUN 0). PLACEHOLDER.
-# The silenzio111 branch measured first_lba = 0x200000, last_lba = 0x3A00000 on this
-# board; those values stay unverified here and the kernel/payload steps do not read
-# them, so the safe placeholder is kept until "unixnu build userdata" is brought up.
+# UserData partition geometry (GPT entry "userdata" of LUN 0).
+# Measured on this device: "fastboot getvar partition-size:userdata" =
+# 0xBDEBFB000 = 50,981,744,640 bytes = 47.48 GiB = 12,446,715 x 4-KiB LBA.
+# Only the capacity (last_lba - first_lba + 1) * lba_bytes is consumed, by
+# "unixnu build userdata" (scripts/unixnu/userdata.py), to refuse an image that
+# would not fit the partition; the kernel and payload steps never read it and
+# the image itself is written from offset 0. first_lba stays 0 because it is not
+# derivable from a partition size alone -- fill the real GPT start LBA here if it
+# ever needs to describe the physical layout rather than the capacity.
+# The silenzio111 branch's 0x200000/0x3A00000 encode 224 GiB, i.e. a different
+# partition table; they are not this device's geometry.
 [userdata]
 first_lba = 0x0
-last_lba = 0x0
+last_lba = 0xBDEBFA
 lba_bytes = 4096
 windows = [
   { name = "OS", component = "OS" },

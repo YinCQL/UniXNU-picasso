@@ -1,0 +1,67 @@
+{
+  "schema": "picasso-verified-root-policy-v1",
+  "root_image": {
+    "name": "_userdata-root.img",
+    "bytes": 9382658048,
+    "sha256": "fd43ee7035ce185ce4215ac93fdc006fd784a54b3b7442e21457c226cbe03093",
+    "manifest_sha256": "bc908a6cf66491055077798550660f40128bfe6dce2fdc0db56e6af96511208d"
+  },
+  "trust": {
+    "algorithm": "RSA3072-PKCS1v1.5-SHA256",
+    "minimum_generation": 1,
+    "trusted_key_sha256": "68c19aa4796e89fb48e0cc2f8243131fe23d31d3cf59554f7298a6cf8882e704",
+    "owner_public_key_sha256": "e4df39c79f0660e439c6b945e94631681b464eac799d810ebd7b8245492b725a",
+    "private_key_ignored": true
+  },
+  "windows": [
+    {
+      "image_bytes": 6077580800,
+      "auth_record_bytes": 131072,
+      "block_count": 46369,
+      "volume_uuid": "04769D26-2CA0-4825-B443-E2E5F88300F2",
+      "generation": 1,
+      "image_sha256": "e5634d04a8ac35f024845f583394e0a35deb26a04cb0c00286a8674e25a9a4f2",
+      "hash_table_sha256": "bf35b66f98e49d859f75bc1b6910fb6150b1e726a740d798e6ddff61984a2fc8",
+      "signed_header_signature_sha256": "ffd4f26baa8bafa886a5feaa57db9437dd331de5b8471b17fffc9e10f23853bd",
+      "header_signature_bytes": 544,
+      "manifest_bytes": 1484352,
+      "openssl_signature_verified": true,
+      "name": "OS",
+      "offset": 1048576,
+      "size": 6077580800,
+      "manifest_sha256": "8bc305e2cd92081d24048254647e8dc34fa1315811203ff5d78b774204629a4c"
+    },
+    {
+      "image_bytes": 3303014400,
+      "auth_record_bytes": 131072,
+      "block_count": 25200,
+      "volume_uuid": "8846FE78-2910-4297-AF97-D59BB6F8FC16",
+      "generation": 1,
+      "image_sha256": "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f",
+      "hash_table_sha256": "493f5c1f302ac4fa98eac2ac47744e2a0555926f864c80ab2ddc14a128a2a430",
+      "signed_header_signature_sha256": "83676ff4932cc48453e497c5eb3fc695a67c6ca050c138ae6ddc59d37ae06561",
+      "header_signature_bytes": 544,
+      "manifest_bytes": 806944,
+      "openssl_signature_verified": true,
+      "name": "SystemOS",
+      "offset": 6079643648,
+      "size": 3303014400,
+      "manifest_sha256": "179663ff55de975c1e8510e1b6a7d56a6a9924b45bd434b6ee9120d1d4471d7d"
+    }
+  ],
+  "kernel_embedded": {
+    "auth_record_bytes": 131072,
+    "bytes_per_window": {
+      "OS": 1484352,
+      "SystemOS": 806944
+    },
+    "hash_tables_embedded": true,
+    "runtime_scan_required": false
+  },
+  "policy_assembly_sha256": "d7557ef94c5b9a50788801acf8df4e25dd3590a033bc5d7a865fac5939baa9ee",
+  "policy_object_sha256": null,
+  "root_image_modified": false,
+  "partition_write_operations": false,
+  "hardware_tested": false,
+  "boot_root_authenticated": false
+}
