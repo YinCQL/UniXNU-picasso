@@ -58,7 +58,7 @@
     "hash_tables_embedded": true,
     "runtime_scan_required": false
   },
-  "policy_assembly_sha256": "d7557ef94c5b9a50788801acf8df4e25dd3590a033bc5d7a865fac5939baa9ee",
+  "policy_assembly_sha256": "7155c8880d63fadf2c2b5aefd85bb89abe5bc8ad739d24718cb1dc66a327d4dc",
   "policy_object_sha256": null,
   "root_image_modified": false,
   "partition_write_operations": false,

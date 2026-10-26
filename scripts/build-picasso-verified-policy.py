@@ -331,7 +331,10 @@ def write_policy_assembly(output, anchor, role_files):
         '_verified_root_policy_count:\n',
         f'.quad {len(role_files)}\n',
     ])
-    assembly.write_text(''.join(lines))
+    # newline='\n' keeps the artifact byte-identical on Windows and macOS: the
+    # attestation below records this file's SHA-256, and a CRLF checkout would
+    # make the committed tree fail its own integrity check on the runner.
+    assembly.write_text(''.join(lines), encoding='utf-8', newline='\n')
     return assembly
 
 
@@ -470,7 +473,7 @@ def main():
             'boot_root_authenticated': False,
     }
     (output / 'attestation.json').write_text(
-        json.dumps(attestation, indent=2) + '\n'
+        json.dumps(attestation, indent=2) + '\n', encoding='utf-8', newline='\n'
     )
 
     print(json.dumps({
