@@ -37,9 +37,24 @@ CONFIG_XNU_NATIVE_UFS=y
 # CONFIG_XNU_VERIFIED_ROOT_PROBE is not set
 CONFIG_XNU_OWNER_ROOT_AUDIT=y
 CONFIG_XNU_OWNER_ROOT_TRUST=y
-# CONFIG_XNU_OWNER_CACHE_MOUNT is not set
-# CONFIG_XNU_OWNER_CACHE_STARTUP is not set
-# CONFIG_XNU_OWNER_BOOT_MANIFEST is not set
+# Mount the SystemOS cryptex volume as the dyld shared cache carrier. launchd
+# cannot map the shared cache from the OS volume: the cache lives on SystemOS,
+# and without this mount vm_shared_region_start_address() fails with an empty
+# region. The owner chain mounts it read-only at /private/preboot after
+# re-verifying the device against the owner-signed policy, then hands
+# DYLD_SHARED_CACHE_DIR to the init environment. OWNER_CACHE_VOLUME_UUID is the
+# APFS volume UUID inside the signed SystemOS image (published as disk1s1).
+# OWNER_UNION_SYSTEMOS stays off: that path overlays the cache onto / with
+# MNT_UNION and would additionally need CONFIG_UNION_MOUNTS, which this board's
+# kernel configuration does not set.
+CONFIG_XNU_OWNER_CACHE_MOUNT=y
+# Select the dyld startup bit so the original ignition sequence does not run a
+# second, unauthenticated cache path; requires the mount above.
+CONFIG_XNU_OWNER_CACHE_STARTUP=y
+# Publish the authenticated boot manifest for the mounted pair; requires the
+# startup selection. OWNER_DATA_MOUNT stays off until the Data seed is wired.
+CONFIG_XNU_OWNER_BOOT_MANIFEST=y
+CONFIG_XNU_OWNER_CACHE_VOLUME_UUID="8846FE78-2910-4297-AF97-D59BB6F8FC16"
 # CONFIG_XNU_OWNER_DATA_MOUNT is not set
 # CONFIG_XNU_OWNER_UNION_SYSTEMOS is not set
 # CONFIG_XNU_BOOT_PROGRESS is not set

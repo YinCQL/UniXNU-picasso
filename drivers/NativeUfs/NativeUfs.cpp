@@ -1778,6 +1778,93 @@ extern "C" int native_verified_block_root_authorized (dev_t device)
   }
   return result;
 }
+
+// Called from the owner cache mount in kern_exec.c (offline-owner-systemos-mount.patch):
+// resolve the published IOMedia whose UUID equals the SystemOS volume UUID to the
+// dev_t of the NativeUfs window that backs it, plus the /dev node the mount syscall
+// takes. The owner chain mounts that cryptex volume as the dyld shared cache carrier;
+// returning a device the kernel cannot mount fails the boot closed, so every check
+// here is a hard requirement.
+//
+// The provider walk mirrors native_verified_block_root_authorized(): find the one
+// IOMedia carrying this UUID, then confirm the NativeUfsBlock under it signed exactly
+// that UUID. A device this driver did not authenticate is never handed out.
+extern "C" int native_verified_block_volume_device(const char *uuid, dev_t *device,
+                                                char *path, size_t pathBytes)
+{
+	if (!uuid || !device || !path || pathBytes < 16) {
+		return 0;
+	}
+	*device = NODEV;
+	path[0] = 0;
+
+	OSDictionary *matching = IOService::serviceMatching("IOMedia");
+	if (!matching) {
+		return 0;
+	}
+	OSIterator *iterator = IOService::getMatchingServices(matching);
+	matching->release();
+	if (!iterator) {
+		IOLog("NATIVE_VOLUME_DEVICE uuid=%s iterator=0\n", uuid);
+		return 0;
+	}
+
+	unsigned matches = 0;
+	bool authenticated = false;
+	dev_t found = NODEV;
+	char foundPath[64] = {};
+	while (OSObject *object = iterator->getNextObject()) {
+		IOService *media = OSDynamicCast(IOService, object);
+		if (!media) {
+			continue;
+		}
+		OSString *id = OSDynamicCast(OSString, media->getProperty("UUID"));
+		if (!id || id->getLength() != 36 || strcmp(id->getCStringNoCopy(), uuid)) {
+			continue;
+		}
+		if (++matches != 1) {
+			break;
+		}
+		// IOMedia publishes its device node as the BSD name, which is what mount() resolves.
+		OSString *bsd = OSDynamicCast(OSString, media->getProperty(kIOBSDNameKey));
+		OSNumber *majorValue = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMajorKey));
+		OSNumber *minorValue = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMinorKey));
+		if (!bsd || !majorValue || !minorValue) {
+			continue;
+		}
+		int written = snprintf(foundPath, sizeof(foundPath), "/dev/%s",
+		                       bsd->getCStringNoCopy());
+		if (written <= 0 || written >= static_cast<int>(sizeof(foundPath))) {
+			continue;
+		}
+		found = makedev(majorValue->unsigned32BitValue(), minorValue->unsigned32BitValue());
+
+		// Only a window this driver signed for exactly this UUID may be mounted.
+		unsigned depth = 0;
+		for (IOService *provider = media; provider && depth < 64;
+		     provider = provider->getProvider()) {
+			++depth;
+			NativeUfsBlock *block = OSDynamicCast(NativeUfsBlock, provider);
+			if (!block) {
+				continue;
+			}
+			authenticated = block->authenticatesVolume(uuid);
+			break;
+		}
+	}
+	iterator->release();
+
+	if (matches != 1 || !authenticated || found == NODEV) {
+		IOLog("NATIVE_VOLUME_DEVICE uuid=%s matches=%u authenticated=%u result=0\n",
+		      uuid, matches, authenticated ? 1u : 0u);
+		return 0;
+	}
+	strlcpy(path, foundPath, pathBytes);
+	*device = found;
+	IOLog("NATIVE_VOLUME_DEVICE uuid=%s dev=%x path=%s result=1\n",
+	      uuid, static_cast<unsigned>(found), path);
+	return 1;
+}
 #endif
 
 bool NativeUfsBlock::start (IOService *provider)
