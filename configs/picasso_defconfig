@@ -17,6 +17,11 @@ CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 CONFIG_XNU_EXTRA_LD_ARCHIVES=""
 
+# Publish a bare ApplePMGRNub for the unchanged AMFI: its configuration
+# settings match ApplePMGRNub and OR bit 2 into the always-on state, and the
+# provider field below the nub stays NULL so nothing touches Apple PMGR.
+# package/PicassoPmgr.cpp, run from the sheng-platform-power hook in bsd_init.
+CONFIG_XNU_SHENG_PMGR=y
 # CONFIG_XNU_SOURCE_PTHREAD is not set
 # CONFIG_XNU_SOURCE_MOCKFS is not set
 CONFIG_XNU_NATIVE_UFS=y

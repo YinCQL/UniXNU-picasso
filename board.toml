@@ -61,6 +61,10 @@ archives = [
   # Stage 6: the UFS controller driver. Its board constants (GccUfs.h) carry
   # the SM7250 physical windows; the ADT ufshc/ufsphy nodes only match classes.
   "build-arm-driver.py NativeUfs",
+  # Publishes the ApplePMGRNub the unchanged AMFI looks for (package/PicassoPmgr.cpp).
+  # The archive lands in build/sheng-platform-power/libShengPlatformPower.a, the path
+  # build-xnu-4k-baseline.sh force-loads when CONFIG_XNU_SHENG_PMGR=1.
+  "build-picasso-pmgr.py",
 ]
 
 [kernel.prelink]
@@ -157,14 +161,15 @@ kernel_args = [
   "-v",
   "debug=0x14e",
   "cpus=1",
-  # Drive the UFS controller. native-ufs-root=1 is the sheng production
-  # path but upstream's payload guard demands the sheng PMGR shim
-  # (sheng-pmgr=2 + _sheng_pmgr_run linked). native-ufs-probe=12 runs the
-  # SAME startRoot() hardware bring-up from the root-device personality and
-  # panics with the full media report (GPT/userdata geometry) after a
-  # short delay -- the stage-6 data we need, without the shim. If AMFI
-  # then panics "No PMGR", the shim port becomes the next task.
-  "native-ufs-probe=12",
+  # Production root path. native-ufs-root=1 starts the root from the
+  # root-device personality without the diagnostic media-report panic that
+  # native-ufs-probe=12 ends with. Upstream's payload guard (check_native_root)
+  # requires sheng-pmgr=2 and a linked _sheng_pmgr_run for this mode, because
+  # the unchanged target AMFI otherwise panics with "No PMGR?" while looking
+  # for ApplePMGRNub in its configuration settings; package/PicassoPmgr.cpp
+  # publishes that nub, and CONFIG_XNU_SHENG_PMGR links it.
+  "native-ufs-root=1",
+  "sheng-pmgr=2",
   # Let bsd_init start the CDC console before the UFS publication diagnostic
   # runs, so a later UFS panic still has a complete host-side log.
   "native-ufs-start-delay=5",
