@@ -1853,7 +1853,11 @@ extern "C" int native_verified_block_manifest_sha384(dev_t device, const char *u
 	if (!uuid || strlen(uuid) != 36) {
 		return 0;
 	}
-	return verifiedVolumeQuery(device, uuid, digest);
+	int result = verifiedVolumeQuery(device, uuid, digest);
+	IOLog ("NATIVE_MANIFEST_SHA384 device=%x uuid=%s result=%d digest=%02x%02x%02x%02x\n",
+	       static_cast<unsigned> (device), uuid, result,
+	       digest[0], digest[1], digest[2], digest[3]);
+	return result;
 }
 
 // The device and /dev node backing a signed volume UUID, for the owner cache mount.
@@ -1910,10 +1914,14 @@ extern "C" int native_verified_block_volume_device(const char *uuid, dev_t *devi
 	}
 	iterator->release();
 	if (!authenticated || matches != 1) {
+		IOLog ("NATIVE_VOLUME_DEVICE uuid=%s matches=%u authenticated=%u result=0\n",
+		       uuid, matches, authenticated ? 1u : 0u);
 		return 0;
 	}
 	*device = candidate;
 	strlcpy(path, candidatePath, size);
+	IOLog ("NATIVE_VOLUME_DEVICE uuid=%s dev=%x path=%s result=1\n",
+	       uuid, static_cast<unsigned> (candidate), path);
 	return 1;
 }
 #endif

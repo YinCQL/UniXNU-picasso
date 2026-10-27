@@ -177,16 +177,17 @@ kernel_args = [
   # timebase+yield path has been exercised on hardware; scans also yield at
   # every 128 KiB batch so CDC keeps draining.
   "native-ufs-delay-yield=1",
-  # The embedded manifest removes the 9.4 GiB scan, so enable command tracing
-  # for the first hardware qualification of the new bring-up path.
-  "native-ufs-diagnostics=1",
-  # IOKit matching trace: kIOLogMatch(0x10) | kIOLogProbe(0x2) |
-  # kIOLogConfig(0x20) | kIOLogCatalogue(0x200). Three silent runs in a row
-  # (root, probe=12 variants) mean start() is never reached; this shows
-  # whether the personalities registered, whether ArmDTPlatform matched the
-  # root nub, and whether NativeUfs::probe was called at all. The log is
-  # long -- capture it in screen photos in sequence.
-  "io=0x232",
+  # Command tracing stays off. It prints two lines per SCSI/query command
+  # (NATIVE_UFS_NOP clear=begin/end, named for the UCD clear they share), and a
+  # boot that is reading the root volume emits them continuously, which buries
+  # every other message. Set it back to 1 only when the UFS transport itself is
+  # the question.
+  "native-ufs-diagnostics=0",
+  # IOKit matching trace is off for the same reason as the UFS one: it answers
+  # whether a personality matched, which the earlier root and probe=12 runs have
+  # already established, and it prints a very long log while doing so. Turn it
+  # back on when a driver is suspected of never being matched; the bits are
+  # kIOLogMatch(0x10) | kIOLogProbe(0x2) | kIOLogConfig(0x20) | kIOLogCatalogue(0x200).
   # USB console (usb branch): 1 = state probe only, 2 = run the CDC-ACM
   # console streaming (DWC3 device mode; the PC sees a serial port carrying
   # the last 256 KiB of console text and then live output).
