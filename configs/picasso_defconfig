@@ -44,9 +44,10 @@ CONFIG_XNU_OWNER_ROOT_TRUST=y
 # re-verifying the device against the owner-signed policy, then hands
 # DYLD_SHARED_CACHE_DIR to the init environment. OWNER_CACHE_VOLUME_UUID is the
 # APFS volume UUID inside the signed SystemOS image (published as disk1s1).
-# OWNER_UNION_SYSTEMOS stays off: that path overlays the cache onto / with
-# MNT_UNION and would additionally need CONFIG_UNION_MOUNTS, which this board's
-# kernel configuration does not set.
+# OWNER_UNION_SYSTEMOS stays off for now: it overlays SystemOS onto / with
+# MNT_UNION. The kernel tree does select union mounts (DEVELOPMENT includes
+# FILESYS_DEV), but that path is the heavier fallback -- the carrier route
+# below authorizes the SystemOS mount in place and is sufficient.
 CONFIG_XNU_OWNER_CACHE_MOUNT=y
 # Select the dyld startup bit so the original ignition sequence does not run a
 # second, unauthenticated cache path; requires the mount above.
@@ -55,6 +56,13 @@ CONFIG_XNU_OWNER_CACHE_STARTUP=y
 # startup selection. OWNER_DATA_MOUNT stays off until the Data seed is wired.
 CONFIG_XNU_OWNER_BOOT_MANIFEST=y
 CONFIG_XNU_OWNER_CACHE_VOLUME_UUID="8846FE78-2910-4297-AF97-D59BB6F8FC16"
+# The SystemOS carrier is mounted at /private/preboot, not unioned onto /.
+# The kernel's non-CSR shared-region path only accepts a shared cache that
+# sits on the root volume or on /private/preboot/Cryptexes; the carrier
+# patch authorizes the authenticated SystemOS mount instead. Without it the
+# mapping is refused and vm_shared_region_start_address() reports an empty
+# region. Requires OWNER_CACHE_STARTUP.
+CONFIG_XNU_OWNER_CACHE_CARRIER=y
 # CONFIG_XNU_OWNER_DATA_MOUNT is not set
 # CONFIG_XNU_OWNER_UNION_SYSTEMOS is not set
 # CONFIG_XNU_BOOT_PROGRESS is not set
