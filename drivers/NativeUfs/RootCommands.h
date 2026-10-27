@@ -8,9 +8,27 @@
 struct HardwareTransferPort {
   uint64_t deadline;
   uint32_t tracePoll;
+  uint32_t kicks;
+  uint32_t reenables;
+  // A slot can be latched without the controller ever fetching it, and then the
+  // doorbell stays set with no completion for the whole deadline. Re-writing the
+  // doorbell makes it fetch the slot again. Re-enabling the request list has to
+  // come first: a controller that cleared UTRLRSR ignores doorbell writes
+  // entirely, so the kick alone would do nothing there. Both are cheap next to
+  // the timeout they prevent, so they run periodically rather than on failure --
+  // by the time the deadline expires the descriptor may already be abandoned and
+  // this driver never resubmits into a slot it does not own.
   void beginPoll (uint32_t poll) {
     tracePoll = poll;
     if (poll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT poll=begin\n");
+    if (poll != 1 && (poll & 0x3fff) == 0) {
+      if ((read32 (gHost.hc, 0x60) & 1) == 0) {
+        hostWrite (0x60, 1);
+        ++reenables;
+      }
+      hostWrite (0x58, 1);
+      ++kicks;
+    }
   }
   uint32_t doorbell () {
     uint32_t value = read32 (gHost.hc, 0x58);
