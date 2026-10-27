@@ -1550,7 +1550,7 @@ index 0000000..3a1b2c4
 +diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
 +--- a/bsd/kern/bsd_init.c
 ++++ b/bsd/kern/bsd_init.c
-+@@ -688,6 +688,11 @@
++@@ -692,6 +692,11 @@
 + 	bsd_init_kprintf("calling bsd_bufferinit\n");
 + 	bsd_bufferinit();
 + 
