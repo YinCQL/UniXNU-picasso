@@ -78,6 +78,15 @@ jobs:
           ls -lh "$IPSW"
           echo "UNIXNU_IPSW=$PWD/$IPSW" >> "$GITHUB_ENV"
 
+      # The original static and System trust caches are extracted from the pinned
+      # IPSW here rather than committed; board.toml pins the accepted bundle hash.
+      - name: Bundle the original trust caches
+        run: |
+          mkdir -p out/picasso/logs
+          TREE=$(python3 ./unixnu --prepare)
+          python3 ./unixnu ipsw fetch StaticTrustCache Cryptex1,SystemTrustCache 2>&1 | tee out/picasso/logs/actions-ipsw.log
+          python3 scripts/prepare-original-trust.py --tree "$TREE" --inputs out/ipsw/21H461 --output out/picasso/original-static-system.bundle 2>&1 | tee out/picasso/logs/actions-trust.log
+
       - name: Build kernel + payload
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -86,7 +95,7 @@ jobs:
           python3 ./unixnu defconfig picasso_defconfig
           python3 ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
           mkdir -p out/picasso/logs
-          python3 ./unixnu build kernel payload -j 3 2>&1 | tee out/picasso/logs/actions-build.log
+          python3 ./unixnu build kernel payload -j 3 --trust-cache out/picasso/original-static-system.bundle 2>&1 | tee out/picasso/logs/actions-build.log
 
       - name: Report kernel/payload sizes
         run: |

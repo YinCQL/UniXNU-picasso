@@ -254,10 +254,26 @@ kernel_args = [
 #         "com.apple.kec.libpthread" does not exist and fails the closure);
 #         its pthread_kext_register call fills the function table.
 panic_screen = true
+# The original static and System trust caches, bundled by
+# scripts/prepare-original-trust.py from the pinned IPSW. DarwinBoot copies the
+# bundle into the kernel window and fills the ADT TrustCache placeholder with its
+# address and size; without it the kernel logs "no external trust caches found"
+# and has no original Apple hashes to check userspace binaries against. The
+# allow-list below pins the exact bundle this board accepts, so a mismatched or
+# substituted input fails the payload step instead of booting.
+trust_cache_sha256 = ["7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7"]
 
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"
 chip_id = "7250"
+# Declare an iPad-class device: /model iPad7,1, /target-type J120, the J120 panel
+# artwork in /product, no Home button in /buttons, and the dev-board security
+# tuple in /chosen (certificate-security-mode 1). The original AMFI reads that
+# tuple to choose its code-signing trust policy for the platform; under the
+# production policy it rejects the adhoc-signed userspace with "unsuitable CT
+# policy 0", which is the stage 5 blocker. sheng and hummer run the same values
+# on hardware against the same 21H461 userspace.
+ipad_identity = true
 # Select the authenticated OS APFS volume by its published IOMedia UUID. The
 # VerifiedRoot window identity check independently binds this UUID to the
 # owner-signed image before the block device is published.
