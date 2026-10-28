@@ -2814,10 +2814,7 @@ index f394e746b5f26677910edfeb2b2eb07035e2fffd..e481dac39865c4245173a316b376f5ef
 diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
 --- a/osfmk/console/serial_console.c
 +++ b/osfmk/console/serial_console.c
-@@ -642,12 +642,24 @@
- 	}
- }
- 
+@@ -525,4 +525,16 @@ console_write(char *str, int size)
  void
  console_write(char *str, int size)
  {
@@ -2833,16 +2830,8 @@ diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
 +			picasso_usb_log_write(str, (unsigned)size);
 +		}
 +	}
- 	picasso_ring_puts(str, size);
  	if (disableConsoleOutput) {
- 		return;
- 	}
- 
- 	assert(str != NULL);
-@@ -728,12 +740,16 @@
-  *
-  * @param c The character to print.
-  */
+@@ -607,4 +619,8 @@ console_write_unbuffered(char c)
  void
  console_write_unbuffered(char c)
  {
@@ -2851,11 +2840,6 @@ diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
 +		picasso_usb_log_char(c);
 +	}
  	if (disableConsoleOutput) {
- 		return;
- 	}
- 	picasso_ring_putc(c);
- 
- 	_cnputc(c, true);
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
 index e9daeed833924a653c2243f46615527a3e9b4195..1d670170759e04d18f6d57f3f78d6e420ade0812 100644
 --- a/osfmk/kern/debug.c
