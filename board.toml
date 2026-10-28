@@ -188,6 +188,13 @@ kernel_args = [
   # already established, and it prints a very long log while doing so. Turn it
   # back on when a driver is suspected of never being matched; the bits are
   # kIOLogMatch(0x10) | kIOLogProbe(0x2) | kIOLogConfig(0x20) | kIOLogCatalogue(0x200).
+  # Diagnostic-only: keep console output flowing when an early kernel path
+  # logs with interrupts disabled. Without this XNU panics at
+  # serial_console.c:175 before CDC can deliver the surrounding context.
+  "nointr_consio=1",
+  # IOLog has a separate interrupt-context assertion in IOLib.cpp. This
+  # diagnostic-only escape hatch lets those messages reach the CDC console.
+  "nointr_iolog=1",
   # USB console (usb branch): 1 = state probe only, 2 = run the CDC-ACM
   # console streaming (DWC3 device mode; the PC sees a serial port carrying
   # the last 256 KiB of console text and then live output).
@@ -197,6 +204,13 @@ kernel_args = [
   # this, the read-only guard sees zero matches and deliberately leaves the
   # controller untouched.
   "picasso_usb_smmu=6",
+  # Let bsd_init continue to root mounting after the CDC poller starts.
+  # hold=1 parks bsd_init indefinitely for USB-only qualification; that mode
+  # cannot exercise this branch's UFS/root/SystemOS path.
+  "picasso_usb_hold=0",
+  # The XNU CDC panic/reset path uses PSHOLD as its final fallback and arms the
+  # IMEM Fastboot reason before either panic or command reset.
+  "picasso_usb_reset=pshold",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
@@ -205,7 +219,8 @@ kernel_args = [
 # SYSTEM_RESET entry_probe_reset_delay seconds after the MMU is enabled --
 # a spontaneous reboot after that delay is the signal that start.s completed.
 # panic_screen redirects panic() to a renderer that draws on the kernel's own
-# framebuffer mapping, so any panic after PE_create_console becomes readable.
+# framebuffer mapping. The Picasso CDC console captures the panic stream
+# synchronously, so keep this disabled while CDC is the evidence path.
 # Bisect deeper with entry_probe_reset_after (one call per run; payload.py keys
 # map to the script's --reset-after/--in/--occurrence options).
 # Bisect log (2026-10-24), one probe per run; ~6 s reboot = the call completed:
@@ -259,7 +274,7 @@ kernel_args = [
 #         is com.apple.kec.pthread (libpthread's kext.xcconfig MODULE_NAME;
 #         "com.apple.kec.libpthread" does not exist and fails the closure);
 #         its pthread_kext_register call fills the function table.
-panic_screen = true
+panic_screen = false
 # The original static and System trust caches, bundled by
 # scripts/prepare-original-trust.py from the pinned IPSW. DarwinBoot copies the
 # bundle into the kernel window and fills the ADT TrustCache placeholder with its

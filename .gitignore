@@ -3,3 +3,7 @@ out/
 *.img
 *.fd
 build/
+.DS_Store
+__pycache__/
+*.py[cod]
+/picasso-diagnostics/
