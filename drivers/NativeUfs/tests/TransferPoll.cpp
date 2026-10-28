@@ -9,6 +9,7 @@ struct Sample { uint32_t db, ocs, is; };
 struct FakePort {
   std::vector<Sample> samples;
   unsigned index = 0, reads = 0;
+  void beginPoll(uint32_t poll) { assert(poll == index + 1); }
   uint32_t doorbell() { return samples[index].db; }
   uint32_t interrupt() { return samples[index].is; }
   uint32_t completedOcs() {

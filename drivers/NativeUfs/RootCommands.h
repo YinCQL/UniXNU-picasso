@@ -8,27 +8,11 @@
 struct HardwareTransferPort {
   uint64_t deadline;
   uint32_t tracePoll;
-  uint32_t kicks;
-  uint32_t reenables;
-  // A slot can be latched without the controller ever fetching it, and then the
-  // doorbell stays set with no completion for the whole deadline. Re-writing the
-  // doorbell makes it fetch the slot again. Re-enabling the request list has to
-  // come first: a controller that cleared UTRLRSR ignores doorbell writes
-  // entirely, so the kick alone would do nothing there. Both are cheap next to
-  // the timeout they prevent, so they run periodically rather than on failure --
-  // by the time the deadline expires the descriptor may already be abandoned and
-  // this driver never resubmits into a slot it does not own.
+  // Polling only observes the submitted slot. Re-ringing or restarting the
+  // request list here can race completion and reuse DMA still owned by the HC.
   void beginPoll (uint32_t poll) {
     tracePoll = poll;
     if (poll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT poll=begin\n");
-    if (poll != 1 && (poll & 0x3fff) == 0) {
-      if ((read32 (gHost.hc, 0x60) & 1) == 0) {
-        hostWrite (0x60, 1);
-        ++reenables;
-      }
-      hostWrite (0x58, 1);
-      ++kicks;
-    }
   }
   uint32_t doorbell () {
     uint32_t value = read32 (gHost.hc, 0x58);
@@ -47,8 +31,17 @@ struct HardwareTransferPort {
     if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT poll invalidate0 ocs=%x\n", value);
     return value;
   }
-  bool expired () { return mach_absolute_time () >= deadline; }
-  void delay () { IODelay (2); }
+  bool expired () {
+    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT clock=begin\n");
+    uint64_t now = mach_absolute_time ();
+    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT clock=end now=%llx deadline=%llx\n", now, deadline);
+    return now >= deadline;
+  }
+  void delay () {
+    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT delay=begin\n");
+    IODelay (2);
+    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT delay=end\n");
+  }
 };
 
 static void putBe32 (uint8_t *at, uint32_t value)
@@ -124,7 +117,9 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT is_ack=end is=%x\n", read32 (gHost.hc, 0x20));
   HardwareTransferPort port;
   port.tracePoll = 0;
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT deadline=begin timeout_us=%u\n", timeoutUs);
   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, &port.deadline);
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT deadline=end value=%llx\n", port.deadline);
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT doorbell=begin\n");
   hostWrite (0x58, 1);
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT doorbell=end db=%x\n", read32 (gHost.hc, 0x58));

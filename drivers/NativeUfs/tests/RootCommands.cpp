@@ -5,62 +5,92 @@
 #include <algorithm>
 #include <string>
 enum class Fault { None, Empty, Type, Tag, Lun, Query, Residual, Underflow,
-  Oversize, SenseLength, CheckCondition, Timeout, Fatal, Stop, Start, HighBase };
+  Oversize, SenseLength, CheckCondition, Timeout, BusyTimeout, Fatal, Stop, Start, HighBase,
+  BoundaryComplete, BoundaryFatal, BoundaryExpired };
 static Fault fault;
 static std::array<uint8_t,kDmaBytes> device;
 static std::array<uint32_t,64> registers;
 static uint64_t now;
-static unsigned writes, releases;
-static bool released;
+static unsigned writes, releases, acquires, doorbellWrites, runStopWrites, pollDelays;
+static bool released, submitted;
+static constexpr unsigned kFormerKickPoll = 16384;
+
+static bool boundaryFault()
+{
+  return fault==Fault::BoundaryComplete || fault==Fault::BoundaryFatal || fault==Fault::BoundaryExpired;
+}
+
+static void completeResponse()
+{
+  registers[0x58/4]=0;
+  uint8_t *cmd=device.data()+kUcdOffset, *rsp=cmd+kRspOffset;
+  std::fill(rsp,rsp+512,uint8_t(0));
+  memset(device.data()+kDataOffset,0x7b,kDataMax);
+  *reinterpret_cast<uint32_t *>(device.data()+8)=0;
+  if (fault==Fault::Empty) return;
+  memcpy(rsp,cmd,32); rsp[0]=cmd[0]+0x20; rsp[1]=0;
+  if (cmd[0]==1) putBe32(rsp+12,0);
+  if (cmd[0]==0x16) putBe32(rsp+20,0x11);
+  if (fault==Fault::Type) rsp[0]=0x3f;
+  if (fault==Fault::Tag) ++rsp[3];
+  if (fault==Fault::Lun) ++rsp[2];
+  if (fault==Fault::Query) ++rsp[13];
+  if (fault==Fault::Residual) putBe32(rsp+12,4096);
+  if (fault==Fault::Underflow) rsp[1]=0x20;
+  if (fault==Fault::Oversize) rsp[10]=0xff;
+  if (fault==Fault::SenseLength) { rsp[11]=2; rsp[33]=18; }
+  if (fault==Fault::CheckCondition) {
+    rsp[7]=2; rsp[11]=20; rsp[33]=18; rsp[34]=0x70;
+    rsp[36]=6; rsp[46]=0x29; rsp[47]=0;
+  }
+}
 
 static uint64_t io(unsigned op,uint64_t address,uint64_t value,void *bytes)
 {
   if (op==0) return registers.at(address/4);
   if (op==1) {
     ++writes;
+    if (address==0x60) ++runStopWrites;
     if (address==0x20) registers[address/4]&=~uint32_t(value);
     else if (!(address==0x60 && ((fault==Fault::Stop && !value) || (fault==Fault::Start && value))) &&
              !(address==0x54 && fault==Fault::HighBase)) registers.at(address/4)=uint32_t(value);
     if (address==0x58) {
+      ++doorbellWrites;
       assert(released); released=false;
+      submitted=true;
+      if (boundaryFault() || fault==Fault::BusyTimeout) return 0;
       if (fault==Fault::Fatal) { registers[0x20/4]=0x20000; return 0; }
       registers[0x58/4]=0;
       if (fault==Fault::Timeout) return 0;
-      uint8_t *cmd=device.data()+kUcdOffset, *rsp=cmd+kRspOffset;
-      std::fill(rsp,rsp+512,0);
-      memset(device.data()+kDataOffset,0x7b,kDataMax);
-      *reinterpret_cast<uint32_t *>(device.data()+8)=0;
-      if (fault==Fault::Empty) return 0;
-      memcpy(rsp,cmd,32); rsp[0]=cmd[0]+0x20; rsp[1]=0;
-      if (cmd[0]==1) putBe32(rsp+12,0);
-      if (cmd[0]==0x16) putBe32(rsp+20,0x11);
-      if (fault==Fault::Type) rsp[0]=0x3f;
-      if (fault==Fault::Tag) ++rsp[3];
-      if (fault==Fault::Lun) ++rsp[2];
-      if (fault==Fault::Query) ++rsp[13];
-      if (fault==Fault::Residual) putBe32(rsp+12,4096);
-      if (fault==Fault::Underflow) rsp[1]=0x20;
-      if (fault==Fault::Oversize) rsp[10]=0xff;
-      if (fault==Fault::SenseLength) { rsp[11]=2; rsp[33]=18; }
-      if (fault==Fault::CheckCondition) {
-        rsp[7]=2; rsp[11]=20; rsp[33]=18; rsp[34]=0x70;
-        rsp[36]=6; rsp[46]=0x29; rsp[47]=0;
-      }
+      completeResponse();
     }
   }
   if (op==2 || op==3) {
     assert(address>=gHost.phys && address-gHost.phys+value<=device.size());
     auto at=device.data()+(address-gHost.phys);
     if (op==2) { ++releases; memcpy(at,bytes,value); released=true; }
-    else memcpy(bytes,at,value);
+    else { ++acquires; memcpy(bytes,at,value); }
   }
   if (op==4) return now;
-  if (op==5) now+=value;
+  if (op==5) {
+    now+=value;
+    if (submitted && boundaryFault() && ++pollDelays==kFormerKickPoll-1) {
+      // Change hardware state between polls, immediately before the old kick
+      // point. Also expire the deadline: completion/fatal must be observed first.
+      now=200000;
+      registers[0x60/4]=0;
+      if (fault==Fault::BoundaryExpired) registers[0x58/4]=0; // OCS remains invalid.
+      else completeResponse();
+      if (fault==Fault::BoundaryFatal) registers[0x20/4]=0x20000;
+    }
+  }
   return 0;
 }
 static void reset(Fault f=Fault::None)
 {
-  fault=f; device.fill(0); registers.fill(0); now=0; writes=releases=0; released=false;
+  fault=f; device.fill(0); registers.fill(0); now=0;
+  writes=releases=acquires=doorbellWrites=runStopWrites=pollDelays=0;
+  released=submitted=false;
   registers[0x34/4]=1; registers[0x30/4]=15; registers[0x60/4]=1;
   ufs_test_reset(io,0x8cb5e9000);
 }
@@ -78,6 +108,21 @@ static void assertQuarantined()
 }
 int main()
 {
+  for (Fault f: {Fault::BoundaryComplete,Fault::BoundaryFatal,Fault::BoundaryExpired}) {
+    reset(f);
+    IOReturn result=ufs_test_nop();
+    assert(gRootDiagnostic.polls==kFormerKickPoll && now==200000);
+    assert(doorbellWrites==1 && releases==1 && runStopWrites==0);
+    assert(registers[0x60/4]==0); // Never restart a stopped request list while polling.
+    if (f==Fault::BoundaryComplete) {
+      assert(result==kIOReturnSuccess && gRootDiagnostic.ocs==0 && !ufs_test_poisoned());
+    } else {
+      assert(result==(f==Fault::BoundaryFatal ? kIOReturnIOError : kIOReturnTimeout));
+      assert(gRootDiagnostic.ocs==15);
+      if (f==Fault::BoundaryFatal) assert(acquires==0); // Fatal takes precedence over OCS=0.
+      assertQuarantined();
+    }
+  }
   reset(); assert(ufs_test_nop()==0);
   uint32_t value=0; assert(ufs_test_query(3,2,&value)==0 && value==0x11);
   std::array<uint8_t,131072> out;
@@ -89,10 +134,12 @@ int main()
   auto oldWrites=writes;
   assert(ufs_test_read(0,0xffffffffULL,2,out.data())==kIOReturnBadArgument && writes==oldWrites);
   for (Fault f: {Fault::Empty,Fault::Type,Fault::Tag,Fault::Lun,Fault::Residual,
-                Fault::Underflow,Fault::Oversize,Fault::SenseLength,Fault::Timeout,Fault::Fatal}) {
+                Fault::Underflow,Fault::Oversize,Fault::SenseLength,Fault::Timeout,Fault::BusyTimeout,Fault::Fatal}) {
     reset(f); out.fill(0xa5);
     assert(ufs_test_read(0,1,1,out.data())!=0);
     assert(std::all_of(out.begin(),out.end(),[](uint8_t x){return x==0xa5;}));
+    assert(doorbellWrites==1 && releases==1 && runStopWrites==0);
+    if (f==Fault::BusyTimeout) assert(acquires==0); // Do not read HC-owned descriptors.
     assertQuarantined();
   }
   reset(Fault::Query); value=0xabcdef;
@@ -120,5 +167,5 @@ int main()
   reset(Fault::HighBase); assert(ufs_test_stop_queue()); assert(!ufs_test_start_queue());
   reset(); assert(ufs_test_stop_queue() && ufs_test_start_queue());
   assert(registers[0x50/4]==0xcb5e9000 && registers[0x54/4]==8);
-  puts("PASS: actual command/queue path; malformed DMA responses, bounds, short reads, sense, quarantine, queue refusal and full-width DMA");
+  puts("PASS: actual command/queue path; 16384-poll completion/fatal/deadline boundaries, no resubmission, DMA ownership, malformed responses, bounds, quarantine and queue refusal");
 }

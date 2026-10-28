@@ -1,5 +1,9 @@
 # Owner cache integration audit
 
+The transport issue recorded below was subsequently reproduced and corrected
+in the [UFS NOP investigation](ufs-nop-investigation.md). That follow-up does
+not establish a device root-mount or owner-cache success.
+
 ## Audited inputs
 
 - Local starting commit: `8e57db66d178ecb3a1681dc47154c85281bb4522` on `feat/ufs-stage6`.

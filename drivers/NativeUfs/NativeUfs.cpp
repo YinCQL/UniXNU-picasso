@@ -921,9 +921,14 @@ static void hostWrite (unsigned offset, uint32_t value)
   __asm__ volatile ("dsb sy" ::: "memory");
 }
 
+// Keep ordinary block I/O quiet while exposing the first transport command's
+// boundaries even with native-ufs-diagnostics=0. This flag is enabled only
+// around the bring-up NOP, not subsequent SCSI/query commands or root reads.
+static bool gRootNopTrace = false;
+#define NATIVE_UFS_TRACE(...) do { if (gRootDiagnosticEnabled || gRootNopTrace) IOLog(__VA_ARGS__); } while (0)
 #include "RootQueue.h"
-
 #include "RootCommands.h"
+#undef NATIVE_UFS_TRACE
 
 static bool waitTimebaseNanosecondsWithYield (uint64_t duration)
 {
@@ -1072,7 +1077,16 @@ static bool hostBringUp (const char **why)
   }
   gRootDiagnostic.stage = "NOP OUT";
   // NOP OUT proves the transport before touching the SCSI layer.
-  if (hostNop () != kIOReturnSuccess) {
+  IOLog ("NATIVE_UFS_BRINGUP nop begin\n");
+  gRootNopTrace = true;
+  IOReturn nopResult = hostNop ();
+  gRootNopTrace = false;
+  IOLog ("NATIVE_UFS_BRINGUP nop end result=%08x command=%u polls=%u ocs=%x "
+         "db_seen=%x is_seen=%x protocol=%u response=%08x\n",
+         static_cast<unsigned> (nopResult), gRootDiagnostic.command,
+         gRootDiagnostic.polls, gRootDiagnostic.ocs, gRootDiagnostic.dbSeen,
+         gRootDiagnostic.isSeen, gRootDiagnostic.protocol, gRootDiagnostic.response);
+  if (nopResult != kIOReturnSuccess) {
     gHost.ready = false;
     *why = "NOP OUT";
     return false;
