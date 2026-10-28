@@ -5,9 +5,24 @@
 #include <cstdio>
 #include <cstring>
 #include <cassert>
+#include <cstdarg>
 #include "../RootDiagnostics.h"
 #include "../TransferPoll.h"
+#ifdef NATIVE_UFS_TEST_TRACE
+static unsigned traceCalls;
+static void ufsTestTrace(const char *format, ...) {
+  char line[1024];
+  va_list arguments;
+  va_start(arguments,format);
+  int length=vsnprintf(line,sizeof(line),format,arguments);
+  va_end(arguments);
+  assert(length>=0 && size_t(length)<sizeof(line));
+  ++traceCalls;
+}
+#define NATIVE_UFS_TRACE(...) ufsTestTrace(__VA_ARGS__)
+#else
 #define NATIVE_UFS_TRACE(...) ((void)0)
+#endif
 using IOReturn = uint32_t;
 constexpr IOReturn kIOReturnSuccess=0, kIOReturnError=0xe00002bc,
   kIOReturnBadArgument=0xe00002c2, kIOReturnIOError=0xe00002ca,
@@ -48,6 +63,9 @@ void ufs_test_reset(Callback cb, uint64_t physical) {
   callback=cb; memset(memory,0,sizeof(memory));
   gHost={memory,physical,true,false,0,nullptr}; gRootDiagnostic=UfsRootDiagnostics{};
   gStoreOpen=gLogOpen=false; gStoreFirst=gStoreBlocks=gLogFirst=gLogBlocks=0;
+#ifdef NATIVE_UFS_TEST_TRACE
+  traceCalls=0;
+#endif
 }
 uint8_t *ufs_test_memory() { return memory; }
 bool ufs_test_poisoned() { return gHost.poisoned; }
@@ -65,5 +83,8 @@ uint32_t ufs_test_sync() { return hostSyncCache(); }
 uint32_t ufs_test_nop() {
   return hostNop();
 }
+#ifdef NATIVE_UFS_TEST_TRACE
+unsigned ufs_test_trace_calls() { return traceCalls; }
+#endif
 int ufs_test_report(char *out,size_t size) { return formatUfsRootDiagnostics(out,size,gRootDiagnostic,"host harness"); }
 }

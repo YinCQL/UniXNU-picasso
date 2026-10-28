@@ -921,11 +921,11 @@ static void hostWrite (unsigned offset, uint32_t value)
   __asm__ volatile ("dsb sy" ::: "memory");
 }
 
-// Keep ordinary block I/O quiet while exposing the first transport command's
-// boundaries even with native-ufs-diagnostics=0. This flag is enabled only
-// around the bring-up NOP, not subsequent SCSI/query commands or root reads.
-static bool gRootNopTrace = false;
-#define NATIVE_UFS_TRACE(...) do { if (gRootDiagnosticEnabled || gRootNopTrace) IOLog(__VA_ARGS__); } while (0)
+// Keep ordinary block I/O quiet while exposing the initial transport commands'
+// boundaries even with native-ufs-diagnostics=0. Enable this only around the
+// bring-up NOP and its one power Query, not subsequent SCSI or root reads.
+static bool gRootBringupTrace = false;
+#define NATIVE_UFS_TRACE(...) do { if (gRootDiagnosticEnabled || gRootBringupTrace) IOLog(__VA_ARGS__); } while (0)
 #include "RootQueue.h"
 #include "RootCommands.h"
 #undef NATIVE_UFS_TRACE
@@ -1078,9 +1078,9 @@ static bool hostBringUp (const char **why)
   gRootDiagnostic.stage = "NOP OUT";
   // NOP OUT proves the transport before touching the SCSI layer.
   IOLog ("NATIVE_UFS_BRINGUP nop begin\n");
-  gRootNopTrace = true;
+  gRootBringupTrace = true;
   IOReturn nopResult = hostNop ();
-  gRootNopTrace = false;
+  gRootBringupTrace = false;
   IOLog ("NATIVE_UFS_BRINGUP nop end result=%08x command=%u polls=%u ocs=%x "
          "db_seen=%x is_seen=%x protocol=%u response=%08x\n",
          static_cast<unsigned> (nopResult), gRootDiagnostic.command,
@@ -1097,7 +1097,25 @@ static bool hostBringUp (const char **why)
   }
   uint32_t power = 0;
   gRootDiagnostic.stage = "power mode query";
-  if (hostQueryRead (0x03, 0x02, &power) != kIOReturnSuccess) {
+  IOLog ("NATIVE_UFS_BRINGUP power_query begin opcode=03 idn=02\n");
+  const uint32_t queryCommandBefore = gRootDiagnostic.command;
+  gRootBringupTrace = true;
+  IOReturn queryResult = hostQueryRead (0x03, 0x02, &power);
+  gRootBringupTrace = false;
+  // hostSubmit increments command only after its preflight succeeds. A failed
+  // UCD clear/preflight must not report the preceding NOP's completion fields.
+  const bool queryCommandStarted = gRootDiagnostic.command != queryCommandBefore;
+  IOLog ("NATIVE_UFS_BRINGUP power_query end result=%08x command_started=%u command=%u "
+         "polls=%u ocs=%x db_seen=%x is_seen=%x protocol=%u response=%08x power=%x\n",
+         static_cast<unsigned> (queryResult), queryCommandStarted ? 1U : 0U,
+         queryCommandStarted ? gRootDiagnostic.command : 0U,
+         queryCommandStarted ? gRootDiagnostic.polls : 0U,
+         queryCommandStarted ? gRootDiagnostic.ocs : 15U,
+         queryCommandStarted ? gRootDiagnostic.dbSeen : 0U,
+         queryCommandStarted ? gRootDiagnostic.isSeen : 0U,
+         queryCommandStarted ? gRootDiagnostic.protocol : 0U,
+         queryCommandStarted ? gRootDiagnostic.response : 0U, power);
+  if (queryResult != kIOReturnSuccess) {
     gHost.ready = false;
     *why = "power mode query";
     return false;
