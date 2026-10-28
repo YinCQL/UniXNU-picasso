@@ -37,13 +37,10 @@ CONFIG_XNU_NATIVE_UFS=y
 # CONFIG_XNU_VERIFIED_ROOT_PROBE is not set
 CONFIG_XNU_OWNER_ROOT_AUDIT=y
 CONFIG_XNU_OWNER_ROOT_TRUST=y
-# Mount the SystemOS cryptex volume as the dyld shared cache carrier. launchd
-# cannot map the shared cache from the OS volume: the cache lives on SystemOS,
-# and without this mount vm_shared_region_start_address() fails with an empty
-# region. The owner chain mounts it read-only at /private/preboot after
-# re-verifying the device against the owner-signed policy, then hands
-# DYLD_SHARED_CACHE_DIR to the init environment. OWNER_CACHE_VOLUME_UUID is the
-# APFS volume UUID inside the signed SystemOS image (published as disk1s1).
+# Mount the authenticated SystemOS cryptex read-only at /private/preboot and
+# pass DYLD_SHARED_CACHE_DIR to init. This requires the OS root to have mounted
+# already; it cannot resolve an earlier IOFindBSDRoot wait. CACHE_VOLUME_UUID
+# selects the signed APFS volume by UUID, not by its variable diskNsM name.
 # OWNER_UNION_SYSTEMOS stays off for now: it overlays SystemOS onto / with
 # MNT_UNION. The kernel tree does select union mounts (DEVELOPMENT includes
 # FILESYS_DEV), but that path is the heavier fallback -- the carrier route
@@ -57,11 +54,11 @@ CONFIG_XNU_OWNER_CACHE_STARTUP=y
 CONFIG_XNU_OWNER_BOOT_MANIFEST=y
 CONFIG_XNU_OWNER_CACHE_VOLUME_UUID="8846FE78-2910-4297-AF97-D59BB6F8FC16"
 # The SystemOS carrier is mounted at /private/preboot, not unioned onto /.
-# The kernel's non-CSR shared-region path only accepts a shared cache that
-# sits on the root volume or on /private/preboot/Cryptexes; the carrier
-# patch authorizes the authenticated SystemOS mount instead. Without it the
-# mapping is refused and vm_shared_region_start_address() reports an empty
-# region. Requires OWNER_CACHE_STARTUP.
+# The non-CSR shared-region path checks the root mount and the mount resolved
+# through /private/preboot/Cryptexes. The carrier patch adds the authenticated
+# SystemOS mount/direct-parent check for our non-union path. Requires
+# OWNER_CACHE_STARTUP. A first shared_region_check_np() returning an empty
+# region is not by itself evidence that the subsequent mapping failed.
 CONFIG_XNU_OWNER_CACHE_CARRIER=y
 # CONFIG_XNU_OWNER_DATA_MOUNT is not set
 # CONFIG_XNU_OWNER_UNION_SYSTEMOS is not set
