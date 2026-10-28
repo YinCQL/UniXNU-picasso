@@ -1,0 +1,37 @@
+PICASSO USB: setup type=21 req=22 value=0003 index=0000 len=0
+PICASSO USB: EPSTATE host-open ep2 result=0 state=0x00020004 busy=1 rsc=2 trb=c47ec000/00000000/00000200/00000819 DALEPENA=0000002f DCTL=80000000 DSTS=00027d00 events=373/8
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: setup type=21 req=20 value=0000 index=0000 len=7
+PICASSO USB: event 541 ep2 0x00006084
+PICASSO USB: RX event type=2 status=0x00000006 rem=495 len=512 ctl=0x00000818 rsc=2
+PICASSO CDC: RX complete type=2 status=6 bytes=17
+PICASSO USB: RX arm mps=512 len=512 trb=0xc47ea080 result=0 cmd=0x00020007 rsc=2 started=1
+PICASSO USB: EPSTATE after-arm ep2 result=0 state=0x00000004 busy=1 rsc=2 trb=c47ec000/00000000/00000200/00000819 DALEPENA=0000002f DCTL=80000000 DSTS=0002e588 events=542/4
+PICASSO CDC: command 'reboot-fastboot'
+PICASSO CDC: reboot-fastboot requested; using reset mode 2
+PICASSO CDC: IMEM Fastboot reason arm pa=0x146ab65c previous=0x24018441 target=0x77665500
+PICASSO CDC: IMEM Fastboot reason armed readback=0x77665500
+PICASSO CDC: fastboot flush begin tx_busy=1 pending=150
+PICASSO CDC: fastboot flush complete; entering configured reset path
