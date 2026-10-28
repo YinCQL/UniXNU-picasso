@@ -25,7 +25,8 @@
   progress.
 - **USB kernel console: working.** The kernel exposes a CDC-ACM device named
   `picasso XNU USB console` and streams the buffered/live console over DWC3.
-  Capture it with `scripts/capture-picasso-usb-console.py`; see
+  Capture it on macOS with `scripts/capture-picasso-usb-console.py`, or on Windows
+  by double-clicking `capture-logs.cmd` for automatic device detection and saving; see
   `docs/usb-console-bringup.md` for hardware results and safeguards.
 
 
