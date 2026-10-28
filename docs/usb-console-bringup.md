@@ -6,6 +6,12 @@ and subsequent kernel output over USB, without a screen photo.
 
 ## Host capture
 
+Bulk-IN EP3 event lines and the periodic poller heartbeat are disabled by
+default. Add the kernel boot argument `picasso_usb_trace=1` to enable them for
+USB debugging. This takes effect in a newly built boot image; it is not a host
+capture-script option. Event processing and the explicit poll/watchdog loop
+continue with tracing disabled. Other startup, control and error logs remain.
+
 ### Windows
 
 Double-click **`capture-logs.cmd`** at the repository root before booting the phone.

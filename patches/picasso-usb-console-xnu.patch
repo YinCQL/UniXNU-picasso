@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..2237fb2
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,2737 @@
+@@ -0,0 +1,2743 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -32,6 +32,7 @@ index 0000000..2237fb2
 + * rate or PHY power state is changed here. ABL/UEFI leave the controller
 + * powered from the fastboot session. Boot-arg picasso_usb=1 probes state
 + * only, 2 also runs the console.
++ * picasso_usb_trace=1 enables bulk-IN event and poller heartbeat logs.
 + */
 +#include <sys/param.h>
 +#include <sys/systm.h>
@@ -378,6 +379,7 @@ index 0000000..2237fb2
 +	bool        rx_transfer_started;
 +	bool        notify_busy;
 +	bool        trace_commands;
++	bool        trace_polling;
 +	bool        smmu_guard;
 +	bool        live;
 +	bool        hold;
@@ -1853,6 +1855,7 @@ index 0000000..2237fb2
 +			unsigned event_ep = (ev & 1) ? 0u : ((ev >> 1) & 0x1fu);
 +			ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
 +			if (!ud.panic_mode &&
++			    (event_ep != EP_TX || ud.trace_polling) &&
 +			    (event_ep == EP_RX || ud.events < 200)) {
 +				pur_emit_event(ud.events, event_ep, ev);
 +			}
@@ -2309,7 +2312,7 @@ index 0000000..2237fb2
 +		if ((polls & 0x3ffu) == 0) {
 +			picasso_usb_watchdog_pet();
 +		}
-+		if ((polls % 4096) == 0) {
++		if (ud.trace_polling && (polls % 4096) == 0) {
 +			printf("PICASSO USB: poller heartbeat polls=%llu events=%llu rx_busy=%u\n",
 +			    polls, ud.events, ud.rx_busy ? 1u : 0u);
 +		}
@@ -2604,10 +2607,12 @@ index 0000000..2237fb2
 +	int panic_test = 0;
 +	int panic_reset = 1;
 +	int watchdog = 1;
++	int trace_polling = 0;
 +	char reset_mode[16] = "psci";
 +
 +	PE_parse_boot_argn("picasso_usb", &enabled, sizeof(enabled));
 +	PE_parse_boot_argn("picasso_usb_hold", &hold, sizeof(hold));
++	PE_parse_boot_argn("picasso_usb_trace", &trace_polling, sizeof(trace_polling));
 +	PE_parse_boot_argn("picasso_usb_smmu", &bind_smmu, sizeof(bind_smmu));
 +	PE_parse_boot_argn("picasso_usb_panic_test", &panic_test,
 +	    sizeof(panic_test));
@@ -2619,6 +2624,7 @@ index 0000000..2237fb2
 +	    sizeof(reset_mode));
 +	ud.mps = 64;
 +	ud.hold = hold != 0;
++	ud.trace_polling = trace_polling != 0;
 +	ud.panic_test = panic_test != 0;
 +	ud.panic_reset = panic_reset != 0;
 +	ud.watchdog = watchdog != 0;
