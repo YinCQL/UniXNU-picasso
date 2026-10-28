@@ -4,6 +4,10 @@
 #ifndef NATIVE_UFS_TRACE
 #define NATIVE_UFS_TRACE(...) do { if (gRootDiagnosticEnabled) IOLog(__VA_ARGS__); } while (0)
 #endif
+#ifndef NATIVE_UFS_READ_TRACE
+#define NATIVE_UFS_READ_TRACE(...) NATIVE_UFS_TRACE(__VA_ARGS__)
+#endif
+#include "PollPause.h"
 
 struct HardwareTransferPort {
   uint64_t deadline;
@@ -38,9 +42,9 @@ struct HardwareTransferPort {
     return now >= deadline;
   }
   void delay () {
-    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT delay=begin\n");
-    IODelay (2);
-    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT delay=end\n");
+    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT delay=begin mode=cpu-yield hints=%u\n", kUfsPollPauseHintCount);
+    ufsPollPause (hostCpuRelax);
+    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT delay=end mode=cpu-yield\n");
   }
 };
 
@@ -319,6 +323,10 @@ static IOReturn hostQueryRead (uint8_t opcode, uint8_t idn, uint32_t *value)
   return kIOReturnSuccess;
 }
 
+// Accessed under gHost.lock. Keep boot read boundaries bounded even if APFS
+// performs many requests while looking for the root volume.
+static unsigned gRootReadTraceCount = 0;
+
 // Read `blocks` (<= kDataMax / 4096) 4096-byte blocks of LUN `lun` starting at `lba` into dst.
 static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst)
 {
@@ -326,6 +334,13 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
     return kIOReturnBadArgument;
   }
   IOLockLock (gHost.lock);
+  const bool traceRead = gRootReadTraceCount < 8;
+  if (traceRead) {
+    ++gRootReadTraceCount;
+    NATIVE_UFS_READ_TRACE ("NATIVE_UFS_READ begin sample=%u lun=%u lba=%llx blocks=%u\n",
+                          gRootReadTraceCount, lun, static_cast<unsigned long long> (lba), blocks);
+  }
+  const uint32_t commandBefore = gRootDiagnostic.command;
   gRootDiagnostic.lba = lba;
   uint8_t cdb[10] = { 0x28, 0, uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
@@ -333,6 +348,20 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   IOReturn status = hostScsi (lun, cdb, 10, true, blocks * 4096U, 1000000, &scsi);
   if (status == kIOReturnSuccess) {
     memcpy (dst, gHost.virt + kDataOffset, blocks * 4096U);
+  }
+  if (traceRead || status != kIOReturnSuccess) {
+    if (gRootDiagnostic.command != commandBefore) {
+      NATIVE_UFS_READ_TRACE ("NATIVE_UFS_READ end result=%08x lba=%llx blocks=%u command=%u polls=%u ocs=%x scsi=%x protocol=%u\n",
+                            static_cast<unsigned> (status), static_cast<unsigned long long> (lba), blocks,
+                            gRootDiagnostic.command, gRootDiagnostic.polls, gRootDiagnostic.ocs,
+                            scsi, gRootDiagnostic.protocol);
+    } else {
+      NATIVE_UFS_READ_TRACE ("NATIVE_UFS_READ end result=%08x lba=%llx blocks=%u command_started=0 scsi=%x\n",
+                            static_cast<unsigned> (status), static_cast<unsigned long long> (lba), blocks, scsi);
+    }
+  }
+  if (traceRead && gRootReadTraceCount == 8) {
+    NATIVE_UFS_READ_TRACE ("NATIVE_UFS_READ sample limit reached; further successful reads are quiet\n");
   }
   IOLockUnlock (gHost.lock);
   return status;

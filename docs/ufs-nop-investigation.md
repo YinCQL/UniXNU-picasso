@@ -64,6 +64,29 @@ gets checked when the polling code is running.
 This log still starts midway through a line. EP3 event and heartbeat traces
 are disabled in this build, so their absence cannot establish a USB failure.
 
+## Latest device evidence: power query succeeds, LUN readiness is next
+
+The user identified `picasso-windows-20261029-061253-386.log` as a capture from
+successful Compose run [40776894540](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40776894540),
+head `c9c8ffaa1b1a5738c1feccf96f053b954c138123`. The capture is 14,132 bytes /
+252 lines, SHA-256
+`b96b1955a8a6c691119130e913d013349be4cea2761e034a6d1c6adbd6f75788`.
+The image/run association is user-confirmed, not an independently checked boot
+image hash. This capture still lacks the early boot prefix.
+
+Both NOP and power query complete in one poll. The query passes response
+validation (`response=36000001`, `protocol=0`) and returns `power=11`. That
+value skips the wake branch, leaving the first TEST UNIT READY (TUR) command
+as the next unobserved completion. The log has no `lun ready`, publication or
+root mount evidence; the OS UUID wait remains.
+
+Across these captures, commands with detailed tracing complete before their
+first delay, and the following quiet command has no captured result. This
+supports removing the transfer poll's dependency on scheduler/WFE wakeups;
+it does not prove that the first TUR is blocked in `IODelay` or exclude other
+transport/timing problems. In particular, the successful first polls have not
+exercised the command wait path on the device.
+
 ## Configuration regression context
 
 The user reports that the older version, before enabling
@@ -103,8 +126,10 @@ Markers cover clearing the command area, cache publication, deadline
 construction, initial doorbell submission, the first poll's clock/delay calls,
 response processing and the final result. Summaries use captured diagnostics;
 the temporary trace flag does not enable the global diagnostic register dump.
-Normal SCSI commands and block reads remain quiet. Diagnostic output can affect
-timing and is not itself proof of completion.
+Detailed command traces remain disabled for ordinary SCSI and block reads.
+Bounded bring-up and read summaries described below make the later stages
+observable. Diagnostic output can affect timing and is not itself proof of
+completion.
 
 The query summary distinguishes a failure before command submission from an
 actual query result, so it cannot present the preceding NOP's completion as the
@@ -113,12 +138,37 @@ doorbell submission are removed; values still come from the existing preflight
 and first poll. This also changes NOP trace timing and MMIO counts, although
 the ordered writes and completion checks remain in place.
 
-On the next build, follow `NATIVE_UFS_BRINGUP power_query begin` through the
-query and submit markers to `power_query end`. Distinguish the last completed
-begin/end pair before changing transport behavior. Query completion should be
-followed by the existing power/LUN/layout/publication stages; owner-cache
-investigation still requires an actual root mount first. This instrumentation
-does not change the query protocol, deadline, polling delay or quarantine policy.
+The transfer poll now calls `ufsPollPause()` instead of `IODelay(2)`. The shared
+helper executes exactly 64 CPU hints, using the ARM `yield` instruction in the
+driver. It never calls WFE, a scheduler wait or a clock itself. This bounds each
+pacing batch without requiring a wakeup; it is not a calibrated 2 microsecond
+delay. The existing outer monotonic deadline, completion/fatal priority,
+single submission and DMA quarantine remain unchanged. A frozen command clock
+can still prevent the outer timeout; this change does not claim to repair it.
+
+Interrupts and preemption stay enabled as before. A slow or stuck command can
+consume more CPU while it polls, including the longer read/write/sync deadlines
+which share this transport. Queue-takeover and other existing waits are outside
+this narrowly scoped change.
+
+The next image includes these bounded checkpoints together, so later failures
+do not require adding a new log for each command:
+
+- Host bring-up entry/result, NOP, power query, and TUR entry plus at most 20
+  attempt results. TUR keeps its detailed trace off during submission/polling.
+- The first eight block-read start/result pairs (LBA, block count and result),
+  then only command failures. This does not print every APFS read.
+- GPT header, entries and root manifest reads, parsed layout, and userdata
+  range. A layout failure also reports the parser's reason.
+- Per-window preparation, policy/signature/hash/protection boundaries,
+  identity validation, publisher scheduling, start and volume-ready waits.
+  SystemOS must still become ready before OS is published.
+- Existing `NATIVE_OWNER_TRUST`, `NATIVE_OWNER_CACHE` stage/result and
+  `NATIVE_OWNER_CARRIER` logs remain available after root discovery/mounting.
+
+Compare the last begin/end pair and return code. A published IOMedia or matching
+UUID alone is not proof of root mounting or shared-cache success. This change
+does not disable any owner-cache option or authorization check.
 
 ## Host validation
 
@@ -140,7 +190,7 @@ details are kept locally under `out/ufs-poll-regression-20261029/`.
 UBSan was not run. These are host checks of production command logic, not an
 Apple SDK build or device verification of the repair.
 
-The follow-up fixtures explicitly complete NOP first, then hold the power
+The `c9c8ffa` fixtures explicitly completed NOP first, then held the power
 query busy for three calls to the production `IODelay(2)` adapter before
 completion. They also cover query preflight busy/fatal rejection, delayed
 fatal status, invalid response echo, DB=0 with invalid OCS, and a persistently
@@ -153,3 +203,22 @@ evaluates and formats their arguments without depending on exact log text.
 Results and source hashes are in `out/ufs-power-query-20261029/results.json`.
 The fixture supplies the clock/delay primitives; it does not exercise XNU's
 scheduler or WFE, or prove that this device's query can complete.
+
+For the bounded-pause change, the production fixtures use a separate CPU-hint
+callback and reject legacy delay calls during command polling. They complete
+NOP and Query immediately, then require five pause batches for TUR, also
+covering fatal status, simultaneous completion/fatal, both timeout forms and
+subsequent quarantine. The simulated time per hint batch is arbitrary; it is
+not a device delay calibration. A direct `HardwareTransferPort::delay()` check
+confirms no clock, legacy-delay, MMIO or DMA callbacks, and the standalone
+helper compiles without declaring any clock or scheduler API.
+
+Ten host runs pass: PollPause, TransferPoll and RootPublication in normal/ASan
+variants, plus RootCommands with traces off/on in normal/ASan variants.
+The production RootLayout header also passes trace-off/on MSVC syntax checks;
+those checks only declare transport and crypto types and do not link or execute
+crypto. Updated Python runners parse and extract the production CPU hint.
+Results and tested source hashes are in
+`out/ufs-poll-pause-20261029/results.json`.
+No ARM64 compilation/disassembly, QEMU execution, UBSan, complete OpenSSL layout
+test or SDK/device validation of this change has been performed.

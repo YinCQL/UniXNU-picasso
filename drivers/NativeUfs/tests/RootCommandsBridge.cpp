@@ -37,7 +37,8 @@ alignas(4096) static uint8_t memory[kDmaBytes];
 using Callback = uint64_t (*)(unsigned operation, uint64_t address, uint64_t value, void *bytes);
 static Callback callback;
 // 0: MMIO read; 1: ordered MMIO write; 2: release DMA; 3: acquire DMA;
-// 4: monotonic microseconds; 5: delay microseconds. Callbacks must not throw.
+// 4: monotonic microseconds; 5: legacy delay microseconds (queue only);
+// 6: one non-sleeping CPU hint. Callbacks must not throw.
 static uint32_t read32(uintptr_t, unsigned offset) { return uint32_t(callback(0,offset,0,nullptr)); }
 static void hostWrite(unsigned offset, uint32_t value) { callback(1,offset,value,nullptr); }
 static void cacheCivac(const void *start, size_t length) {
@@ -51,6 +52,7 @@ static void clock_interval_to_deadline(uint32_t interval, unsigned scale, uint64
 }
 static uint64_t mach_absolute_time() { return callback(4,0,0,nullptr); }
 static void IODelay(uint32_t us) { callback(5,0,us,nullptr); }
+static void hostCpuRelax() { callback(6,0,0,nullptr); }
 static void IOLockLock(void *) {}
 static void IOLockUnlock(void *) {}
 static IOReturn recordTransport(IOReturn result,uint32_t ocs) {
@@ -62,6 +64,7 @@ extern "C" {
 void ufs_test_reset(Callback cb, uint64_t physical) {
   callback=cb; memset(memory,0,sizeof(memory));
   gHost={memory,physical,true,false,0,nullptr}; gRootDiagnostic=UfsRootDiagnostics{};
+  gRootReadTraceCount=0;
   gStoreOpen=gLogOpen=false; gStoreFirst=gStoreBlocks=gLogFirst=gLogBlocks=0;
 #ifdef NATIVE_UFS_TEST_TRACE
   traceCalls=0;

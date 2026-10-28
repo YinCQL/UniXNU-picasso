@@ -36,7 +36,7 @@ def main():
     source=Path(__file__).resolve().parent
     production=source.parent/'NativeUfs.cpp'
     extracted='\n'.join(extract(production.read_text(),name) for name in
-                        ('read32','write32','cacheCivac','cacheInvalidate','hostWrite'))
+                        ('read32','write32','cacheCivac','cacheInvalidate','hostWrite','hostCpuRelax'))
     (out/'RootHardwareExtracted.h').write_text(extracted)
     (out/'link.ld').write_text('''ENTRY(_start)
 SECTIONS {
@@ -100,7 +100,7 @@ SECTIONS {
         results.append({'case':name,'dma_pa':hex(physical),'shareability':sharing,'passed':True,
                         'registers':dict(re.findall(r'^(\w+)=(0x[0-9a-f]+)$',log,re.M))})
     files=[production,source/'RootCommandsArm64.cpp',source/'RootCommandsArm64.S',Path(__file__).resolve()]
-    files += [source.parent/name for name in ('RootCommands.h','RootQueue.h','TransferPoll.h',
+    files += [source.parent/name for name in ('RootCommands.h','RootQueue.h','TransferPoll.h','PollPause.h',
                                              'RootTransportLayout.h','RootDiagnostics.h')]
     report={'results':results,'qemu':subprocess.check_output([qemu,'--version'],text=True).splitlines()[0],
             'compiler':subprocess.check_output([compiler,'--version'],text=True).splitlines()[0],

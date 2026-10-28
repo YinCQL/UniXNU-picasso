@@ -921,13 +921,22 @@ static void hostWrite (unsigned offset, uint32_t value)
   __asm__ volatile ("dsb sy" ::: "memory");
 }
 
-// Keep ordinary block I/O quiet while exposing the initial transport commands'
-// boundaries even with native-ufs-diagnostics=0. Enable this only around the
-// bring-up NOP and its one power Query, not subsequent SCSI or root reads.
+// This CPU hint cannot enter XNU's WFE/scheduler-based delay path. It is not a
+// timed sleep; the transfer loop still checks its original monotonic deadline.
+static void hostCpuRelax (void)
+{
+  __asm__ volatile ("yield" ::: "memory");
+}
+
+// Keep detailed command traces off for ordinary block I/O while exposing the
+// initial transport commands' boundaries even with native-ufs-diagnostics=0.
+// Enable this only around the bring-up NOP and its one power Query, not later reads.
 static bool gRootBringupTrace = false;
 #define NATIVE_UFS_TRACE(...) do { if (gRootDiagnosticEnabled || gRootBringupTrace) IOLog(__VA_ARGS__); } while (0)
 #include "RootQueue.h"
+#define NATIVE_UFS_READ_TRACE(...) IOLog(__VA_ARGS__)
 #include "RootCommands.h"
+#undef NATIVE_UFS_READ_TRACE
 #undef NATIVE_UFS_TRACE
 
 static bool waitTimebaseNanosecondsWithYield (uint64_t duration)
@@ -1139,13 +1148,20 @@ static bool hostBringUp (const char **why)
     }
   }
   gRootDiagnostic.stage = "LUN ready";
-  if (gRootDiagnosticEnabled) {
-    IOLog ("NATIVE_UFS_BRINGUP lun_ready=begin\n");
-  }
+  IOLog ("NATIVE_UFS_BRINGUP lun_ready begin lun=0 attempts=20\n");
   for (unsigned attempt = 0; attempt < 20; attempt++) {
     uint8_t tur[6] = { 0, 0, 0, 0, 0, 0 };
     uint32_t scsi = 0;
-    if (hostScsi (0, tur, 6, false, 0, 200000, &scsi) == kIOReturnSuccess) {
+    const uint32_t readyCommandBefore = gRootDiagnostic.command;
+    IOReturn readyResult = hostScsi (0, tur, 6, false, 0, 200000, &scsi);
+    const bool readyCommandStarted = gRootDiagnostic.command != readyCommandBefore;
+    IOLog ("NATIVE_UFS_BRINGUP lun_ready attempt=%u result=%08x scsi=%04x "
+           "command_started=%u polls=%u ocs=%x\n",
+           attempt + 1, static_cast<unsigned> (readyResult), scsi,
+           readyCommandStarted ? 1U : 0U,
+           readyCommandStarted ? gRootDiagnostic.polls : 0U,
+           readyCommandStarted ? gRootDiagnostic.ocs : 15U);
+    if (readyResult == kIOReturnSuccess) {
       gHost.ready = true;
       if (gRootDiagnosticEnabled) {
         IOLog ("NATIVE_UFS_BRINGUP lun_ready=ok attempt=%u\n", attempt);
@@ -1168,7 +1184,9 @@ static uint32_t be32w (const uint8_t *at)
   return (uint32_t (at[0]) << 24) | (uint32_t (at[1]) << 16) | (uint32_t (at[2]) << 8) | at[3];
 }
 
+#define NATIVE_UFS_LAYOUT_TRACE(...) IOLog(__VA_ARGS__)
 #include "RootLayout.h"
+#undef NATIVE_UFS_LAYOUT_TRACE
 #include "RootWindowRead.h"
 #include "RootPublication.h"
 
@@ -1557,11 +1575,14 @@ bool NativeUfsBlock::configureVerification ()
   gRootDiagnostic.windowBytes = bytes;
   gRootDiagnostic.policyCount = verified_root_policy_count;
   gRootDiagnostic.verify = 0xffffffff;
+  IOLog ("NATIVE_UFS_VERIFY policy_select begin window=%s bytes=%llu policies=%llu\n",
+         label, bytes, verified_root_policy_count);
   // Select the one policy whose signed image size equals this window; two matches are refused.
   const uint8_t *manifest = nullptr;
   uint64_t manifestBytes = 0;
   if (!verified_root_policy_count || verified_root_policy_count > 16) {
     gRootDiagnostic.stage = "policy count invalid";
+    IOLog ("NATIVE_UFS_VERIFY policy_select end window=%s result=failed reason=%s\n", label, gRootDiagnostic.stage);
     return false;
   }
   for (uint64_t index = 0; index < verified_root_policy_count; ++index) {
@@ -1569,6 +1590,7 @@ bool NativeUfsBlock::configureVerification ()
     if (!policy.manifest ||
         policy.manifestBytes < VR_HEADER_BYTES + VR_SIGNATURE_BYTES) {
       gRootDiagnostic.stage = "policy envelope invalid";
+      IOLog ("NATIVE_UFS_VERIFY policy_select end window=%s result=failed reason=%s\n", label, gRootDiagnostic.stage);
       return false;
     }
     uint64_t imageBytes = le64 (policy.manifest + 24);
@@ -1577,6 +1599,7 @@ bool NativeUfsBlock::configureVerification ()
     }
     if (manifest) {
       gRootDiagnostic.stage = "duplicate capacity-matching policy";
+      IOLog ("NATIVE_UFS_VERIFY policy_select end window=%s result=failed reason=%s\n", label, gRootDiagnostic.stage);
       return false;
     }
     manifest = policy.manifest;
@@ -1584,47 +1607,58 @@ bool NativeUfsBlock::configureVerification ()
   }
   if (!manifest) {
     gRootDiagnostic.stage = "no capacity-matching policy";
+    IOLog ("NATIVE_UFS_VERIFY policy_select end window=%s result=failed reason=%s\n", label, gRootDiagnostic.stage);
     return false;
   }
+  IOLog ("NATIVE_UFS_VERIFY policy_select end window=%s result=selected manifest_bytes=%llu\n", label, manifestBytes);
   if (le32 (manifest + 8) != 1 || le32 (manifest + 12) != VR_HEADER_BYTES ||
       le32 (manifest + 16) != kEmbeddedAuthRecordBytes || le32 (manifest + 20) != 0 ||
       le64 (manifest + 152) < 1) {
     gRootDiagnostic.stage = "signed header fields";
+    IOLog ("NATIVE_UFS_VERIFY rejected window=%s reason=%s\n", label, gRootDiagnostic.stage);
     return false;
   }
   gRootDiagnostic.stage = "owner signature";
+  IOLog ("NATIVE_UFS_VERIFY owner_signature begin window=%s\n", label);
   if (!verifyPolicyHeader (
         manifest, VR_HEADER_BYTES + VR_SIGNATURE_BYTES, verified_root_key
       )) {
     gRootDiagnostic.verify = VR_SIGNATURE;
+    IOLog ("NATIVE_UFS_VERIFY owner_signature end window=%s result=failed reason=%s\n", label, gRootDiagnostic.stage);
     return false;
   }
+  IOLog ("NATIVE_UFS_VERIFY owner_signature end window=%s result=ok\n", label);
 
   uint64_t blockCount = (bytes + kEmbeddedAuthRecordBytes - 1) / kEmbeddedAuthRecordBytes;
   if (le64 (manifest + 32) != blockCount ||
       blockCount > (UINT64_MAX - VR_HEADER_BYTES - VR_SIGNATURE_BYTES) / 32) {
     gRootDiagnostic.stage = "signed image block count";
+    IOLog ("NATIVE_UFS_VERIFY rejected window=%s reason=%s\n", label, gRootDiagnostic.stage);
     return false;
   }
   uint64_t envelopeBytes = VR_HEADER_BYTES + VR_SIGNATURE_BYTES + blockCount * 32;
   if (manifestBytes != envelopeBytes) {
     gRootDiagnostic.stage = "embedded policy envelope length";
+    IOLog ("NATIVE_UFS_VERIFY rejected window=%s reason=%s\n", label, gRootDiagnostic.stage);
     return false;
   }
   vm_size_t tableBytes = round_page (static_cast<vm_size_t> (envelopeBytes));
   if (envelopeBytes > SIZE_MAX || tableBytes < envelopeBytes ||
       tableBytes > UINT64_MAX - 4096) {
     gRootDiagnostic.stage = "hash table size overflow";
+    IOLog ("NATIVE_UFS_VERIFY rejected window=%s reason=%s\n", label, gRootDiagnostic.stage);
     return false;
   }
   verifiedStorageBytes = tableBytes + 4096;
   gRootDiagnostic.stage = "policy allocation";
-  IOLog ("NATIVE_UFS_VERIFY allocate window=%s bytes=%llu records=%llu table=%llu\n",
+  IOLog ("NATIVE_UFS_VERIFY allocate begin window=%s bytes=%llu records=%llu table=%llu\n",
          label, bytes, blockCount, blockCount * 32);
   if (kmem_alloc (kernel_map, &verifiedStorage, verifiedStorageBytes,
                   static_cast<kma_flags_t> (KMA_KOBJECT | KMA_DATA), VM_KERN_MEMORY_SECURITY) != KERN_SUCCESS) {
+    IOLog ("NATIVE_UFS_VERIFY allocate end window=%s result=failed reason=%s\n", label, gRootDiagnostic.stage);
     return false;
   }
+  IOLog ("NATIVE_UFS_VERIFY allocate end window=%s result=ok\n", label);
   memcpy (reinterpret_cast<void *> (verifiedStorage), manifest, manifestBytes);
   uint8_t *hashes = reinterpret_cast<uint8_t *> (
     verifiedStorage + VR_HEADER_BYTES + VR_SIGNATURE_BYTES
@@ -1632,18 +1666,24 @@ bool NativeUfsBlock::configureVerification ()
   uint8_t *key = reinterpret_cast<uint8_t *> (verifiedStorage + tableBytes);
   memcpy (key, verified_root_key, VR_KEY_BYTES);
   uint8_t tableDigest[32];
+  IOLog ("NATIVE_UFS_VERIFY table_sha256 begin window=%s bytes=%llu\n", label, blockCount * 32);
   if (!vr_xnu_crypto.sha256 (hashes, static_cast<size_t> (blockCount * 32), tableDigest) ||
       !equalDigest (tableDigest, manifest + 88, sizeof (tableDigest))) {
     gRootDiagnostic.stage = "embedded hash table";
     gRootDiagnostic.verify = VR_HASH_TABLE;
+    IOLog ("NATIVE_UFS_VERIFY table_sha256 end window=%s result=failed reason=%s\n", label, gRootDiagnostic.stage);
     return false;
   }
+  IOLog ("NATIVE_UFS_VERIFY table_sha256 end window=%s result=ok\n", label);
 
   gRootDiagnostic.stage = "policy read-only protection";
+  IOLog ("NATIVE_UFS_VERIFY protect begin window=%s\n", label);
   if (vm_map_protect (kernel_map, verifiedStorage, verifiedStorage + verifiedStorageBytes,
                       VM_PROT_READ, TRUE) != KERN_SUCCESS) {
+    IOLog ("NATIVE_UFS_VERIFY protect end window=%s result=failed reason=%s\n", label, gRootDiagnostic.stage);
     return false;
   }
+  IOLog ("NATIVE_UFS_VERIFY protect end window=%s result=ok\n", label);
   verified.hashes = hashes;
   verified.image_bytes = bytes;
   verified.block_count = blockCount;
@@ -2143,15 +2183,20 @@ static void discardPendingWindow (unsigned index)
 
 static void publishThread (void *, wait_result_t)
 {
+  IOLog ("NATIVE_UFS_PUBLISH thread begin windows=%u\n", gPublicationPlan.count);
   struct Operations {
     bool start (unsigned index) {
       NativeUfsBlock *device = gPendingDevice[index];
       gRootDiagnostic.stage = "root window service start";
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Start);
       gRootDiagnostic.publicationWindow = index;
-      if (!device->start (gPendingProvider)) return false;
+      IOLog ("NATIVE_UFS_PUBLISH start begin window=%u name=%s\n", index, device->windowLabel ());
+      if (!device->start (gPendingProvider)) {
+        IOLog ("NATIVE_UFS_PUBLISH start end window=%u result=failed\n", index);
+        return false;
+      }
       native_ufs_blocks_published = native_ufs_blocks_published + 1;
-      IOLog ("NativeUfs: published %s\n", device->windowLabel ());
+      IOLog ("NATIVE_UFS_PUBLISH start end window=%u name=%s result=published\n", index, device->windowLabel ());
       return true;
     }
     bool wait (unsigned index) {
@@ -2160,20 +2205,33 @@ static void publishThread (void *, wait_result_t)
       gRootDiagnostic.stage = "media publication";
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Media);
       gRootDiagnostic.publicationWindow = index;
+      IOLog ("NATIVE_UFS_PUBLISH media_wait begin window=%u name=%s uuid=%s max_waits=300 interval_ms=100\n",
+             index, device->windowLabel (), uuid);
       bool ready = false;
+      bool waitFailed = false;
+      unsigned waits = 0;
       // Diagnostic mode affects reporting only, never the dependency gate.
       for (unsigned tick = 0; tick <= 300; ++tick) {
         ready = mediaWithUuidExists (uuid, device);
         if (ready || tick == 300) break;
-        if (!waitTimebaseMillisecondsWithYield (100)) break;
+        if (!waitTimebaseMillisecondsWithYield (100)) {
+          waitFailed = true;
+          break;
+        }
+        ++waits;
       }
-      IOLog ("NativeUfs: %s volume %s %s\n", device->windowLabel (), uuid, ready ? "ready" : "not ready");
+      IOLog ("NATIVE_UFS_PUBLISH media_wait end window=%u name=%s uuid=%s result=%s waits=%u\n",
+             index, device->windowLabel (), uuid,
+             ready ? "ready" : waitFailed ? "wait_failed" : "timeout", waits);
       if (!ready) captureMissingMedia (uuid);
       return ready;
     }
     void discard (unsigned index) { discardPendingWindow (index); }
   } operations;
   UfsRootPublicationResult result = ufsPublishRootWindows (operations, gPublicationPlan);
+  IOLog ("NATIVE_UFS_PUBLISH thread end result=%s phase=%u window=%u published=%u\n",
+         result.phase == UfsRootPhase::Complete ? "ready" : "failed",
+         static_cast<unsigned> (result.phase), result.index, result.published);
   if (result.phase != UfsRootPhase::Complete) {
     gRootDiagnostic.result = result.phase == UfsRootPhase::Start ? kIOReturnIOError : kIOReturnTimeout;
     const char *reason = result.phase == UfsRootPhase::Start ? "root window service start failed" :
@@ -2441,19 +2499,27 @@ bool NativeUfs::startRoot (IOService *provider)
   const char *why = "";
   IOLog ("NATIVE_UFS_START root path entered\n");
   native_ufs_root_step = 1;
+  IOLog ("NATIVE_UFS_START host_bringup begin\n");
   if (!hostBringUp (&why)) {
+    IOLog ("NATIVE_UFS_START host_bringup end result=failed reason=%s\n", why);
     rootDiagnosticFailure (why);
     IOLog ("NativeUfs: root bring-up failed: %s\n", why);
     return false;
   }
+  IOLog ("NATIVE_UFS_START host_bringup end result=ready\n");
   native_ufs_root_step = 2;
+  IOLog ("NATIVE_UFS_START root_layout begin\n");
   RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
   if (!layout || !findRootLayout (layout, &why)) {
-    rootDiagnosticFailure (layout ? why : "root layout allocation failed");
+    if (!layout) why = "root layout allocation failed";
+    IOLog ("NATIVE_UFS_START root_layout end result=failed reason=%s\n", why);
+    rootDiagnosticFailure (why);
     IOLog ("NativeUfs: root layout failed: %s\n", why);
     if (layout) IOFree (layout, sizeof (RootLayout));
     return false;
   }
+  IOLog ("NATIVE_UFS_START root_layout end result=parsed windows=%u manifest_status=%u image_bytes=%llx\n",
+         layout->windows, layout->manifestStatus, layout->imageBytes);
   native_ufs_root_step = 3;
   if (layout->manifestStatus != 0) {
     rootDiagnosticFailure ("root manifest rejected");
@@ -2467,15 +2533,22 @@ bool NativeUfs::startRoot (IOService *provider)
   const char *names[4] = {};
   for (unsigned i = 0; i < layout->windows; ++i) names[i] = layout->window[i].name;
   if (!ufsBuildRootPlan (names, layout->windows, gPublicationPlan)) {
+    IOLog ("NATIVE_UFS_PUBLISH plan result=failed reason=distinct_OS_and_SystemOS_required windows=%u\n",
+           layout->windows);
     rootDiagnosticFailure ("root windows require distinct OS and SystemOS");
     IOFree (layout, sizeof (RootLayout));
     return false;
   }
+  IOLog ("NATIVE_UFS_PUBLISH plan result=ready windows=%u first=%u last=%u\n",
+         gPublicationPlan.count, gPublicationPlan.order[0], gPublicationPlan.order[gPublicationPlan.count - 1]);
+  IOLog ("NATIVE_UFS_START service_start begin\n");
   if (!IOService::start (provider)) {
+    IOLog ("NATIVE_UFS_START service_start end result=failed\n");
     rootDiagnosticFailure ("root IOService start failed");
     IOFree (layout, sizeof (RootLayout));
     return false;
   }
+  IOLog ("NATIVE_UFS_START service_start end result=ready\n");
   // Prepare all windows or publish none. Diagnostics never decide policy.
   gPending = 0;
   gPendingProvider = this;
@@ -2487,37 +2560,54 @@ bool NativeUfs::startRoot (IOService *provider)
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Prepare);
       gRootDiagnostic.publicationWindow = index;
       gRootDiagnostic.windowBytes = layout->window[index].size;
-      IOLog ("NATIVE_UFS_PUBLISH allocate window=%u offset=%llx size=%llx\n",
-             index, layout->window[index].offset, layout->window[index].size);
+      IOLog ("NATIVE_UFS_PUBLISH prepare begin window=%u name=%s offset=%llx size=%llx\n",
+             index, layout->window[index].name, layout->window[index].offset, layout->window[index].size);
       NativeUfsBlock *device = OSTypeAlloc (NativeUfsBlock);
       IOLog ("NATIVE_UFS_PUBLISH allocate window=%u device=%p\n", index, device);
       gPendingDevice[index] = device;
       gPendingAttached[index] = false;
       gPendingUuid[index][0] = 0;
       uint64_t absolute = layout->userdataFirst * 4096ULL + layout->window[index].offset;
-      if (!device || !device->init (static_cast<OSDictionary *> (nullptr)) ||
-          !device->configure (layout->window[index].name, absolute, layout->window[index].size)) return false;
+      const char *prepareFailure = !device ? "allocation" :
+        !device->init (static_cast<OSDictionary *> (nullptr)) ? "initialization" :
+        !device->configure (layout->window[index].name, absolute, layout->window[index].size) ? "configuration" : nullptr;
+      if (prepareFailure) {
+        IOLog ("NATIVE_UFS_PUBLISH prepare end window=%u result=failed reason=%s\n", index, prepareFailure);
+        return false;
+      }
       IOLog ("NATIVE_UFS_PUBLISH configured window=%u name=%s\n",
              index, layout->window[index].name);
       gRootDiagnostic.stage = "root window attachment";
-      if (!device->attach (owner)) return false;
-      IOLog ("NATIVE_UFS_PUBLISH attached window=%u\n", index);
+      if (!device->attach (owner)) {
+        IOLog ("NATIVE_UFS_PUBLISH prepare end window=%u result=failed reason=attachment\n", index);
+        return false;
+      }
       gPendingAttached[index] = true;
       ++gPending;
       gRootDiagnostic.prepared = gPending;
+      IOLog ("NATIVE_UFS_PUBLISH prepare end window=%u result=attached prepared=%u\n", index, gPending);
       return true;
     }
     bool validate () {
       gRootDiagnostic.stage = "signed window identities";
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Identity);
+      IOLog ("NATIVE_UFS_PUBLISH identities begin windows=%u\n", gPending);
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
       for (unsigned i = 0; i < gPending; ++i) {
         gRootDiagnostic.publicationWindow = i;
-        if (!gPendingDevice[i]->signedVolumeUuid (gPendingUuid[i])) return false;
-        for (unsigned j = 0; j < i; ++j) if (!strcmp (gPendingUuid[i], gPendingUuid[j])) return false;
+        if (!gPendingDevice[i]->signedVolumeUuid (gPendingUuid[i])) {
+          IOLog ("NATIVE_UFS_PUBLISH identities end result=failed window=%u reason=unsigned_volume\n", i);
+          return false;
+        }
+        for (unsigned j = 0; j < i; ++j) if (!strcmp (gPendingUuid[i], gPendingUuid[j])) {
+          IOLog ("NATIVE_UFS_PUBLISH identities end result=failed window=%u duplicate=%u\n", i, j);
+          return false;
+        }
       }
+      IOLog ("NATIVE_UFS_PUBLISH identities end result=ready windows=%u\n", gPending);
       return true;
 #else
+      IOLog ("NATIVE_UFS_PUBLISH identities end result=failed reason=verification_disabled\n");
       return false; // Root publication requires owner verification in every build.
 #endif
     }
@@ -2525,13 +2615,16 @@ bool NativeUfs::startRoot (IOService *provider)
       gRootDiagnostic.stage = "root publisher thread";
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Schedule);
       gRootDiagnostic.publicationWindow = 0xffffffff;
+      IOLog ("NATIVE_UFS_PUBLISH schedule begin\n");
       thread_t thread = nullptr;
       owner->retain ();
       if (kernel_thread_start (publishThread, nullptr, &thread) != KERN_SUCCESS) {
         owner->release ();
+        IOLog ("NATIVE_UFS_PUBLISH schedule end result=failed\n");
         return false;
       }
       thread_deallocate (thread);
+      IOLog ("NATIVE_UFS_PUBLISH schedule end result=dispatched\n");
       return true;
     }
     void discard (unsigned index) { discardPendingWindow (index); }
