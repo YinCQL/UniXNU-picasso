@@ -12,15 +12,16 @@ index 19b4065..b22147f 100644
  
 diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
 new file mode 100644
-index 0000000..bfe7ccc
+index 0000000..2237fb2
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,1409 @@
+@@ -0,0 +1,2737 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
-+ * kernel. Log output only: the console mirror ring is streamed on the bulk IN
-+ * endpoint; there is no command processing or RX data path.
++ * kernel. The console mirror ring is streamed on the bulk IN endpoint, panic
++ * output uses a separate synchronous path, and the bulk OUT endpoint accepts a
++ * small diagnostic command set.
 + *
 + * Hardware notes (SM7250): the USB controller is a Synopsys DWC3 at
 + * 0x0a600000 behind Qualcomm's dwc-usb3-msm wrapper (QSCRATCH at +0xf8800),
@@ -54,27 +55,158 @@ index 0000000..bfe7ccc
 +
 +#define PURing_SIZE   (256 * 1024)
 +#define PURing_MASK   (PURing_SIZE - 1)
++#define PU_PANIC_RING_SIZE  (128u * 1024u)
++#define PU_PANIC_RING_MASK  (PU_PANIC_RING_SIZE - 1)
++#define PU_CMD_SIZE         80u
++#define PSHOLD_PA           0x0c264000u
++#define APSS_WDT_PA         0x17c10000u
++#define IMEM_PA             0x146ab000u
++#define IMEM_RESTART_REASON 0x65cu
++#define IMEM_FASTBOOT_MODE  0x77665500u
++#define APSS_WDT_RST        0x04u
++#define APSS_WDT_EN         0x08u
++#define APSS_WDT_BARK       0x10u
++#define APSS_WDT_BITE       0x14u
++#define APSS_WDT_RATE_HZ    32768u
++#define APSS_WDT_TIMEOUT_MS 15000u
++#define APSS_WDT_FORCED_BITE 4u
++#define PICASSO_USB_FLUSH_POLLS 64u
++#define PICASSO_USB_FINAL_FLUSH_POLLS 8u
++#define PICASSO_USB_FLUSH_GAP_US 100u
++
++enum picasso_usb_reset_mode {
++	PICASSO_USB_RESET_WATCHDOG = 0,
++	PICASSO_USB_RESET_PSCI = 1,
++	PICASSO_USB_RESET_PSHOLD = 2
++};
 +
 +static struct {
 +	char        buffer[PURing_SIZE];
 +	uint64_t    total;
 +} pur_ring;
++static struct {
++	char        buffer[PU_PANIC_RING_SIZE];
++	uint64_t    total;
++} pup_ring;
 +static uint32_t _Atomic pur_lock;
 +static uint64_t _Atomic pur_dropped;
++static uint64_t pup_pos;
++static uint32_t _Atomic pup_flush_lock;
 +static bool pur_live;                   /* set once the TX thread streams */
++static bool pu_panic_active;
++
++struct pur_text {
++	char     bytes[96];
++	uint32_t length;
++};
 +
 +void picasso_usb_log_char(char c);
++void picasso_usb_log_write(const char *data, uint32_t length);
++void picasso_usb_console_start(void);
++void picasso_usb_panic_begin(void);
++void picasso_usb_panic_putc(char c);
++void picasso_usb_panic_write(const char *text, int size);
++void picasso_usb_panic_flush(void);
++void picasso_usb_panic_reset(void);
++static void picasso_usb_console_drive_poll(void);
++static void ud_process_command(void);
++static void ud_finish_reboot(void);
++static void picasso_usb_watchdog_disable(void);
++static void ud_configure(void);
++
++void
++picasso_usb_log_write(const char *data, uint32_t length)
++{
++	if (pu_panic_active || data == NULL || length == 0) {
++		return;
++	}
++	if (!os_atomic_cmpxchg(&pur_lock, 0, 1, acquire)) {
++		os_atomic_add(&pur_dropped, length, relaxed);
++		return;
++	}
++	for (uint32_t i = 0; i < length; i++) {
++		pur_ring.buffer[pur_ring.total & PURing_MASK] = data[i];
++		pur_ring.total++;
++	}
++	os_atomic_store(&pur_lock, 0, release);
++	/*
++	 * bsd_init still runs before early kernel threads reliably receive CPU.
++	 * Drive the DWC3 event ring from console output itself until the
++	 * background poller becomes schedulable.
++	 */
++	picasso_usb_console_drive_poll();
++}
 +
 +void
 +picasso_usb_log_char(char c)
 +{
++	picasso_usb_log_write(&c, 1);
++}
++
++/*
++ * Event logging may run from inside console output, so it must never call
++ * printf() recursively. Append the complete diagnostic line to the console
++ * ring with one lock acquisition instead.
++ */
++static void
++pur_emit_raw(const char *data, uint32_t length)
++{
 +	if (!os_atomic_cmpxchg(&pur_lock, 0, 1, acquire)) {
-+		os_atomic_add(&pur_dropped, 1, relaxed);
++		os_atomic_add(&pur_dropped, length, relaxed);
 +		return;
 +	}
-+	pur_ring.buffer[pur_ring.total & PURing_MASK] = c;
-+	pur_ring.total++;
++	for (uint32_t i = 0; i < length; i++) {
++		pur_ring.buffer[pur_ring.total & PURing_MASK] = data[i];
++		pur_ring.total++;
++	}
 +	os_atomic_store(&pur_lock, 0, release);
++}
++
++static void
++pur_text_append(struct pur_text *text, const char *value)
++{
++	while (*value != '\0' && text->length < sizeof(text->bytes)) {
++		text->bytes[text->length++] = *value++;
++	}
++}
++
++static void
++pur_text_u64(struct pur_text *text, uint64_t value)
++{
++	char digits[20];
++	uint32_t count = 0;
++	do {
++		digits[count++] = (char)('0' + value % 10);
++		value /= 10;
++	} while (value != 0);
++	while (count != 0 && text->length < sizeof(text->bytes)) {
++		text->bytes[text->length++] = digits[--count];
++	}
++}
++
++static void
++pur_text_hex32(struct pur_text *text, uint32_t value)
++{
++	static const char hex[] = "0123456789abcdef";
++	for (int shift = 28; shift >= 0; shift -= 4) {
++		if (text->length < sizeof(text->bytes)) {
++			text->bytes[text->length++] = hex[(value >> shift) & 0xfu];
++		}
++	}
++}
++
++static void
++pur_emit_event(uint64_t index, unsigned ep, uint32_t event)
++{
++	struct pur_text text = { .length = 0 };
++	pur_text_append(&text, "PICASSO USB: event ");
++	pur_text_u64(&text, index);
++	pur_text_append(&text, " ep");
++	pur_text_u64(&text, ep);
++	pur_text_append(&text, " 0x");
++	pur_text_hex32(&text, event);
++	pur_text_append(&text, "\r\n");
++	pur_emit_raw(text.bytes, text.length);
 +}
 +
 +static uint32_t
@@ -93,6 +225,18 @@ index 0000000..bfe7ccc
 +	}
 +	*pos += n;
 +	os_atomic_store(&pur_lock, 0, release);
++	return n;
++}
++
++static uint32_t
++pup_copy(char *out, uint32_t max)
++{
++	uint64_t pending = pup_ring.total - pup_pos;
++	uint32_t n = (uint32_t)MIN((uint64_t)max, pending);
++	for (uint32_t i = 0; i < n; i++) {
++		out[i] = pup_ring.buffer[(pup_pos + i) & PU_PANIC_RING_MASK];
++	}
++	pup_pos += n;
 +	return n;
 +}
 +
@@ -132,8 +276,15 @@ index 0000000..bfe7ccc
 +#define QSCRATCH_PWR_EVT_MASK   0x5cu
 +
 +#define GCTL            0xc110u
++#define GHWPARAMS3      0xc14cu
++#define GHWPARAMS4      0xc150u
++#define GHWPARAMS5      0xc154u
++#define GHWPARAMS6      0xc158u
++#define GHWPARAMS7      0xc15cu
 +#define GUSB2PHYCFG0    0xc200u
 +#define GUSB3PIPECTL0   0xc2c0u
++#define GTXFIFOSIZ(n)   (0xc300u + 4u * (n))
++#define GRXFIFOSIZ(n)   (0xc380u + 4u * (n))
 +#define GEVNTADRLO      0xc400u
 +#define GEVNTADRHI      0xc404u
 +#define GEVNTSIZ        0xc408u
@@ -157,13 +308,22 @@ index 0000000..bfe7ccc
 +
 +#define DEPCMD_SETEPCONFIG      1u
 +#define DEPCMD_SETTRANSFRESOURCE 2u
++#define DEPCMD_GETEPSTATE       3u
 +#define DEPCMD_SETSTALL         4u
++#define DEPCMD_CLEARSTALL       5u
 +#define DEPCMD_STARTTRANSFER    6u
++#define DEPCMD_UPDATETRANSFER   7u
++#define DEPCMD_ENDTRANSFER      8u
 +#define DEPCMD_DEPSTARTCFG      9u
++#define DEPCMD_FORCE_RM         (1u << 11)
 +#define DEPCMD_CMDACT           (1u << 10)
++#define DEPCMD_CMDIOC           (1u << 8)
++
++#define UD_EPCMD_NO_RESOURCE    (-2)
 +
 +#define TRB_HWO         (1u << 0)
 +#define TRB_LST         (1u << 1)
++#define TRB_CSP         (1u << 3)
 +#define TRB_ISP_IMI     (1u << 10)
 +#define TRB_IOC         (1u << 11)
 +#define TRBCTL_NORMAL   (1u << 4)
@@ -171,11 +331,15 @@ index 0000000..bfe7ccc
 +#define TRBCTL_STATUS2  (3u << 4)
 +#define TRBCTL_STATUS3  (4u << 4)
 +#define TRBCTL_DATA     (5u << 4)
++#define TRBCTL_LINK     (8u << 4)
 +
 +/* physical endpoints: 0/1 = ep0 OUT/IN, 2 = bulk OUT, 3 = bulk IN */
 +#define EP_RX           2u
 +#define EP_TX           3u
 +#define EP_NOTIFY       5u
++
++#define UD_DIAG_REQUEST 0x50u
++#define UD_DIAG_MAGIC   0x50554447u
 +
 +/* DMA area layout */
 +#define UD_EVT          0x0000u         /* event buffer, 4 KiB */
@@ -183,6 +347,8 @@ index 0000000..bfe7ccc
 +#define UD_TRB_OUT      0x1000u         /* ep0 OUT TRB */
 +#define UD_TRB_IN       0x1010u         /* ep0 IN TRB */
 +#define UD_TRB_TX       0x1030u         /* bulk IN TRB */
++#define UD_TRB_RX       0x1080u         /* bulk OUT TRB */
++#define UD_TRB_RX_LINK  0x1090u         /* bulk OUT ring link */
 +#define UD_TRB_NOTIFY   0x1020u         /* interrupt IN endpoint */
 +#define UD_SETUP        0x1040u         /* 8-byte setup packet */
 +#define UD_DATA         0x1100u         /* ep0 data stage, 512 bytes */
@@ -190,6 +356,8 @@ index 0000000..bfe7ccc
 +#define UD_NOTIFY_SIZE  10u
 +#define UD_TX           0x2000u         /* bulk IN log chunk, 4 KiB */
 +#define UD_TX_SIZE      0x1000u
++#define UD_RX           0x3000u         /* bulk OUT command chunk */
++#define UD_RX_SIZE      0x200u
 +#define UD_SIZE         0x4000u
 +
 +static struct {
@@ -203,15 +371,172 @@ index 0000000..bfe7ccc
 +	uint8_t     last_request;
 +	uint16_t    data_length;
 +	bool        configured;
++	bool        ep0_busy;
++	bool        ep0_ready;
 +	bool        tx_busy;
++	bool        rx_busy;
++	bool        rx_transfer_started;
 +	bool        notify_busy;
 +	bool        trace_commands;
 +	bool        smmu_guard;
 +	bool        live;
 +	bool        hold;
++	bool        host_open;
++	bool        panic_test;
++	bool        panic_mode;
++	bool        panic_pending;
++	bool        panic_reset;
++	bool        cmd_pending;
++	bool        reboot_pending;
++	bool        reset_pending;
++	bool        hang_pending;
++	bool        watchdog;
++	bool        watchdog_armed;
++	unsigned    reset_mode;
++	vm_offset_t pshold;
++	vm_offset_t wdt;
++	vm_offset_t imem;
++	uint32_t _Atomic poll_lock;
 +	uint64_t    tx_pos;                  /* ring reader position */
-+	uint64_t    events, chars;
++	uint64_t    events, chars, rx_bytes;
++	uint64_t    commands;
++	uint32_t    mps;
++	uint32_t    setups;
++	uint32_t    ep0_active_ep;
++	uint32_t    resource[6];
++	uint32_t    event_complete[6];
++	uint32_t    event_inprogress[6];
++	uint32_t    event_notready[6];
++	uint32_t    last_event[6];
++	char        cmd[PU_CMD_SIZE];
++	uint32_t    cmd_len;
++	uint32_t    rx_len;
++	uint32_t    reboot_wait;
 +} ud;
++
++struct ud_diag {
++	uint32_t magic;
++	uint32_t version;
++	uint32_t size;
++	uint32_t state;
++	uint32_t mps;
++	uint32_t configured;
++	uint32_t ep0_busy;
++	uint32_t ep0_ready;
++	uint32_t ep0_active;
++	uint32_t tx_busy;
++	uint32_t rx_busy;
++	uint32_t rx_started;
++	uint32_t notify_busy;
++	uint32_t cmd_pending;
++	uint32_t setups;
++	uint32_t events;
++	uint32_t chars;
++	uint32_t rx_bytes;
++	uint32_t rx_len;
++	uint32_t resource[6];
++	uint32_t trb_out[4];
++	uint32_t trb_in[4];
++	uint32_t trb_rx[4];
++	uint32_t trb_tx[4];
++	uint32_t trb_notify[4];
++	uint64_t pur_total;
++	uint64_t pur_dropped;
++	uint64_t tx_pos;
++	uint32_t dalepena;
++	uint32_t devten;
++	uint32_t gctl;
++	uint32_t dctl;
++	uint32_t dsts;
++	uint32_t gevntcount;
++	uint32_t last_request;
++	uint32_t data_length;
++	uint32_t host_open;
++	uint32_t cmd_len;
++	uint32_t cmd_pending_snapshot;
++	uint32_t commands;
++	uint32_t setup_words[2];
++	uint32_t rx_words[8];
++	uint32_t cmd_words[20];
++	uint32_t event_complete[6];
++	uint32_t event_inprogress[6];
++	uint32_t event_notready[6];
++	uint32_t last_event[6];
++};
++
++static void ud_sync(uint32_t off, uint32_t len);
++static uint32_t dwc_rd(uint32_t off);
++
++static void
++ud_diag_trb(uint32_t offset, uint32_t out[4])
++{
++	volatile uint32_t *trb = (volatile uint32_t *)(ud.dma + offset);
++
++	ud_sync(offset, 16);
++	for (unsigned i = 0; i < 4; i++) {
++		out[i] = trb[i];
++	}
++}
++
++static void
++ud_diag_snapshot(struct ud_diag *diag)
++{
++	memset(diag, 0, sizeof(*diag));
++	diag->magic = UD_DIAG_MAGIC;
++	diag->version = 1;
++	diag->size = sizeof(*diag);
++	diag->state = ud.state;
++	diag->mps = ud.mps;
++	diag->configured = ud.configured;
++	diag->ep0_busy = ud.ep0_busy;
++	diag->ep0_ready = ud.ep0_ready;
++	diag->ep0_active = ud.ep0_active_ep;
++	diag->tx_busy = ud.tx_busy;
++	diag->rx_busy = ud.rx_busy;
++	diag->rx_started = ud.rx_transfer_started;
++	diag->notify_busy = ud.notify_busy;
++	diag->cmd_pending = ud.cmd_pending;
++	diag->setups = ud.setups;
++	diag->events = (uint32_t)ud.events;
++	diag->chars = (uint32_t)ud.chars;
++	diag->rx_bytes = ud.rx_bytes;
++	diag->rx_len = ud.rx_len;
++	memcpy(diag->resource, ud.resource, sizeof(diag->resource));
++	ud_diag_trb(UD_TRB_OUT, diag->trb_out);
++	ud_diag_trb(UD_TRB_IN, diag->trb_in);
++	ud_diag_trb(UD_TRB_RX, diag->trb_rx);
++	ud_diag_trb(UD_TRB_TX, diag->trb_tx);
++	ud_diag_trb(UD_TRB_NOTIFY, diag->trb_notify);
++	diag->pur_total = pur_ring.total;
++	diag->pur_dropped = os_atomic_load(&pur_dropped, relaxed);
++	diag->tx_pos = ud.tx_pos;
++	diag->dalepena = dwc_rd(DALEPENA);
++	diag->devten = dwc_rd(DEVTEN);
++	diag->gctl = dwc_rd(GCTL);
++	diag->dctl = dwc_rd(DCTL);
++	diag->dsts = dwc_rd(DSTS);
++	diag->gevntcount = dwc_rd(GEVNTCOUNT) & 0xffffu;
++	diag->last_request = ud.last_request;
++	diag->data_length = ud.data_length;
++	diag->host_open = ud.host_open;
++	diag->cmd_len = ud.cmd_len;
++	diag->cmd_pending_snapshot = ud.cmd_pending;
++	diag->commands = (uint32_t)ud.commands;
++	ud_sync(UD_SETUP, 8);
++	memcpy(diag->setup_words, (const void *)(ud.dma + UD_SETUP),
++	    sizeof(diag->setup_words));
++	ud_sync(UD_RX, sizeof(diag->rx_words));
++	memcpy(diag->rx_words, (const void *)(ud.dma + UD_RX),
++	    sizeof(diag->rx_words));
++	memcpy(diag->cmd_words, ud.cmd, sizeof(diag->cmd_words));
++	memcpy(diag->event_complete, ud.event_complete,
++	    sizeof(diag->event_complete));
++	memcpy(diag->event_inprogress, ud.event_inprogress,
++	    sizeof(diag->event_inprogress));
++	memcpy(diag->event_notready, ud.event_notready,
++	    sizeof(diag->event_notready));
++	memcpy(diag->last_event, ud.last_event, sizeof(diag->last_event));
++}
 +
 +static inline uint32_t
 +usb_rd(vm_offset_t base, uint32_t off)
@@ -709,51 +1034,103 @@ index 0000000..bfe7ccc
 +static int
 +ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
 +{
-+	if (ud.trace_commands) {
++	if (ud.trace_commands && !ud.panic_mode) {
 +		printf("PICASSO USB: ep%u cmd %u prepare\n", ep, cmd);
 +	}
-+	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u PAR0 write begin 0x%08x\n", ep, cmd, p0);
++	/*
++	 * Issue one command and poll CMDACT, as Linux does. DEPCMD status 1 is
++	 * "no transfer resource", not "command ring full"; reissuing the same
++	 * STARTTRANSFER cannot make an active endpoint resource disappear.
++	 */
 +	dwc_wr(DEPCMDPAR0(ep), p0);
-+	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u PAR0 write returned\n", ep, cmd);
-+	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u PAR1 write begin 0x%08x\n", ep, cmd, p1);
 +	dwc_wr(DEPCMDPAR1(ep), p1);
-+	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u PAR1 write returned\n", ep, cmd);
-+	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u PAR2 write begin 0x%08x\n", ep, cmd, p2);
 +	dwc_wr(DEPCMDPAR2(ep), p2);
-+	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u PAR2 write returned\n", ep, cmd);
-+	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u command write begin 0x%08x\n", ep, cmd, cmd | DEPCMD_CMDACT);
 +	*(volatile uint32_t *)(ud.dwc + DEPCMD(ep)) = cmd | DEPCMD_CMDACT;
-+	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u command store emitted (no dsb)\n", ep, cmd);
 +	__asm__ volatile ("dsb sy" ::: "memory");
-+	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u command dsb returned\n", ep, cmd);
-+	if (ud.trace_commands) {
-+		printf("PICASSO USB: ep%u cmd %u command write returned\n", ep, cmd);
-+		printf("PICASSO USB: ep%u cmd %u command readback begin\n", ep, cmd);
-+		uint32_t submitted = dwc_rd(DEPCMD(ep));
-+		printf("PICASSO USB: ep%u cmd %u submitted reg 0x%08x\n", ep, cmd, submitted);
-+	}
-+	for (int i = 0; i < 1000; i++) {
-+		uint32_t v = dwc_rd(DEPCMD(ep));
-+		if (!(v & DEPCMD_CMDACT)) {
-+			uint32_t status = (v >> 12) & 0xf;
-+			if (status) {
-+				printf("PICASSO USB: ep%u cmd %u status %u\n", ep, cmd, status);
-+				return -1;
++
++	for (unsigned poll = 0; poll < 5000; poll++) {
++		uint32_t value = dwc_rd(DEPCMD(ep));
++		if (!(value & DEPCMD_CMDACT)) {
++			uint32_t status = (value >> 12) & 0xf;
++			if (status != 0) {
++				if (!ud.panic_mode) {
++					printf("PICASSO USB: ep%u cmd %u status %u%s reg=0x%08x\n",
++					    ep, cmd, status,
++					    status == 1 ? " (no transfer resource)" : "",
++					    value);
++				}
++				return status == 1 ? UD_EPCMD_NO_RESOURCE : -1;
 +			}
-+			if (ud.trace_commands) {
-+				printf("PICASSO USB: ep%u cmd %u complete reg 0x%08x polls %d\n", ep, cmd, v, i + 1);
++			if (ud.trace_commands && !ud.panic_mode) {
++				printf("PICASSO USB: ep%u cmd %u complete reg=0x%08x polls=%u\n",
++				    ep, cmd, value, poll + 1);
++			}
++			if (cmd == DEPCMD_STARTTRANSFER) {
++				ud.resource[ep] = (value >> 16) & 0x7fu;
 +			}
 +			return 0;
 +		}
 +		picasso_usb_busy_wait(1);
 +	}
-+	printf("PICASSO USB: ep%u cmd %u timeout\n", ep, cmd);
++	if (!ud.panic_mode) {
++		printf("PICASSO USB: ep%u cmd %u timeout\n", ep, cmd);
++	}
 +	return -1;
 +}
 +
-+/* One TRB (at DMA offset trb) on physical endpoint ep. */
++static int
++ud_epcmd_named(const char *name, unsigned ep, uint32_t cmd,
++    uint32_t p0, uint32_t p1, uint32_t p2)
++{
++	int result = ud_epcmd(ep, cmd, p0, p1, p2);
++	if (!ud.panic_mode) {
++		printf("PICASSO USB: %s ep%u cmd=%u result=%d reg=0x%08x rsc=%u\n",
++		    name, ep, cmd & 0xfu, result, dwc_rd(DEPCMD(ep)), ud.resource[ep]);
++	}
++	return result;
++}
++
 +static void
-+ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
++ud_dump_ep_state(const char *tag, unsigned ep)
++{
++	volatile uint32_t *trb = NULL;
++	uint32_t trb_off = 0;
++	int result = ud_epcmd(ep, DEPCMD_GETEPSTATE, 0, 0, 0);
++	uint32_t state = dwc_rd(DEPCMDPAR2(ep));
++
++	if (ep == EP_RX) {
++		trb_off = UD_TRB_RX;
++	} else if (ep == EP_TX) {
++		trb_off = UD_TRB_TX;
++	} else if (ep == EP_NOTIFY) {
++		trb_off = UD_TRB_NOTIFY;
++	}
++	if (trb_off != 0) {
++		trb = (volatile uint32_t *)(ud.dma + trb_off);
++		ud_sync(trb_off, 16);
++		printf("PICASSO USB: EPSTATE %s ep%u result=%d state=0x%08x "
++		    "busy=%u rsc=%u trb=%08x/%08x/%08x/%08x "
++		    "DALEPENA=%08x DCTL=%08x DSTS=%08x events=%llu/%u\n",
++		    tag, ep, result, state,
++		    ep == EP_RX ? ud.rx_busy : ep == EP_TX ? ud.tx_busy :
++		    ep == EP_NOTIFY ? ud.notify_busy : 0u,
++		    ud.resource[ep], trb[0], trb[1], trb[2], trb[3],
++		    dwc_rd(DALEPENA), dwc_rd(DCTL), dwc_rd(DSTS),
++		    ud.events, dwc_rd(GEVNTCOUNT) & 0xffffu);
++		return;
++	}
++	printf("PICASSO USB: EPSTATE %s ep%u result=%d state=0x%08x "
++	    "busy=%u rsc=%u DALEPENA=%08x DCTL=%08x DSTS=%08x events=%llu/%u\n",
++	    tag, ep, result, state,
++	    ep == EP_RX ? ud.rx_busy : ep == EP_TX ? ud.tx_busy :
++	    ep == EP_NOTIFY ? ud.notify_busy : 0u,
++	    ud.resource[ep], dwc_rd(DALEPENA), dwc_rd(DCTL), dwc_rd(DSTS),
++	    ud.events, dwc_rd(GEVNTCOUNT) & 0xffffu);
++}
++
++static uint64_t
++ud_prepare_trb(uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl,
++    uint32_t flags)
 +{
 +	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + trb);
 +	uint64_t bpa = ud.dma_pa + buf;
@@ -761,24 +1138,267 @@ index 0000000..bfe7ccc
 +	t[0] = (uint32_t)bpa;
 +	t[1] = (uint32_t)(bpa >> 32);
 +	t[2] = len;
-+	t[3] = ctl | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC;
++	/*
++	 * Linux only sets ISP/IMI for isochronous transfers or OUT requests
++	 * with short_not_ok. None of this gadget's endpoints need it.
++	 */
++	t[3] = ctl | TRB_HWO | flags | TRB_IOC;
 +	ud_sync(trb, 16);
 +	if (len) {
 +		ud_sync(buf, len);
 +	}
++	return ud.dma_pa + trb;
++}
++
++/* One TRB (at DMA offset trb) on physical endpoint ep. */
++static int
++ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
++{
++	if (ep <= 1 && ud.ep0_busy) {
++		unsigned active = ud.ep0_active_ep;
++		uint32_t resource = ud.resource[active];
++		uint32_t command = DEPCMD_ENDTRANSFER | DEPCMD_FORCE_RM |
++		    DEPCMD_CMDIOC | (resource << 16);
++		int result = ud_epcmd(active, command, 0, 0, 0);
++		if (!ud.panic_mode) {
++			printf("PICASSO USB: ep0 restart ended physical ep%u rsc=%u "
++			    "result=%d\n", active, resource, result);
++		}
++		ud.resource[active] = 0;
++		ud.ep0_busy = false;
++		ud.ep0_active_ep = 0;
++	}
++	uint64_t tpa = ud_prepare_trb(trb, buf, len, ctl, TRB_LST);
++	int result = ud_epcmd(ep, DEPCMD_STARTTRANSFER,
++	    (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++	if (result == 0 && ep <= 1) {
++		ud.ep0_busy = true;
++		ud.ep0_active_ep = ep;
++	}
++	return result;
++}
++
++static void
++ud_ep0_end_active(const char *reason)
++{
++	if (!ud.ep0_busy) {
++		return;
++	}
++	unsigned ep = ud.ep0_active_ep;
++	uint32_t resource = ud.resource[ep];
++	uint32_t command = DEPCMD_ENDTRANSFER | DEPCMD_FORCE_RM |
++	    DEPCMD_CMDIOC | (resource << 16);
++	int result = ud_epcmd(ep, command, 0, 0, 0);
++	if (!ud.panic_mode) {
++		printf("PICASSO USB: ep0 end active (%s) physical ep%u rsc=%u "
++		    "result=%d\n", reason, ep, resource, result);
++	}
++	ud.resource[ep] = 0;
++	ud.ep0_busy = false;
++	ud.ep0_active_ep = 0;
++}
++
++static void
++ud_data_endpoints_abort(void)
++{
++	const unsigned endpoints[] = { EP_RX, EP_TX, EP_NOTIFY };
++	for (unsigned i = 0; i < sizeof(endpoints) / sizeof(endpoints[0]); i++) {
++		unsigned ep = endpoints[i];
++		if (ud.resource[ep] != 0) {
++			uint32_t command = DEPCMD_ENDTRANSFER | DEPCMD_FORCE_RM |
++			    DEPCMD_CMDIOC | (ud.resource[ep] << 16);
++			int result = ud_epcmd(ep, command, 0, 0, 0);
++			if (!ud.panic_mode && result != 0) {
++				printf("PICASSO USB: reset abort ep%u failed result=%d\n",
++				    ep, result);
++			}
++		}
++		ud.resource[ep] = 0;
++	}
++	ud.tx_busy = false;
++	ud.rx_busy = false;
++	ud.rx_transfer_started = false;
++	ud.notify_busy = false;
++}
++
++static void
++ud_link_down_cleanup(void)
++{
++	ud_data_endpoints_abort();
++	ud.configured = false;
++	ud.host_open = false;
++	ud.cmd_len = 0;
++}
++
++/*
++ * An endpoint prestarted by the no-op transfer uses Update Transfer for all
++ * subsequent TRBs. Linux uses the No Response form without CMDACT/CMDIOC.
++ * For a non-stream bulk OUT endpoint Linux sets CSP and leaves LST clear.
++ */
++static int
++ud_update_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
++{
++	(void)ud_prepare_trb(trb, buf, len, ctl, TRB_CSP);
++	uint32_t command = DEPCMD_UPDATETRANSFER | (ud.resource[ep] << 16);
++	*(volatile uint32_t *)(ud.dwc + DEPCMD(ep)) = command;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return 0;
++}
++
++/*
++ * Linux primes every bulk/interrupt endpoint with a zeroed no-op TRB after
++ * DALEPENA.  DWC3 then treats subsequent No Response Update Transfer commands
++ * as normal endpoint activity instead of leaving the endpoint uninitialised.
++ */
++static int
++ud_noop_start(unsigned ep, uint32_t trb)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + trb);
++
++	t[0] = 0;
++	t[1] = 0;
++	t[2] = 0;
++	t[3] = 0;
++	ud_sync(trb, 16);
 +	uint64_t tpa = ud.dma_pa + trb;
-+	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++	return ud_epcmd_named("rx-noop", ep, DEPCMD_STARTTRANSFER,
++	    (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++}
++
++/* Terminate the two-entry bulk OUT ring with a hardware-owned link TRB. */
++static void
++ud_init_rx_ring(void)
++{
++	volatile uint32_t *link = (volatile uint32_t *)(ud.dma + UD_TRB_RX_LINK);
++	uint64_t first = ud.dma_pa + UD_TRB_RX;
++
++	link[0] = (uint32_t)first;
++	link[1] = (uint32_t)(first >> 32);
++	link[2] = 0;
++	link[3] = TRB_HWO | TRBCTL_LINK;
++	ud_sync(UD_TRB_RX_LINK, 16);
++	if (!ud.panic_mode) {
++		printf("PICASSO USB: RX ring first=0x%llx link=0x%llx ctl=0x%08x\n",
++		    first, ud.dma_pa + UD_TRB_RX_LINK, link[3]);
++	}
++}
++
++/*
++ * USB reset is destructive to endpoint resource allocation on this controller.
++ * Rebuild EP0 from the databook sequence and only restore data endpoints if the
++ * host had already selected the configuration.
++ */
++static int
++ud_ep0_rebuild(const char *reason)
++{
++	bool restore_configured = ud.configured;
++
++	ud_ep0_end_active(reason);
++	if (restore_configured) {
++		ud_data_endpoints_abort();
++		ud.configured = false;
++	}
++	ud.ep0_ready = false;
++	ud.ep0_busy = false;
++	ud.ep0_active_ep = 0;
++	ud.resource[0] = 0;
++	ud.resource[1] = 0;
++	dwc_wr(DALEPENA, 0);
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) != 0 ||
++	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3),
++	    (1u << 8) | (1u << 10) | (0u << 25), 0) != 0 ||
++	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) != 0 ||
++	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3),
++	    (1u << 8) | (1u << 10) | (1u << 25), 0) != 0 ||
++	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) != 0) {
++		if (!ud.panic_mode) {
++			printf("PICASSO USB: ep0 rebuild failed (%s)\n", reason);
++		}
++		return -1;
++	}
++	dwc_wr(DALEPENA, 0x3);
++	ud.ep0_ready = true;
++	if (!ud.panic_mode) {
++		printf("PICASSO USB: ep0 resources rebuilt (%s), DALEPENA=0x%08x\n",
++		    reason, dwc_rd(DALEPENA));
++	}
++	if (restore_configured) {
++		ud_configure();
++	}
++	return 0;
++}
++
++static int
++ud_ep0_start_recovering(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len,
++    uint32_t ctl, const char *phase)
++{
++	unsigned saved_state = ud.state;
++	int result = ud_start_trb(ep, trb, buf, len, ctl);
++
++	if (result == UD_EPCMD_NO_RESOURCE &&
++	    ud_ep0_rebuild(phase) == 0) {
++		ud.state = saved_state;
++		result = ud_start_trb(ep, trb, buf, len, ctl);
++	}
++	return result;
++}
++
++static void
++ud_start_rx(void)
++{
++	if (!ud.configured || ud.rx_busy) {
++		return;
++	}
++	if (!ud.rx_transfer_started) {
++		/*
++		 * Linux primes every non-control endpoint with a zeroed no-op
++		 * STARTTRANSFER after DALEPENA. This assigns the resource index
++		 * used by subsequent no-response UPDATE_TRANSFER commands.
++		 */
++		ud_init_rx_ring();
++		int prime = ud_noop_start(EP_RX, UD_TRB_RX);
++		if (prime != 0 || ud.resource[EP_RX] == 0) {
++			if (!ud.panic_mode) {
++				printf("PICASSO USB: RX no-op prime failed result=%d rsc=%u\n",
++				    prime, ud.resource[EP_RX]);
++			}
++			return;
++		}
++		ud.rx_transfer_started = true;
++	}
++	ud.rx_len = UD_RX_SIZE;
++	ud.rx_busy = true;
++	int result = ud_update_trb(EP_RX, UD_TRB_RX, UD_RX, UD_RX_SIZE,
++	    TRBCTL_NORMAL);
++	if (!ud.panic_mode) {
++		printf("PICASSO USB: RX arm mps=%u len=%u trb=0x%llx result=%d "
++		    "cmd=0x%08x rsc=%u started=%u\n",
++		    ud.mps, UD_RX_SIZE, ud.dma_pa + UD_TRB_RX, result,
++		    dwc_rd(DEPCMD(EP_RX)), ud.resource[EP_RX],
++		    ud.rx_transfer_started ? 1u : 0u);
++		ud_dump_ep_state("after-arm", EP_RX);
++	}
++	if (result != 0) {
++		ud.rx_busy = false;
++	}
 +}
 +
 +static void
 +ud_start_setup(void)
 +{
++	if (!ud.ep0_ready && ud_ep0_rebuild("setup") != 0) {
++		return;
++	}
 +	ud.state = EP0_SETUP;
 +	if (ud.trace_commands) {
 +		printf("PICASSO USB: setup TRB prepare va %p pa 0x%llx\n",
 +		    (void *)(ud.dma + UD_TRB_OUT), ud.dma_pa + UD_TRB_OUT);
 +	}
-+	ud_start_trb(0, UD_TRB_OUT, UD_SETUP, 8, TRBCTL_SETUP);
++	int result = ud_ep0_start_recovering(0, UD_TRB_OUT, UD_SETUP, 8,
++	    TRBCTL_SETUP, "setup no-resource");
++	if (result != 0 && !ud.panic_mode) {
++		printf("PICASSO USB: setup STARTTRANSFER failed result=%d\n", result);
++	}
 +	if (ud.trace_commands) {
 +		printf("PICASSO USB: setup TRB command returned\n");
 +	}
@@ -787,6 +1407,7 @@ index 0000000..bfe7ccc
 +static void
 +ud_stall(void)
 +{
++	ud_ep0_end_active("stall");
 +	ud_epcmd(0, DEPCMD_SETSTALL, 0, 0, 0);
 +	ud_start_setup();
 +}
@@ -840,25 +1461,43 @@ index 0000000..bfe7ccc
 +static void
 +ud_configure(void)
 +{
++	int failed = 0;
++
 +	if (ud.configured) {
 +		return;
 +	}
-+	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
-+	    ud_epcmd(EP_NOTIFY, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17), (1u << 8) | (EP_NOTIFY << 25), 0) ||
-+	    ud_epcmd(EP_NOTIFY, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
-+	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (64u << 3), (1u << 8) | (EP_RX << 25), 0) ||
-+	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
-+	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (64u << 3) | (1u << 17),
-+	    (1u << 8) | (EP_TX << 25), 0) ||
-+	    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++	failed |= ud_epcmd_named("start-config", 0,
++	    DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) != 0;
++	failed |= ud_epcmd_named("rx-config", EP_RX, DEPCMD_SETEPCONFIG,
++	    (2u << 1) | (ud.mps << 3),
++	    (1u << 8) | (1u << 9) | (EP_RX << 25), 0) != 0;
++	failed |= ud_epcmd_named("rx-resource", EP_RX,
++	    DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) != 0;
++	failed |= ud_epcmd_named("tx-config", EP_TX, DEPCMD_SETEPCONFIG,
++	    (2u << 1) | (ud.mps << 3) | (1u << 17),
++	    (1u << 8) | (1u << 9) | (EP_TX << 25), 0) != 0;
++	failed |= ud_epcmd_named("tx-resource", EP_TX,
++	    DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) != 0;
++	failed |= ud_epcmd_named("notify-config", EP_NOTIFY,
++	    DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17),
++	    (1u << 8) | (8u << 16) | (EP_NOTIFY << 25), 0) != 0;
++	failed |= ud_epcmd_named("notify-resource", EP_NOTIFY,
++	    DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) != 0;
++	if (failed) {
 +		printf("PICASSO USB: data endpoints setup failed\n");
 +		return;
 +	}
-+	/* Bulk OUT stays enabled but never armed: the host's input NAKs. */
 +	dwc_wr(DALEPENA, 0x3u | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_NOTIFY));
++	printf("PICASSO USB: endpoints enabled mps=%u DALEPENA=0x%08x\n",
++	    ud.mps, dwc_rd(DALEPENA));
 +	ud.configured = true;
++	ud.tx_pos = pur_ring.total > PURing_SIZE ?
++	    pur_ring.total - PURing_SIZE : 0;
 +	ud.tx_busy = false;
++	ud.rx_busy = false;
 +	ud.notify_busy = false;
++	ud_dump_ep_state("pre-arm", EP_RX);
++	ud_start_rx();
 +	printf("PICASSO USB: configured, streaming the console\n");
 +	{
 +		uint8_t *notification = (uint8_t *)(ud.dma + UD_NOTIFY);
@@ -888,7 +1527,16 @@ index 0000000..bfe7ccc
 +	ud.data_in = (type & 0x80) != 0;
 +	ud.last_request = req;
 +	ud.data_length = length;
-+	if ((type & 0x60) == 0x20) {   /* CDC class requests on control interface 0 */
++	if (ud.setups++ < 96) {
++		printf("PICASSO USB: setup type=%02x req=%02x value=%04x index=%04x len=%u\n",
++		    type, req, value, index, length);
++	}
++	if (type == 0xc0 && req == UD_DIAG_REQUEST && index == 0) {
++		struct ud_diag diag;
++		ud_diag_snapshot(&diag);
++		n = MIN((uint32_t)length, (uint32_t)sizeof(diag));
++		memcpy(data, &diag, n);
++	} else if ((type & 0x60) == 0x20) {   /* CDC class requests on control interface 0 */
 +		if ((type & 0x1f) != 1 || index != 0) {
 +			ok = false;
 +		} else if (req == 0x20 && type == 0x21 && length == sizeof(ud_line_coding)) {
@@ -896,8 +1544,15 @@ index 0000000..bfe7ccc
 +		} else if (req == 0x21 && type == 0xa1) {
 +			memcpy(data, ud_line_coding, sizeof(ud_line_coding));
 +			n = sizeof(ud_line_coding);
-+		} else if ((req == 0x22 || req == 0x23) && type == 0x21 && length == 0) {
-+			/* SET_CONTROL_LINE_STATE or SEND_BREAK: accepted, no device action. */
++		} else if (req == 0x22 && type == 0x21 && length == 0) {
++			/* SET_CONTROL_LINE_STATE: bit 0 tracks the host opening the port. */
++			bool was_open = ud.host_open;
++			ud.host_open = (value & 1u) != 0;
++			if (ud.host_open && !was_open && ud.configured) {
++				ud_dump_ep_state("host-open", EP_RX);
++			}
++		} else if (req == 0x23 && type == 0x21 && length == 0) {
++			/* SEND_BREAK: accepted, no device action. */
 +		} else {
 +			ok = false;
 +		}
@@ -906,7 +1561,16 @@ index 0000000..bfe7ccc
 +	} else if (req == 6) {          /* GET_DESCRIPTOR */
 +		switch (value >> 8) {
 +		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
-+		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 2:
++			memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc));
++			n = sizeof(ud_cfg_desc);
++			for (uint32_t i = 0; i + 5 < n && data[i] >= 2; i += data[i]) {
++				if (data[i + 1] == 5 && (data[i + 3] & 3u) == 2u) {
++					data[i + 4] = (uint8_t)ud.mps;
++					data[i + 5] = (uint8_t)(ud.mps >> 8);
++				}
++			}
++			break;
 +		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
 +		default: ok = false; break;
 +		}
@@ -921,6 +1585,35 @@ index 0000000..bfe7ccc
 +		data[0] = ud.configured ? 1 : 0; n = 1;
 +	} else if (req == 0) {          /* GET_STATUS */
 +		data[0] = 0; data[1] = 0; n = 2;
++	} else if (req == 1 && type == 0x02 && value == 0 &&
++	    index != 0 && (index & 0x70) == 0) {
++		/* CLEAR_FEATURE(ENDPOINT_HALT), including macOS's open-time clear. */
++		unsigned ep = (index & 0x0f) * 2 + ((index >> 7) & 1);
++		if (ep >= 6) {
++			ok = false;
++		} else {
++			printf("PICASSO USB: clear halt ep=0x%02x phys=%u busy=%u rsc=%u\n",
++			    index, ep, ep == EP_RX ? ud.rx_busy :
++			    ep == EP_TX ? ud.tx_busy :
++			    ep == EP_NOTIFY ? ud.notify_busy : 0u, ud.resource[ep]);
++			if (ud.resource[ep] != 0) {
++				ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_FORCE_RM |
++				    (ud.resource[ep] << 16), 0, 0, 0);
++				ud.resource[ep] = 0;
++			}
++			if (ud_epcmd(ep, DEPCMD_CLEARSTALL, 0, 0, 0) != 0) {
++				ok = false;
++			} else {
++				if (ep == EP_RX) {
++					ud.rx_busy = false;
++					ud.rx_transfer_started = false;
++				} else if (ep == EP_TX) {
++					ud.tx_busy = false;
++				} else if (ep == EP_NOTIFY) {
++					ud.notify_busy = false;
++				}
++			}
++		}
 +	} else if (req == 11 && (type & 0x1f) == 1 && index == 1 && value == 0) {
 +		/* SET_INTERFACE: the sole data-interface alternate setting is zero. */
 +	} else if (req == 10 && (type & 0x1f) == 1 && index == 1) {
@@ -932,6 +1625,9 @@ index 0000000..bfe7ccc
 +		ud_stall();
 +		return;
 +	}
++	if (req == 1 && type == 0x02 && index == 0x01) {
++		ud_start_rx();
++	}
 +	if (length == 0) {
 +		ud.state = EP0_WAIT_STATUS2;
 +		return;
@@ -941,9 +1637,11 @@ index 0000000..bfe7ccc
 +		if (n > length) {
 +			n = length;
 +		}
-+		ud_start_trb(1, UD_TRB_IN, UD_DATA, n, TRBCTL_DATA);
++		ud_ep0_start_recovering(1, UD_TRB_IN, UD_DATA, n, TRBCTL_DATA,
++		    "data-in no-resource");
 +	} else {
-+		ud_start_trb(0, UD_TRB_OUT, UD_DATA, length, TRBCTL_DATA);
++		ud_ep0_start_recovering(0, UD_TRB_OUT, UD_DATA, length, TRBCTL_DATA,
++		    "data-out no-resource");
 +	}
 +}
 +
@@ -953,7 +1651,15 @@ index 0000000..bfe7ccc
 +	if (!ud.configured || ud.tx_busy) {
 +		return;
 +	}
-+	uint32_t n = pur_copy(&ud.tx_pos, (char *)(ud.dma + UD_TX), UD_TX_SIZE);
++	uint32_t n = 0;
++	if (ud.panic_mode) {
++		n = pup_copy((char *)(ud.dma + UD_TX), UD_TX_SIZE);
++		if (n == 0) {
++			return;
++		}
++	} else {
++		n = pur_copy(&ud.tx_pos, (char *)(ud.dma + UD_TX), UD_TX_SIZE);
++	}
 +	if (n == 0) {
 +		return;
 +	}
@@ -963,34 +1669,75 @@ index 0000000..bfe7ccc
 +}
 +
 +static void
++ud_rx_consume(const uint8_t *data, uint32_t size)
++{
++	for (uint32_t i = 0; i < size; i++) {
++		char c = (char)data[i];
++		if (c == '\r' || c == '\n') {
++			if (ud.cmd_len != 0 && !ud.cmd_pending) {
++				ud.cmd[ud.cmd_len] = '\0';
++				ud.cmd_pending = true;
++			}
++			ud.cmd_len = 0;
++		} else if (c == '\b' || c == 0x7f) {
++			if (ud.cmd_len != 0) {
++				ud.cmd_len--;
++			}
++		} else if (c >= ' ' && c <= '~') {
++			if (ud.cmd_len + 1 < sizeof(ud.cmd)) {
++				ud.cmd[ud.cmd_len++] = c;
++			} else {
++				ud.cmd_len = 0;
++				printf("PICASSO CDC: command too long\n");
++			}
++		}
++	}
++}
++
++static void
 +ud_event(uint32_t ev)
 +{
 +	if (ev & 1) {                   /* device event */
 +		uint32_t type = (ev >> 8) & 0xf;
 +		if (type == 1) {        /* USB reset */
 +			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
-+			ud.configured = false;
-+			ud.tx_busy = false;
-+			ud.state = EP0_SETUP;
-+			ud_start_setup();
++			ud_link_down_cleanup();
++			if (ud_ep0_rebuild("usb reset") == 0) {
++				ud_start_setup();
++			}
 +		} else if (type == 2) { /* connect done */
 +			uint32_t speed = dwc_rd(DSTS) & 7;
-+			/* ep0 max packet: 64 at high/full speed (modify action) */
-+			ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
-+			    (1u << 8) | (1u << 10) | (0u << 25), 0);
-+			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
-+			    (1u << 8) | (1u << 10) | (1u << 25), 0);
-+			printf("PICASSO USB: connected, speed %u\n", speed);
++			ud.mps = speed == 0 ? 512u : 64u;
++			if (!ud.ep0_ready && ud_ep0_rebuild("connect done") == 0) {
++				ud_start_setup();
++			}
++			if (!ud.panic_mode) {
++				printf("PICASSO USB: connected, speed %u\n", speed);
++			}
 +		} else if (type == 0) {
-+			printf("PICASSO USB: disconnect\n");
-+			ud.configured = false;
-+			ud.tx_busy = false;
++			if (!ud.panic_mode) {
++				printf("PICASSO USB: disconnect\n");
++			}
++			ud_link_down_cleanup();
++			if (ud_ep0_rebuild("disconnect") == 0) {
++				ud_start_setup();
++			}
 +		}
 +		return;
 +	}
 +	unsigned ep = (ev >> 1) & 0x1f;
 +	unsigned type = (ev >> 6) & 0xf;
 +	unsigned status = (ev >> 12) & 0xf;
++	if (ep < 6) {
++		ud.last_event[ep] = ev;
++		if (type == 1) {
++			ud.event_complete[ep]++;
++		} else if (type == 2) {
++			ud.event_inprogress[ep]++;
++		} else if (type == 3) {
++			ud.event_notready[ep]++;
++		}
++	}
 +	if (ep == EP_TX && type == 1) {         /* bulk IN complete */
 +		ud.tx_busy = false;
 +		return;
@@ -999,10 +1746,71 @@ index 0000000..bfe7ccc
 +		ud.notify_busy = false;
 +		return;
 +	}
++	if (ep == EP_RX && (type == 1 || type == 2)) {
++		/* Linux completes a bulk TRB for both Complete and InProgress. */
++		ud.rx_busy = false;
++		ud_sync(UD_TRB_RX, 16);
++		volatile uint32_t *trb = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
++		uint32_t remaining = trb[2];
++		struct pur_text diag = { .length = 0 };
++		pur_text_append(&diag, "PICASSO USB: RX event type=");
++		pur_text_u64(&diag, type);
++		pur_text_append(&diag, " status=0x");
++		pur_text_hex32(&diag, status);
++		pur_text_append(&diag, " rem=");
++		pur_text_u64(&diag, remaining);
++		pur_text_append(&diag, " len=");
++		pur_text_u64(&diag, ud.rx_len);
++		pur_text_append(&diag, " ctl=0x");
++		pur_text_hex32(&diag, trb[3]);
++		pur_text_append(&diag, " rsc=");
++		pur_text_u64(&diag, ud.resource[EP_RX]);
++		pur_text_append(&diag, "\r\n");
++		pur_emit_raw(diag.bytes, diag.length);
++		if (!(status & 1u) && remaining <= ud.rx_len) {
++			uint32_t received = ud.rx_len - remaining;
++			if (!ud.panic_mode) {
++				printf("PICASSO CDC: RX complete type=%u status=%x bytes=%u\n",
++				    type, status, received);
++			}
++			if (received != 0) {
++				ud_sync(UD_RX, received);
++				ud_rx_consume((const uint8_t *)(ud.dma + UD_RX), received);
++				ud.rx_bytes += received;
++			}
++		}
++		ud_start_rx();
++		return;
++	}
++	if (ep == EP_RX && type == 3) {        /* bulk OUT transfer not ready */
++		if (!ud.panic_mode) {
++			printf("PICASSO CDC: RX not-ready status=%x busy=%u rsc=%u\n",
++			    status, ud.rx_busy ? 1u : 0u, ud.resource[EP_RX]);
++		}
++		if (!ud.rx_busy) {
++			ud_start_rx();
++		}
++		return;
++	}
 +	if (ep > 1) {
 +		return;
 +	}
-+	if (type == 1) {                /* XferComplete */
++	if (type == 1 || type == 2) {   /* XferComplete or terminal InProgress */
++		if (!ud.ep0_busy || ud.ep0_active_ep != ep) {
++			return;
++		}
++		if (type == 2) {
++			uint32_t trb = ep == 0 ? UD_TRB_OUT : UD_TRB_IN;
++			ud_sync(trb, 16);
++			volatile uint32_t *control =
++			    (volatile uint32_t *)(ud.dma + trb);
++			if (control[3] & TRB_HWO) {
++				return;
++			}
++		}
++		ud.resource[ep] = 0;
++		ud.ep0_busy = false;
++		ud.ep0_active_ep = 0;
 +		switch (ud.state) {
 +		case EP0_SETUP:
 +			ud_sync(UD_SETUP, 8);
@@ -1028,36 +1836,485 @@ index 0000000..bfe7ccc
 +		if (ud.state == EP0_WAIT_STATUS2 || ud.state == EP0_WAIT_STATUS3) {
 +			uint32_t ctl = ud.state == EP0_WAIT_STATUS3 ? TRBCTL_STATUS3 : TRBCTL_STATUS2;
 +			ud.state = EP0_STATUS;
-+			ud_start_trb(ep, ep ? UD_TRB_IN : UD_TRB_OUT, UD_DATA, 0, ctl);
++			ud_ep0_start_recovering(ep, ep ? UD_TRB_IN : UD_TRB_OUT,
++			    UD_DATA, 0, ctl, "status no-resource");
 +		}
 +	}
 +}
 +
 +static void
-+ud_poll(void)
++ud_poll_events(void)
 +{
 +	uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffffu;
 +	if (count) {
 +		ud_sync(UD_EVT, UD_EVT_SIZE);
 +		for (uint32_t done = 0; done < count; done += 4) {
 +			uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++			unsigned event_ep = (ev & 1) ? 0u : ((ev >> 1) & 0x1fu);
 +			ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
-+			if (ud.events++ < 200) {
-+				printf("PICASSO USB: event 0x%08x\n", ev);
++			if (!ud.panic_mode &&
++			    (event_ep == EP_RX || ud.events < 200)) {
++				pur_emit_event(ud.events, event_ep, ev);
 +			}
++			ud.events++;
 +			ud_event(ev);
 +		}
 +		dwc_wr(GEVNTCOUNT, count);
 +	}
++	if (ud.cmd_pending && !ud.panic_mode) {
++		ud_process_command();
++	}
++}
++
++static void
++ud_poll(void)
++{
++	ud_poll_events();
 +	ud_tx_pump();
++}
++
++static bool
++ud_command_is(const char *command, const char *expected)
++{
++	while (*command != '\0' && *expected != '\0') {
++		char a = *command++;
++		char b = *expected++;
++		if (a >= 'A' && a <= 'Z') {
++			a = (char)(a - 'A' + 'a');
++		}
++		if (b >= 'A' && b <= 'Z') {
++			b = (char)(b - 'A' + 'a');
++		}
++		if (a != b) {
++			return false;
++		}
++	}
++	return *command == '\0' && *expected == '\0';
++}
++
++static void
++picasso_usb_watchdog_pet(void)
++{
++	if (ud.watchdog_armed && ud.wdt != 0) {
++		usb_wr(ud.wdt, APSS_WDT_RST, 1);
++	}
++}
++
++static void
++picasso_usb_watchdog_arm(void)
++{
++	if (!ud.watchdog || ud.wdt == 0) {
++		return;
++	}
++	uint32_t ticks =
++	    (APSS_WDT_TIMEOUT_MS * APSS_WDT_RATE_HZ / 1000u) - 1u;
++	usb_wr(ud.wdt, APSS_WDT_EN, 0);
++	usb_wr(ud.wdt, APSS_WDT_RST, 1);
++	usb_wr(ud.wdt, APSS_WDT_BARK, ticks);
++	usb_wr(ud.wdt, APSS_WDT_BITE, ticks);
++	usb_wr(ud.wdt, APSS_WDT_EN, 1);
++	ud.watchdog_armed = true;
++	printf("PICASSO USB: APSS watchdog armed ticks=%u bark=%u bite=%u ctl=%u\n",
++	    ticks, usb_rd(ud.wdt, APSS_WDT_BARK),
++	    usb_rd(ud.wdt, APSS_WDT_BITE),
++	    usb_rd(ud.wdt, APSS_WDT_EN));
++}
++
++static void
++picasso_usb_watchdog_disable(void)
++{
++	if (ud.wdt != 0) {
++		usb_wr(ud.wdt, APSS_WDT_EN, 0);
++	}
++	ud.watchdog_armed = false;
++}
++
++static bool
++picasso_usb_pshold_reset(void)
++{
++	if (ud.pshold == 0) {
++		ud.pshold = ml_io_map(PSHOLD_PA, PAGE_SIZE);
++	}
++	if (ud.pshold == 0) {
++		printf("PICASSO CDC: PSHOLD map failed pa=0x%x; reset skipped\n",
++		    PSHOLD_PA);
++		return false;
++	}
++	printf("PICASSO CDC: PSHOLD reset begin pa=0x%x va=%p\n",
++	    PSHOLD_PA, (void *)ud.pshold);
++	*(volatile uint32_t *)ud.pshold = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (;;) {
++		__asm__ volatile ("wfe" ::: "memory");
++	}
++}
++
++static bool
++picasso_usb_arm_fastboot_reason(void)
++{
++	if (ud.imem == 0) {
++		printf("PICASSO CDC: IMEM Fastboot reason unavailable\n");
++		return false;
++	}
++
++	uint32_t previous = usb_rd(ud.imem, IMEM_RESTART_REASON);
++	printf("PICASSO CDC: IMEM Fastboot reason arm pa=0x%x previous=0x%08x target=0x%08x\n",
++	    IMEM_PA + IMEM_RESTART_REASON, previous, IMEM_FASTBOOT_MODE);
++	usb_wr(ud.imem, IMEM_RESTART_REASON, IMEM_FASTBOOT_MODE);
++	uint32_t readback = usb_rd(ud.imem, IMEM_RESTART_REASON);
++	if (readback != IMEM_FASTBOOT_MODE) {
++		printf("PICASSO CDC: IMEM Fastboot reason readback mismatch=0x%08x\n",
++		    readback);
++		return false;
++	}
++	printf("PICASSO CDC: IMEM Fastboot reason armed readback=0x%08x\n",
++	    readback);
++	return true;
++}
++
++static void
++picasso_usb_psci_reset(void)
++{
++	/*
++	 * The device tree declares the PSCI conduit as SMC. Unlike an APSS
++	 * watchdog bite, this enters the same firmware reset path that has
++	 * already rebooted Picasso during the entry probes, so it should keep
++	 * the PMIC SOFT_SPARE reason DarwinBoot programmed.
++	 */
++	register uint64_t x0 __asm__("x0") = 0x84000009ull;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	__asm__ volatile ("msr daifset, #0xf" ::: "memory");
++	__asm__ volatile ("smc #0" : "+r" (x0)
++	    : "r" (x1), "r" (x2), "r" (x3)
++	    : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++	      "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	printf("PICASSO CDC: PSCI reset returned (x0=%llu); falling back\n",
++	    (unsigned long long)x0);
++}
++
++static void
++picasso_usb_watchdog_reset(void)
++{
++	if (ud.wdt == 0) {
++		ud.wdt = ml_io_map(APSS_WDT_PA, PAGE_SIZE);
++	}
++	/*
++	 * DarwinBoot has already preset the PMIC SOFT_SPARE reset reason.
++	 * Keep this path as a fallback for firmware where PSCI reset is not
++	 * available.
++	 */
++	if (ud.wdt != 0) {
++		/*
++		 * Match the vendor WatchDogTriggerBite() sequence exactly:
++		 * pet the running watchdog, replace BITE with the four-tick
++		 * value, then stop servicing it.  Re-arming first can make the
++		 * controller reload a long count when BITE is rewritten.
++		 */
++		if (!(usb_rd(ud.wdt, APSS_WDT_EN) & 1u)) {
++			uint32_t ticks =
++			    (APSS_WDT_TIMEOUT_MS * APSS_WDT_RATE_HZ / 1000u) - 1u;
++			usb_wr(ud.wdt, APSS_WDT_BARK, ticks);
++			usb_wr(ud.wdt, APSS_WDT_BITE, ticks);
++			usb_wr(ud.wdt, APSS_WDT_EN, 1);
++			ud.watchdog_armed = true;
++		}
++		usb_wr(ud.wdt, APSS_WDT_RST, 1);
++		usb_wr(ud.wdt, APSS_WDT_BITE, APSS_WDT_FORCED_BITE);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		__asm__ volatile ("msr daifset, #0xf" ::: "memory");
++		for (;;) {
++			__asm__ volatile ("wfe" ::: "memory");
++		}
++	}
++}
++
++static void
++picasso_usb_system_reset(void)
++{
++	printf("PICASSO CDC: reset begin mode=%u\n", ud.reset_mode);
++	(void)picasso_usb_arm_fastboot_reason();
++	if (ud.reset_mode == PICASSO_USB_RESET_PSCI) {
++		picasso_usb_psci_reset();
++	}
++	if (ud.reset_mode != PICASSO_USB_RESET_PSHOLD) {
++		picasso_usb_watchdog_reset();
++	}
++	printf("PICASSO CDC: reset fallback PSHOLD\n");
++	if (!picasso_usb_pshold_reset()) {
++		printf("PICASSO CDC: reset failed; console remains alive\n");
++	}
++}
++
++static bool
++ud_flush_console(unsigned polls, unsigned gap_usec)
++{
++	for (unsigned i = 0; i < polls; i++) {
++		ud_poll_events();
++		ud_tx_pump();
++		if (!ud.tx_busy && pur_ring.total == ud.tx_pos) {
++			return true;
++		}
++		picasso_usb_busy_wait(gap_usec);
++	}
++	return !ud.tx_busy && pur_ring.total == ud.tx_pos;
++}
++
++static void
++ud_finish_reboot(void)
++{
++	/*
++	 * Never make reset conditional on an infinitely busy console ring:
++	 * PICASSO USB events can append bytes while this drain is running.
++	 * Give the current output a short, fixed opportunity to leave, then
++	 * reset unconditionally. The IMEM Fastboot reason was armed above.
++	 */
++	(void)picasso_usb_arm_fastboot_reason();
++	printf("PICASSO CDC: fastboot flush begin tx_busy=%u pending=%llu\n",
++	    ud.tx_busy ? 1u : 0u, pur_ring.total - ud.tx_pos);
++	bool flushed = ud_flush_console(PICASSO_USB_FLUSH_POLLS,
++	    PICASSO_USB_FLUSH_GAP_US);
++	printf("PICASSO CDC: fastboot flush %s; entering configured reset path\n",
++	    flushed ? "complete" : "deadline");
++	(void)ud_flush_console(PICASSO_USB_FINAL_FLUSH_POLLS,
++	    PICASSO_USB_FLUSH_GAP_US);
++	picasso_usb_system_reset();
++}
++
++static void
++ud_finish_hang(void)
++{
++	/*
++	 * Deliberately stop the only CPU without masking the APSS watchdog.
++	 * This proves that a scheduler hang can still reset to Fastboot while
++	 * the host keeps the final CDC breadcrumbs.
++	 */
++	(void)picasso_usb_arm_fastboot_reason();
++	printf("PICASSO CDC: hang-test flush begin\n");
++	(void)ud_flush_console(PICASSO_USB_FLUSH_POLLS,
++	    PICASSO_USB_FLUSH_GAP_US);
++	printf("PICASSO CDC: hang-test CPU halt begin; awaiting watchdog\n");
++	(void)ud_flush_console(PICASSO_USB_FINAL_FLUSH_POLLS,
++	    PICASSO_USB_FLUSH_GAP_US);
++	__asm__ volatile ("msr daifset, #0xf" ::: "memory");
++	for (;;) {
++		__asm__ volatile ("wfe" ::: "memory");
++	}
++}
++
++static void
++ud_process_command(void)
++{
++	ud.cmd_pending = false;
++	ud.commands++;
++	printf("PICASSO CDC: command '%s'\n", ud.cmd);
++	if (ud_command_is(ud.cmd, "help")) {
++		printf("PICASSO CDC: commands: help | status | panic-test | reset-test | hang-test | reboot-fastboot\n");
++	} else if (ud_command_is(ud.cmd, "status")) {
++		printf("PICASSO CDC: configured=%u host_open=%u live=%u panic=%u "
++		    "watchdog=%u armed=%u reset=%u events=%llu tx=%llu "
++		    "rx=%llu dropped=%llu\n",
++		    ud.configured ? 1u : 0u, ud.host_open ? 1u : 0u,
++		    ud.live ? 1u : 0u, ud.panic_mode ? 1u : 0u,
++		    ud.watchdog ? 1u : 0u, ud.watchdog_armed ? 1u : 0u,
++		    ud.reset_mode, ud.events, ud.chars, ud.rx_bytes,
++		    os_atomic_load(&pur_dropped, relaxed));
++	} else if (ud_command_is(ud.cmd, "panic-test")) {
++		printf("PICASSO CDC: panic-test requested; emitting marker now\n");
++		/*
++		 * ud_process_command() runs with poll_lock held. Defer the panic
++		 * until ud_poll_serialized() has released that lock; otherwise the
++		 * panic flush path would recursively drive the same DWC3 event ring.
++		 */
++		ud.panic_pending = true;
++	} else if (ud_command_is(ud.cmd, "reset-test")) {
++		printf("PICASSO CDC: reset-test requested; draining then reset mode %u\n",
++		    ud.reset_mode);
++		ud.reset_pending = true;
++	} else if (ud_command_is(ud.cmd, "hang-test")) {
++		printf("PICASSO CDC: hang-test requested; stopping CPU and watchdog pets\n");
++		ud.hang_pending = true;
++	} else if (ud_command_is(ud.cmd, "reboot-fastboot")) {
++		printf("PICASSO CDC: reboot-fastboot requested; using reset mode %u\n",
++		    ud.reset_mode);
++		ud.reboot_pending = true;
++	} else if (ud.cmd[0] != '\0') {
++		printf("PICASSO CDC: unknown command '%s'; type help\n", ud.cmd);
++	}
++}
++
++static void
++pup_put(char c)
++{
++	if (pup_ring.total - pup_pos >= PU_PANIC_RING_SIZE) {
++		pup_pos++;
++	}
++	pup_ring.buffer[pup_ring.total & PU_PANIC_RING_MASK] = c;
++	pup_ring.total++;
++}
++
++static void
++pup_puts(const char *text, int size)
++{
++	for (int i = 0; i < size; i++) {
++		pup_put(text[i]);
++	}
++}
++
++void
++picasso_usb_panic_begin(void)
++{
++	static const char marker[] = "\r\n=== PICASSO CDC PANIC BEGIN ===\r\n";
++	if (pu_panic_active) {
++		return;
++	}
++	pu_panic_active = true;
++	ud.panic_mode = true;
++	pup_puts(marker, (int)(sizeof(marker) - 1));
++	picasso_usb_panic_flush();
++}
++
++void
++picasso_usb_panic_putc(char c)
++{
++	if (!pu_panic_active) {
++		return;
++	}
++	if (c == '\n') {
++		pup_put('\r');
++	}
++	pup_put(c);
++	if (c == '\n' || pup_ring.total - pup_pos >= 512) {
++		picasso_usb_panic_flush();
++	}
++}
++
++void
++picasso_usb_panic_write(const char *text, int size)
++{
++	if (!pu_panic_active || text == NULL || size <= 0) {
++		return;
++	}
++	for (int i = 0; i < size; i++) {
++		if (text[i] == '\n') {
++			pup_put('\r');
++		}
++		pup_put(text[i]);
++	}
++	if (size > 1 || text[size - 1] == '\n' ||
++	    pup_ring.total - pup_pos >= 512) {
++		picasso_usb_panic_flush();
++	}
++}
++
++void
++picasso_usb_panic_flush(void)
++{
++	if (!pu_panic_active || !ud.live || !ud.configured ||
++	    !os_atomic_cmpxchg(&pup_flush_lock, 0, 1, acquire)) {
++		return;
++	}
++	/* Try-lock only: a panic must never wait for a normal USB poller. */
++	if (!os_atomic_cmpxchg(&ud.poll_lock, 0, 1, acquire)) {
++		os_atomic_store(&pup_flush_lock, 0, release);
++		return;
++	}
++	for (unsigned i = 0; i < 20000; i++) {
++		ud_poll();
++		if (!ud.tx_busy && pup_ring.total == pup_pos) {
++			break;
++		}
++		picasso_usb_busy_wait(5);
++	}
++	os_atomic_store(&ud.poll_lock, 0, release);
++	os_atomic_store(&pup_flush_lock, 0, release);
++}
++
++void
++picasso_usb_panic_reset(void)
++{
++	if (!ud.panic_reset) {
++		return;
++	}
++
++	/*
++	 * The panic stream is already sent synchronously. Repeat the bounded
++	 * drain so the final backtrace/stackshot bytes reach the host before
++	 * the reset removes power from the USB controller.
++	 */
++	for (unsigned i = 0; i < 8; i++) {
++		picasso_usb_panic_flush();
++		picasso_usb_busy_wait(1000);
++	}
++	(void)picasso_usb_arm_fastboot_reason();
++	static const char reset_notice[] =
++	    "\r\n=== PICASSO CDC PANIC FLUSH COMPLETE: FASTBOOT REASON ARMED ===\r\n";
++	picasso_usb_panic_write(reset_notice, sizeof(reset_notice) - 1);
++	picasso_usb_panic_flush();
++	picasso_usb_system_reset();
++}
++
++static void
++ud_poll_serialized(void)
++{
++	if (!os_atomic_cmpxchg(&ud.poll_lock, 0, 1, acquire)) {
++		return;
++	}
++	ud_poll();
++	os_atomic_store(&ud.poll_lock, 0, release);
++	if (ud.reboot_pending && !ud.panic_mode) {
++		ud.reboot_pending = false;
++		ud_finish_reboot();
++	}
++	if (ud.hang_pending && !ud.panic_mode) {
++		ud.hang_pending = false;
++		ud_finish_hang();
++	}
++	if (ud.panic_pending && !ud.panic_mode) {
++		ud.panic_pending = false;
++		panic("PICASSO CDC PANIC TEST: synchronous panic capture is active");
++	}
++	if (ud.reset_pending && !ud.panic_mode) {
++		ud.reset_pending = false;
++		ud_finish_reboot();
++	}
++}
++
++static void
++picasso_usb_console_drive_poll(void)
++{
++	if (!pur_live || ud.hold) {
++		return;
++	}
++	ud_poll_serialized();
 +}
 +
 +static void
 +ud_thread(void *arg __unused, wait_result_t wr __unused)
 +{
++	uint64_t polls = 0;
++
++	/*
++	 * The early Picasso timer path is not reliable yet.  A deadline-based
++	 * poller sleeps once and is never scheduled again, which also makes the
++	 * host-side bulk OUT endpoint look dead.  Keep the diagnostic console
++	 * runnable with a bounded spin and explicit yields instead.
++	 */
++	printf("PICASSO USB: busy poller started\n");
 +	for (;;) {
-+		ud_poll();
-+		ud_sleep_ms(2);
++		ud_poll_serialized();
++		polls++;
++		if ((polls & 0x3ffu) == 0) {
++			picasso_usb_watchdog_pet();
++		}
++		if ((polls % 4096) == 0) {
++			printf("PICASSO USB: poller heartbeat polls=%llu events=%llu rx_busy=%u\n",
++			    polls, ud.events, ud.rx_busy ? 1u : 0u);
++		}
++		picasso_usb_busy_wait(100);
++		thread_yield_internal(0);
 +	}
 +}
 +
@@ -1067,14 +2324,25 @@ index 0000000..bfe7ccc
 +	if (!hold) {
 +		return;
 +	}
++	if (!ud.watchdog_armed) {
++		picasso_usb_watchdog_arm();
++	}
 +	printf("PICASSO USB: holding at bsd_init; SMMU guard %s\n",
 +	    ud.smmu_guard ? "PASS" : "FAIL");
++	uint32_t panic_test_polls = 0;
 +	for (;;) {
 +		if (ud.live) {
-+			ud_poll();
++			ud_poll_serialized();
++			picasso_usb_watchdog_pet();
++			if (ud.panic_test && ud.configured && ud.host_open &&
++			    ++panic_test_polls >= 1000) {
++				printf("PICASSO CDC: automatic panic-test after host attach\n");
++				panic("PICASSO CDC PANIC TEST: automatic capture is active");
++			}
 +			picasso_usb_busy_wait(1000);
 +		} else {
 +			ud_sleep_ms(1000);
++			picasso_usb_watchdog_pet();
 +		}
 +	}
 +}
@@ -1127,6 +2395,14 @@ index 0000000..bfe7ccc
 +	ud.dwc = dwc;
 +	printf("PICASSO USB: controller id=%08x hwparams0=%08x awidth=%u gctl=%08x\n",
 +	    devid, hwparams0, awidth, gctl);
++	printf("PICASSO USB: hwparams3..7=%08x %08x %08x %08x %08x\n",
++	    usb_rd(dwc, GHWPARAMS3), usb_rd(dwc, GHWPARAMS4),
++	    usb_rd(dwc, GHWPARAMS5), usb_rd(dwc, GHWPARAMS6),
++	    usb_rd(dwc, GHWPARAMS7));
++	printf("PICASSO USB: FIFO pre-reset rx0=%08x tx=%08x/%08x/%08x/%08x\n",
++	    usb_rd(dwc, GRXFIFOSIZ(0)), usb_rd(dwc, GTXFIFOSIZ(0)),
++	    usb_rd(dwc, GTXFIFOSIZ(1)), usb_rd(dwc, GTXFIFOSIZ(2)),
++	    usb_rd(dwc, GTXFIFOSIZ(3)));
 +	if ((devid >> 16) != 0x5533 && (devid >> 16) != 0x3331) {
 +		printf("PICASSO USB: unsupported DWC3 id; controller untouched\n");
 +		return;
@@ -1205,6 +2481,10 @@ index 0000000..bfe7ccc
 +	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
 +		return;
 +	}
++	printf("PICASSO USB: FIFO post-reset rx0=%08x tx=%08x/%08x/%08x/%08x\n",
++	    usb_rd(dwc, GRXFIFOSIZ(0)), usb_rd(dwc, GTXFIFOSIZ(0)),
++	    usb_rd(dwc, GTXFIFOSIZ(1)), usb_rd(dwc, GTXFIFOSIZ(2)),
++	    usb_rd(dwc, GTXFIFOSIZ(3)));
 +
 +	qs = dwc + QSCRATCH_OFFSET;
 +	printf("PICASSO USB: QSCRATCH %p (wrapper map %p + 0x%x)\n",
@@ -1219,19 +2499,7 @@ index 0000000..bfe7ccc
 +	ud.trace_commands = true;
 +	dwc_wr(DCFG, dwc_rd(DCFG) & ~(7u | (0x7fu << 3)));
 +
-+	printf("PICASSO USB: ep0 DEPSTARTCFG\n");
-+	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0)) { return; }
-+	printf("PICASSO USB: ep0 out config\n");
-+	if (ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0)) { return; }
-+	printf("PICASSO USB: ep0 out fifo\n");
-+	if (ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) { return; }
-+	printf("PICASSO USB: ep0 in config\n");
-+	if (ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0)) { return; }
-+	printf("PICASSO USB: ep0 in fifo\n");
-+	if (ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) { return; }
-+	printf("PICASSO USB: ep0 in resources ready\n");
-+	dwc_wr(DALEPENA, 0x3);
-+	printf("PICASSO USB: ep0 enabled\n");
++	if (ud_ep0_rebuild("initial") != 0) { return; }
 +
 +	uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
 +	uint32_t ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
@@ -1269,7 +2537,7 @@ index 0000000..bfe7ccc
 +			picasso_usb_busy_wait((sample_ms[s] - elapsed_ms) * 1000);
 +			elapsed_ms = sample_ms[s];
 +		}
-+		ud_poll();
++		ud_poll_serialized();
 +		uint32_t dsts = dwc_rd(DSTS);
 +		uint32_t dctl = dwc_rd(DCTL);
 +		uint32_t phycfg = dwc_rd(GUSB2PHYCFG0);
@@ -1288,12 +2556,41 @@ index 0000000..bfe7ccc
 +	}
 +	if (!ud.hold) {
 +		thread_t thread;
++		unsigned handoff_ms = 0;
++		while ((!ud.configured || !ud.host_open) && handoff_ms < 10000) {
++			picasso_usb_busy_wait(1000);
++			ud_poll_serialized();
++			handoff_ms++;
++			if (ud.configured &&
++			    (handoff_ms <= 5 || handoff_ms % 1000 == 0)) {
++				ud_dump_ep_state("handoff", EP_RX);
++			}
++		}
++		printf("PICASSO USB: live handoff configured=%u host_open=%u after %u ms\n",
++		    ud.configured ? 1u : 0u, ud.host_open ? 1u : 0u, handoff_ms);
++		ud_poll_serialized();
++		/* Let the host attach to the newly enumerated tty and drain the
++		 * early console before control returns to bsd_init. */
++		for (unsigned settle_ms = 0; settle_ms < 500; settle_ms++) {
++			picasso_usb_busy_wait(1000);
++			ud_poll_serialized();
++			if (settle_ms % 100 == 99) {
++				ud_dump_ep_state("settle", EP_RX);
++			}
++		}
++		picasso_usb_watchdog_arm();
++		if (ud.watchdog_armed) {
++			printf("PICASSO USB: APSS watchdog armed timeout=%u ms\n",
++			    APSS_WDT_TIMEOUT_MS);
++		}
 +		kern_return_t result = kernel_thread_start(ud_thread, NULL, &thread);
 +		if (result == KERN_SUCCESS) {
 +			thread_deallocate(thread);
 +			printf("PICASSO USB: background poller started\n");
++			ud_poll_serialized();
 +		} else {
 +			printf("PICASSO USB: background poller failed (%d)\n", result);
++			picasso_usb_watchdog_disable();
 +		}
 +	}
 +}
@@ -1304,14 +2601,45 @@ index 0000000..bfe7ccc
 +	int enabled = 0;
 +	int hold = 0;
 +	int bind_smmu = 0;
++	int panic_test = 0;
++	int panic_reset = 1;
++	int watchdog = 1;
++	char reset_mode[16] = "psci";
 +
 +	PE_parse_boot_argn("picasso_usb", &enabled, sizeof(enabled));
 +	PE_parse_boot_argn("picasso_usb_hold", &hold, sizeof(hold));
 +	PE_parse_boot_argn("picasso_usb_smmu", &bind_smmu, sizeof(bind_smmu));
++	PE_parse_boot_argn("picasso_usb_panic_test", &panic_test,
++	    sizeof(panic_test));
++	PE_parse_boot_argn("picasso_usb_panic_reset", &panic_reset,
++	    sizeof(panic_reset));
++	PE_parse_boot_argn("picasso_usb_watchdog", &watchdog,
++	    sizeof(watchdog));
++	PE_parse_boot_argn("picasso_usb_reset", reset_mode,
++	    sizeof(reset_mode));
++	ud.mps = 64;
 +	ud.hold = hold != 0;
++	ud.panic_test = panic_test != 0;
++	ud.panic_reset = panic_reset != 0;
++	ud.watchdog = watchdog != 0;
++	if (strcmp(reset_mode, "watchdog") == 0) {
++		ud.reset_mode = PICASSO_USB_RESET_WATCHDOG;
++	} else if (strcmp(reset_mode, "pshold") == 0) {
++		ud.reset_mode = PICASSO_USB_RESET_PSHOLD;
++	} else {
++		ud.reset_mode = PICASSO_USB_RESET_PSCI;
++	}
 +	if (!enabled) {
 +		return;
 +	}
++	ud.pshold = ml_io_map(PSHOLD_PA, PAGE_SIZE);
++	ud.wdt = ml_io_map(APSS_WDT_PA, PAGE_SIZE);
++	ud.imem = ml_io_map(IMEM_PA, PAGE_SIZE);
++	printf("PICASSO USB: PSHOLD mapped=%u panic-reset=%u watchdog=%u "
++	    "mapped=%u IMEM mapped=%u reset=%u(%s)\n",
++	    ud.pshold != 0 ? 1u : 0u, ud.panic_reset ? 1u : 0u,
++	    ud.watchdog ? 1u : 0u, ud.wdt != 0 ? 1u : 0u,
++	    ud.imem != 0 ? 1u : 0u, ud.reset_mode, reset_mode);
 +	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
 +	if (gcc == 0) {
 +		printf("PICASSO USB: GCC map failed\n");
@@ -1425,11 +2753,31 @@ index 0000000..bfe7ccc
 +	}
 +	picasso_usb_park(hold);
 +}
+diff --git a/osfmk/kern/printf.c b/osfmk/kern/printf.c
+index aeac9d3..7700994 100644
+--- a/osfmk/kern/printf.c
++++ b/osfmk/kern/printf.c
+@@ -928,6 +928,15 @@ consdebug_putc(char c)
+ void
+ consdebug_putc_unbuffered(char c)
+ {
++	{
++		/*
++		 * This is the semantic unbuffered debugger-output entry point.
++		 * Hooking console_write_unbuffered() instead would capture the
++		 * same byte again through the PE_kputc video-console fallback.
++		 */
++		extern void picasso_usb_panic_putc(char);
++		picasso_usb_panic_putc(c);
++	}
+ 	console_write_unbuffered(c);
+ 
+ 	debug_putc(c);
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index bb558ee..82e3e51 100644
+index f394e746b5f26677910edfeb2b2eb07035e2fffd..e481dac39865c4245173a316b376f5ef5940fe04 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -506,6 +506,10 @@ bsd_init(void)
+@@ -593,6 +593,10 @@ bsd_init(void)
  	throttle_init();
  
  	printf(copyright);
@@ -1440,20 +2788,124 @@ index bb558ee..82e3e51 100644
  
  #if CONFIG_DEV_KMEM
  	bsd_init_kprintf("calling dev_kmem_init\n");
+@@ -1070,6 +1074,9 @@ bsd_init(void)
+ 	bsd_init_kprintf("done\n");
+ }
+ 
++int picasso_trace_user_return;
++unsigned int picasso_trace_user_return_count;
++
+ #if defined(XNU_OWNER_ROOT_AUDIT) && XNU_OWNER_ROOT_AUDIT
+ #if defined(XNU_OWNER_ROOT_TRUST) && XNU_OWNER_ROOT_TRUST
+ volatile int native_owner_root_trust_enabled = 1;
+@@ -1285,8 +1289,11 @@ bsdinit_task(void)
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
++	picasso_trace_user_return = 1;
+ 	load_init_program(p);
++	printf("PICASSO_INIT: load_init_program returned\n");
+ 	lock_trace = 1;
++	printf("PICASSO_INIT: retired init thread returning\n");
+ }
+ 
+ kern_return_t
+
 diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
-index e6d38d3..3a02700 100644
 --- a/osfmk/console/serial_console.c
 +++ b/osfmk/console/serial_console.c
-@@ -259,6 +259,12 @@ _cnputc(char c, bool poll)
- 	if (c == '\n') {
- 		_cnputc('\r', poll);
- 	}
+@@ -525,4 +525,16 @@ console_write(char *str, int size)
+ void
+ console_write(char *str, int size)
+ {
++	{
++		extern void picasso_usb_panic_write(const char *, int);
++		if (str != NULL && size > 0) {
++			picasso_usb_panic_write(str, size);
++		}
++	}
++	{
++		extern void picasso_usb_log_write(const char *, unsigned);
++		if (str != NULL && size > 0) {
++			picasso_usb_log_write(str, (unsigned)size);
++		}
++	}
+ 	if (disableConsoleOutput) {
+@@ -607,4 +619,8 @@ console_write_unbuffered(char c)
+ void
+ console_write_unbuffered(char c)
+ {
 +	{
 +		extern void picasso_usb_log_char(char);
-+		/* stored once per character, after the CR expansion,
-+		 * recursive '\r' also lands here and is stored exactly once. */
 +		picasso_usb_log_char(c);
 +	}
+ 	if (disableConsoleOutput) {
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index e9daeed833924a653c2243f46615527a3e9b4195..1d670170759e04d18f6d57f3f78d6e420ade0812 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1132,6 +1132,10 @@ void
+ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsigned int reason, void *ctx,
+     uint64_t panic_options_mask, void *panic_data_ptr, unsigned long panic_caller)
+ {
++	{
++		extern void picasso_usb_panic_begin(void);
++		picasso_usb_panic_begin();
++	}
+ #pragma clang diagnostic pop
  
- 	cons_ops[idx].putc(c, poll);
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
+@@ -1239,6 +1243,12 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ void
+ panic_spin_forever(void)
+ {
++	{
++		extern void picasso_usb_panic_flush(void);
++		extern void picasso_usb_panic_reset(void);
++		picasso_usb_panic_flush();
++		picasso_usb_panic_reset();
++	}
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
+ 		/* On arm32, which doesn't have a WFE timeout, this may not return.  But that should be OK on this path. */
+
+diff --git a/iokit/Kernel/IOLib.cpp b/iokit/Kernel/IOLib.cpp
+index 7addbb3..de3d6bb 100644
+--- a/iokit/Kernel/IOLib.cpp
++++ b/iokit/Kernel/IOLib.cpp
+@@ -61,6 +61,7 @@
+ #include <os/log_private.h>
+ #include <sys/msgbuf.h>
+ #include <console/serial_protos.h>
++#include <pexpert/pexpert.h>
+ 
+ #if IOKITSTATS
+ 
+@@ -123,6 +124,7 @@ iopa_t gIOBMDPageAllocator;
+ 
+ static queue_head_t gIOMallocContiguousEntries;
+ static lck_mtx_t *  gIOMallocContiguousEntriesLock;
++static bool picasso_allow_iolog_interrupts_disabled;
+ 
+ #if __x86_64__
+ enum { kIOMaxPageableMaps    = 8 };
+@@ -183,6 +185,9 @@ IOLibInit(void)
+ 		return;
+ 	}
+ 
++	PE_parse_boot_argn("nointr_iolog", &picasso_allow_iolog_interrupts_disabled,
++	    sizeof(picasso_allow_iolog_interrupts_disabled));
++
+ 	IOLockGroup = lck_grp_alloc_init("IOKit", LCK_GRP_ATTR_NULL);
+ 
+ #if IOTRACKING
+@@ -1587,7 +1592,8 @@ _IOLogv(const char *format, va_list ap, void *caller)
+ 	}
+ 	va_end(ap2);
+ 
+-	assertf(ml_get_interrupts_enabled() || ml_is_quiescing() ||
++	assertf(picasso_allow_iolog_interrupts_disabled ||
++	    ml_get_interrupts_enabled() || ml_is_quiescing() ||
+ 	    debug_mode_active() || !gCPUsRunning,
+ 	    "IOLog called with interrupts disabled");
  }

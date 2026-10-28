@@ -1,0 +1,69 @@
+PICASSO USB: EPSTATE host-open ep2 result=0 state=0x00020004 busy=1 rsc=2 trb=c47fb000/00000000/00000200/00000819 DALEPENA=0000002f DCTL=80000000 DSTS=00026ce0 events=851/8
+PICASSO USB: event 995 ep2 0x00006084
+PICASSO CDC: RX complete type=2 status=6 bytes=12
+PICASSO USB: RX arm mps=512 len=512 trb=0xc47f9080 result=0 cmd=0x00020007 rsc=2 started=1
+PICASSO USB: EPSTATE after-arm ep2 result=0 state=0x00000004 busy=1 rsc=2 trb=c47fb000/00000000/00000200/00000819 DALEPENA=0000002f DCTL=80000000 DSTS=0002be88 events=996/4
+PICASSO CDC: command 'panic-test'
+PICASSO CDC: panic-test requested; emitting marker now
+
+=== PICASSO CDC PANIC BEGIN ===
+panic(cpu 0 caller 0xfffffff007bf94e8): PICASSO CDC PANIC TEST: synchronous panic capture is active @picasso_usb.c:1713
+Debugger message: panic
+Memory ID: 0x0
+OS release type: Not set yet
+OS version: Not set yet
+Kernel version: Darwin Kernel Version 23.6.0: Mon Oct 26 11:08:44 CST 2026; silenzio:ios-obj/DEVELOPMENT_ARM64_BCM2837
+KernelCache UUID: 028AC0B3FF2C534AC42C4AA055E27299
+Kernel UUID: 07C816B6-0284-3E53-97E3-014EE4302206
+Boot session UUID: ACFA2513-F25C-4754-B474-CE8193B1CDFA
+iBoot version: 
+iBoot Stage 2 version: 
+secure boot?: YES
+roots installed: 0
+Paniclog version: 14
+Kernel text base:  0xfffffff007004000
+mach_absolute_time: 0x2a71ea307
+Epoch Time:        sec       usec
+  Boot    : 0x00000000 0x00000000
+  Sleep   : 0x00000000 0x00000000
+  Wake    : 0x00000000 0x00000000
+  Calendar: 0x00000000 0x00000000
+
+Zone info:
+  Zone map: 0xfffffff202278000 - 0xfffffff802278000
+  . PGZ   : 0xfffffff202278000 - 0xfffffff2022d7000
+  . VM    : 0xfffffff2022d7000 - 0xfffffff2e892f000
+  . RO    : 0xfffffff2e892f000 - 0xfffffff3355f7000
+  . GEN0  : 0xfffffff3355f7000 - 0xfffffff41bc4f000
+  . GEN1  : 0xfffffff41bc4f000 - 0xfffffff5022a7000
+  . GEN2  : 0xfffffff5022a7000 - 0xfffffff5e88ff000
+  . GEN3  : 0xfffffff5e88ff000 - 0xfffffff6cef57000
+  . DATA  : 0xfffffff6cef57000 - 0xfffffff802278000
+  Metadata: 0xfffffff070110000 - 0xfffffff076110000
+  Bitmaps : 0xfffffff076110000 - 0xfffffff0761cc000
+  Extra   : 0 - 0
+
+TPIDRx_ELy = {1: 0xfffffff5022bf598  0: 0x0000000000000000  0ro: 0x0000000000000000 }
+CORE 0 is the one that panicked. Check the full backtrace for details.
+Compressor Info: 0% of compressed pages limit (OK) and 0% of segments limit (OK) with 0 swapfiles and OK swap space
+Panicked task 0xfffffff5e8949890: 0 pages, 54 threads: pid 0: 
+Panicked thread: 0xfffffff5022bf598, backtrace: 0xfffffffbf9777530, tid: 101
+		  lr: 0xfffffff0074a90d0  fp: 0xfffffffbf97775b0
+		  lr: 0xfffffff00763205c  fp: 0xfffffffbf97775d0
+		  lr: 0xfffffff0076241c4  fp: 0xfffffffbf9777620
+		  lr: 0xfffffff007bf652c  fp: 0xfffffffbf9777710
+		  lr: 0xfffffff0076235d8  fp: 0xfffffffbf9777720
+		  lr: 0xfffffff0074a86f8  fp: 0xfffffffbf9777bf0
+		  lr: 0xfffffff0074a97fc  fp: 0xfffffffbf9777c70
+		  lr: 0xfffffff007bbfd80  fp: 0xfffffffbf9777c90
+		  lr: 0xfffffff007bf94e8  fp: 0xfffffffbf9777cb0
+		  lr: 0xfffffff007682560  fp: 0xfffffffbf9777d10
+		  lr: 0xfffffff00768207c  fp: 0xfffffffbf9777db0
+		  lr: 0xfffffff0078ec574  fp: 0xfffffffbf9777ed0
+		  lr: 0xfffffff007bcbd5c  fp: 0xfffffffbf9777f20
+		  lr: 0xfffffff0076274a4  fp: 0x0000000000000000
+
+
+** Stackshot Succeeded ** Bytes Traced 5534 (Uncompressed 19824) **
+
+Please go to https://panic.apple.com to report this panic

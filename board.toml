@@ -168,6 +168,13 @@ kernel_args = [
   # The embedded manifest removes the 9.4 GiB scan, so enable command tracing
   # for the first hardware qualification of the new bring-up path.
   "native-ufs-diagnostics=1",
+  # Diagnostic-only: keep console output flowing when an early kernel path
+  # logs with interrupts disabled. Without this XNU panics at
+  # serial_console.c:175 before CDC can deliver the surrounding context.
+  "nointr_consio=1",
+  # IOLog has a separate interrupt-context assertion in IOLib.cpp. This
+  # diagnostic-only escape hatch lets those messages reach the CDC console.
+  "nointr_iolog=1",
   # IOKit matching trace: kIOLogMatch(0x10) | kIOLogProbe(0x2) |
   # kIOLogConfig(0x20) | kIOLogCatalogue(0x200). Three silent runs in a row
   # (root, probe=12 variants) mean start() is never reached; this shows
@@ -184,6 +191,12 @@ kernel_args = [
   # this, the read-only guard sees zero matches and deliberately leaves the
   # controller untouched.
   "picasso_usb_smmu=6",
+  # Keep the CDC console alive for the full boot instead of dropping it when
+  # the initial host-open state is observed.
+  "picasso_usb_hold=1",
+  # The XNU CDC panic/reset path uses PSHOLD as its final fallback and arms the
+  # IMEM Fastboot reason before either panic or command reset.
+  "picasso_usb_reset=pshold",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
@@ -192,7 +205,8 @@ kernel_args = [
 # SYSTEM_RESET entry_probe_reset_delay seconds after the MMU is enabled --
 # a spontaneous reboot after that delay is the signal that start.s completed.
 # panic_screen redirects panic() to a renderer that draws on the kernel's own
-# framebuffer mapping, so any panic after PE_create_console becomes readable.
+# framebuffer mapping. The Picasso CDC console captures the panic stream
+# synchronously, so keep this disabled while CDC is the evidence path.
 # Bisect deeper with entry_probe_reset_after (one call per run; payload.py keys
 # map to the script's --reset-after/--in/--occurrence options).
 # Bisect log (2026-10-24), one probe per run; ~6 s reboot = the call completed:
@@ -246,7 +260,7 @@ kernel_args = [
 #         is com.apple.kec.pthread (libpthread's kext.xcconfig MODULE_NAME;
 #         "com.apple.kec.libpthread" does not exist and fails the closure);
 #         its pthread_kext_register call fills the function table.
-panic_screen = true
+panic_screen = false
 
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"
