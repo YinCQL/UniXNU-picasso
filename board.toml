@@ -87,6 +87,8 @@ roots = [
   "com.apple.driver.ApplePMGR",
   "com.apple.filesystems.apfs",
   "com.apple.iokit.IOHIDFamily",
+  # Original IOBSD-matched IOSurfaceRoot, required by graphics/media clients.
+  "com.apple.iokit.IOSurface",
   "com.apple.iokit.IOStorageFamily",
   "com.apple.kec.Libm",
   "com.apple.kec.corecrypto",

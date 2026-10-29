@@ -24,6 +24,7 @@
 #define OS_REASON_SIGNAL 2
 #define WTERMSIG(x) ((x) & 0177)
 #define WIFSIGNALED(x) (WTERMSIG(x) != 0177 && WTERMSIG(x) != 0)
+#define WEXITSTATUS(x) (((x) >> 8) & 0xff)
 #ifdef _MSC_VER
 #define __ATOMIC_ACQUIRE 2
 #define __ATOMIC_RELEASE 3
@@ -66,6 +67,8 @@ static int proc_getpid(proc_t p) { return p->pid; }
 static int proc_pidversion(proc_t p) { return p->pidversion; }
 static uint64_t proc_uniqueid(proc_t p) { return p->uniqueid; }
 static task_t proc_task(proc_t p) { return p->task; }
+static char host_exit_description[200];
+static const char *exit_reason_get_string_desc(struct reason *r) { return r ? host_exit_description : NULL; }
 static uint64_t thread_tid(thread_t t) { return t->tid; }
 static int is_saved_state64(arm_saved_state_t *s) { return s->is64; }
 static uint32_t get_saved_state_cpsr(arm_saved_state_t *s) { return s->cpsr; }
@@ -99,7 +102,7 @@ static struct mapping *find(user_addr_t address) {
  return NULL;
 }
 static int copyin(user_addr_t address,void *destination,size_t n) {
- assert(picasso_fault_lock==0 && lines%6==3);++reads;
+ assert(picasso_fault_lock==0 && (scenario>=56 ? lines%7==4 : lines%6==3));++reads;
  if((scenario==25 && address==0x1000) ||
     (scenario==28 && address==UINT64_C(0x10000ab0c)) ||
     (scenario==29 && address==0x9000) ||
@@ -112,7 +115,7 @@ static int copyin(user_addr_t address,void *destination,size_t n) {
  memcpy(destination,m->data,n); return 0;
 }
 static int copyinstr(user_addr_t address,char *destination,size_t capacity,size_t *copied) {
- assert(picasso_fault_lock==0 && lines%6==3);++reads;
+ assert(picasso_fault_lock==0 && (scenario>=56 ? lines%7==4 : lines%6==3));++reads;
  if((scenario==33 && address==0xb000) || (scenario==34 && address==0x8000)) return EFAULT;
  struct mapping *m=find(address);
  if(!m) return EFAULT;
@@ -183,6 +186,32 @@ int main(int argc,char **argv) {
   for(unsigned i=0;i<29;++i) assert(picasso_faults[0].x[i]==state.x[i]);
  }
  cp=&proc;picasso_fault_lock=0;
+ if(scenario>=56) {
+  strcpy(proc.p_name,"backboardd");
+  strcpy(host_exit_description,"reason\nline\t\200");
+  if(scenario==56) {
+   picasso_report_service_exit(&proc,rv);
+   contains("PICASSO_SERVICE exit sample=1 pid=95 name=backboardd");
+   contains("description=reason?line??");contains("record=breakpoint-snapshot");
+   assert(lines==7 && reads<=8);goto pass;
+  }
+  if(scenario==57) {strcpy(proc.p_name,"backboardd-helper");picasso_report_service_exit(&proc,rv);assert(!lines && !reads);goto pass;}
+  if(scenario==58) {rv=78<<8;picasso_report_service_exit(&proc,rv);contains("status=78");contains("record=not-breakpoint-exit");assert(lines==2 && !reads);goto pass;}
+  if(scenario==59) {reason.osr_code=9;picasso_report_service_exit(&proc,9);contains("exit_signal=9 namespace=2 code=9");contains("record=not-breakpoint-exit");assert(lines==2 && !reads);goto pass;}
+  if(scenario==60) {++thread.tid;picasso_report_service_exit(&proc,rv);contains("record=missing");assert(lines==2 && !reads);goto pass;}
+  if(scenario==61) {proc.p_exit_reason=NULL;picasso_report_service_exit(&proc,rv);contains("description=\n");contains("namespace=0 code=0");assert(lines==2 && !reads);goto pass;}
+  if(scenario==62) {
+   const char *names[]={"backboardd","SpringBoard","mediaserverd","audiomxd","CommCenter","powerd","mobiletimerd"};
+   for(unsigned n=0;n<7;++n) {
+    strcpy(proc.p_name,names[n]);
+    for(unsigned i=0;i<20;++i) {++proc.pid;picasso_report_service_exit(&proc,0);}
+   }
+   assert(lines==56 && !reads);contains("sample=4");assert(!strstr(output,"sample=5"));
+   /* Service quotas must not consume the critical-exit quota. */
+   picasso_report_critical_fault(&proc,0);assert(lines==57);contains("PICASSO_CRITICAL sample=1");goto pass;
+  }
+  if(scenario==63) {memset(host_exit_description,'A',sizeof(host_exit_description));host_exit_description[199]=0;picasso_report_service_exit(&proc,0);assert(lines==2 && !reads);char *s=strstr(output,"description=")+12;assert(strchr(s,'\n')-s==160);goto pass;}
+ }
  if(scenario==7) picasso_fault_lock=1;
  if(scenario==8) ++proc.pid;
  if(scenario==9) ++proc.pidversion;

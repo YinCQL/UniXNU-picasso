@@ -1870,7 +1870,7 @@ diff --git a/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch b/patches/xnu/z
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
-@@ -0,0 +1,1447 @@
+@@ -0,0 +1,1677 @@
 +diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 +--- a/bsd/vfs/vfs_syscalls.c
 ++++ b/bsd/vfs/vfs_syscalls.c
@@ -2317,7 +2317,7 @@ new file mode 100644
 + 
 + #if SYSV_SHM
 + #include <sys/shm_internal.h>   /* shmexit */
-+@@ -1359,6 +1364,173 @@
++@@ -1359,6 +1364,203 @@
 + 
 + #define OS_REASON_TOTAL_USER_FAULTS_PER_PROC  5
 + 
@@ -2386,7 +2386,7 @@ new file mode 100644
 ++	}
 ++}
 ++
-++/* Called only after the original critical-exit policy decided to panic.
+++/* Used after the critical-exit decision, or for a bounded selected-service exit.
 ++ * A handled breakpoint can precede another exit. Select only the newest
 ++ * snapshot from this exact process lifetime, task and exiting thread when
 ++ * OS_REASON_SIGNAL identifies SIGTRAP (which may arrive as SIGKILL); never
@@ -2394,10 +2394,8 @@ new file mode 100644
 ++ * No user memory is read while holding the capture lock. Copy failures are
 ++ * diagnostic values and cannot change the original coredump/sync/panic path. */
 ++static void
-++picasso_report_critical_fault(proc_t p, int rv)
+++picasso_report_user_fault(proc_t p, int rv, unsigned ticket, const char *kind)
 ++{
-++	static unsigned report_count;
-++	unsigned ticket = picasso_pid1_trace_ticket(&report_count, 8);
 ++	if (!ticket) return;
 ++	struct picasso_user_fault f = {0};
 ++	const char *record = "not-breakpoint-exit";
@@ -2428,8 +2426,8 @@ new file mode 100644
 ++	char process_name[32];
 ++	snprintf(process_name, sizeof(process_name), "%.31s", p->p_name);
 ++	picasso_fault_printable(process_name, sizeof(process_name));
-++	printf("PICASSO_CRITICAL sample=%u pid=%d name=%.31s unique=%llu thread=%llu exit_signal=%d namespace=%u code=%llx record=%s\n",
-++	    ticket, proc_getpid(p), process_name, (unsigned long long)uniqueid, (unsigned long long)tid,
+++	printf("PICASSO_%s sample=%u pid=%d name=%.31s unique=%llu thread=%llu exit_signal=%d namespace=%u code=%llx record=%s\n",
+++	    kind, ticket, proc_getpid(p), process_name, (unsigned long long)uniqueid, (unsigned long long)tid,
 ++	    WTERMSIG(rv), reason, (unsigned long long)code, record);
 ++	if (!f.valid) return;
 ++	printf("PICASSO_EL0 PC=%llx LR=%llx SP=%llx FP=%llx ESR=%llx main_header=%llx cache_slide=%llx\n",
@@ -2485,13 +2483,45 @@ new file mode 100644
 ++	    (unsigned long long)frames[2], (unsigned long long)frames[3], (unsigned long long)frames[4], (unsigned long long)frames[5]);
 ++	printf("PICASSO_EL0 x0str_error=%d candidate_text=%.160s\n", message_error, message);
 ++}
+++
+++static void
+++picasso_report_critical_fault(proc_t p, int rv)
+++{
+++	static unsigned report_count;
+++	picasso_report_user_fault(p, rv, picasso_pid1_trace_ticket(&report_count, 8), "CRITICAL");
+++}
+++
+++/* PICASSO_SERVICE_EXIT_BEGIN */
+++static void
+++picasso_report_service_exit(proc_t p, int rv)
+++{
+++	static const char * const names[] = {
+++		"backboardd", "SpringBoard", "mediaserverd", "audiomxd",
+++		"CommCenter", "powerd", "mobiletimerd"
+++	};
+++	static unsigned counts[7];
+++	for (unsigned index = 0; index < 7; ++index) {
+++		if (strncmp(p->p_name, names[index], sizeof(p->p_name))) continue;
+++		unsigned ticket = picasso_pid1_trace_ticket(&counts[index], 4);
+++		if (!ticket) return;
+++		char description[161] = {0};
+++		const char *source = p->p_exit_reason ? exit_reason_get_string_desc(p->p_exit_reason) : NULL;
+++		if (source) snprintf(description, sizeof(description), "%.160s", source);
+++		picasso_fault_printable(description, sizeof(description));
+++		printf("PICASSO_SERVICE exit sample=%u pid=%d name=%s rv=%x status=%d description=%.160s\n",
+++		    ticket, proc_getpid(p), names[index], (unsigned)rv, WEXITSTATUS(rv), description);
+++		picasso_report_user_fault(p, rv, ticket, "SERVICE");
+++		return;
+++	}
+++}
+++/* PICASSO_SERVICE_EXIT_END */
 ++#endif
 ++/* PICASSO_USER_FAULT_END */
 ++
 + static int
 + abort_with_payload_internal(proc_t p,
 +     uint32_t reason_namespace, uint64_t reason_code,
-+@@ -1368,6 +1540,22 @@
++@@ -1368,6 +1570,22 @@
 + {
 + 	os_reason_t exit_reason = OS_REASON_NULL;
 + 	kern_return_t kr = KERN_SUCCESS;
@@ -2514,7 +2544,7 @@ new file mode 100644
 + 
 + 	if (internal_flags & OS_REASON_IFLAG_USER_FAULT) {
 + 		uint32_t old_value = atomic_load_explicit(&p->p_user_faults,
-+@@ -1375,13 +1563,13 @@
++@@ -1375,13 +1593,13 @@
 + 
 + #if DEVELOPMENT || DEBUG
 + 		if (bootarg_disable_user_faults) {
@@ -2530,7 +2560,7 @@ new file mode 100644
 + 			}
 + 			// this reloads the value in old_value
 + 			if (atomic_compare_exchange_strong_explicit(&p->p_user_faults,
-+@@ -1422,16 +1610,17 @@
++@@ -1422,16 +1640,17 @@
 + 
 + 	switch (kr) {
 + 	case KERN_SUCCESS:
@@ -2554,7 +2584,7 @@ new file mode 100644
 + 
 + int
 + abort_with_payload(struct proc *cur_proc, struct abort_with_payload_args *args,
-+@@ -1820,6 +2009,15 @@
++@@ -1820,6 +2039,15 @@
 + static void
 + proc_handle_critical_exit(proc_t p, int rv)
 + {
@@ -2570,7 +2600,7 @@ new file mode 100644
 + 	if (!proc_should_trigger_panic(p, rv)) {
 + 		// No panic, bail out
 + 		return;
-+@@ -1834,6 +2032,9 @@
++@@ -1834,6 +2062,9 @@
 + 	}
 + #endif /* DEVELOPMENT */
 + 
@@ -2580,6 +2610,19 @@ new file mode 100644
 + 	char *exit_reason_desc = exit_reason_get_string_desc(p->p_exit_reason);
 + 
 + 	if (p->p_exit_reason == OS_REASON_NULL) {
++@@ -1901,6 +2132,12 @@
++ 	boot_progress_exit(proc_getpid(p),p->p_name,rv,
++ 	    p->p_exit_reason ? p->p_exit_reason->osr_namespace : 0,
++ 	    p->p_exit_reason ? p->p_exit_reason->osr_code : 0);
+++
+++/* PICASSO_SERVICE_TRACE_BEGIN */
+++#if __arm64__ && (DEVELOPMENT || DEBUG)
+++	picasso_report_service_exit(p, rv);
+++#endif
+++/* PICASSO_SERVICE_TRACE_END */
++ 
++ 	if (p->p_crash_behavior != 0 || p == initproc) {
++ 		proc_handle_critical_exit(p, rv);
 +diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
 +--- a/bsd/kern/sys_generic.c
 ++++ b/bsd/kern/sys_generic.c
@@ -3278,7 +3321,106 @@ new file mode 100644
 + #include <sys/kauth.h>
 + #include <sys/codesign.h>
 + #include <sys/code_signing.h>
-+@@ -2777,6 +2780,20 @@
++@@ -2694,6 +2697,78 @@
++ 	return internal_io_service_match_property_table(service, matching, matchingCnt, matches);
++ }
++ 
+++/* PICASSO_SERVICE_TRACE_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++/* No iterator consumption or serialized user-data logging. Counters are per
+++ * process name and operation, shared across restarts, with at most 12 pairs. */
+++struct picasso_service_trace {
+++	unsigned ticket, operation;
+++	int pid;
+++	uint64_t tid;
+++	const char *name;
+++};
+++static void
+++picasso_trace_text(char *out, size_t size, const char *source)
+++{
+++	snprintf(out, size, "%.*s", size ? (int)(size - 1) : 0, source ? source : "<absent>");
+++	for (size_t i = 0; i < size && out[i]; ++i) {
+++		if ((unsigned char)out[i] < 32 || (unsigned char)out[i] > 126) out[i] = '?';
+++	}
+++}
+++static void
+++picasso_trace_property(OSDictionary *dict, const char *key, char *out, size_t size)
+++{
+++	OSObject *object = dict ? dict->getObject(key) : NULL;
+++	OSString *text = OSDynamicCast(OSString, object);
+++	picasso_trace_text(out, size, text ? text->getCStringNoCopy() : object ? "<non-string>" : NULL);
+++}
+++static picasso_service_trace
+++picasso_service_begin(unsigned operation, OSDictionary *dict, const char *detail, unsigned type)
+++{
+++	picasso_service_trace trace = {};
+++	static const char * const names[] = {"backboardd", "SpringBoard"};
+++	static unsigned counters[2][4];
+++	char name[32] = {0};
+++	int pid = proc_selfpid();
+++	proc_name(pid, name, sizeof(name));
+++	if (operation >= 4) return trace;
+++	for (unsigned index = 0; index < 2; ++index) {
+++		if (strcmp(name, names[index])) continue;
+++		unsigned *counter = &counters[index][operation];
+++		unsigned value = __atomic_load_n(counter, __ATOMIC_RELAXED);
+++		while (value < 12) {
+++			if (__atomic_compare_exchange_n(counter, &value, value + 1, false,
+++			    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+++				trace.ticket = value + 1;
+++				break;
+++			}
+++		}
+++		if (!trace.ticket) return trace;
+++		trace.operation = operation; trace.pid = pid;
+++		trace.tid = thread_tid(current_thread()); trace.name = names[index];
+++		char provider[64], match[64], resource[64], extra[64];
+++		picasso_trace_property(dict, "IOProviderClass", provider, sizeof(provider));
+++		picasso_trace_property(dict, "IONameMatch", match, sizeof(match));
+++		picasso_trace_property(dict, "IOResourceMatch", resource, sizeof(resource));
+++		picasso_trace_text(extra, sizeof(extra), detail);
+++		printf("PICASSO_IOKIT begin op=%u sample=%u pid=%d name=%s thread=%llu provider=%s match=%s resource=%s detail=%s type=%u\n",
+++		    operation, trace.ticket, pid, trace.name, (unsigned long long)trace.tid,
+++		    provider, match, resource, extra, type);
+++		return trace;
+++	}
+++	return trace;
+++}
+++static void
+++picasso_service_end(const picasso_service_trace &trace, IOReturn rpc, IOReturn result, bool object)
+++{
+++	if (!trace.ticket) return;
+++	printf("PICASSO_IOKIT end op=%u sample=%u pid=%d name=%s thread=%llu rpc=%x result=%x object=%u\n",
+++	    trace.operation, trace.ticket, trace.pid, trace.name, (unsigned long long)trace.tid,
+++	    (unsigned)rpc, (unsigned)result, object ? 1u : 0u);
+++}
+++#endif
+++/* PICASSO_SERVICE_TRACE_END */
+++
++ static kern_return_t
++ internal_io_service_get_matching_services(
++ 	mach_port_t main_port,
++@@ -2713,9 +2788,19 @@
++ 	obj = OSUnserializeXML(matching, matching_size);
++ 
++ 	if ((dict = OSDynamicCast( OSDictionary, obj))) {
+++/* PICASSO_SERVICE_TRACE_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++		picasso_service_trace trace = picasso_service_begin(1, dict, NULL, 0);
+++#endif
+++/* PICASSO_SERVICE_TRACE_END */
++ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
++ 		*existing = IOUserIterator::withIterator(IOService::getMatchingServices( dict ));
++ 		kr = kIOReturnSuccess;
+++/* PICASSO_SERVICE_TRACE_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++		picasso_service_end(trace, kr, kr, *existing != NULL);
+++#endif
+++/* PICASSO_SERVICE_TRACE_END */
++ 	} else {
++ 		kr = kIOReturnBadArgument;
++ 	}
++@@ -2777,6 +2862,20 @@
 + }
 + 
 + 
@@ -3299,7 +3441,7 @@ new file mode 100644
 + static kern_return_t
 + internal_io_service_get_matching_service(
 + 	mach_port_t main_port,
-+@@ -2796,9 +2813,18 @@
++@@ -2796,9 +2895,28 @@
 + 	obj = OSUnserializeXML(matching, matching_size);
 + 
 + 	if ((dict = OSDynamicCast( OSDictionary, obj))) {
@@ -3308,9 +3450,19 @@ new file mode 100644
 ++		unsigned ticket = provider && provider->isEqualTo("IOWatchdog") ? picasso_watchdog_match_ticket() : 0;
 ++		uint64_t tid = ticket ? thread_tid(current_thread()) : 0;
 ++#endif
+++/* PICASSO_SERVICE_TRACE_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++		picasso_service_trace trace = picasso_service_begin(0, dict, NULL, 0);
+++#endif
+++/* PICASSO_SERVICE_TRACE_END */
 + 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
 + 		*service = IOService::copyMatchingService( dict );
 + 		kr = *service ? kIOReturnSuccess : kIOReturnNotFound;
+++/* PICASSO_SERVICE_TRACE_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++		picasso_service_end(trace, kr, kr, *service != NULL);
+++#endif
+++/* PICASSO_SERVICE_TRACE_END */
 ++#if DEVELOPMENT || DEBUG
 ++		if (ticket) printf("PICASSO_WATCHDOG match sample=%u pid=%d thread=%llu kr=%x found=%u\n",
 ++		    ticket, proc_selfpid(), (unsigned long long)tid, (unsigned)kr, *service ? 1u : 0u);
@@ -3318,3 +3470,81 @@ new file mode 100644
 + 	} else {
 + 		kr = kIOReturnBadArgument;
 + 	}
++@@ -2878,6 +2996,12 @@
++ 	OSDictionary *              dict;
++ 	IOReturn                    err;
++ 	natural_t                   userMsgType;
+++/* PICASSO_SERVICE_TRACE_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++	picasso_service_trace trace = {};
+++#endif
+++/* PICASSO_SERVICE_TRACE_END */
+++
++ 
++ 	if (main_port != main_device_port) {
++ 		return kIOReturnNotPrivileged;
++@@ -2901,6 +3025,11 @@
++ 			err = kIOReturnBadArgument;
++ 			continue;
++ 		}
+++/* PICASSO_SERVICE_TRACE_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++		trace = picasso_service_begin(2, dict, notification_type, 0);
+++#endif
+++/* PICASSO_SERVICE_TRACE_END */
++ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
++ 
++ 		if ((sym == gIOPublishNotification)
++@@ -2952,6 +3081,11 @@
++ 		obj->release();
++ 	}
++ 
+++/* PICASSO_SERVICE_TRACE_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++	picasso_service_end(trace, err, err, userNotify != NULL);
+++#endif
+++/* PICASSO_SERVICE_TRACE_END */
++ 	return err;
++ }
++ 
++@@ -4386,13 +4520,28 @@
++ 		return kIOReturnBadArgument;
++ 	}
++ 
+++/* PICASSO_SERVICE_TRACE_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++	picasso_service_trace trace = picasso_service_begin(3, NULL, service->getMetaClass()->getClassName(), connect_type);
+++#endif
+++/* PICASSO_SERVICE_TRACE_END */
++ #if CONFIG_MACF
++ 	if (!native_sandbox_grant(service) && mac_iokit_check_open_service(kauth_cred_get(), service, connect_type) != 0) {
+++/* PICASSO_SERVICE_TRACE_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++		picasso_service_end(trace, kIOReturnNotPermitted, kIOReturnNotPermitted, false);
+++#endif
+++/* PICASSO_SERVICE_TRACE_END */
++ 		return kIOReturnNotPermitted;
++ 	}
++ #endif
++ 	do{
++ 		if (properties) {
+++/* PICASSO_SERVICE_TRACE_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++		picasso_service_end(trace, kIOReturnUnsupported, kIOReturnUnsupported, false);
+++#endif
+++/* PICASSO_SERVICE_TRACE_END */
++ 			return kIOReturnUnsupported;
++ 		}
++ #if 0
++@@ -4594,6 +4743,11 @@
++ 	*connection = client;
++ 	*result = res;
++ 
+++/* PICASSO_SERVICE_TRACE_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++	picasso_service_end(trace, err, res, client != NULL);
+++#endif
+++/* PICASSO_SERVICE_TRACE_END */
++ 	return err;
++ }
++ 

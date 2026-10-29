@@ -134,6 +134,25 @@ jobs:
             --native-prelink-dir "$UNIXNU_TREE/kits/NativePrelink" \
             --output out/picasso/logs/watchdog-policy.json
 
+      - name: Verify original graphics surface dependency
+        run: |
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          kernel = Path('out/picasso/kernel/kernel.macho')
+          plan = json.loads(kernel.with_suffix('.json').read_text())
+          if hashlib.sha256(kernel.read_bytes()).hexdigest() != plan['candidate_sha256']:
+              raise SystemExit('Prelink report does not match kernel.macho')
+          component = 'com.apple.iokit.IOSurface'
+          if component not in plan['components']:
+              raise SystemExit('Missing original IOSurfaceRoot dependency')
+          start = plan['module_entrypoints'][component]['start_va']
+          if not any(e['module'] == component and e['segment'] == '__TEXT_EXEC'
+                     and e['va'] <= start < e['va'] + e['size'] for e in plan['extents']):
+              raise SystemExit('Missing executable IOSurface module entry')
+          print(f'Prelink includes {component}, start={start:#x}')
+          PY
+
       - name: Upload the kernel, payload and logs
         if: always()
         uses: actions/upload-artifact@v4

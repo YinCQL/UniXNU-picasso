@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 
-CASE_COUNT = 56
+CASE_COUNT = 64
 
 
 def one(pattern, source):

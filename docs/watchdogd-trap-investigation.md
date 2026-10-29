@@ -1,5 +1,9 @@
 # Watchdogd trap after early boot
 
+Build 75 passes AES startup on the phone and reaches userspace service
+supervision. The newest investigation and changes are in
+[backboard-watchdog-investigation.md](backboard-watchdog-investigation.md).
+
 ## Build 40962648495: fix local inline-method lookup in the AES verifier
 
 Build 74 at `4d2482b32a036a18cbb4d5082ada0308c91725c5` completed the
