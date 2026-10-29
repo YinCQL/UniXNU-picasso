@@ -1,160 +1,180 @@
 # Watchdogd trap after early boot
 
-## Evidence from build 40901155087
+## Confirmed missing service in build 40922207086
 
-The user confirms that `picasso-windows-20261029-233904-750.log` uses
-[40901155087](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40901155087)
-at `9ea860c79146853e8e51c22ede5ec3935d414ac9`, and the phone reboots automatically.
-The capture is 149,823 bytes / 1,995 lines, SHA-256
-`76281eec6c0cc9d63ab8341b725dbf94e3b8690f885d712413a3fed972d0d559`.
+The user confirms automatic reboot with
+[40922207086](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40922207086),
+head b67e8481813a4c780f1a13e0641670ed65b97445, artifact 12919601876 /
+picasso-bootimg-69. The downloaded kernel is 54,136,832 bytes, SHA-256
+3514d87b9fe2ab4e0256ee1847f8e8b8e0baa34d22c33fc1b94fad5248f6a4e1.
+Its LC_UUID AE74B65C-E92A-3B8E-8748-96F633B955AC matches the phone's panic.
+The actual boot.img used on the phone has not been independently hashed.
 
-This build completed successfully, including real macOS APFS preparation and the
-FAT/UUID/storage checks. Downloaded artifact `12910063127` (`picasso-bootimg-65`)
-has kernel SHA-256 `d23f646ecf0ce5e78a2f6660e2d4161a05801a59f81fa8927ae099db304a6752`.
-Its Mach-O UUID `4CA91C9F-72DA-3A3F-98F7-28D54500CC64` matches the device panic log.
-The individual boot.img used on the phone has not been independently hashed.
+The capture picasso-windows-20261030-014603-884.log is 150,643 bytes, SHA-256
+d12ecabcf1568b853f277b7c2851c495b539781b5f1f788ad99aa12e167b47fc.
+Data reaches `done stage=4 error=0 readonly=0`; launchd reports
+**Early boot complete. Continuing system boot.** The failure follows:
 
-The actual payload is 62,914,560 bytes (60 MiB), with 55,225,157 bytes of contents
-against the 59,768,832-byte guard. Data is 268,435,456 logical bytes and 1,011,808
-packed bytes, UUID `357CF4C4-2F4D-4CC7-AA8D-A9DCFF2ACBDC`. Both source and Data
-had ownership enabled on the macOS runner; source VFS flags were 3 (read-only),
-Data flags were 2 (writable).
+- PID 95 / thread 409 queries IOWatchdog: `kr=e00002f0 found=0`.
+- The same thread's breakpoint snapshot reports PC/LR 0x100851b0c,
+  ESR 0xf2000001 and instruction 0xd4200020 (BRK #1).
+- The critical process exits with OS_REASON_SIGNAL / SIGTRAP.
+- The original critical-process panic, panic flush and PSHOLD reset follow.
 
-The phone reports `NATIVE_OWNER_DATA done stage=4 error=0 readonly=0` for
-`/dev/disk3s1`. Original tzinit passes its former fatal step, launchd validates
-its signed cache, and logs **Early boot complete. Continuing system boot.**
-The following failure is watchdogd PID 95 exiting with namespace 2 / subcode 5,
-then the existing critical-process panic, panic flush and PSHOLD reset.
-The failed core-file open is secondary to that process exit.
+One executable slide, 0x847000, aligns four locations in unchanged watchdogd:
 
-The pinned XNU definitions identify this as `OS_REASON_SIGNAL / SIGTRAP`.
-`OS_REASON_WATCHDOG` is a separate namespace (20); a daemon named watchdogd
-exiting does not itself prove a hardware watchdog timeout. The capture has no
-EL0 PC or assertion text for this fault, so it cannot select a specific trap.
+| Runtime location | Original address | Meaning |
+| --- | --- | --- |
+| PC/LR 0x100851b0c | 0x10000ab0c | Missing IOWatchdog service BRK |
+| Frame return 0x10084d830 | 0x100006830 | Return from missing-service cold path |
+| Frame return 0x10084f958 | 0x100008958 | Return from watchdog connection in main |
+| x20 0x10084f90c | 0x10000890c | LC_MAIN |
 
-## Original binary comparison
+This confirms **missing IOWatchdog**, before IOServiceOpen, PMU lookup or
+external methods. It is not an observed hardware bite or PMU failure.
+The original 21H461 daemon SHA-256 is
+ded4c688e1c2add74acf3e7f9eea5fe2c2c569180ce81492221877944d913a01.
 
-The unchanged executable was extracted read-only from the exact original 21H461
-OS DMG. `/usr/libexec/watchdogd` is 170,144 bytes, SHA-256
-`ded4c688e1c2add74acf3e7f9eea5fe2c2c569180ce81492221877944d913a01`, matching the
-fixed upstream's `scripts/check-watchdogd-branches.py` input. Original launchd
-also matches the seed's expected hash. The original watchdogd plist retains
-its `IOWatchdog` launch event and `PanicOnConsecutiveCrash` policy.
+The previous diagnostic's image0 is IOKit.framework. Dyld image order does not
+guarantee that image0 is the executable. The new diagnostic passes the actual
+task mach_header_vm_address from OSFMK into the BSD snapshot and labels image0
+as `dyld-first`. Use `main_header` for future main-image addresses.
 
-Running that script against the actual binary with explicit OS API stand-ins
-reproduces these paths:
+## Original policy with the SM7250 watchdog
 
-| Original connection result | Outcome / unslid PC |
-| --- | --- |
-| Native machine, service missing | BRK at `0x10000ab0c` |
-| Service present, IOServiceOpen error | BRK at `0x10000ab54` |
-| Service present, open succeeds | Returns connected |
-| Virtual machine, service missing | Exits zero |
-| PMU lookup required, no primary PMU service | BRK at `0x10000b160` |
+PicassoWatchdog derives from the original 21H461 IOWatchdog (size 0xf8).
+The original AppleARMWatchdogTimer kext remains in the prelink closure: APFS
+depends on its metaclass, global and event handler. Loading that module registers
+the parent and entitled UserClient without attaching the Apple hardware driver
+to fabricated DT/MMIO.
 
-These tests establish binary behavior, not the phone's actual branch. The binary
-also has PMU and external-method assertions. `_os_crash` precedes the two listed
-BRKs, so x0 at the trap is only a candidate string pointer, not a guaranteed
-assertion message. The stable PC, image base and LR remain essential.
-The entry point calls watchdog connection before PMU lookup. Four no-pmu
-initializer and three PMU lookup cases were also executed with explicit API
-stand-ins. In this binary, the no-pmu initializer first checks internal-diagnostic
-variant status; a false result skips both the boot-argument and ADT lookup.
+The native service retains original policy start/check, stop, newUserClient,
+root/entitlement checks, APFS defang and panic behavior. Its three hardware slots
+use the actual SM7250 APSS watchdog at 0x17c10000. The board currently boots one
+CPU; this does not implement Apple's per-core checker for future SMP.
 
-The original AppleARMWatchdogTimer personality expects Apple hardware
-(`AppleARMIODevice`, `wdt,s5l8960x`). XNU's generic `IOWatchDogTimer` is a different
-interface from the `IOWatchdog` UserClient queried here. The older guacamole
-no-pmu workaround and other boards' disabled-daemon policies do not establish
-a suitable backend for this board.
+The service prepares a workloop and high-priority timer before claiming hardware.
+Claim permanently retires USB's independent boot pets. Each 1-second callback
+executes the original policy check before petting the 15-second hardware
+watchdog. The original first deadline (600 seconds), subsequent checkin deadline
+(90 seconds) and daemon's normal target checkin interval (10 seconds) remain
+distinct. A policy panic cannot reach the subsequent pet.
 
-## Diagnostic change and next check
+All hardware writers share the IRQ-protected, nonblocking ownership lock.
+Readbacks check enable/bark/bite; the write-only reset pulse has no invented
+acknowledgement. Panic, reset and forced-bite paths permanently reject ordinary
+operations. Ownership is never released back to USB. Before claim, resource
+failure cleans up; after claim, a failed start, enable, pet, timeout scheduling
+or attempted free panics.
 
-The final device diagnostic patch records EL0 breakpoint registers before
-exception delivery. Capture uses eight fixed records and a try-lock, without
-printing, allocating or reading user memory in the trap. Records carry PID,
-process unique ID, exec generation, task identity and thread ID.
+The original registerService call is asynchronous. After starting the timer,
+bootstrap waits up to 5 seconds for real IOWatchdog matching and checks instance
+identity. It loads the original module before explicitly registering the native
+metaclass with preModLoad/postModLoad.
 
-After the original critical-exit policy decides to panic, `PICASSO_CRITICAL`
-reports the process, signal, reason and record status. A matching signal reason
-2/code 5 enables `PICASSO_EL0` register output, followed by bounded instruction,
-three-frame, image0/path and candidate x0-text reads. XNU may deliver a reasoned
-SIGTRAP through SIGKILL, so the diagnostic reports the actual exit signal and
-uses the reason code to identify the fault. Missing or mismatched records and
-copy failures remain explicit; they never suppress the original panic.
+## Volatile boot-stage interface
 
-`PICASSO_WATCHDOG match` reports the first eight actual single-service queries
-for `IOProviderClass=IOWatchdog`, including PID/thread, result and whether a
-service was found. It adds no extra matching or service-open call and preserves
-the original matching dictionary, return value and lifetime rules.
+Original main connects to IOWatchdog, then matches
+`IOService + IOPropertyMatch={IOPMUPrimary=1}`, then calls selectors 0, 1 and 9.
+Missing PMU would hit a different BRK, 0x10000b160. That is a binary dependency
+established by analysis; it has not yet been observed on this phone. Returning
+a disabled watchdog does not skip this lookup.
 
-The next log should correlate this result with watchdogd's EL0 snapshot. For a
-PC in the main image, subtract the reported `image0` base and add its preferred
-base `0x100000000` before comparing with the original binary. A genuine service
-or PMU backend fix depends on that observation. This change fills a diagnostic
-gap; it does not claim that watchdogd or the reboot is already fixed.
+PicassoBootState implements only the known boot-stage property API. It publishes
+IOPMUPrimary=1 and initial IOPMUBootStage=0, with explicit `volatile-software`
+and HardwarePMUImplemented=false properties. Administrator-only setProperties
+accepts exactly one OSNumber boot stage in 0..255, samples it once, and stores
+an independent number under the registry property lock. Unknown operations,
+extra keys, invalid types/ranges and allocation failures return errors.
+Repeated stage-255 writes produce one log.
 
-The ARM64 exception caller samples the cached shared-region slide and passes it
-as a `uint32_t` argument. The BSD capture helper does not access `struct task`
-fields: that structure is opaque under BSD's compilation flags.
+It reuses an existing primary service when present and verifies property
+matching after synchronous publication. The value lasts for this boot only.
+This is not a PMIC, battery, persistent boot history or power-control
+implementation. Other system clients may require additional real capabilities.
 
-Snapshots are best effort: an overwritten record or a different exiting thread
-can produce `missing`. A matching snapshot is the latest breakpoint on that
-process/task/thread, not proof that it caused the later exit. User-memory reads
-have size limits but can still fault or block; the register lines print first,
-and memory-derived fields may be unavailable.
+## Build integration and ABI checks
 
-Host validation extracts the actual generated capture/report helpers, checks
-the fixed XNU dyld structure layouts, and passes 51 cases in both normal MSVC and
-ASan builds. Cases include the SIGKILL carrier, process/exec/thread identity,
-ring overwrite and busy handling, copy failures, frame limits, output budgets
-and printing registers before any user-memory read. Two complete patch passes
-check all 61 patches and stable output for 12 source files. Removing the added
-diagnostics restores the three affected files exactly; the other nine remain
-unchanged. These are host checks, not Apple SDK or device execution of the new
-diagnostic code.
+scripts/build-picasso-pmgr.py replays the actual IOPlatformExpert C++ compile
+record for Pmgr, Watchdog and BootState, preserving kernel macros, SDK and target
+flags. It redirects dependency/diagnostic outputs to protect the original
+record. All objects must be ordinary ARM64, iOS 17 Mach-O objects.
 
-On 2026-10-30, the resumed review verified that the current outer patch and all
-12 generated-source hashes match that completed replay, then rebuilt and ran
-the actual helpers: 51 capture/report cases in normal and ASan builds, plus 14
-service-matching cases in normal, ASan and release configurations. The latter
-cover the original return/release behavior, malformed dictionaries, query/output
-limits and concurrent ticket allocation. Independent review also reran the
-original watchdogd connection branches. No new CI build or phone boot has yet
-validated this diagnostic patch.
+The board pins the original kernelcache SHA and prelink slide.
+prepare-picasso-watchdog-bindings.py checks the complete image, class sizes,
+171 virtual slots, function fingerprints and APFS references. The compiled
+Watchdog object's inherited slots, permitted overrides, original imports and
+parent metaclass are audited before and after late conversion. The alias object
+must contain exactly the checked original targets.
 
-## Build 40917708279: BSD task type boundary
+Watchdog and BootState static constructors must run late. LLVM objcopy removes
+their automatic __mod_init_func section. LLVM 18 does not support
+--globalize-symbol for Mach-O, so the builder exports the exact initializer by
+updating N_EXT, nlist groups, LC_DYSYMTAB, relocation indices and indirect-symbol
+indices. Unsupported auxiliary tables fail closed. Every executable section
+must retain identical bytes. The final object must have no automatic
+initializer and must export the required initializer.
 
-Artifact `picasso-bootimg-68` belongs to failed run
-[40917708279](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40917708279),
-head `1c035600e22832c2edae320ef5dab6ab4bccd507`. Its bootstrap log has one Clang
-error: `kern_exit.c:1415:27: incomplete definition of type 'struct task'` at
-`current_task()->task_shared_region_slide`. The later corecrypto message about
-missing XNU symbol names follows the interrupted bootstrap; it is not an
-independent corecrypto compilation error. This run produced logs and a Data
-seed, but no composed boot image.
+Only Pmgr.o, Watchdog.late.o, BootState.late.o and watchdog-bindings.o enter
+the existing libShengPlatformPower.a force-load path. A new archive is checked
+for exact membership before installation; the previous archive is moved to a
+unique backup directory.
 
-`kern/task.h` puts the complete task structure behind `MACH_KERNEL_PRIVATE`.
-OSFMK's build defines that macro; BSD's build defines `BSD_KERNEL_PRIVATE`.
-The initial host fixture supplied a complete task structure, so its tests did
-not catch this access violation. The fix reads the same cached field in
-`sleh.c`, where the structure is visible, and passes the value into the BSD
-helper. Both declarations and the definition use the same third `uint32_t`
-argument. This preserves the cached value, including the all-ones sentinel,
-and adds no task locking to breakpoint capture.
+Both manual workflows fetch KernelCache before archive building and export
+UNIXNU_KERNELCACHE. The fixed upstream cmd_ipsw special-cases KernelCache and
+calls its decompressor, rather than merely extracting the compressed member.
+Both workflows upload platform JSON reports, compiler logs, objects and archive.
 
-The checked-in host regression now keeps `task_t` as a pointer to an undefined
-`struct task`. It compiles the extracted BSD helper and checks 53 scenarios in
-normal and ASan builds, including zero and `UINT32_MAX` slide values. A negative
-compile restores only the old private-field read and must fail for the opaque
-type error. The Windows runner rejects every nonzero process exit status.
-Both full patch-replay passes and these host checks pass; a successful full
-Apple SDK build and new device log are still required.
+Late-registration ordering was informed by the tutorial-linked
+[watchdog service notes](https://github.com/mouse233/unixnu-fuxi/blob/feat/ramdisk-test/diagnostics/ram-root/watchdog-service.md)
+and sheng's platform archive builder. This board uses its real SM7250 backend.
 
-From the device repository, after creating a replayed XNU tree:
+## Verification and next checkpoint
 
-```sh
-python scripts/check-picasso-user-fault.py --xnu out/watchdogd-task-boundary-replay-20261030/xnu --output out/user-fault-check-NEW
-```
+Local reports are under out/watchdog-integration-20261030/:
 
-The output directory must not exist. Compiler logs and all generated fixtures
-are retained, including the expected failing compile.
+- 16 builder/ABI checks use real LLVM ARM64 Mach-O schema objects, including a
+  real C++ initializer, a separate-object link with no unresolved symbols,
+  virtual-slot negatives, complete archive assembly and old-archive retention.
+  The schema inputs are not an SDK compilation of the production drivers.
+- BootState: 12 startup scenarios in ordinary and ASan builds, plus property
+  privilege/shape/bounds, single sampling, independent storage, failed-store
+  preservation, publication and diagnostic-limit checks.
+- Watchdog lifecycle: 10 scenarios in ordinary and ASan builds, covering cleanup
+  before claim, permanent ownership after claim, policy-before-pet ordering,
+  stop/enable/timer behavior and original client result preservation.
+  IOKit, scheduling and original policy are host stand-ins.
+- The unchanged backend and fixture match the prior 25+25 passing groups.
+  The diagnostic source and fixture match the prior 56+56 passing cases.
+- Both patch hashes and all 12 generated sources match the saved successful
+  two-pass 61-patch replay. No identical replay was repeated.
+- The downloaded build-69 kernel hash matches metadata and its UUID matches
+  the device log. Python, TOML, YAML and workflow input ordering were checked.
+
+There is no new production-driver iPhoneOS SDK compile or device qualification
+in these results. No CI was dispatched and no phone operation was performed.
+The latest successful build remains 40922207086/b67e848, which predates this
+service implementation. A new manual SDK build must pass the real-object guards.
+
+The next device log should show original IOWatchdog matching, original
+newUserClient type 1 succeeding, the first original policy check/hardware pet,
+and subsequent boot-stage progress. If another critical process fails, use its
+new main_header/PC and original panic evidence to identify the next stop.
+
+Reproduction from the device repository, using new output directories:
+
+~~~sh
+python scripts/check-picasso-platform-build.py --output out/platform-build-NEW \
+  --kernelcache /path/to/original/kernelcache.macho \
+  --native-prelink-dir /path/to/fixed/NativePrelink --llvm-bin /path/to/llvm/bin
+python scripts/check-picasso-boot-state.py --output out/boot-state-NEW
+python scripts/check-picasso-watchdog-service.py --output out/watchdog-service-NEW
+python scripts/check-picasso-watchdog-backend.py --output out/watchdog-backend-NEW
+python scripts/check-picasso-user-fault.py --xnu /path/to/replayed/xnu --output out/user-fault-NEW
+~~~
+
+The earlier build 40917708279 failed because BSD read an opaque struct task
+field. Commit b67e848 moved the read to OSFMK and passed the cached slide into
+BSD. Build 40922207086 subsequently compiled successfully. The new main_header
+follows the same boundary; BSD still does not dereference task internals, and
+the host regression retains an opaque task_t negative case.

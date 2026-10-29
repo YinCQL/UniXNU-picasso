@@ -63,7 +63,7 @@ archives = [
   "build-arm-driver.py NativeUfs",
   # Volatile APFS Data; shares NativeUfs's exact original IOStorage bindings.
   "build-arm-driver.py NativeRamBlock",
-  # Publishes the ApplePMGRNub the unchanged AMFI looks for (package/PicassoPmgr.cpp).
+  # Publishes ApplePMGRNub, the original-policy SM7250 watchdog, and volatile boot-stage storage.
   # The archive lands in build/sheng-platform-power/libShengPlatformPower.a, the path
   # build-xnu-4k-baseline.sh force-loads when CONFIG_XNU_SHENG_PMGR=1.
   "build-picasso-pmgr.py",
@@ -72,7 +72,7 @@ archives = [
 [kernel.prelink]
 tool = "kits/NativePrelink/emit_prelink.py"
 kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
-kernelcache_sha256 = ""
+kernelcache_sha256 = "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7"
 slide = "-0x1000000"
 early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
 roots = [

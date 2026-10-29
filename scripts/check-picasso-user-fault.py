@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 
-CASE_COUNT = 53
+CASE_COUNT = 56
 
 
 def one(pattern, source):
@@ -32,15 +32,18 @@ def extract(xnu, out):
     dyld = (xnu / 'osfmk/kdp/kdp_dyld.h').read_text(encoding='utf-8')
     capture = one(r'/\* PICASSO_USER_FAULT_BEGIN.*?/\* PICASSO_USER_FAULT_END \*/', kernel)
     ticket = one(r'^static unsigned\npicasso_pid1_trace_ticket\(.*?\n}', kernel)
-    signature = 'void picasso_user_breakpoint(void *, uint32_t, uint32_t);'
+    signature = 'void picasso_user_breakpoint(void *, uint32_t, uint32_t, uint64_t);'
     if signature not in capture or 'extern ' + signature not in sleh:
-        raise ValueError('BSD and ARM64 declarations must accept the same three arguments')
-    one(r'^picasso_user_breakpoint\(void \*saved, uint32_t esr, uint32_t shared_cache_slide\)', capture)
-    call = one(r'^\s*picasso_user_breakpoint\(state, esr, current_task\(\)->task_shared_region_slide\);', sleh)
+        raise ValueError('BSD and ARM64 declarations must accept the same four arguments')
+    one(r'^picasso_user_breakpoint\(void \*saved, uint32_t esr, uint32_t shared_cache_slide, uint64_t main_header\)', capture)
+    call = one(r'^\s*picasso_user_breakpoint\(state, esr, current_task\(\)->task_shared_region_slide,\s*'
+               r'current_task\(\)->mach_header_vm_address\);', sleh)
     if sleh.index(call) > sleh.index('boot_progress_user_breakpoint(state, esr);'):
         raise ValueError('Capture must precede the existing breakpoint handling')
     if capture.count('f->slide = shared_cache_slide;') != 1:
         raise ValueError('BSD capture must preserve the supplied slide value')
+    if capture.count('f->main_header = main_header;') != 1:
+        raise ValueError('BSD capture must preserve the supplied executable header address')
     production = ticket + '\n' + capture + '\n'
     (out / 'actual-helper.inc').write_text(production, encoding='utf-8', newline='\n')
     types = '\n'.join(one(r'^struct ' + name + r' \{.*?^\};', dyld)

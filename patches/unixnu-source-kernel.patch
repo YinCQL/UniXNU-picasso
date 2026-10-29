@@ -1870,7 +1870,7 @@ diff --git a/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch b/patches/xnu/z
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
-@@ -0,0 +1,1443 @@
+@@ -0,0 +1,1447 @@
 +diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 +--- a/bsd/vfs/vfs_syscalls.c
 ++++ b/bsd/vfs/vfs_syscalls.c
@@ -2317,7 +2317,7 @@ new file mode 100644
 + 
 + #if SYSV_SHM
 + #include <sys/shm_internal.h>   /* shmexit */
-+@@ -1359,6 +1364,170 @@
++@@ -1359,6 +1364,173 @@
 + 
 + #define OS_REASON_TOTAL_USER_FAULTS_PER_PROC  5
 + 
@@ -2342,14 +2342,14 @@ new file mode 100644
 ++	unsigned valid;
 ++	int pid, pidversion;
 ++	task_t task;
-++	uint64_t uniqueid, tid, pc, lr, sp, fp, esr, slide, x[29];
+++	uint64_t uniqueid, tid, pc, lr, sp, fp, esr, slide, main_header, x[29];
 ++};
 ++static struct picasso_user_fault picasso_faults[8];
 ++static unsigned picasso_fault_lock, picasso_fault_next, picasso_fault_filled;
 ++
-++void picasso_user_breakpoint(void *, uint32_t, uint32_t);
+++void picasso_user_breakpoint(void *, uint32_t, uint32_t, uint64_t);
 ++void
-++picasso_user_breakpoint(void *saved, uint32_t esr, uint32_t shared_cache_slide)
+++picasso_user_breakpoint(void *saved, uint32_t esr, uint32_t shared_cache_slide, uint64_t main_header)
 ++{
 ++	arm_saved_state_t *state = saved;
 ++	proc_t p = current_proc();
@@ -2368,8 +2368,9 @@ new file mode 100644
 ++	f->sp = get_saved_state_sp(state);
 ++	f->fp = get_saved_state_fp(state);
 ++	f->esr = esr;
-++	/* The ARM64 caller reads this cached value without taking task locks. */
+++	/* The ARM64 caller reads these cached values without taking task locks. */
 ++	f->slide = shared_cache_slide;
+++	f->main_header = main_header;
 ++	for (unsigned i = 0; i < 29; ++i) f->x[i] = get_saved_state_reg(state, i);
 ++	f->valid = 1;
 ++	picasso_fault_next = (picasso_fault_next + 1) % 8;
@@ -2431,9 +2432,10 @@ new file mode 100644
 ++	    ticket, proc_getpid(p), process_name, (unsigned long long)uniqueid, (unsigned long long)tid,
 ++	    WTERMSIG(rv), reason, (unsigned long long)code, record);
 ++	if (!f.valid) return;
-++	printf("PICASSO_EL0 PC=%llx LR=%llx SP=%llx FP=%llx ESR=%llx cache_slide=%llx\n",
+++	printf("PICASSO_EL0 PC=%llx LR=%llx SP=%llx FP=%llx ESR=%llx main_header=%llx cache_slide=%llx\n",
 ++	    (unsigned long long)f.pc, (unsigned long long)f.lr, (unsigned long long)f.sp,
-++	    (unsigned long long)f.fp, (unsigned long long)f.esr, (unsigned long long)f.slide);
+++	    (unsigned long long)f.fp, (unsigned long long)f.esr,
+++	    (unsigned long long)f.main_header, (unsigned long long)f.slide);
 ++	printf("PICASSO_EL0 x0=%llx x1=%llx x2=%llx x3=%llx x19=%llx x20=%llx x21=%llx x22=%llx x23=%llx\n",
 ++	    (unsigned long long)f.x[0], (unsigned long long)f.x[1], (unsigned long long)f.x[2],
 ++	    (unsigned long long)f.x[3], (unsigned long long)f.x[19], (unsigned long long)f.x[20],
@@ -2449,6 +2451,7 @@ new file mode 100644
 ++	struct user64_dyld_image_info image = {0};
 ++	int instruction_error = copyin((user_addr_t)f.pc, &instruction, sizeof(instruction));
 ++	if (instruction_error) instruction = 0;
+++	/* image0/path describe dyld's first entry, which need not be the executable. */
 ++	int image_error = copyin(task_get_all_image_info_addr(current_task()), &info, sizeof(info));
 ++	if (!image_error) {
 ++		if (info.infoArrayCount && info.infoArray) {
@@ -2475,7 +2478,7 @@ new file mode 100644
 ++	if (message_error) message[0] = 0;
 ++	picasso_fault_printable(message, sizeof(message));
 ++	picasso_fault_printable(image_path, sizeof(image_path));
-++	printf("PICASSO_EL0 insn=%x insn_error=%d image0=%llx image_error=%d path_error=%d path=%.80s\n",
+++	printf("PICASSO_EL0 insn=%x insn_error=%d image0_kind=dyld-first image0=%llx image_error=%d path_error=%d path=%.80s\n",
 ++	    instruction, instruction_error, (unsigned long long)image.imageLoadAddress, image_error, path_error, image_path);
 ++	printf("PICASSO_EL0 frames=%u error=%d stop=%s %llx/%llx %llx/%llx %llx/%llx\n",
 ++	    depth, frame_error, frame_stop, (unsigned long long)frames[0], (unsigned long long)frames[1],
@@ -2488,7 +2491,7 @@ new file mode 100644
 + static int
 + abort_with_payload_internal(proc_t p,
 +     uint32_t reason_namespace, uint64_t reason_code,
-+@@ -1368,6 +1537,22 @@
++@@ -1368,6 +1540,22 @@
 + {
 + 	os_reason_t exit_reason = OS_REASON_NULL;
 + 	kern_return_t kr = KERN_SUCCESS;
@@ -2511,7 +2514,7 @@ new file mode 100644
 + 
 + 	if (internal_flags & OS_REASON_IFLAG_USER_FAULT) {
 + 		uint32_t old_value = atomic_load_explicit(&p->p_user_faults,
-+@@ -1375,13 +1560,13 @@
++@@ -1375,13 +1563,13 @@
 + 
 + #if DEVELOPMENT || DEBUG
 + 		if (bootarg_disable_user_faults) {
@@ -2527,7 +2530,7 @@ new file mode 100644
 + 			}
 + 			// this reloads the value in old_value
 + 			if (atomic_compare_exchange_strong_explicit(&p->p_user_faults,
-+@@ -1422,16 +1607,17 @@
++@@ -1422,16 +1610,17 @@
 + 
 + 	switch (kr) {
 + 	case KERN_SUCCESS:
@@ -2551,7 +2554,7 @@ new file mode 100644
 + 
 + int
 + abort_with_payload(struct proc *cur_proc, struct abort_with_payload_args *args,
-+@@ -1820,6 +2006,15 @@
++@@ -1820,6 +2009,15 @@
 + static void
 + proc_handle_critical_exit(proc_t p, int rv)
 + {
@@ -2567,7 +2570,7 @@ new file mode 100644
 + 	if (!proc_should_trigger_panic(p, rv)) {
 + 		// No panic, bail out
 + 		return;
-+@@ -1834,6 +2029,9 @@
++@@ -1834,6 +2032,9 @@
 + 	}
 + #endif /* DEVELOPMENT */
 + 
@@ -3246,17 +3249,18 @@ new file mode 100644
 + 
 + static void handle_breakpoint(arm_saved_state_t *, uint32_t) __dead2;
 ++#if DEVELOPMENT || DEBUG
-++extern void picasso_user_breakpoint(void *, uint32_t, uint32_t);
+++extern void picasso_user_breakpoint(void *, uint32_t, uint32_t, uint64_t);
 ++#endif
 + 
 + typedef void (*abort_inspector_t)(uint32_t, fault_status_t *, vm_prot_t *);
 + static void inspect_instruction_abort(uint32_t, fault_status_t *, vm_prot_t *);
-+@@ -1230,6 +1233,9 @@
++@@ -1230,6 +1233,10 @@
 + 	mach_exception_data_type_t codes[2]  = {EXC_ARM_BREAKPOINT};
 + 	mach_msg_type_number_t     numcodes  = 2;
 + 
 ++#if DEVELOPMENT || DEBUG
-++	picasso_user_breakpoint(state, esr, current_task()->task_shared_region_slide);
+++	picasso_user_breakpoint(state, esr, current_task()->task_shared_region_slide,
+++	    current_task()->mach_header_vm_address);
 ++#endif
 + 	boot_progress_user_breakpoint(state, esr);
 + #if __has_feature(ptrauth_calls)

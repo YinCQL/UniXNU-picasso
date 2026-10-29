@@ -26,9 +26,17 @@ HOST_TEST = r"""#include <cassert>
 #include <vector>
 
 #define __unused [[maybe_unused]]
+#define _Atomic /* Serial fixture; concurrent atomics are tested by the backend fixture. */
 #define NSEC_PER_MSEC 1000000ULL
 enum { acquire, release };
 using wait_result_t = int;
+using boolean_t = bool;
+static bool irq_enabled;
+static boolean_t ml_set_interrupts_enabled(bool enabled) {
+    bool previous = irq_enabled;
+    irq_enabled = enabled;
+    return previous;
+}
 
 struct {
     unsigned poll_lock;
@@ -55,6 +63,7 @@ static bool os_atomic_cmpxchg(unsigned *p, unsigned from, unsigned to, int) {
     return true;
 }
 static void os_atomic_store(unsigned *p, unsigned value, int) { *p = value; }
+static unsigned os_atomic_load(const unsigned *p, int) { return *p; }
 static void ud_poll(void) {
     assert(ud.poll_lock == 1 && !in_poll);
     in_poll = true;
@@ -71,10 +80,16 @@ static void ud_poll(void) {
     in_poll = false;
 }
 static void usb_wr(uintptr_t base, unsigned off, unsigned value) {
-    assert(!in_poll && ud.poll_lock == 0 && !ud.panic_mode);
+    assert(!in_poll && ud.poll_lock == 0 && !ud.panic_mode && !irq_enabled);
     assert(base == ud.wdt && off == 4u && value == 1);
     ++pet_calls;
     sequence.emplace_back("pet");
+}
+static unsigned usb_rd(uintptr_t base, unsigned off) {
+    assert(base == ud.wdt && !irq_enabled);
+    if (off == 8u) return 1u;
+    assert(off == 0x10u || off == 0x14u);
+    return 491519u;
 }
 static uint64_t mach_absolute_time(void) {
     sequence.emplace_back("clock");
@@ -117,6 +132,9 @@ static int test_printf(const char *format, ...) {
 
 static void reset(void) {
     ud = {};
+    picasso_wdt_lock = picasso_wdt_terminal = 0;
+    picasso_wdt_owner = nullptr;
+    irq_enabled = true;
     ud.watchdog_armed = true;
     ud.wdt = 0x1000;
     pur_live = true;
@@ -332,12 +350,18 @@ def extract_production(patch, out):
         raise ValueError(f'Incorrect new-file hunk count: {count} != {len(lines) - 1}')
     source = '\n'.join(line[1:] for line in lines[1:]) + '\n'
     (out / 'picasso_usb.c').write_text(source, encoding='utf-8', newline='\n')
+    backend_names = ['picasso_watchdog_enter', 'picasso_watchdog_leave',
+                     'picasso_watchdog_live_locked', 'picasso_watchdog_config_locked',
+                     'picasso_watchdog_pet_locked']
     names = ['picasso_usb_watchdog_pet', 'ud_poll_serialized', 'picasso_usb_console_drive_poll',
              'ud_monotonic_ns', 'ud_timer_irq_snapshot', 'ud_background_poll', 'ud_thread']
     definitions = source[source.index('#define UD_WATCHDOG_INITIAL_REPORTS'):
                          source.index('static uint64_t\nud_monotonic_ns')]
-    watchdog_reset = re.search(r'^#define APSS_WDT_RST\s+[^\n]+', source, re.M)[0] + '\n'
-    parts = ([watchdog_reset] + [extract_function(source, name) for name in names[:3]] + [definitions] +
+    watchdog_constants = '\n'.join(re.findall(r'^#define (?:APSS_WDT_|PICASSO_WDT_TICKS)[^\n]+', source, re.M)) + '\n'
+    backend_state = '\n'.join(re.search(r'^static [^\n]*\b' + name + r';$', source, re.M)[0]
+                              for name in ('picasso_wdt_lock', 'picasso_wdt_terminal', 'picasso_wdt_owner')) + '\n'
+    parts = ([watchdog_constants, backend_state] + [extract_function(source, name) for name in backend_names] +
+             [extract_function(source, name) for name in names[:3]] + [definitions] +
              [extract_function(source, name) for name in names[3:]])
     (out / 'production.h').write_text('\n'.join(parts), encoding='utf-8', newline='\n')
     if '#define APSS_WDT_TIMEOUT_MS 15000u' not in source:
@@ -346,7 +370,7 @@ def extract_production(patch, out):
         raise ValueError('The diagnostic ArmCpu counter must remain an optional weak import')
     return {'patch_sha256': hashlib.sha256(patch.read_bytes()).hexdigest(),
             'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
-            'extracted_functions': names, 'new_file_hunk_lines': count}
+            'extracted_functions': backend_names + names, 'new_file_hunk_lines': count}
 
 
 def find_vcvars():

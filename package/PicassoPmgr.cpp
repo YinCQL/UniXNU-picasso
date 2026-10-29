@@ -19,6 +19,8 @@
 #include <pexpert/pexpert.h>
 
 extern "C" void sheng_pmgr_run(void);
+extern "C" void picasso_boot_state_run(void);
+extern "C" void picasso_watchdog_run(void);
 
 // Bring-up evidence for the boot-progress panel and the UFS log: 0 nothing tried, 1 class absent,
 // 2 allocation failed, 3 published, 4 discovery check failed.
@@ -39,6 +41,10 @@ static const OSMetaClass *nubMetaClass(void)
 
 extern "C" void sheng_pmgr_run(void)
 {
+  // BSD initialization runs after IOKit and the USB hardware watchdog setup,
+  // before launchd can ask for the platform watchdog and boot-stage services.
+  picasso_boot_state_run();
+  picasso_watchdog_run();
   unsigned mode = 0;
   if (!PE_parse_boot_argn("sheng-pmgr", &mode, sizeof(mode)) || (mode == 0)) {
     return;

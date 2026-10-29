@@ -49,7 +49,7 @@ typedef uint8_t dyld_bool;
 /* Deliberately opaque, as task_t is in the BSD translation unit. */
 struct task;
 typedef struct task *task_t;
-struct host_task { uint32_t cached_slide; uint64_t image_info; };
+struct host_task { uint32_t cached_slide; uint64_t image_info, main_header; };
 struct reason { unsigned osr_namespace; uint64_t osr_code; };
 struct proc { int pid, pidversion; uint64_t uniqueid; struct reason *p_exit_reason; task_t task; char p_name[33]; };
 typedef struct proc *proc_t;
@@ -129,9 +129,13 @@ static void contains(const char *needle) {
 static void reset_output(void) { bytes=lines=0; output[0]=0; }
 int main(int argc,char **argv) {
  assert(argc==2); scenario=atoi(argv[1]);
- struct host_task task={0xabc,0x9000},other_task={0xdef,0x9000};
+ struct host_task task={0xabc,0x9000,UINT64_C(0x100000000)},other_task={0xdef,0x9000,0};
  if(scenario==51) task.cached_slide=0;
  if(scenario==52) task.cached_slide=UINT32_MAX;
+ if(scenario==53) task.main_header=UINT64_C(0x100847000);
+ if(scenario==54) task.main_header=0;
+ if(scenario==55) task.main_header=UINT64_C(0xfedcba9876543210);
+ const uint64_t captured_main_header=task.main_header;
  struct reason reason={OS_REASON_SIGNAL,SIGTRAP};
  struct proc proc={95,3,98765,&reason,(task_t)&task,"watchdogd"},other=proc;
  arm_saved_state_t state={0}; state.is64=1;state.pc=UINT64_C(0x10000ab0c);state.lr=0x1234;state.sp=0x4560;state.fp=0x1000;
@@ -143,6 +147,10 @@ int main(int argc,char **argv) {
  struct user64_dyld_image_info image={UINT64_C(0x100000000),0xb000,0};
  uint64_t frames[4][2]={{0x1100,0x5100},{0x1200,0x5200},{0x1300,0x5300},{0,0x5400}};
  char message[256]="IOWatchdog is missing",path[128]="/usr/libexec/watchdogd";
+ if(scenario==53) {
+  image.imageLoadAddress=UINT64_C(0x19022b000);
+  strcpy(path,"/System/Library/Frameworks/IOKit.framework/IOKit");
+ }
  map(state.pc,&instruction,sizeof(instruction));
  map(UINT64_C(0x10000ab54),&instruction,sizeof(instruction));
  map(0x9000,&info,sizeof(info));map(0xa000,&image,sizeof(image));
@@ -165,12 +173,13 @@ int main(int argc,char **argv) {
  if(scenario==40) state.fp=0;
  if(scenario==41) state.pc=0;
  if(scenario==42) {frames[0][0]=0x101000;frames[1][0]=0;map(0x101000,frames[1],sizeof(frames[1]));}
- if(scenario==39) picasso_user_breakpoint(NULL,0xf2000000,task.cached_slide);
- else if(scenario!=2) picasso_user_breakpoint(&state,0xf2000000,task.cached_slide);
+ if(scenario==39) picasso_user_breakpoint(NULL,0xf2000000,task.cached_slide,task.main_header);
+ else if(scenario!=2) picasso_user_breakpoint(&state,0xf2000000,task.cached_slide,task.main_header);
  assert(!reads && !bytes && !lines);
  if(scenario!=2 && scenario!=3 && scenario!=4 && scenario!=5 && scenario!=6 && scenario!=39) {
   assert(picasso_faults[0].valid && picasso_faults[0].pc==state.pc && picasso_faults[0].lr==state.lr && picasso_faults[0].sp==state.sp && picasso_faults[0].fp==state.fp);
   assert(picasso_faults[0].slide==(uint64_t)task.cached_slide);
+  assert(picasso_faults[0].main_header==captured_main_header);
   for(unsigned i=0;i<29;++i) assert(picasso_faults[0].x[i]==state.x[i]);
  }
  cp=&proc;picasso_fault_lock=0;
@@ -191,18 +200,19 @@ int main(int argc,char **argv) {
  if(scenario==17) reason.osr_code=6;
  if(scenario==18) proc.p_exit_reason=NULL;
  if(scenario==20) {
-  for(unsigned i=0;i<8;++i) {++proc.pidversion;picasso_user_breakpoint(&state,0xf2000000,task.cached_slide);}
+  for(unsigned i=0;i<8;++i) {++proc.pidversion;picasso_user_breakpoint(&state,0xf2000000,task.cached_slide,task.main_header);}
   proc.pidversion=3;assert(picasso_fault_filled==8);
  }
- if(scenario==21) {state.pc=UINT64_C(0x10000ab54);picasso_user_breakpoint(&state,0xf2000000,task.cached_slide);}
+ if(scenario==21) {state.pc=UINT64_C(0x10000ab54);picasso_user_breakpoint(&state,0xf2000000,task.cached_slide,task.main_header);}
  if(scenario==38) {
-  for(unsigned i=0;i<8;++i) {picasso_user_breakpoint(&state,0xf2000000,task.cached_slide);picasso_report_critical_fault(&proc,SIGTRAP);}
+  for(unsigned i=0;i<8;++i) {picasso_user_breakpoint(&state,0xf2000000,task.cached_slide,task.main_header);picasso_report_critical_fault(&proc,SIGTRAP);}
   assert(lines==48);unsigned prior_reads=reads,prior_bytes=bytes;
-  picasso_user_breakpoint(&state,0xf2000000,task.cached_slide);picasso_report_critical_fault(&proc,SIGTRAP);
+  picasso_user_breakpoint(&state,0xf2000000,task.cached_slide,task.main_header);picasso_report_critical_fault(&proc,SIGTRAP);
   assert(reads==prior_reads && bytes==prior_bytes && lines==48);
   contains("sample=8");goto pass;
  }
  state.pc=0xdeadbeef;state.lr=0xfefefefe;state.x[0]=0;task.cached_slide=0xffff;
+ task.main_header=UINT64_C(0x123456789abcdef0);
  picasso_report_critical_fault(&proc,rv);
  if((scenario>=2 && scenario<=6) || (scenario>=8 && scenario<=12) || scenario==20 || scenario==39) {
   contains("record=missing");assert(lines==1 && reads==0);goto pass;
@@ -213,6 +223,18 @@ int main(int argc,char **argv) {
  if(scenario==51) contains("cache_slide=0\n");
  else if(scenario==52) contains("cache_slide=ffffffff\n");
  else contains("cache_slide=abc\n");
+ if(scenario==53) {
+  contains("main_header=100847000 cache_slide=");
+  contains("image0_kind=dyld-first image0=19022b000 ");
+  contains("path=/System/Library/Frameworks/IOKit.framework/IOKit\n");
+ } else if(scenario==54) {
+  contains("main_header=0 cache_slide=");
+  contains("image0_kind=dyld-first image0=100000000 ");
+ } else if(scenario==55) {
+  contains("main_header=fedcba9876543210 cache_slide=");
+  contains("image0_kind=dyld-first image0=100000000 ");
+ } else contains("main_header=100000000 cache_slide=");
+ assert(!strstr(output,"123456789abcdef0"));
  contains("LR=1234");contains("x0=8000");assert(!strstr(output,"deadbeef"));
  if(scenario==1) contains("exit_signal=9 namespace=2 code=5");
  if(scenario==19) {unsigned r=reads;reset_output();picasso_report_critical_fault(&proc,rv);contains("record=missing");assert(reads==r && lines==1);goto pass;}

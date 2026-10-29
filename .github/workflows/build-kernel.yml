@@ -93,7 +93,8 @@ jobs:
         run: |
           mkdir -p out/picasso/logs
           TREE=$(python3 ./unixnu --prepare)
-          python3 ./unixnu ipsw fetch OS StaticTrustCache Cryptex1,SystemTrustCache 2>&1 | tee out/picasso/logs/actions-ipsw.log
+          python3 ./unixnu ipsw fetch OS KernelCache StaticTrustCache Cryptex1,SystemTrustCache 2>&1 | tee out/picasso/logs/actions-ipsw.log
+          echo "UNIXNU_KERNELCACHE=$PWD/out/ipsw/21H461/kernelcache.decompressed" >> "$GITHUB_ENV"
           python3 scripts/prepare-original-trust.py --tree "$TREE" --inputs out/ipsw/21H461 --output out/picasso/original-static-system.bundle 2>&1 | tee out/picasso/logs/actions-trust.log
 
       - name: Prepare volatile APFS Data from the original OS
@@ -131,6 +132,10 @@ jobs:
             device/out/picasso/kernel/**
             device/out/picasso/payload/**
             device/out/picasso/logs/**
+            device/out/picasso/tree/build/sheng-platform-power/*.json
+            device/out/picasso/tree/build/sheng-platform-power/*.log
+            device/out/picasso/tree/build/sheng-platform-power/*.o
+            device/out/picasso/tree/build/sheng-platform-power/*.a
             device/out/picasso/ram-data/*.json
             device/out/picasso/ram-data/data.dbrdisk
             device/out/picasso/.config

@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..2237fb2
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,2841 @@
+@@ -0,0 +1,3007 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -111,6 +111,10 @@ index 0000000..2237fb2
 +void picasso_usb_panic_write(const char *text, int size);
 +void picasso_usb_panic_flush(void);
 +void picasso_usb_panic_reset(void);
++bool picasso_watchdog_backend_claim(const void *owner);
++bool picasso_watchdog_backend_enable(const void *owner);
++bool picasso_watchdog_backend_disable(const void *owner);
++bool picasso_watchdog_backend_pet(const void *owner);
 +static void picasso_usb_console_drive_poll(void);
 +static void ud_process_command(void);
 +static void ud_finish_reboot(void);
@@ -1897,46 +1901,213 @@ index 0000000..2237fb2
 +	return *command == '\0' && *expected == '\0';
 +}
 +
++/* PICASSO_WATCHDOG_BACKEND_BEGIN: all APSS WDT writes share this lock. */
++#define PICASSO_WDT_TICKS ((APSS_WDT_TIMEOUT_MS * APSS_WDT_RATE_HZ / 1000u) - 1u)
++static uint32_t _Atomic picasso_wdt_lock;
++static uint32_t _Atomic picasso_wdt_terminal;
++static const void *picasso_wdt_owner;
++static bool picasso_wdt_forced;
++
++static bool
++picasso_watchdog_enter(boolean_t *interrupts)
++{
++	*interrupts = ml_set_interrupts_enabled(false);
++	if (!os_atomic_cmpxchg(&picasso_wdt_lock, 0, 1, acquire)) {
++		ml_set_interrupts_enabled(*interrupts);
++		return false;
++	}
++	return true;
++}
++
 +static void
++picasso_watchdog_leave(boolean_t interrupts)
++{
++	os_atomic_store(&picasso_wdt_lock, 0, release);
++	ml_set_interrupts_enabled(interrupts);
++}
++
++static void
++picasso_usb_watchdog_terminal(void)
++{
++	/* Even a panic encountering a busy lock can permanently reject new work.
++	 * An already locked operation precedes the terminal transition. Forced
++	 * bite programming must take the same lock before replacing its count. */
++	os_atomic_store(&picasso_wdt_terminal, 1, release);
++}
++
++static bool
++picasso_watchdog_live_locked(void)
++{
++	return !os_atomic_load(&picasso_wdt_terminal, acquire) && ud.wdt != 0;
++}
++
++static bool
++picasso_watchdog_config_locked(bool enabled)
++{
++	return ud.wdt != 0 &&
++	    usb_rd(ud.wdt, APSS_WDT_EN) == (enabled ? 1u : 0u) &&
++	    usb_rd(ud.wdt, APSS_WDT_BARK) == PICASSO_WDT_TICKS &&
++	    usb_rd(ud.wdt, APSS_WDT_BITE) == PICASSO_WDT_TICKS;
++}
++
++static bool
++picasso_watchdog_pet_locked(void)
++{
++	if (!ud.watchdog_armed || !picasso_watchdog_config_locked(true) ||
++	    !picasso_watchdog_live_locked()) return false;
++	/* RST is a pulse: validate persistent registers, not an invented RST ack. */
++	usb_wr(ud.wdt, APSS_WDT_RST, 1);
++	return picasso_watchdog_config_locked(true);
++}
++
++static bool
++picasso_watchdog_program_locked(void)
++{
++	/* Once started, finish the bounded arm sequence even if terminal is
++	 * requested concurrently, so an interrupted arm cannot leave EN=0. */
++	usb_wr(ud.wdt, APSS_WDT_EN, 0);
++	usb_wr(ud.wdt, APSS_WDT_RST, 1);
++	usb_wr(ud.wdt, APSS_WDT_BARK, PICASSO_WDT_TICKS);
++	usb_wr(ud.wdt, APSS_WDT_BITE, PICASSO_WDT_TICKS);
++	usb_wr(ud.wdt, APSS_WDT_EN, 1);
++	ud.watchdog_armed = picasso_watchdog_config_locked(true);
++	return ud.watchdog_armed;
++}
++
++bool
++picasso_watchdog_backend_claim(const void *owner)
++{
++	boolean_t interrupts;
++	if (owner == NULL || !picasso_watchdog_enter(&interrupts)) return false;
++	bool result = false;
++	if (picasso_watchdog_live_locked() &&
++	    (picasso_wdt_owner == NULL || picasso_wdt_owner == owner) &&
++	    picasso_watchdog_pet_locked() && picasso_watchdog_live_locked()) {
++		picasso_wdt_owner = owner;
++		result = true;
++	}
++	picasso_watchdog_leave(interrupts);
++	return result;
++}
++
++bool
++picasso_watchdog_backend_pet(const void *owner)
++{
++	boolean_t interrupts;
++	if (owner == NULL || !picasso_watchdog_enter(&interrupts)) return false;
++	bool result = picasso_watchdog_live_locked() && picasso_wdt_owner == owner &&
++	    picasso_watchdog_pet_locked();
++	picasso_watchdog_leave(interrupts);
++	return result;
++}
++
++bool
++picasso_watchdog_backend_disable(const void *owner)
++{
++	boolean_t interrupts;
++	if (owner == NULL || !picasso_watchdog_enter(&interrupts)) return false;
++	bool result = false;
++	if (picasso_watchdog_live_locked() && picasso_wdt_owner == owner &&
++	    picasso_watchdog_config_locked(ud.watchdog_armed)) {
++		if (ud.watchdog_armed) usb_wr(ud.wdt, APSS_WDT_EN, 0);
++		result = picasso_watchdog_config_locked(false);
++		if (result) ud.watchdog_armed = false;
++	}
++	picasso_watchdog_leave(interrupts);
++	return result;
++}
++
++bool
++picasso_watchdog_backend_enable(const void *owner)
++{
++	boolean_t interrupts;
++	if (owner == NULL || !picasso_watchdog_enter(&interrupts)) return false;
++	bool result = false;
++	if (picasso_watchdog_live_locked() && picasso_wdt_owner == owner &&
++	    picasso_watchdog_config_locked(ud.watchdog_armed)) {
++		result = ud.watchdog_armed ? picasso_watchdog_pet_locked() :
++		    picasso_watchdog_program_locked();
++	}
++	picasso_watchdog_leave(interrupts);
++	return result;
++}
++
++static bool
 +picasso_usb_watchdog_pet(void)
 +{
-+	if (ud.watchdog_armed && ud.wdt != 0) {
-+		usb_wr(ud.wdt, APSS_WDT_RST, 1);
-+	}
++	boolean_t interrupts;
++	if (!picasso_watchdog_enter(&interrupts)) return false;
++	bool result = picasso_watchdog_live_locked() && picasso_wdt_owner == NULL &&
++	    picasso_watchdog_pet_locked();
++	picasso_watchdog_leave(interrupts);
++	return result;
 +}
 +
 +static void
 +picasso_usb_watchdog_arm(void)
 +{
-+	if (!ud.watchdog || ud.wdt == 0) {
-+		return;
++	boolean_t interrupts;
++	if (!picasso_watchdog_enter(&interrupts)) return;
++	bool attempted = ud.watchdog && picasso_watchdog_live_locked() &&
++	    picasso_wdt_owner == NULL;
++	bool armed = false;
++	uint32_t bark = 0, bite = 0, control = 0;
++	if (attempted) {
++		armed = picasso_watchdog_program_locked();
++		bark = usb_rd(ud.wdt, APSS_WDT_BARK);
++		bite = usb_rd(ud.wdt, APSS_WDT_BITE);
++		control = usb_rd(ud.wdt, APSS_WDT_EN);
 +	}
-+	uint32_t ticks =
-+	    (APSS_WDT_TIMEOUT_MS * APSS_WDT_RATE_HZ / 1000u) - 1u;
-+	usb_wr(ud.wdt, APSS_WDT_EN, 0);
-+	usb_wr(ud.wdt, APSS_WDT_RST, 1);
-+	usb_wr(ud.wdt, APSS_WDT_BARK, ticks);
-+	usb_wr(ud.wdt, APSS_WDT_BITE, ticks);
-+	usb_wr(ud.wdt, APSS_WDT_EN, 1);
-+	ud.watchdog_armed = true;
-+	printf("PICASSO USB: APSS watchdog armed ticks=%u bark=%u bite=%u ctl=%u\n",
-+	    ticks, usb_rd(ud.wdt, APSS_WDT_BARK),
-+	    usb_rd(ud.wdt, APSS_WDT_BITE),
-+	    usb_rd(ud.wdt, APSS_WDT_EN));
++	picasso_watchdog_leave(interrupts);
++	if (attempted) printf("PICASSO USB: APSS watchdog %s ticks=%u bark=%u bite=%u ctl=%u\n",
++	    armed ? "armed" : "arm failed", PICASSO_WDT_TICKS, bark, bite, control);
 +}
 +
 +static void
 +picasso_usb_watchdog_disable(void)
 +{
-+	if (ud.wdt != 0) {
++	boolean_t interrupts;
++	if (!picasso_watchdog_enter(&interrupts)) return;
++	if (picasso_watchdog_live_locked() && picasso_wdt_owner == NULL) {
 +		usb_wr(ud.wdt, APSS_WDT_EN, 0);
++		if (usb_rd(ud.wdt, APSS_WDT_EN) == 0) ud.watchdog_armed = false;
 +	}
-+	ud.watchdog_armed = false;
++	picasso_watchdog_leave(interrupts);
 +}
++
++static bool
++picasso_usb_watchdog_force_bite(void)
++{
++	picasso_usb_watchdog_terminal();
++	boolean_t interrupts;
++	if (!picasso_watchdog_enter(&interrupts)) return false;
++	bool result = false;
++	if (ud.wdt != 0 && !picasso_wdt_forced) {
++		/* Preserve the vendor pet-then-four-tick-bite sequence. No other
++		 * WDT writer can reload a longer count after this critical section. */
++		if (!(usb_rd(ud.wdt, APSS_WDT_EN) & 1u)) {
++			usb_wr(ud.wdt, APSS_WDT_BARK, PICASSO_WDT_TICKS);
++			usb_wr(ud.wdt, APSS_WDT_BITE, PICASSO_WDT_TICKS);
++			usb_wr(ud.wdt, APSS_WDT_EN, 1);
++		}
++		usb_wr(ud.wdt, APSS_WDT_RST, 1);
++		usb_wr(ud.wdt, APSS_WDT_BITE, APSS_WDT_FORCED_BITE);
++		picasso_wdt_forced = true;
++	}
++	if (ud.wdt != 0 && picasso_wdt_forced) {
++		ud.watchdog_armed = (usb_rd(ud.wdt, APSS_WDT_EN) & 1u) != 0;
++		result = ud.watchdog_armed &&
++		    usb_rd(ud.wdt, APSS_WDT_BITE) == APSS_WDT_FORCED_BITE;
++	}
++	picasso_watchdog_leave(interrupts);
++	return result;
++}
++/* PICASSO_WATCHDOG_BACKEND_END */
 +
 +static bool
 +picasso_usb_pshold_reset(void)
 +{
++	picasso_usb_watchdog_terminal();
 +	if (ud.pshold == 0) {
 +		ud.pshold = ml_io_map(PSHOLD_PA, PAGE_SIZE);
 +	}
@@ -1980,6 +2151,7 @@ index 0000000..2237fb2
 +static void
 +picasso_usb_psci_reset(void)
 +{
++	picasso_usb_watchdog_terminal();
 +	/*
 +	 * The device tree declares the PSCI conduit as SMC. Unlike an APSS
 +	 * watchdog bite, this enters the same firmware reset path that has
@@ -2003,6 +2175,7 @@ index 0000000..2237fb2
 +static void
 +picasso_usb_watchdog_reset(void)
 +{
++	picasso_usb_watchdog_terminal();
 +	if (ud.wdt == 0) {
 +		ud.wdt = ml_io_map(APSS_WDT_PA, PAGE_SIZE);
 +	}
@@ -2011,23 +2184,7 @@ index 0000000..2237fb2
 +	 * Keep this path as a fallback for firmware where PSCI reset is not
 +	 * available.
 +	 */
-+	if (ud.wdt != 0) {
-+		/*
-+		 * Match the vendor WatchDogTriggerBite() sequence exactly:
-+		 * pet the running watchdog, replace BITE with the four-tick
-+		 * value, then stop servicing it.  Re-arming first can make the
-+		 * controller reload a long count when BITE is rewritten.
-+		 */
-+		if (!(usb_rd(ud.wdt, APSS_WDT_EN) & 1u)) {
-+			uint32_t ticks =
-+			    (APSS_WDT_TIMEOUT_MS * APSS_WDT_RATE_HZ / 1000u) - 1u;
-+			usb_wr(ud.wdt, APSS_WDT_BARK, ticks);
-+			usb_wr(ud.wdt, APSS_WDT_BITE, ticks);
-+			usb_wr(ud.wdt, APSS_WDT_EN, 1);
-+			ud.watchdog_armed = true;
-+		}
-+		usb_wr(ud.wdt, APSS_WDT_RST, 1);
-+		usb_wr(ud.wdt, APSS_WDT_BITE, APSS_WDT_FORCED_BITE);
++	if (picasso_usb_watchdog_force_bite()) {
 +		__asm__ volatile ("dsb sy" ::: "memory");
 +		__asm__ volatile ("msr daifset, #0xf" ::: "memory");
 +		for (;;) {
@@ -2039,6 +2196,7 @@ index 0000000..2237fb2
 +static void
 +picasso_usb_system_reset(void)
 +{
++	picasso_usb_watchdog_terminal();
 +	printf("PICASSO CDC: reset begin mode=%u\n", ud.reset_mode);
 +	(void)picasso_usb_arm_fastboot_reason();
 +	if (ud.reset_mode == PICASSO_USB_RESET_PSCI) {
@@ -2070,6 +2228,7 @@ index 0000000..2237fb2
 +static void
 +ud_finish_reboot(void)
 +{
++	picasso_usb_watchdog_terminal();
 +	/*
 +	 * Never make reset conditional on an infinitely busy console ring:
 +	 * PICASSO USB events can append bytes while this drain is running.
@@ -2091,6 +2250,7 @@ index 0000000..2237fb2
 +static void
 +ud_finish_hang(void)
 +{
++	picasso_usb_watchdog_terminal();
 +	/*
 +	 * Deliberately stop the only CPU without masking the APSS watchdog.
 +	 * This proves that a scheduler hang can still reset to Fastboot while
@@ -2133,17 +2293,21 @@ index 0000000..2237fb2
 +		 * until ud_poll_serialized() has released that lock; otherwise the
 +		 * panic flush path would recursively drive the same DWC3 event ring.
 +		 */
++		picasso_usb_watchdog_terminal();
 +		ud.panic_pending = true;
 +	} else if (ud_command_is(ud.cmd, "reset-test")) {
 +		printf("PICASSO CDC: reset-test requested; draining then reset mode %u\n",
 +		    ud.reset_mode);
++		picasso_usb_watchdog_terminal();
 +		ud.reset_pending = true;
 +	} else if (ud_command_is(ud.cmd, "hang-test")) {
 +		printf("PICASSO CDC: hang-test requested; stopping CPU and watchdog pets\n");
++		picasso_usb_watchdog_terminal();
 +		ud.hang_pending = true;
 +	} else if (ud_command_is(ud.cmd, "reboot-fastboot")) {
 +		printf("PICASSO CDC: reboot-fastboot requested; using reset mode %u\n",
 +		    ud.reset_mode);
++		picasso_usb_watchdog_terminal();
 +		ud.reboot_pending = true;
 +	} else if (ud.cmd[0] != '\0') {
 +		printf("PICASSO CDC: unknown command '%s'; type help\n", ud.cmd);
@@ -2171,6 +2335,7 @@ index 0000000..2237fb2
 +void
 +picasso_usb_panic_begin(void)
 +{
++	picasso_usb_watchdog_terminal();
 +	static const char marker[] = "\r\n=== PICASSO CDC PANIC BEGIN ===\r\n";
 +	if (pu_panic_active) {
 +		return;
@@ -2240,6 +2405,7 @@ index 0000000..2237fb2
 +void
 +picasso_usb_panic_reset(void)
 +{
++	picasso_usb_watchdog_terminal();
 +	if (!ud.panic_reset) {
 +		return;
 +	}
@@ -2340,13 +2506,13 @@ index 0000000..2237fb2
 +		    ud_monotonic_ns());
 +	}
 +	bool normal = ud_poll_serialized();
-+	bool petted = normal && !ud.panic_mode && ud.watchdog_armed && ud.wdt != 0;
++	/* Ownership and the actual RST write are decided under the WDT lock. */
++	bool petted = normal && !ud.panic_mode && picasso_usb_watchdog_pet();
 +	uint64_t now_ns = 0, gap_ns = 0;
 +	bool gap_valid = false;
 +	if (petted) {
 +		/* Service a completed normal poll before diagnostics or yielding.
 +		 * A failed try-lock is not USB progress and must not feed the dog. */
-+		picasso_usb_watchdog_pet();
 +		now_ns = ud_monotonic_ns();
 +		gap_valid = progress->have_pet && now_ns >= progress->last_pet_ns;
 +		if (gap_valid) {
