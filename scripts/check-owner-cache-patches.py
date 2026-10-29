@@ -21,6 +21,7 @@ REPLAY_SOURCES = (
     'bsd/kern/sys_generic.c', 'bsd/kern/kern_descrip.c',
     'bsd/kern/kern_mman.c', 'bsd/kern/ubc_subr.c',
     'osfmk/arm64/sleh.c', 'iokit/Kernel/IOUserClient.cpp',
+    'bsd/vfs/vfs_attrlist.c', 'bsd/kern/bsd_init.c',
 )
 
 
@@ -74,6 +75,7 @@ def main():
     diagnostics = tree / 'patches/xnu/zzzzz-picasso-launchd-diagnostics.patch'
     assert diagnostics.is_file(), 'Missing launchd diagnostics patch'
     assert late[0] == diagnostics, 'Launchd diagnostics must be reversed first'
+    assert late[1] == tree / 'patches/xnu/zzzz-picasso-systemos-union.patch'
     prelink = sorted(a.prelink_patches.resolve().glob('*.patch'))
     if not prelink:
         raise RuntimeError('No prelink patches; refusing an incomplete replay')
@@ -105,9 +107,17 @@ def main():
     assert 'NATIVE_OWNER_CARRIER root=%x cache=%x accepted=%u' in vm
     config = (DEVICE / 'configs/picasso_defconfig').read_text()
     for selector in ('OWNER_ROOT_TRUST', 'OWNER_CACHE_MOUNT', 'OWNER_CACHE_STARTUP',
-                     'OWNER_BOOT_MANIFEST', 'OWNER_CACHE_CARRIER'):
+                     'OWNER_BOOT_MANIFEST', 'OWNER_UNION_SYSTEMOS'):
         assert config.count('CONFIG_XNU_' + selector + '=y') == 1
         assert '# CONFIG_XNU_' + selector + ' is not set' not in config
+    assert config.count('# CONFIG_XNU_OWNER_CACHE_CARRIER is not set') == 1
+    assert 'CONFIG_XNU_OWNER_CACHE_CARRIER=y' not in config
+    assert '-DXNU_OWNER_UNION_SYSTEMOS=$OWNER_UNION_SYSTEMOS' in baseline
+    assert 'request.flags |= MNT_UNION;' in kern
+    assert 'cache_authorized = cache_authorized && native_union;' in kern
+    assert 'native_owner_union_path("/usr/lib/libobjc-trampolines.dylib", cache_mount)' in kern
+    assert 'native_owner_union_path("/sbin/launchd", root_mount)' in kern
+    assert 'p == kernproc && rootvnode == olddp' in (xnu / 'bsd/vfs/vfs_syscalls.c').read_text()
     assert '-DXNU_OWNER_CACHE_CARRIER=$OWNER_CACHE_CARRIER' in baseline
     assert 'UFS_ARCHIVE=$ROOT/build/native-ufs/libNativeUfs.a' in baseline
     assert '#define PREBOOT_CRYPTEX_PATH "/private/preboot/Cryptexes"' in vm

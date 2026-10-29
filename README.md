@@ -1,13 +1,11 @@
 # UniXNU on Redmi K30 5G (picasso, SM7250)
 
-> **Status: the XNU kernel boots through to the root-device wait.** The UEFI
-> firmware boots the UniXNU menu, and the xnu entry starts the kernel through
-> DarwinBoot. The kernel reaches the BSD layer, loads the AMFI / AppleImage4 /
-> MAC-framework and pthread kexts, brings up mbufs, dlil and lo0, registers
-> APFS, and then waits for a root device.
->
-> Storage bring-up (UFS root) is the current stage; a usable system is still
-> several stages away.
+> **Status: original early userspace runs; service startup is still incomplete.**
+> UFS, authenticated OS/SystemOS, the dyld shared cache, volatile Data and AES
+> startup pass on the device. The latest tested image reboots after a userspace
+> watchdog timeout. The current SystemOS union change addresses an observed
+> missing-library abort and still needs a new build and device test; see
+> [the investigation](docs/objc-trampolines-investigation.md).
 >
 > UEFI firmware: https://github.com/YinCQL/uefi_picasso
 
@@ -16,13 +14,11 @@
 - **UEFI firmware: working.** Boots to the UniXNU menu. UFS Mass Storage, GOP
   framebuffer, button input and stable boot all work. Built via the UniXNU build
   driver; produces a flashable `Mu-picasso-unixnu-0.img`.
-- **XNU kernel: boots to the root-device wait.** Build workflow, first-console
-  config and the SM7250 ADT generator are in place, and the SM7250 kernel patch
-  set (`patches/unixnu-source-kernel.patch`) builds the kernel that DarwinBoot
-  starts. AMFI early-security init, the `com.apple.kec.pthread` kext and the
-  NativeUfs driver are linked in; the verbose boot log scrolls live on the
-  framebuffer and ends at the IOMedia/root wait. UFS bring-up (stage 6) is in
-  progress.
+- **XNU kernel: reaches original launchd and system services.** NativeUfs
+  publishes the authenticated OS and SystemOS volumes; APFS mounts them and
+  dyld maps the shared cache. A separate writable Data volume runs in RAM.
+  Service failures and the watchdog reboot remain under investigation; a
+  usable SpringBoard display and persistent Data are not established.
 - **USB kernel console: working.** The kernel exposes a CDC-ACM device named
   `picasso XNU USB console` and streams the buffered/live console over DWC3.
   Capture it on macOS with `scripts/capture-picasso-usb-console.py`, or on Windows
@@ -33,7 +29,8 @@
 ## Build
 
 - Firmware: `Build UniXNU UEFI for picasso` workflow -> `fastboot boot Mu-picasso-unixnu-0.img`.
-- Kernel + payload: `picasso XNU kernel` workflow (macos-latest).
+- Kernel + payload + boot image: `Compose Boot Image (FD + kernel + payload)`
+  workflow (macos-latest).
 
 ## Tooling merged from the silenzio111 fork
 

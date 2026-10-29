@@ -1780,19 +1780,20 @@ diff --git a/patches/xnu/offline-owner-cache-carrier.patch b/patches/xnu/offline
 diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
 --- a/scripts/build-xnu-4k-baseline.sh
 +++ b/scripts/build-xnu-4k-baseline.sh
-@@ -35,7 +35,10 @@
+@@ -35,7 +35,11 @@
  # Remove them first so earlier independent patches retain their idempotent checks.
  # The same holds for the boot-time GPU addon mount and the staged system apps copy (zzy), which edit the owner Data mount function
  # inside the systemos patch. Reverse newest first; the loop below re-applies them in name order.
 -for LATE_PATCH in "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \
 +for LATE_PATCH in "$ROOT/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch" \
++    "$ROOT/patches/xnu/zzzz-picasso-systemos-union.patch" \
 +    "$ROOT/patches/xnu/zzz-picasso-usb-console.patch" \
 +    "$ROOT/patches/xnu/zzz-picasso-console-ring.patch" \
 +    "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \
      "$ROOT/patches/xnu/zzy-native-gpu-addon-mount.patch"; do
    if git -C .cache/xnu-work apply --reverse --check "$LATE_PATCH" >/dev/null 2>&1; then
      git -C .cache/xnu-work apply --reverse "$LATE_PATCH"
-@@ -180,8 +183,12 @@
+@@ -180,8 +184,12 @@
    exit 1
  fi
  if [ "$NATIVE_RAM_BLOCK" = 1 ]; then
@@ -1807,7 +1808,7 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
      exit 1
    fi
    PERSONALITY_CFLAGS="$PERSONALITY_CFLAGS -DXNU_NATIVE_RAM_BLOCK=1"
-@@ -254,8 +261,9 @@
+@@ -254,8 +262,9 @@
    echo 'XNU_OWNER_ROOT_AUDIT must be 0 or 1' >&2
    exit 1
  fi
@@ -1819,7 +1820,7 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
    exit 1
  fi
  OWNER_ROOT_TRUST=${XNU_OWNER_ROOT_TRUST:-0}
-@@ -263,8 +271,9 @@
+@@ -263,8 +272,9 @@
    echo 'XNU_OWNER_ROOT_TRUST must be 0 or 1' >&2
    exit 1
  fi
@@ -1831,7 +1832,7 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
    exit 1
  fi
  ADRENO_FIRMWARE_PROBE=${XNU_ADRENO_FIRMWARE_PROBE:-0}
-@@ -400,7 +409,10 @@
+@@ -400,7 +410,10 @@
  text = '/* Scratch Data IOKit selection disabled. */\n'
  if sys.argv[2:4] == ['1', '1']:
      try:
@@ -1843,7 +1844,7 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
      except ValueError:
          raise SystemExit('Set XNU_OWNER_DATA_VOLUME_UUID to the actual observed scratch APFS volume UUID')
      text = '#define XNU_OWNER_DATA_VOLUME_UUID "' + value + '"\n'
-@@ -417,9 +429,19 @@
+@@ -417,9 +430,19 @@
      path.write_text(text)
  PY_DATA_UUID
  OWNER_DATA_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-data-mount-mode
@@ -3548,3 +3549,78 @@ new file mode 100644
 + 	return err;
 + }
 + 
+diff --git a/patches/xnu/zzzz-picasso-systemos-union.patch b/patches/xnu/zzzz-picasso-systemos-union.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/zzzz-picasso-systemos-union.patch
+@@ -0,0 +1,70 @@
++diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
++--- a/bsd/kern/kern_exec.c
+++++ b/bsd/kern/kern_exec.c
++@@ -7048,6 +7048,23 @@
++ {
++ 	__asm__ volatile("" : : "r"(status), "r"(authorized) : "memory");
++ }
+++
+++#if defined(XNU_OWNER_UNION_SYSTEMOS) && XNU_OWNER_UNION_SYSTEMOS
+++/* Verify both layers through the same absolute paths that original dyld uses.
+++ * A lookup is not code-signature validation; normal vnode/AMFI checks still run
+++ * when the unchanged file is opened and mapped by its caller. */
+++static int
+++native_owner_union_path(const char *path, mount_t expected)
+++{
+++	vnode_t vp = NULLVP;
+++	int error = vnode_lookup(path, 0, &vp, vfs_context_current());
+++	int matched = !error && vp && vnode_vtype(vp) == VREG && vnode_mount(vp) == expected;
+++	if (!error && !matched) error = EAUTH;
+++	printf("NATIVE_OWNER_UNION path=%s error=%d source_match=%d\n", path, error, matched);
+++	if (vp) vnode_put(vp);
+++	return error;
+++}
+++#endif
++ 
++ static int
++ native_owner_cache_prepare(proc_t p, user_addr_t scratch, user_addr_t *envp)
++@@ -7142,6 +7159,8 @@
++ 	int native_union = (vfs_flags(cache_mount) & MNT_UNION) &&
++ 	    vnode_mountedhere(original_os_root) == cache_mount && rootvnode == mounted_root;
++ 	native_owner_cache_native_union = native_union;
+++	printf("NATIVE_OWNER_CACHE composition union=%d flags=%llx\n", native_union,
+++	    (unsigned long long)native_owner_cache_actual_mount_flags);
++ 	cache_authorized = readonly && actual == selected &&
++ 	    !strcmp(vfs_statfs(cache_mount)->f_fstypename, "apfs") && native_verified_block_root_authorized(actual);
++ #if defined(XNU_OWNER_UNION_SYSTEMOS) && XNU_OWNER_UNION_SYSTEMOS
++@@ -7150,6 +7169,11 @@
++ 	if (!cache_authorized) { error = EAUTH; goto done; }
++ 	native_owner_cache_stage = 5;
++ 	printf("NATIVE_OWNER_CACHE stage=5 cache=%x authorized=1 readonly=%d\n", (unsigned)actual, readonly);
+++#if defined(XNU_OWNER_UNION_SYSTEMOS) && XNU_OWNER_UNION_SYSTEMOS
+++	if ((error = native_owner_union_path("/usr/lib/libobjc-trampolines.dylib", cache_mount)) != 0 ||
+++	    (error = native_owner_union_path("/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64", cache_mount)) != 0 ||
+++	    (error = native_owner_union_path("/sbin/launchd", root_mount)) != 0) goto done;
+++#endif
++ #if !defined(XNU_OWNER_UNION_SYSTEMOS) || !XNU_OWNER_UNION_SYSTEMOS
++ 	if ((error = copyout(environment, environment_vector[0], strlen(environment) + 1)) != 0 ||
++ 	    (error = copyout(environment_vector, scratch + 0x500, sizeof(environment_vector))) != 0) goto done;
++diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
++--- a/bsd/vfs/vfs_syscalls.c
+++++ b/bsd/vfs/vfs_syscalls.c
++@@ -2539,9 +2539,16 @@
++ 	 */
++ 	proc_fdlock(p);
++ 	if (fdp->fd_cdir == olddp) {
++-		old_cvp = olddp;
+++		/* set_rootvnode() gives kernproc a borrowed alias of rootvnode.
+++		 * checkdirs() below transfers that one root reference. Moving the
+++		 * alias here must not consume a second old-root usecount; return
+++		 * its unused provisional new_cvp reference in the usual cleanup.
+++		 * All independently owned cwd/rdir references retain their path. */
+++		if (!(p == kernproc && rootvnode == olddp)) {
+++			old_cvp = olddp;
+++			new_cvp = NULL;
+++		}
++ 		fdp->fd_cdir = newdp;
++-		new_cvp = NULL;
++ 	}
++ 	if (fdp->fd_rdir == olddp) {
++ 		old_rvp = olddp;

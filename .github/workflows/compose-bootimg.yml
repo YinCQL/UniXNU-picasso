@@ -207,6 +207,8 @@ jobs:
             device/out/picasso/tree/build/native-aes/*.log
             device/out/picasso/tree/build/native-aes/*.o
             device/out/picasso/tree/build/native-aes/*.a
+            device/out/picasso/tree/build/xnu/**/kern_exec.cpo.json
+            device/out/picasso/tree/build/xnu/**/vfs_syscalls.cpo.json
             device/out/picasso/ram-data/*.json
             device/out/picasso/ram-data/data.dbrdisk
             device/out/picasso/.config

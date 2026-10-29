@@ -37,14 +37,11 @@ CONFIG_XNU_NATIVE_RAM_BLOCK=y
 # CONFIG_XNU_VERIFIED_ROOT_PROBE is not set
 CONFIG_XNU_OWNER_ROOT_AUDIT=y
 CONFIG_XNU_OWNER_ROOT_TRUST=y
-# Mount the authenticated SystemOS cryptex read-only at /private/preboot and
-# pass DYLD_SHARED_CACHE_DIR to init. This requires the OS root to have mounted
-# already; it cannot resolve an earlier IOFindBSDRoot wait. CACHE_VOLUME_UUID
-# selects the signed APFS volume by UUID, not by its variable diskNsM name.
-# OWNER_UNION_SYSTEMOS stays off for now: it overlays SystemOS onto / with
-# MNT_UNION. The kernel tree does select union mounts (DEVELOPMENT includes
-# FILESYS_DEV), but that path is the heavier fallback -- the carrier route
-# below authorizes the SystemOS mount in place and is sufficient.
+# Compose the authenticated SystemOS cryptex read-only over the mounted OS
+# using native union lookup. Standalone libraries such as libobjc-trampolines
+# must be visible at /usr/lib; selecting only the shared-cache directory does
+# not expose these files. The original OS remains the lower layer.
+# CACHE_VOLUME_UUID selects the signed APFS volume, not a variable diskNsM name.
 CONFIG_XNU_OWNER_CACHE_MOUNT=y
 # Select the dyld startup bit so the original ignition sequence does not run a
 # second, unauthenticated cache path; requires the mount above.
@@ -53,15 +50,12 @@ CONFIG_XNU_OWNER_CACHE_STARTUP=y
 # startup selection. Data is a separate volatile APFS volume prepared in CI.
 CONFIG_XNU_OWNER_BOOT_MANIFEST=y
 CONFIG_XNU_OWNER_CACHE_VOLUME_UUID="8846FE78-2910-4297-AF97-D59BB6F8FC16"
-# The SystemOS carrier is mounted at /private/preboot, not unioned onto /.
-# The non-CSR shared-region path checks the root mount and the mount resolved
-# through /private/preboot/Cryptexes. The carrier patch adds the authenticated
-# SystemOS mount/direct-parent check for our non-union path. Requires
-# OWNER_CACHE_STARTUP. A first shared_region_check_np() returning an empty
-# region is not by itself evidence that the subsequent mapping failed.
-CONFIG_XNU_OWNER_CACHE_CARRIER=y
+# The shared cache is now on the process root mount, so the additional
+# non-union carrier allowance is unnecessary. Original signature and owner
+# verification remain enabled for both volumes.
+# CONFIG_XNU_OWNER_CACHE_CARRIER is not set
 CONFIG_XNU_OWNER_DATA_MOUNT=y
-# CONFIG_XNU_OWNER_UNION_SYSTEMOS is not set
+CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
 # CONFIG_XNU_BOOT_PROGRESS is not set
 
 # prepare-picasso-ram-data.py writes the formatted APFS volume's actual UUID

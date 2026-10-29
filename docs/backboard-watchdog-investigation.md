@@ -1,5 +1,9 @@
 # Userspace watchdog after AES startup
 
+Build 76's service-exit diagnostics identify a missing standalone Objective-C
+library. See [the SystemOS union investigation](objc-trampolines-investigation.md)
+for the current change and validation limits. The build-75 work below is historical.
+
 Build 75 / [40964749987](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40964749987)
 at `59eaf23dc10066a5a0f0b799764c591451beb950` completed successfully.
 The downloaded artifact is `12938756852` / `picasso-bootimg-75`.
