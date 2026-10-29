@@ -20,6 +20,7 @@ REPLAY_SOURCES = (
     'bsd/kern/kern_exit.c', 'bsd/vfs/vfs_syscalls.c', 'bsd/vfs/vfs_lookup.c',
     'bsd/kern/sys_generic.c', 'bsd/kern/kern_descrip.c',
     'bsd/kern/kern_mman.c', 'bsd/kern/ubc_subr.c',
+    'osfmk/arm64/sleh.c', 'iokit/Kernel/IOUserClient.cpp',
 )
 
 

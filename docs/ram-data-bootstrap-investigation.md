@@ -1,5 +1,8 @@
 # Writable Data for original launchd boot tasks
 
+Build 40901155087 now mounts Data writable and reaches early boot completion.
+The next captured panic is [watchdogd's SIGTRAP](watchdogd-trap-investigation.md).
+
 ## Device evidence
 
 The user identifies `picasso-windows-20261029-221748-215.log` as build

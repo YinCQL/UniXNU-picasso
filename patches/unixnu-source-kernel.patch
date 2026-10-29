@@ -1870,7 +1870,7 @@ diff --git a/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch b/patches/xnu/z
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
-@@ -0,0 +1,1199 @@
+@@ -0,0 +1,1443 @@
 +diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 +--- a/bsd/vfs/vfs_syscalls.c
 ++++ b/bsd/vfs/vfs_syscalls.c
@@ -2300,7 +2300,7 @@ new file mode 100644
 +diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 +--- a/bsd/kern/kern_exit.c
 ++++ b/bsd/kern/kern_exit.c
-+@@ -135,6 +135,7 @@
++@@ -135,11 +135,16 @@
 + 
 + #include <vm/vm_protos.h>
 + #include <os/log.h>
@@ -2308,7 +2308,16 @@ new file mode 100644
 + #include <os/system_event_log.h>
 + 
 + #include <pexpert/pexpert.h>
-+@@ -1359,6 +1360,21 @@
++ 
++ #include <kdp/kdp_dyld.h>
+++#if __arm64__ && (DEVELOPMENT || DEBUG)
+++#include <arm/thread.h>
+++#include <arm64/proc_reg.h>
+++#endif
++ 
++ #if SYSV_SHM
++ #include <sys/shm_internal.h>   /* shmexit */
++@@ -1359,6 +1364,170 @@
 + 
 + #define OS_REASON_TOTAL_USER_FAULTS_PER_PROC  5
 + 
@@ -2327,10 +2336,159 @@ new file mode 100644
 ++}
 ++#endif
 ++
+++/* PICASSO_USER_FAULT_BEGIN: register-only capture; bounded ordinary-exit report. */
+++#if __arm64__ && (DEVELOPMENT || DEBUG)
+++struct picasso_user_fault {
+++	unsigned valid;
+++	int pid, pidversion;
+++	task_t task;
+++	uint64_t uniqueid, tid, pc, lr, sp, fp, esr, slide, x[29];
+++};
+++static struct picasso_user_fault picasso_faults[8];
+++static unsigned picasso_fault_lock, picasso_fault_next, picasso_fault_filled;
+++
+++void picasso_user_breakpoint(void *, uint32_t);
+++void
+++picasso_user_breakpoint(void *saved, uint32_t esr)
+++{
+++	arm_saved_state_t *state = saved;
+++	proc_t p = current_proc();
+++	if (!state || !p || !is_saved_state64(state) ||
+++	    !PSR64_IS_USER64(get_saved_state_cpsr(state))) return;
+++	if (__atomic_exchange_n(&picasso_fault_lock, 1, __ATOMIC_ACQUIRE)) return;
+++	struct picasso_user_fault *f = &picasso_faults[picasso_fault_next];
+++	f->valid = 0;
+++	f->pid = proc_getpid(p);
+++	f->pidversion = proc_pidversion(p);
+++	f->uniqueid = proc_uniqueid(p);
+++	f->task = current_task();
+++	f->tid = thread_tid(current_thread());
+++	f->pc = get_saved_state_pc(state);
+++	f->lr = get_saved_state_lr(state);
+++	f->sp = get_saved_state_sp(state);
+++	f->fp = get_saved_state_fp(state);
+++	f->esr = esr;
+++	/* Read the cached value; the telemetry accessor takes task locks. */
+++	f->slide = current_task()->task_shared_region_slide;
+++	for (unsigned i = 0; i < 29; ++i) f->x[i] = get_saved_state_reg(state, i);
+++	f->valid = 1;
+++	picasso_fault_next = (picasso_fault_next + 1) % 8;
+++	if (picasso_fault_filled < 8) ++picasso_fault_filled;
+++	__atomic_store_n(&picasso_fault_lock, 0, __ATOMIC_RELEASE);
+++}
+++
+++static void
+++picasso_fault_printable(char *text, size_t capacity)
+++{
+++	for (size_t i = 0; i < capacity && text[i]; ++i) {
+++		if ((unsigned char)text[i] < 32 || (unsigned char)text[i] > 126) text[i] = '?';
+++	}
+++}
+++
+++/* Called only after the original critical-exit policy decided to panic.
+++ * A handled breakpoint can precede another exit. Select only the newest
+++ * snapshot from this exact process lifetime, task and exiting thread when
+++ * OS_REASON_SIGNAL identifies SIGTRAP (which may arrive as SIGKILL); never
+++ * synthesize trap state from syscall regs.
+++ * No user memory is read while holding the capture lock. Copy failures are
+++ * diagnostic values and cannot change the original coredump/sync/panic path. */
+++static void
+++picasso_report_critical_fault(proc_t p, int rv)
+++{
+++	static unsigned report_count;
+++	unsigned ticket = picasso_pid1_trace_ticket(&report_count, 8);
+++	if (!ticket) return;
+++	struct picasso_user_fault f = {0};
+++	const char *record = "not-breakpoint-exit";
+++	uint64_t tid = thread_tid(current_thread());
+++	uint64_t uniqueid = proc_uniqueid(p);
+++	int pidversion = proc_pidversion(p);
+++	unsigned reason = p->p_exit_reason ? p->p_exit_reason->osr_namespace : 0;
+++	uint64_t code = p->p_exit_reason ? p->p_exit_reason->osr_code : 0;
+++	if (p == current_proc() && proc_task(p) == current_task() &&
+++	    WIFSIGNALED(rv) && reason == OS_REASON_SIGNAL && code == SIGTRAP) {
+++		record = "busy";
+++		if (!__atomic_exchange_n(&picasso_fault_lock, 1, __ATOMIC_ACQUIRE)) {
+++			record = "missing";
+++			for (unsigned n = 0; n < picasso_fault_filled; ++n) {
+++				struct picasso_user_fault *candidate = &picasso_faults[(picasso_fault_next + 7 - n) % 8];
+++				if (candidate->valid && candidate->pid == proc_getpid(p) &&
+++				    candidate->pidversion == pidversion &&
+++				    candidate->uniqueid == uniqueid && candidate->task == current_task() && candidate->tid == tid) {
+++					f = *candidate;
+++					candidate->valid = 0;
+++					record = "breakpoint-snapshot";
+++					break;
+++				}
+++			}
+++			__atomic_store_n(&picasso_fault_lock, 0, __ATOMIC_RELEASE);
+++		}
+++	}
+++	char process_name[32];
+++	snprintf(process_name, sizeof(process_name), "%.31s", p->p_name);
+++	picasso_fault_printable(process_name, sizeof(process_name));
+++	printf("PICASSO_CRITICAL sample=%u pid=%d name=%.31s unique=%llu thread=%llu exit_signal=%d namespace=%u code=%llx record=%s\n",
+++	    ticket, proc_getpid(p), process_name, (unsigned long long)uniqueid, (unsigned long long)tid,
+++	    WTERMSIG(rv), reason, (unsigned long long)code, record);
+++	if (!f.valid) return;
+++	printf("PICASSO_EL0 PC=%llx LR=%llx SP=%llx FP=%llx ESR=%llx cache_slide=%llx\n",
+++	    (unsigned long long)f.pc, (unsigned long long)f.lr, (unsigned long long)f.sp,
+++	    (unsigned long long)f.fp, (unsigned long long)f.esr, (unsigned long long)f.slide);
+++	printf("PICASSO_EL0 x0=%llx x1=%llx x2=%llx x3=%llx x19=%llx x20=%llx x21=%llx x22=%llx x23=%llx\n",
+++	    (unsigned long long)f.x[0], (unsigned long long)f.x[1], (unsigned long long)f.x[2],
+++	    (unsigned long long)f.x[3], (unsigned long long)f.x[19], (unsigned long long)f.x[20],
+++	    (unsigned long long)f.x[21], (unsigned long long)f.x[22], (unsigned long long)f.x[23]);
+++	uint32_t instruction = 0;
+++	uint64_t frames[6] = {0}, frame = f.fp;
+++	unsigned depth = 0;
+++	int frame_error = 0, path_error = -1;
+++	const char *frame_stop = "end";
+++	char message[161] = {0}, image_path[81] = {0};
+++	size_t copied = 0;
+++	struct user64_dyld_all_image_infos info = {0};
+++	struct user64_dyld_image_info image = {0};
+++	int instruction_error = copyin((user_addr_t)f.pc, &instruction, sizeof(instruction));
+++	if (instruction_error) instruction = 0;
+++	int image_error = copyin(task_get_all_image_info_addr(current_task()), &info, sizeof(info));
+++	if (!image_error) {
+++		if (info.infoArrayCount && info.infoArray) {
+++			image_error = copyin(info.infoArray, &image, sizeof(image));
+++			if (!image_error) {
+++				path_error = copyinstr(image.imageFilePath, image_path, sizeof(image_path), &copied);
+++				if (path_error) image_path[0] = 0;
+++			}
+++		} else image_error = ENOENT;
+++	}
+++	if (image_error) image.imageLoadAddress = 0;
+++	for (; depth < 3 && frame; ++depth) {
+++		uint64_t pair[2] = {0};
+++		if (frame & 15) { frame_stop = "unaligned"; break; }
+++		frame_error = copyin((user_addr_t)frame, pair, sizeof(pair));
+++		if (frame_error) { frame_stop = "copy-error"; break; }
+++		frames[depth * 2] = pair[0]; frames[depth * 2 + 1] = pair[1];
+++		if (!pair[0]) { ++depth; break; }
+++		if (pair[0] <= frame || pair[0] - frame > 1048576) { frame_stop = "range"; ++depth; break; }
+++		frame = pair[0];
+++		if (depth == 2) frame_stop = "limit";
+++	}
+++	int message_error = copyinstr((user_addr_t)f.x[0], message, sizeof(message), &copied);
+++	if (message_error) message[0] = 0;
+++	picasso_fault_printable(message, sizeof(message));
+++	picasso_fault_printable(image_path, sizeof(image_path));
+++	printf("PICASSO_EL0 insn=%x insn_error=%d image0=%llx image_error=%d path_error=%d path=%.80s\n",
+++	    instruction, instruction_error, (unsigned long long)image.imageLoadAddress, image_error, path_error, image_path);
+++	printf("PICASSO_EL0 frames=%u error=%d stop=%s %llx/%llx %llx/%llx %llx/%llx\n",
+++	    depth, frame_error, frame_stop, (unsigned long long)frames[0], (unsigned long long)frames[1],
+++	    (unsigned long long)frames[2], (unsigned long long)frames[3], (unsigned long long)frames[4], (unsigned long long)frames[5]);
+++	printf("PICASSO_EL0 x0str_error=%d candidate_text=%.160s\n", message_error, message);
+++}
+++#endif
+++/* PICASSO_USER_FAULT_END */
+++
 + static int
 + abort_with_payload_internal(proc_t p,
 +     uint32_t reason_namespace, uint64_t reason_code,
-+@@ -1368,6 +1384,22 @@
++@@ -1368,6 +1537,22 @@
 + {
 + 	os_reason_t exit_reason = OS_REASON_NULL;
 + 	kern_return_t kr = KERN_SUCCESS;
@@ -2353,7 +2511,7 @@ new file mode 100644
 + 
 + 	if (internal_flags & OS_REASON_IFLAG_USER_FAULT) {
 + 		uint32_t old_value = atomic_load_explicit(&p->p_user_faults,
-+@@ -1375,13 +1407,13 @@
++@@ -1375,13 +1560,13 @@
 + 
 + #if DEVELOPMENT || DEBUG
 + 		if (bootarg_disable_user_faults) {
@@ -2369,7 +2527,7 @@ new file mode 100644
 + 			}
 + 			// this reloads the value in old_value
 + 			if (atomic_compare_exchange_strong_explicit(&p->p_user_faults,
-+@@ -1422,16 +1454,17 @@
++@@ -1422,16 +1607,17 @@
 + 
 + 	switch (kr) {
 + 	case KERN_SUCCESS:
@@ -2393,7 +2551,7 @@ new file mode 100644
 + 
 + int
 + abort_with_payload(struct proc *cur_proc, struct abort_with_payload_args *args,
-+@@ -1820,6 +1853,15 @@
++@@ -1820,6 +2006,15 @@
 + static void
 + proc_handle_critical_exit(proc_t p, int rv)
 + {
@@ -2409,6 +2567,16 @@ new file mode 100644
 + 	if (!proc_should_trigger_panic(p, rv)) {
 + 		// No panic, bail out
 + 		return;
++@@ -1834,6 +2029,9 @@
++ 	}
++ #endif /* DEVELOPMENT */
++ 
+++#if __arm64__ && (DEVELOPMENT || DEBUG)
+++	picasso_report_critical_fault(p, rv);
+++#endif
++ 	char *exit_reason_desc = exit_reason_get_string_desc(p->p_exit_reason);
++ 
++ 	if (p->p_exit_reason == OS_REASON_NULL) {
 +diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
 +--- a/bsd/kern/sys_generic.c
 ++++ b/bsd/kern/sys_generic.c
@@ -3070,3 +3238,79 @@ new file mode 100644
 + #endif
 + static boolean_t
 + cs_validate_hash(
++diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
++--- a/osfmk/arm64/sleh.c
+++++ b/osfmk/arm64/sleh.c
++@@ -162,6 +162,9 @@
++ static void handle_kernel_breakpoint(arm_saved_state_t *, uint32_t);
++ 
++ static void handle_breakpoint(arm_saved_state_t *, uint32_t) __dead2;
+++#if DEVELOPMENT || DEBUG
+++extern void picasso_user_breakpoint(void *, uint32_t);
+++#endif
++ 
++ typedef void (*abort_inspector_t)(uint32_t, fault_status_t *, vm_prot_t *);
++ static void inspect_instruction_abort(uint32_t, fault_status_t *, vm_prot_t *);
++@@ -1230,6 +1233,9 @@
++ 	mach_exception_data_type_t codes[2]  = {EXC_ARM_BREAKPOINT};
++ 	mach_msg_type_number_t     numcodes  = 2;
++ 
+++#if DEVELOPMENT || DEBUG
+++	picasso_user_breakpoint(state, esr);
+++#endif
++ 	boot_progress_user_breakpoint(state, esr);
++ #if __has_feature(ptrauth_calls)
++ 	if (ESR_EC(esr) == ESR_EC_BRK_AARCH64 &&
++diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
++--- a/iokit/Kernel/IOUserClient.cpp
+++++ b/iokit/Kernel/IOUserClient.cpp
++@@ -46,6 +46,9 @@
++ #include <libkern/OSDebug.h>
++ #include <DriverKit/OSAction.h>
++ #include <sys/proc.h>
+++#if DEVELOPMENT || DEBUG
+++#include <kern/thread.h>
+++#endif
++ #include <sys/kauth.h>
++ #include <sys/codesign.h>
++ #include <sys/code_signing.h>
++@@ -2777,6 +2780,20 @@
++ }
++ 
++ 
+++#if DEVELOPMENT || DEBUG
+++static unsigned
+++picasso_watchdog_match_ticket(void)
+++{
+++	static unsigned counter;
+++	unsigned value = __atomic_load_n(&counter, __ATOMIC_RELAXED);
+++	while (value < 8) {
+++		if (__atomic_compare_exchange_n(&counter, &value, value + 1, false,
+++		    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return value + 1;
+++	}
+++	return 0;
+++}
+++#endif
+++
++ static kern_return_t
++ internal_io_service_get_matching_service(
++ 	mach_port_t main_port,
++@@ -2796,9 +2813,18 @@
++ 	obj = OSUnserializeXML(matching, matching_size);
++ 
++ 	if ((dict = OSDynamicCast( OSDictionary, obj))) {
+++#if DEVELOPMENT || DEBUG
+++		OSString *provider = OSDynamicCast(OSString, dict->getObject("IOProviderClass"));
+++		unsigned ticket = provider && provider->isEqualTo("IOWatchdog") ? picasso_watchdog_match_ticket() : 0;
+++		uint64_t tid = ticket ? thread_tid(current_thread()) : 0;
+++#endif
++ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
++ 		*service = IOService::copyMatchingService( dict );
++ 		kr = *service ? kIOReturnSuccess : kIOReturnNotFound;
+++#if DEVELOPMENT || DEBUG
+++		if (ticket) printf("PICASSO_WATCHDOG match sample=%u pid=%d thread=%llu kr=%x found=%u\n",
+++		    ticket, proc_selfpid(), (unsigned long long)tid, (unsigned)kr, *service ? 1u : 0u);
+++#endif
++ 	} else {
++ 		kr = kIOReturnBadArgument;
++ 	}
