@@ -100,6 +100,25 @@ jobs:
           mkdir -p out/picasso/logs
           python3 ./unixnu build kernel payload -j 3 --trust-cache out/picasso/original-static-system.bundle 2>&1 | tee out/picasso/logs/actions-build.log
 
+      - name: Verify original Sandbox is present in the prelinked kernel
+        run: |
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          kernel = Path('out/picasso/kernel/kernel.macho')
+          plan = json.loads(kernel.with_suffix('.json').read_text())
+          if hashlib.sha256(kernel.read_bytes()).hexdigest() != plan['candidate_sha256']:
+              raise SystemExit('Prelink report does not match kernel.macho')
+          for component in ('com.apple.security.sandbox', 'com.apple.kext.AppleMatch'):
+              if component not in plan['components']:
+                  raise SystemExit(f'Missing launchd security dependency: {component}')
+              start = plan['module_entrypoints'][component]['start_va']
+              if not any(e['module'] == component and e['segment'] == '__TEXT_EXEC'
+                         and e['va'] <= start < e['va'] + e['size'] for e in plan['extents']):
+                  raise SystemExit(f'Missing executable module entry: {component}')
+              print(f'Prelink includes {component}, start={start:#x}')
+          PY
+
       - name: Report kernel/payload sizes
         run: |
           ls -l out/picasso/kernel/kernel.macho out/picasso/payload/payload.img

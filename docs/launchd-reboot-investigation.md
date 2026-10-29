@@ -1,5 +1,12 @@
 # Launchd and automatic reboot investigation (2026-10-29)
 
+The newer a6fe178 capture confirms timer IRQ delivery, complete cache
+authentication and successful shared-region mapping, followed by an explicit
+Sandbox/container initialization panic. See
+[the Sandbox dependency investigation](sandbox-bootstrap-investigation.md)
+for the current failure and packaging correction. The records below describe
+the earlier captures and timer/preflight changes.
+
 ## Latest device evidence: 5cd9921
 
 The user confirms that `picasso-windows-20261029-194221-283.log` came from

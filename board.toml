@@ -87,6 +87,10 @@ roots = [
   "com.apple.kec.pthread",
   "com.apple.kext.CoreTrust",
   "com.apple.security.AppleImage4",
+  # The original system library queries the Sandbox MAC policy during
+  # _container_init(), before launchd main. Include its genuine handler;
+  # the prelink dependency closure also brings in AppleMatch.
+  "com.apple.security.sandbox",
 ]
 
 # Firmware step: build the picasso Mu-Silicium UEFI firmware via unixnu.
