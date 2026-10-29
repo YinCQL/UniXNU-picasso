@@ -93,6 +93,10 @@ base `0x100000000` before comparing with the original binary. A genuine service
 or PMU backend fix depends on that observation. This change fills a diagnostic
 gap; it does not claim that watchdogd or the reboot is already fixed.
 
+The ARM64 exception caller samples the cached shared-region slide and passes it
+as a `uint32_t` argument. The BSD capture helper does not access `struct task`
+fields: that structure is opaque under BSD's compilation flags.
+
 Snapshots are best effort: an overwritten record or a different exiting thread
 can produce `missing`. A matching snapshot is the latest breakpoint on that
 process/task/thread, not proof that it caused the later exit. User-memory reads
@@ -117,3 +121,40 @@ cover the original return/release behavior, malformed dictionaries, query/output
 limits and concurrent ticket allocation. Independent review also reran the
 original watchdogd connection branches. No new CI build or phone boot has yet
 validated this diagnostic patch.
+
+## Build 40917708279: BSD task type boundary
+
+Artifact `picasso-bootimg-68` belongs to failed run
+[40917708279](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40917708279),
+head `1c035600e22832c2edae320ef5dab6ab4bccd507`. Its bootstrap log has one Clang
+error: `kern_exit.c:1415:27: incomplete definition of type 'struct task'` at
+`current_task()->task_shared_region_slide`. The later corecrypto message about
+missing XNU symbol names follows the interrupted bootstrap; it is not an
+independent corecrypto compilation error. This run produced logs and a Data
+seed, but no composed boot image.
+
+`kern/task.h` puts the complete task structure behind `MACH_KERNEL_PRIVATE`.
+OSFMK's build defines that macro; BSD's build defines `BSD_KERNEL_PRIVATE`.
+The initial host fixture supplied a complete task structure, so its tests did
+not catch this access violation. The fix reads the same cached field in
+`sleh.c`, where the structure is visible, and passes the value into the BSD
+helper. Both declarations and the definition use the same third `uint32_t`
+argument. This preserves the cached value, including the all-ones sentinel,
+and adds no task locking to breakpoint capture.
+
+The checked-in host regression now keeps `task_t` as a pointer to an undefined
+`struct task`. It compiles the extracted BSD helper and checks 53 scenarios in
+normal and ASan builds, including zero and `UINT32_MAX` slide values. A negative
+compile restores only the old private-field read and must fail for the opaque
+type error. The Windows runner rejects every nonzero process exit status.
+Both full patch-replay passes and these host checks pass; a successful full
+Apple SDK build and new device log are still required.
+
+From the device repository, after creating a replayed XNU tree:
+
+```sh
+python scripts/check-picasso-user-fault.py --xnu out/watchdogd-task-boundary-replay-20261030/xnu --output out/user-fault-check-NEW
+```
+
+The output directory must not exist. Compiler logs and all generated fixtures
+are retained, including the expected failing compile.

@@ -2347,9 +2347,9 @@ new file mode 100644
 ++static struct picasso_user_fault picasso_faults[8];
 ++static unsigned picasso_fault_lock, picasso_fault_next, picasso_fault_filled;
 ++
-++void picasso_user_breakpoint(void *, uint32_t);
+++void picasso_user_breakpoint(void *, uint32_t, uint32_t);
 ++void
-++picasso_user_breakpoint(void *saved, uint32_t esr)
+++picasso_user_breakpoint(void *saved, uint32_t esr, uint32_t shared_cache_slide)
 ++{
 ++	arm_saved_state_t *state = saved;
 ++	proc_t p = current_proc();
@@ -2368,8 +2368,8 @@ new file mode 100644
 ++	f->sp = get_saved_state_sp(state);
 ++	f->fp = get_saved_state_fp(state);
 ++	f->esr = esr;
-++	/* Read the cached value; the telemetry accessor takes task locks. */
-++	f->slide = current_task()->task_shared_region_slide;
+++	/* The ARM64 caller reads this cached value without taking task locks. */
+++	f->slide = shared_cache_slide;
 ++	for (unsigned i = 0; i < 29; ++i) f->x[i] = get_saved_state_reg(state, i);
 ++	f->valid = 1;
 ++	picasso_fault_next = (picasso_fault_next + 1) % 8;
@@ -3246,7 +3246,7 @@ new file mode 100644
 + 
 + static void handle_breakpoint(arm_saved_state_t *, uint32_t) __dead2;
 ++#if DEVELOPMENT || DEBUG
-++extern void picasso_user_breakpoint(void *, uint32_t);
+++extern void picasso_user_breakpoint(void *, uint32_t, uint32_t);
 ++#endif
 + 
 + typedef void (*abort_inspector_t)(uint32_t, fault_status_t *, vm_prot_t *);
@@ -3256,7 +3256,7 @@ new file mode 100644
 + 	mach_msg_type_number_t     numcodes  = 2;
 + 
 ++#if DEVELOPMENT || DEBUG
-++	picasso_user_breakpoint(state, esr);
+++	picasso_user_breakpoint(state, esr, current_task()->task_shared_region_slide);
 ++#endif
 + 	boot_progress_user_breakpoint(state, esr);
 + #if __has_feature(ptrauth_calls)
