@@ -261,10 +261,26 @@ def mounted(image, target, readonly=False):
             raise ValueError('Require exactly one mounted APFS volume')
         info = plistlib.loads(subprocess.check_output([
             'diskutil', 'info', '-plist', volumes[0]['dev-entry']]))
+        # Query the mounted filesystem itself. diskutil's plist read-only keys
+        # differ from its human-readable labels; a missing key is not evidence
+        # of a writable mount. ST_RDONLY is the POSIX statvfs mount flag.
+        flags = os.statvfs(target).f_flag
+        actual_readonly = bool(flags & os.ST_RDONLY)
+        audit = dict(image=str(image), mountpoint=str(target),
+                     requested_readonly=readonly, actual_readonly=actual_readonly,
+                     statvfs_flags=flags, diskutil=info)
+        # Save outside the mount so failure diagnostics survive detach and are
+        # included by the workflows' existing ram-data/*.json artifact pattern.
+        target.with_name(target.name + '-mount.json').write_text(
+            json.dumps(audit, indent=2, default=str) + '\n', encoding='utf-8')
+        print(f'APFS_MOUNT path={target} readonly={int(actual_readonly)} '
+              f'expected={int(readonly)} flags={flags:#x} '
+              f'owners={info.get("GlobalPermissionsEnabled")}', flush=True)
         if info.get('FilesystemType') != 'apfs':
             raise ValueError('Require an APFS filesystem')
-        if info.get('VolumeReadOnly') is not readonly:
-            raise ValueError('Mounted volume has unexpected read-only state')
+        if actual_readonly != readonly:
+            raise ValueError(f'Mounted volume has unexpected read-only state: '
+                             f'expected={readonly}, actual={actual_readonly}, flags={flags:#x}')
         if info.get('GlobalPermissionsEnabled') is not True:
             raise ValueError('Mounted volume must have ownership enabled')
         yield info

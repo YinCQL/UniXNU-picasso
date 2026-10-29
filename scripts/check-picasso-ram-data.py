@@ -15,6 +15,7 @@ import plistlib
 import runpy
 import stat
 import struct
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -221,7 +222,7 @@ def main():
 
     # Mock hdiutil/diskutil outputs to check mount selection and guaranteed detach.
     # These tests do not establish that macOS accepted or formatted an image.
-    def mount_case(name, info, readonly, reject=False, body_error=False):
+    def mount_case(name, info, readonly, flags, reject=False, body_error=False):
         mountpoint = out / name
         attached = {'system-entities': [
             {'dev-entry': '/dev/disk42'},
@@ -229,6 +230,9 @@ def main():
         ]}
         with mock.patch.object(data.subprocess, 'check_output', side_effect=[
                 plistlib.dumps(attached), plistlib.dumps(info)]) as command, \
+                mock.patch.object(data.os, 'statvfs', create=True,
+                                  return_value=SimpleNamespace(f_flag=flags)) as statvfs, \
+                mock.patch.object(data.os, 'ST_RDONLY', 1, create=True), \
                 mock.patch.object(data.subprocess, 'run') as detach:
             def operation():
                 with data.mounted(raw, mountpoint, readonly=readonly) as volume:
@@ -240,15 +244,30 @@ def main():
             else:
                 passes(name, operation)
             detach.assert_called_once_with(['hdiutil', 'detach', '/dev/disk42'], check=True)
+            statvfs.assert_called_once_with(mountpoint)
+            audit = json.loads(mountpoint.with_name(mountpoint.name + '-mount.json').read_text())
+            assert audit['actual_readonly'] == bool(flags & 1)
+            assert audit['requested_readonly'] == readonly and audit['diskutil'] == info
             attach = command.call_args_list[0].args[0]
             assert attach[attach.index('-owners') + 1] == 'on'
             assert ('-readonly' in attach) == readonly
 
-    readonly_info = dict(FilesystemType='apfs', VolumeReadOnly=True, GlobalPermissionsEnabled=True)
-    mount_case('source read-only APFS selection', readonly_info, True)
-    mount_case('source rejects writable mount', {**readonly_info, 'VolumeReadOnly': False}, True, reject=True)
-    mount_case('seed rejects owners-off mount', {**readonly_info, 'GlobalPermissionsEnabled': False}, True, reject=True)
-    mount_case('seed failure still detaches', readonly_info, True, body_error=True)
+    readonly_info = dict(FilesystemType='apfs', GlobalPermissionsEnabled=True)
+    mount_case('source read-only without diskutil read-only key', readonly_info, True, 1)
+    mount_case('source read-only with unrelated mount flags', readonly_info, True, 0x1009)
+    mount_case('seed writable without diskutil read-only key', readonly_info, False, 0x1008)
+    mount_case('source rejects writable mount', readonly_info, True, 0, reject=True)
+    mount_case('seed rejects read-only mount', readonly_info, False, 1, reject=True)
+    mount_case('diskutil cannot override actual writable state',
+               {**readonly_info, 'WritableVolume': False, 'WritableMedia': False}, True, 0, reject=True)
+    mount_case('diskutil cannot override actual read-only state',
+               {**readonly_info, 'WritableVolume': True, 'WritableMedia': True}, True, 1)
+    mount_case('seed rejects owners-off mount',
+               {**readonly_info, 'GlobalPermissionsEnabled': False}, False, 0, reject=True)
+    mount_case('seed rejects missing owners field', {'FilesystemType': 'apfs'}, False, 0, reject=True)
+    mount_case('seed rejects wrong filesystem',
+               {**readonly_info, 'FilesystemType': 'hfs'}, False, 0, reject=True)
+    mount_case('seed failure still detaches', readonly_info, True, 1, body_error=True)
     report = dict(scope='Host format/config/content regression; no APFS mount or device validation',
                   host=os.name, source_sha256=data.sha256(ROOT / 'scripts/prepare-picasso-ram-data.py'),
                   native_posix_ownership_tested=os.name != 'nt', cases=cases)

@@ -56,8 +56,11 @@ jobs:
 
       - name: Check packed Data format and seed validation
         run: |
-          python3 scripts/check-picasso-ram-data.py --output out/picasso/logs/data-host-check \
+          # Fixtures contain intentional symlinks. Upload only the result JSON.
+          python3 scripts/check-picasso-ram-data.py --output out/picasso/host-checks/data \
             --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py"
+          mkdir -p out/picasso/logs
+          cp out/picasso/host-checks/data/results.json out/picasso/logs/data-host-check.json
 
       - name: Install host tools and check the SDK
         run: |

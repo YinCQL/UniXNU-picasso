@@ -105,3 +105,24 @@ Storage import gate tests reject uncovered imports, empty audits and wrong slide
 They do not run Apple's APFS formatter, Apple SDK compilation or a phone.
 The next matching CI build and device log must establish that Data mounts and
 tzinit completes; later launchd failures remain separate work.
+
+## CI mount-state correction
+
+[40898162574](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40898162574)
+at `fb34d7d` passed the macOS host checks, then failed in source OS mount
+validation, before creating Data or compiling XNU. The validator incorrectly
+assumed a `diskutil info -plist` property named `VolumeReadOnly`; the old run did
+not save the plist, so its exact fields/values cannot be recovered from this log.
+The validator now checks `os.statvfs(mountpoint).f_flag & os.ST_RDONLY`, which
+macOS derives from the actual filesystem's `MNT_RDONLY` flag. Source must be
+read-only and Data must be writable; APFS and ownership checks remain required.
+Each mount saves its diskutil information, actual VFS flags and expected state
+in `ram-data/os-mount.json` or `data-mount.json`, even when a check fails.
+
+The same run also failed artifact upload: its recursive logs pattern followed
+an intentional `/Library` test symlink into a protected host directory. Both
+workflows now keep those fixtures under `host-checks/`, outside artifact paths,
+and copy only `results.json` into logs. Fixtures are retained, not deleted.
+The updated host suite covers absent plist read-only fields, unrelated VFS bits,
+writable source rejection, read-only Data rejection, metadata disagreement and
+failure cleanup. A new macOS CI run is still needed to verify the full pipeline.
