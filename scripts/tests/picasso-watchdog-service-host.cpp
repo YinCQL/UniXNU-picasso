@@ -10,7 +10,7 @@
 using IOReturn=int;
 using UInt32=uint32_t;
 using task_t=void*;
-constexpr int kIOReturnSuccess=0, kIOTimerEventSourceOptionsPriorityKernelHigh=1;
+constexpr int kIOReturnSuccess=0, kIOReturnNotReady=2, kIOTimerEventSourceOptionsPriorityKernelHigh=1;
 #define LIBKERN_RETURNS_RETAINED
 #define OSDeclareDefaultStructors(C)
 #ifndef __ATOMIC_RELAXED
@@ -72,13 +72,28 @@ struct IOWorkLoop : OSObject {
   static IOWorkLoop *last;
   int gate=0;
   static IOWorkLoop *workLoop() { if(failure==1)return nullptr; return last=new IOWorkLoop; }
-  void closeGate() { ++gate; }
-  void openGate() { assert(gate>0); --gate; }
   IOReturn addEventSource(IOTimerEventSource*) { events.push_back("add-timer"); return failure==3?1:0; }
   void removeEventSource(IOTimerEventSource*) { events.push_back("remove-timer"); }
   void release() { ++loopReleases; delete this; }
+  // Declarations AND access specifiers extracted from the fixed XNU header.
+  #include "workloop-access.inc"
 };
 IOWorkLoop *IOWorkLoop::last=nullptr;
+void IOWorkLoop::closeGate() { ++gate; }
+void IOWorkLoop::openGate() { assert(gate>0); --gate; }
+IOReturn IOWorkLoop::runAction(Action action, OSObject *target,
+                              void *arg0, void *arg1, void *arg2, void *arg3) {
+  closeGate();
+  auto result=action(target,arg0,arg1,arg2,arg3);
+  openGate();
+  return result;
+}
+#ifdef TEST_ILLEGAL_WORKLOOP_ACCESS
+void illegalWorkloopAccess(IOWorkLoop *loop) {
+  loop->closeGate();
+  loop->openGate();
+}
+#endif
 static int PE_i_can_has_debugger(void *) { return 1; }
 extern "C" bool picasso_watchdog_backend_claim(const void *owner) {
   assert(IOWorkLoop::last->gate>0 && IOTimerEventSource::last && schedules==0);
@@ -108,9 +123,11 @@ extern "C" void picasso_original_iowatchdog_policy_check(IOWatchdog*) {
 }
 #include "watchdog-lifecycle-production.inc"
 static void fire(IOTimerEventSource *timer) {
-  IOWorkLoop::last->closeGate();
-  timer->action(timer->owner,timer);
-  IOWorkLoop::last->openGate();
+  IOWorkLoop::last->runAction([](OSObject *, void *arg0, void *, void *, void *) -> IOReturn {
+    auto fired=static_cast<IOTimerEventSource*>(arg0);
+    fired->action(fired->owner,fired);
+    return kIOReturnSuccess;
+  }, timer->owner, timer);
 }
 int main(int argc,char **argv) {
   assert(argc==2); failure=std::atoi(argv[1]);

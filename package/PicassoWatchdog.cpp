@@ -90,40 +90,45 @@ void PicassoWatchdog::scheduleNextCheck()
 
 void PicassoWatchdog::enableWatchdogHardware()
 {
-  watchdogLoop->closeGate();
-  if (!backendClaimed || !picasso_watchdog_backend_enable(this)) {
-    panic("picasso-watchdog: hardware enable failed after ownership transfer");
-  }
-  hardwareEnabled = true;
-  if (policyReady) {
-    watchdogTimer->enable();
-    scheduleNextCheck();
-  }
-  watchdogLoop->openGate();
+  watchdogLoop->runAction([](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
+    PicassoWatchdog *self = static_cast<PicassoWatchdog *>(owner);
+    if (!self->backendClaimed || !picasso_watchdog_backend_enable(self)) {
+      panic("picasso-watchdog: hardware enable failed after ownership transfer");
+    }
+    self->hardwareEnabled = true;
+    if (self->policyReady) {
+      self->watchdogTimer->enable();
+      self->scheduleNextCheck();
+    }
+    return kIOReturnSuccess;
+  }, this);
 }
 
 void PicassoWatchdog::disableWatchdogHardware()
 {
-  watchdogLoop->closeGate();
-  // The original base stop invokes this hook. Cancel under the same gate as
-  // timerFired so no callback can pet after the disable. The permanent owner
-  // remains installed; client close does not reach this path or restore USB.
-  watchdogTimer->cancelTimeout();
-  watchdogTimer->disable();
-  if (!backendClaimed || !picasso_watchdog_backend_disable(this)) {
-    panic("picasso-watchdog: hardware disable failed after ownership transfer");
-  }
-  hardwareEnabled = false;
-  watchdogLoop->openGate();
+  watchdogLoop->runAction([](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
+    PicassoWatchdog *self = static_cast<PicassoWatchdog *>(owner);
+    // Original stop cancels under the same gate as timerFired. Ownership
+    // remains installed; client close does not restore USB boot pets.
+    self->watchdogTimer->cancelTimeout();
+    self->watchdogTimer->disable();
+    if (!self->backendClaimed || !picasso_watchdog_backend_disable(self)) {
+      panic("picasso-watchdog: hardware disable failed after ownership transfer");
+    }
+    self->hardwareEnabled = false;
+    return kIOReturnSuccess;
+  }, this);
 }
 
 void PicassoWatchdog::petWatchdogHardware()
 {
-  watchdogLoop->closeGate();
-  if (!backendClaimed || !hardwareEnabled || !picasso_watchdog_backend_pet(this)) {
-    panic("picasso-watchdog: hardware pet rejected after policy check");
-  }
-  watchdogLoop->openGate();
+  watchdogLoop->runAction([](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
+    PicassoWatchdog *self = static_cast<PicassoWatchdog *>(owner);
+    if (!self->backendClaimed || !self->hardwareEnabled || !picasso_watchdog_backend_pet(self)) {
+      panic("picasso-watchdog: hardware pet rejected after policy check");
+    }
+    return kIOReturnSuccess;
+  }, this);
 }
 
 void PicassoWatchdog::timerFired(OSObject *owner, IOTimerEventSource *sender)
@@ -165,34 +170,42 @@ bool PicassoWatchdog::start(IOService *provider)
 
   // No timer has been scheduled. Every native resource is ready before the
   // irreversible owner transfer and before original policy publishes us.
-  watchdogLoop->closeGate();
-  if (!picasso_watchdog_backend_claim(this)) {
-    watchdogLoop->openGate();
-    return false;
-  }
-  backendClaimed = true;
+  // runAction is the public entry to the workloop's recursive gate. Direct
+  // openGate/closeGate calls are reserved for IOWorkLoop's event-source friends.
+  IOReturn result = watchdogLoop->runAction([](OSObject *owner, void *argument,
+                                               void *, void *, void *) -> IOReturn {
+    PicassoWatchdog *self = static_cast<PicassoWatchdog *>(owner);
+    IOService *platform = static_cast<IOService *>(argument);
+    if (!picasso_watchdog_backend_claim(self)) {
+      return kIOReturnNotReady;
+    }
+    self->backendClaimed = true;
 
-  // These are the two flag inputs at the original Apple call site. The native
-  // provider is the real platform, with no fabricated Apple DT/MMIO property.
-  uintptr_t flags = PE_i_can_has_debugger(nullptr) ? 1 : 0;
-  if (provider->getProperty("extended-iokit-quiesce-timeout") == nullptr) {
-    flags |= 2;
+    // These are the two flag inputs at the original Apple call site. The native
+    // provider is the real platform, with no fabricated Apple DT/MMIO property.
+    uintptr_t flags = PE_i_can_has_debugger(nullptr) ? 1 : 0;
+    if (platform->getProperty("extended-iokit-quiesce-timeout") == nullptr) {
+      flags |= 2;
+    }
+    if (!picasso_original_iowatchdog_policy_start(self, platform, 0, flags)) {
+      panic("picasso-watchdog: original policy start failed after ownership transfer");
+    }
+    if (!self->hardwareEnabled) {
+      // An explicitly disabled original policy cannot satisfy this platform's
+      // required watchdog owner. Do not turn it into unconditional boot pets.
+      panic("picasso-watchdog: original policy did not enable required hardware");
+    }
+    self->policyReady = true;
+    self->scheduleNextCheck();
+    return kIOReturnSuccess;
+  }, this, provider);
+  if (result != kIOReturnSuccess) {
+    return false; // The only returning failure precedes ownership transfer.
   }
-  if (!picasso_original_iowatchdog_policy_start(this, provider, 0, flags)) {
-    panic("picasso-watchdog: original policy start failed after ownership transfer");
-  }
-  if (!hardwareEnabled) {
-    // An explicitly disabled original policy cannot satisfy this platform's
-    // required watchdog owner. Do not turn it into unconditional boot pets.
-    panic("picasso-watchdog: original policy did not enable required hardware");
-  }
-  policyReady = true;
-  scheduleNextCheck();
-  watchdogLoop->openGate();
 
-  IOLog("picasso-watchdog: original IOWatchdog policy published, size=%lu flags=%lu; "
+  IOLog("picasso-watchdog: original IOWatchdog policy published, size=%lu; "
         "SM7250 owner active, hardware=15s policy=600/90s poll=1s\n",
-        static_cast<unsigned long>(sizeof(IOWatchdog)), static_cast<unsigned long>(flags));
+        static_cast<unsigned long>(sizeof(IOWatchdog)));
   // Current board boots cpus=1. A stalled timer/CPU stops hardware feed. The
   // Apple per-CPU cross-call implementation is not compatible with SM7250;
   // this driver does not claim per-core hang detection for future SMP boots.

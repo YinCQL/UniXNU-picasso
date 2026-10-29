@@ -1,5 +1,32 @@
 # Watchdogd trap after early boot
 
+## Build 40945353230: public workloop gate API
+
+[40945353230](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40945353230)
+at 8c62b6fbd7b64751bfa4f0f9a02f92cf1763c9d4 failed. Its artifact
+12929876207 / picasso-bootimg-70 contains the compiler command and nine errors
+from direct calls to IOWorkLoop::closeGate/openGate in PicassoWatchdog.cpp.
+Those methods are protected; the native service is not an event-source friend.
+The earlier host fixture incorrectly exposed them as public and missed this
+compile boundary. Bootstrap's missing archive symbols are expected before
+archive construction and are not a separate final-link regression.
+
+The service now uses the public IOWorkLoop::runAction API for start and all
+three hardware operations. The fixed XNU implementation calls closeGate,
+executes the action synchronously, then openGate on the same recursive lock.
+Original policy start can therefore call the enable hook recursively, and the
+timer callback can call the pet hook while already holding the workloop gate.
+Resource preparation still precedes permanent claim; returning claim failure
+opens the gate and permits cleanup. Post-claim failures retain the original
+panic behavior. No virtual slots, object fields or hardware rules changed.
+
+The regression extracts the actual Action typedef, runAction declaration and
+access specifiers from the fixed XNU IOWorkLoop.h. Ordinary and ASan builds pass
+all ten lifecycle scenarios with those declarations. A direct-access negative
+compile fails with C2248 for both protected methods. Reports are retained in
+out/watchdog-gate-api-20261030/service-v1/. This checks the actual access contract
+with host IOKit/policy stand-ins; another SDK build is still required.
+
 ## Confirmed missing service in build 40922207086
 
 The user confirms automatic reboot with
@@ -151,8 +178,10 @@ Local reports are under out/watchdog-integration-20261030/:
 - The downloaded build-69 kernel hash matches metadata and its UUID matches
   the device log. Python, TOML, YAML and workflow input ordering were checked.
 
-There is no new production-driver iPhoneOS SDK compile or device qualification
-in these results. No CI was dispatched and no phone operation was performed.
+The SDK attempt in build 40945353230 subsequently found the protected-method
+error described above, before Watchdog object auditing or BootState compilation.
+No successful production-driver SDK build or new device qualification is claimed.
+No CI was dispatched by the assistant and no phone operation was performed.
 The latest successful build remains 40922207086/b67e848, which predates this
 service implementation. A new manual SDK build must pass the real-object guards.
 
@@ -168,7 +197,7 @@ python scripts/check-picasso-platform-build.py --output out/platform-build-NEW \
   --kernelcache /path/to/original/kernelcache.macho \
   --native-prelink-dir /path/to/fixed/NativePrelink --llvm-bin /path/to/llvm/bin
 python scripts/check-picasso-boot-state.py --output out/boot-state-NEW
-python scripts/check-picasso-watchdog-service.py --output out/watchdog-service-NEW
+python scripts/check-picasso-watchdog-service.py --xnu /path/to/replayed/xnu --output out/watchdog-service-NEW
 python scripts/check-picasso-watchdog-backend.py --output out/watchdog-backend-NEW
 python scripts/check-picasso-user-fault.py --xnu /path/to/replayed/xnu --output out/user-fault-NEW
 ~~~
