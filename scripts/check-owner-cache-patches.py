@@ -18,6 +18,8 @@ DEVICE = Path(__file__).resolve().parents[1]
 REPLAY_SOURCES = (
     'bsd/kern/kern_exec.c', 'bsd/vm/vm_unix.c', 'bsd/dev/picasso_usb.c',
     'bsd/kern/kern_exit.c', 'bsd/vfs/vfs_syscalls.c', 'bsd/vfs/vfs_lookup.c',
+    'bsd/kern/sys_generic.c', 'bsd/kern/kern_descrip.c',
+    'bsd/kern/kern_mman.c', 'bsd/kern/ubc_subr.c',
 )
 
 

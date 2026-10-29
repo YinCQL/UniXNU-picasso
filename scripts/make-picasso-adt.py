@@ -7,6 +7,7 @@ SM7250 values taken from the compiled board DT:
   - GICv3 distributor 0x17A00000/0x10000, redistributor 0x17A60000/0x100000
     (arm-io child offsets under an APSS range at 0x17A00000), stride 0x40000
   - CPU timebase 19200000 Hz (Qualcomm SM7250 architectural counter)
+  - Virtual timer GIC_PPI 3: absolute INTID 19, from picasso's live board DT
   - DRAM base 0x80000000; size comes from the actual device observation and
     is cross-checked at build time.
 
@@ -34,6 +35,10 @@ GIC_DIST_SIZE = 0x10000
 GIC_REDIST = 0x17A60000
 GIC_REDIST_SIZE = 0x100000
 TIMEBASE = 19200000
+# /soc/timer interrupts in the picasso board DT: secure, nonsecure, virtual, hyp.
+# The virtual entry is <1 3 0xff08>: GIC_PPI 3 means INTID 16 + 3, not 27.
+# ArmCpu consumes an absolute INTID encoded as a little-endian ADT u32.
+VIRTUAL_TIMER_INTID = 19
 UFS_HC = 0x1d84000
 UFS_HC_SIZE = 0x3000
 UFS_PHY = 0x1d80000
@@ -253,7 +258,8 @@ def main():
                             ('reg', struct.pack('<4Q',
                                                 GIC_DIST - ARMIO_BASE, GIC_DIST_SIZE,
                                                 GIC_REDIST - ARMIO_BASE, GIC_REDIST_SIZE)),
-                            ('redistributor-stride', struct.pack('<Q', 0x40000))]),
+                            ('redistributor-stride', struct.pack('<Q', 0x40000)),
+                            ('virtual-timer-intid', struct.pack('<I', VIRTUAL_TIMER_INTID))]),
               # The GENI UART (0x988000) also sits below the APSS window, so a bus-offset
               # reg would be negative. Like ufshc below, the node is for class matching
               # only; the driver takes the physical base from the board constants.
@@ -275,7 +281,7 @@ def main():
     ])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(tree)
-    print(f'picasso ADT: {len(tree)} bytes, dram {args.dram_size:#x}, timebase {TIMEBASE}')
+    print(f'picasso ADT: {len(tree)} bytes, dram {args.dram_size:#x}, timebase {TIMEBASE}, virtual timer INTID {VIRTUAL_TIMER_INTID}')
 
 
 if __name__ == '__main__':

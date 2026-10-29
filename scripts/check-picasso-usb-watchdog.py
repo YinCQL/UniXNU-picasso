@@ -43,7 +43,8 @@ static Action action;
 static unsigned poll_calls, pet_calls, reboot_calls, hang_calls, panic_calls;
 static unsigned wait_calls, yield_calls, stop_after;
 static uint64_t fake_now_ns, yield_step;
-static bool in_poll, replay_console, in_printf;
+static volatile uint64_t armcpu_timer_interrupts;
+static bool in_poll, replay_console, in_printf, panic_on_yield;
 static std::vector<std::string> logs, sequence;
 struct Stop {};
 
@@ -85,9 +86,12 @@ static void ud_finish_hang(void) { assert(ud.poll_lock == 0); ++hang_calls; }
 static void panic(const char *) { assert(ud.poll_lock == 0); ++panic_calls; ud.panic_mode = true; }
 static void picasso_usb_busy_wait(unsigned value) { assert(value == 100); ++wait_calls; }
 static void thread_yield_internal(int value) {
-    assert(value == 0);
+    assert(value == 1 && !in_poll && ud.poll_lock == 0);
     ++yield_calls;
+    sequence.emplace_back("yield");
     fake_now_ns += yield_step;
+    armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
+    if (panic_on_yield) ud.panic_mode = true;
     if (yield_calls >= stop_after) throw Stop{};
 }
 static int test_printf(const char *format, ...) {
@@ -122,7 +126,8 @@ static void reset(void) {
     stop_after = 1;
     fake_now_ns = 5000000000ULL;
     yield_step = 1000000;
-    in_poll = replay_console = in_printf = false;
+    armcpu_timer_interrupts = 0;
+    in_poll = replay_console = in_printf = panic_on_yield = false;
     logs.clear();
     sequence.clear();
 }
@@ -153,7 +158,37 @@ int main(void) {
     assert(pet_calls == 7 && poll_calls == 7 && wait_calls == 7 && yield_calls == 7);
     assert(containing("watchdog pet") == UD_WATCHDOG_INITIAL_REPORTS);
     assert(containing("heartbeat") == 0);
-    passed("actual production thread services every successful iteration, including the first seven");
+    assert(containing("first yield begin depress_ms=1 mono_ns=5000000000 timer_irqs=0 timer_irq_valid=1") == 1);
+    assert(containing("first yield end mono_ns=5001000000 timer_irqs=1 timer_irq_valid=1") == 1);
+    assert(logs.size() == 9); // Startup + first-poll pair + four pets + first-yield pair.
+    unsigned pending_pet = 0;
+    for (const auto &entry : sequence) {
+        if (entry == "pet") ++pending_pet;
+        if (entry == "yield") { assert(pending_pet == 1); pending_pet = 0; }
+    }
+    passed("production thread pets before each finite-depression yield and reports only the first yield pair");
+
+    reset();
+    run_thread(1); // The mock never returns from its first yield.
+    assert(pet_calls == 1 && containing("first yield begin") == 1 && containing("first yield end") == 0);
+    passed("an unreturned yield leaves an unmatched begin marker without claiming scheduling progress");
+
+    reset();
+    panic_on_yield = true;
+    run_thread(7);
+    assert(pet_calls == 1 && containing("first yield begin") == 1 && containing("first yield end") == 0);
+    passed("panic observed after yielding suppresses the end diagnostic and subsequent normal pets");
+
+    reset();
+    progress = {};
+    assert(ud_timer_irq_snapshot(nullptr) == 0);
+    armcpu_timer_interrupts = 4294967298ULL;
+    ud_background_poll(&progress);
+    armcpu_timer_interrupts = 0;
+    ud_background_poll(&progress);
+    assert(pet_calls == 2 && containing("timer_irqs=4294967298 timer_irq_valid=1") == 1);
+    assert(containing("timer_irqs=0 timer_irq_valid=1") == 1);
+    passed("optional timer snapshot handles null and preserves 64-bit counts without gating pets");
 
     reset();
     progress = {};
@@ -244,7 +279,15 @@ int main(void) {
     for (unsigned i = 0; i < 100; ++i) { fake_now_ns += UD_WATCHDOG_LATE_NS; ud_background_poll(&progress); }
     assert(progress.initial_reports == 4 && progress.late_reports == 8);
     assert(logs.size() == 14 && containing("watchdog pet") == 12 && pet_calls == 106);
-    passed("one-second threshold and total 14-line diagnostic cap preserve continued pets");
+    passed("one-second threshold and 14-line poll-helper diagnostic cap preserve continued pets");
+
+    reset();
+    yield_step = UD_WATCHDOG_LATE_NS;
+    run_thread(100);
+    assert(pet_calls == 100 && containing("watchdog pet") == 12);
+    assert(containing("first yield begin") == 1 && containing("first yield end") == 1);
+    assert(logs.size() == 17); // Existing startup + at most 16 new diagnostics.
+    passed("full production thread caps poll/yield diagnostics while continuing long-gap pets");
 
     reset();
     progress = {};
@@ -258,7 +301,7 @@ int main(void) {
     assert(pet_calls == 2 && containing("gap_ns=12000000000 gap_valid=1 late=1") == 1);
     passed("a lock-busy interval is retained in the next actual pet gap");
 
-    std::puts("PASS: 13 production-helper regression groups; host simulation, not hardware timing validation");
+    std::puts("PASS: 17 production-helper regression groups; host simulation, not hardware timing validation");
 }
 """
 
@@ -290,7 +333,7 @@ def extract_production(patch, out):
     source = '\n'.join(line[1:] for line in lines[1:]) + '\n'
     (out / 'picasso_usb.c').write_text(source, encoding='utf-8', newline='\n')
     names = ['picasso_usb_watchdog_pet', 'ud_poll_serialized', 'picasso_usb_console_drive_poll',
-             'ud_monotonic_ns', 'ud_background_poll', 'ud_thread']
+             'ud_monotonic_ns', 'ud_timer_irq_snapshot', 'ud_background_poll', 'ud_thread']
     definitions = source[source.index('#define UD_WATCHDOG_INITIAL_REPORTS'):
                          source.index('static uint64_t\nud_monotonic_ns')]
     watchdog_reset = re.search(r'^#define APSS_WDT_RST\s+[^\n]+', source, re.M)[0] + '\n'
@@ -299,6 +342,8 @@ def extract_production(patch, out):
     (out / 'production.h').write_text('\n'.join(parts), encoding='utf-8', newline='\n')
     if '#define APSS_WDT_TIMEOUT_MS 15000u' not in source:
         raise ValueError('The 15-second watchdog timeout changed')
+    if 'extern volatile uint64_t armcpu_timer_interrupts __attribute__((weak_import));' not in source:
+        raise ValueError('The diagnostic ArmCpu counter must remain an optional weak import')
     return {'patch_sha256': hashlib.sha256(patch.read_bytes()).hexdigest(),
             'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
             'extracted_functions': names, 'new_file_hunk_lines': count}

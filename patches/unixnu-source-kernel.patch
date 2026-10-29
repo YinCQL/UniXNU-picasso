@@ -1721,7 +1721,7 @@ diff --git a/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch b/patches/xnu/z
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
-@@ -0,0 +1,538 @@
+@@ -0,0 +1,1199 @@
 +diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 +--- a/bsd/vfs/vfs_syscalls.c
 ++++ b/bsd/vfs/vfs_syscalls.c
@@ -2260,3 +2260,664 @@ new file mode 100644
 + 	if (!proc_should_trigger_panic(p, rv)) {
 + 		// No panic, bail out
 + 		return;
++diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
++--- a/bsd/kern/sys_generic.c
+++++ b/bsd/kern/sys_generic.c
++@@ -74,6 +74,7 @@
++ 
++ #include <sys/param.h>
++ #include <sys/systm.h>
+++#include <os/atomic_private.h>
++ #include <sys/filedesc.h>
++ #include <sys/ioctl.h>
++ #include <sys/file_internal.h>
++@@ -392,15 +393,50 @@
++ 	return read_nocancel(p, (struct read_nocancel_args *)uap, retval);
++ }
++ 
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++/* Saturating tickets also bound concurrent PID 1 callers. */
+++static unsigned
+++picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+++{
+++    unsigned value = os_atomic_load(counter, relaxed);
+++    while (value < limit) {
+++        if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+++        value = os_atomic_load(counter, relaxed);
+++    }
+++    return 0;
+++}
+++#endif
+++/* PICASSO_PREFLIGHT_END */
++ int
++ pread_nocancel(struct proc *p, struct pread_nocancel_args *uap, user_ssize_t *retval)
++ {
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++	static unsigned pid1_pread_count;
+++	unsigned pid1_ticket = (proc_getpid(p) == 1) ? picasso_pid1_trace_ticket(&pid1_pread_count, 64) : 0;
+++	uint64_t pid1_thread = pid1_ticket ? thread_tid(current_thread()) : 0;
+++	if (pid1_ticket) printf("PICASSO_PID1 pread begin s=%u t=%llu fd=%d off=%llx req=%llu\n",
+++	    pid1_ticket, (unsigned long long)pid1_thread, uap->fd, (unsigned long long)uap->offset, (unsigned long long)uap->nbyte);
+++#define PICASSO_PID1_PREAD_RETURN(value) do { \
+++	int pid1_error = (value); \
+++	if (pid1_ticket) printf("PICASSO_PID1 pread end s=%u t=%llu fd=%d errno=%d got=%lld\n", \
+++	    pid1_ticket, (unsigned long long)pid1_thread, uap->fd, pid1_error, pid1_error ? -1LL : (long long)*retval); \
+++	return pid1_error; \
+++} while (0)
+++#else
+++#define PICASSO_PID1_PREAD_RETURN(value) return (value)
+++#endif
+++/* PICASSO_PREFLIGHT_END */
++ 	KERNEL_DEBUG_CONSTANT((BSDDBG_CODE(DBG_BSD_SC_EXTENDED_INFO, SYS_pread) | DBG_FUNC_NONE),
++ 	    uap->fd, uap->nbyte, (unsigned int)((uap->offset >> 32)), (unsigned int)(uap->offset), 0);
++ 
++-	return read_internal(p, uap->fd, uap->buf, uap->nbyte, uap->offset,
++-	           FOF_OFFSET, retval);
++-}
+++	PICASSO_PID1_PREAD_RETURN(read_internal(p, uap->fd, uap->buf, uap->nbyte, uap->offset,
+++	           FOF_OFFSET, retval));
+++}
+++#undef PICASSO_PID1_PREAD_RETURN
++ 
++ /*
++  * Pread system call
++diff --git a/bsd/kern/kern_descrip.c b/bsd/kern/kern_descrip.c
++--- a/bsd/kern/kern_descrip.c
+++++ b/bsd/kern/kern_descrip.c
++@@ -74,6 +74,7 @@
++ 
++ #include <sys/param.h>
++ #include <sys/systm.h>
+++#include <kern/thread.h>
++ #include <sys/filedesc.h>
++ #include <sys/kernel.h>
++ #include <sys/vnode_internal.h>
++@@ -2740,6 +2741,22 @@
++ 	return sys_fcntl_outdrop(p, fd, fp, vp, error);
++ }
++ 
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++/* Saturating tickets also bound concurrent PID 1 callers. */
+++static unsigned
+++picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+++{
+++    unsigned value = os_atomic_load(counter, relaxed);
+++    while (value < limit) {
+++        if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+++        value = os_atomic_load(counter, relaxed);
+++    }
+++    return 0;
+++}
+++#endif
+++/* PICASSO_PREFLIGHT_END */
++ int
++ sys_fcntl_nocancel(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
++ {
++@@ -2761,13 +2778,31 @@
++ 	int has_entitlement = 0;
++ 	kauth_cred_t p_cred;
++ 
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++	static unsigned pid1_fcntl_count;
+++	unsigned pid1_ticket = (proc_getpid(p) == 1 && cmd == F_ADDFILESIGS_RETURN) ? picasso_pid1_trace_ticket(&pid1_fcntl_count, 64) : 0;
+++	uint64_t pid1_thread = pid1_ticket ? thread_tid(current_thread()) : 0;
+++	if (pid1_ticket) printf("PICASSO_PID1 fcntl begin s=%u t=%llu fd=%d cmd=%d\n",
+++	    pid1_ticket, (unsigned long long)pid1_thread, fd, cmd);
+++#define PICASSO_PID1_FCNTL_RETURN(value) do { \
+++	int pid1_error = (value); \
+++	if (pid1_ticket) printf("PICASSO_PID1 fcntl end s=%u t=%llu fd=%d errno=%d\n", \
+++	    pid1_ticket, (unsigned long long)pid1_thread, fd, pid1_error); \
+++	return pid1_error; \
+++} while (0)
+++#else
+++#define PICASSO_PID1_FCNTL_RETURN(value) return (value)
+++#endif
+++/* PICASSO_PREFLIGHT_END */
+++
++ 	AUDIT_ARG(fd, uap->fd);
++ 	AUDIT_ARG(cmd, uap->cmd);
++ 
++ 	proc_fdlock(p);
++ 	if ((error = fp_lookup(p, fd, &fp, 1))) {
++ 		proc_fdunlock(p);
++-		return error;
+++		PICASSO_PID1_FCNTL_RETURN(error);
++ 	}
++ 
++ 	SYS_FCNTL_DECLARE_VFS_CONTEXT(context);
++@@ -3838,7 +3873,7 @@
++ 		}
++ 		vp = (struct vnode *)fp_get_data(fp);
++ 
++-		return sys_fcntl__OPENFROM(p, fd, cmd, uap->arg, fp, vp, retval);
+++		PICASSO_PID1_FCNTL_RETURN(sys_fcntl__OPENFROM(p, fd, cmd, uap->arg, fp, vp, retval));
++ 	}
++ 
++ 	/*
++@@ -4024,6 +4059,15 @@
++ 				goto outdrop;
++ 			}
++ 
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++			if (pid1_ticket) printf("PICASSO_PID1 fcntl blob s=%u t=%llu fd=%d base=%llx sigoff=%llx sigbytes=%llu\n",
+++			    pid1_ticket, (unsigned long long)pid1_thread, fd,
+++			    (unsigned long long)fs.fs_file_start, (unsigned long long)fs.fs_blob_start,
+++			    (unsigned long long)fs.fs_blob_size);
+++#endif
+++/* PICASSO_PREFLIGHT_END */
++ 			blob = NULL;
++ 			error = ubc_cs_blob_add(vp,
++ 			    proc_platform(p),
++@@ -5293,11 +5337,12 @@
++ 	}
++ 
++ outdrop:
++-	return sys_fcntl_outdrop(p, fd, fp, vp, error);
+++	PICASSO_PID1_FCNTL_RETURN(sys_fcntl_outdrop(p, fd, fp, vp, error));
++ 
++ out:
++-	return sys_fcntl_out(p, fd, fp, error);
++-}
+++	PICASSO_PID1_FCNTL_RETURN(sys_fcntl_out(p, fd, fp, error));
+++}
+++#undef PICASSO_PID1_FCNTL_RETURN
++ 
++ 
++ /*
++@@ -5414,11 +5459,29 @@
++ 	vfs_context_t ctx = vfs_context_current();
++ 	void * sbptr;
++ 
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++	static unsigned pid1_fstat_count;
+++	unsigned pid1_ticket = (proc_getpid(p) == 1) ? picasso_pid1_trace_ticket(&pid1_fstat_count, 64) : 0;
+++	uint64_t pid1_thread = pid1_ticket ? thread_tid(current_thread()) : 0;
+++	if (pid1_ticket) printf("PICASSO_PID1 fstat begin s=%u t=%llu fd=%d\n",
+++	    pid1_ticket, (unsigned long long)pid1_thread, fd);
+++#define PICASSO_PID1_FSTAT_RETURN(value) do { \
+++	int pid1_error = (value); \
+++	if (pid1_ticket) printf("PICASSO_PID1 fstat end s=%u t=%llu fd=%d errno=%d\n", \
+++	    pid1_ticket, (unsigned long long)pid1_thread, fd, pid1_error); \
+++	return pid1_error; \
+++} while (0)
+++#else
+++#define PICASSO_PID1_FSTAT_RETURN(value) return (value)
+++#endif
+++/* PICASSO_PREFLIGHT_END */
+++
++ 
++ 	AUDIT_ARG(fd, fd);
++ 
++ 	if ((error = fp_lookup(p, fd, &fp, 0)) != 0) {
++-		return error;
+++		PICASSO_PID1_FSTAT_RETURN(error);
++ 	}
++ 	type = fp->f_type;
++ 	data = (caddr_t)fp_get_data(fp);
++@@ -5532,8 +5595,9 @@
++ 	if (fsec != NULL) {
++ 		kauth_filesec_free(fsec);
++ 	}
++-	return error;
++-}
+++	PICASSO_PID1_FSTAT_RETURN(error);
+++}
+++#undef PICASSO_PID1_FSTAT_RETURN
++ 
++ 
++ /*
++diff --git a/bsd/kern/kern_mman.c b/bsd/kern/kern_mman.c
++--- a/bsd/kern/kern_mman.c
+++++ b/bsd/kern/kern_mman.c
++@@ -79,6 +79,8 @@
++ 
++ #include <sys/param.h>
++ #include <sys/systm.h>
+++#include <os/atomic_private.h>
+++#include <kern/thread.h>
++ #include <sys/filedesc.h>
++ #include <sys/proc_internal.h>
++ #include <sys/kauth.h>
++@@ -174,6 +176,22 @@
++  * XXX usage is PROT_* from an interface perspective.  Thus the values of
++  * XXX VM_PROT_* and PROT_* need to correspond.
++  */
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++/* Saturating tickets also bound concurrent PID 1 callers. */
+++static unsigned
+++picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+++{
+++    unsigned value = os_atomic_load(counter, relaxed);
+++    while (value < limit) {
+++        if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+++        value = os_atomic_load(counter, relaxed);
+++    }
+++    return 0;
+++}
+++#endif
+++/* PICASSO_PREFLIGHT_END */
++ int
++ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
++ {
++@@ -204,6 +222,24 @@
++ 	int fd = uap->fd;
++ 	int num_retries = 0;
++ 
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++	static unsigned pid1_mmap_count;
+++	unsigned pid1_ticket = (proc_getpid(p) == 1 && fd >= 0 && !(uap->flags & MAP_ANON)) ? picasso_pid1_trace_ticket(&pid1_mmap_count, 64) : 0;
+++	uint64_t pid1_thread = pid1_ticket ? thread_tid(current_thread()) : 0;
+++	if (pid1_ticket) printf("PICASSO_PID1 mmap begin s=%u t=%llu fd=%d off=%llx len=%llu prot=%x flags=%x\n",
+++	    pid1_ticket, (unsigned long long)pid1_thread, fd, (unsigned long long)uap->pos, (unsigned long long)uap->len, (unsigned)uap->prot, (unsigned)uap->flags);
+++#define PICASSO_PID1_MMAP_RETURN(value) do { \
+++	int pid1_error = (value); \
+++	if (pid1_ticket) printf("PICASSO_PID1 mmap end s=%u t=%llu fd=%d errno=%d addr=%llx\n", \
+++	    pid1_ticket, (unsigned long long)pid1_thread, fd, pid1_error, pid1_error ? 0ULL : (unsigned long long)*retval); \
+++	return pid1_error; \
+++} while (0)
+++#else
+++#define PICASSO_PID1_MMAP_RETURN(value) return (value)
+++#endif
+++/* PICASSO_PREFLIGHT_END */
+++
++ 	/*
++ 	 * Note that for UNIX03 conformance, there is additional parameter checking for
++ 	 * mmap() system call in libsyscall prior to entering the kernel.  The sanity
++@@ -220,7 +256,7 @@
++ 	AUDIT_ARG(fd, uap->fd);
++ 
++ 	if (vm_map_range_overflows(user_map, user_addr, user_size)) {
++-		return EINVAL;
+++		PICASSO_PID1_MMAP_RETURN(EINVAL);
++ 	}
++ 	prot = (uap->prot & VM_PROT_ALL);
++ #if 3777787
++@@ -267,7 +303,7 @@
++ 	    MAP_TRANSLATED_ALLOW_EXECUTE |
++ 	    MAP_UNIX03)) {
++ 		if (proc_2020_fall_os_sdk_or_later()) {
++-			return EINVAL;
+++			PICASSO_PID1_MMAP_RETURN(EINVAL);
++ 		}
++ 	}
++ 
++@@ -282,7 +318,7 @@
++ 
++ 	/* make sure mapping fits into numeric range etc */
++ 	if (os_add3_overflow(file_pos, user_size, vm_map_page_size(user_map) - 1, &sum)) {
++-		return EINVAL;
+++		PICASSO_PID1_MMAP_RETURN(EINVAL);
++ 	}
++ 
++ 	if (flags & MAP_UNIX03) {
++@@ -299,15 +335,15 @@
++ 		}
++ 		if (file_pos & offset_alignment_mask) {
++ 			/* file offset should be page-aligned */
++-			return EINVAL;
+++			PICASSO_PID1_MMAP_RETURN(EINVAL);
++ 		}
++ 		if (!(flags & (MAP_PRIVATE | MAP_SHARED))) {
++ 			/* need either MAP_PRIVATE or MAP_SHARED */
++-			return EINVAL;
+++			PICASSO_PID1_MMAP_RETURN(EINVAL);
++ 		}
++ 		if (user_size == 0) {
++ 			/* mapping length should not be 0 */
++-			return EINVAL;
+++			PICASSO_PID1_MMAP_RETURN(EINVAL);
++ 		}
++ 	}
++ 
++@@ -332,7 +368,7 @@
++ 		    (flags & MAP_RESILIENT_CODESIGN) ||
++ 		    (flags & MAP_RESILIENT_MEDIA) ||
++ 		    (flags & MAP_TPRO)) {
++-			return EINVAL;
+++			PICASSO_PID1_MMAP_RETURN(EINVAL);
++ 		}
++ 	}
++ 
++@@ -341,7 +377,7 @@
++ 		if ((flags & MAP_ANON) ||
++ 		    (flags & MAP_JIT) ||
++ 		    (flags & MAP_TPRO)) {
++-			return EINVAL;
+++			PICASSO_PID1_MMAP_RETURN(EINVAL);
++ 		}
++ 	}
++ 	if (flags & MAP_RESILIENT_CODESIGN) {
++@@ -351,7 +387,7 @@
++ 			 * Quick sanity check. maxprot is calculated below and
++ 			 * we will test it again.
++ 			 */
++-			return EPERM;
+++			PICASSO_PID1_MMAP_RETURN(EPERM);
++ 		}
++ 	}
++ 	if (flags & MAP_SHARED) {
++@@ -370,7 +406,7 @@
++ 	if (flags & MAP_RESILIENT_MEDIA) {
++ 		if ((flags & MAP_ANON) ||
++ 		    (flags & MAP_SHARED)) {
++-			return EINVAL;
+++			PICASSO_PID1_MMAP_RETURN(EINVAL);
++ 		}
++ 	}
++ 	if (flags & MAP_TPRO) {
++@@ -384,7 +420,7 @@
++ 		 */
++ 		if ((prot & VM_PROT_EXECUTE) ||
++ 		    !(prot & VM_PROT_WRITE)) {
++-			return EPERM;
+++			PICASSO_PID1_MMAP_RETURN(EPERM);
++ 		}
++ 	}
++ 
++@@ -400,7 +436,7 @@
++ 		 */
++ 		user_addr -= pageoff;
++ 		if (user_addr & vm_map_page_mask(user_map)) {
++-			return EINVAL;
+++			PICASSO_PID1_MMAP_RETURN(EINVAL);
++ 		}
++ 	}
++ #ifdef notyet
++@@ -424,7 +460,7 @@
++ 	/* Entitlement check against code signing monitor */
++ 	if ((flags & MAP_JIT) && (vm_map_csm_allow_jit(user_map) != KERN_SUCCESS)) {
++ 		printf("[%d] code signing monitor denies JIT mapping\n", proc_pid(p));
++-		return EPERM;
+++		PICASSO_PID1_MMAP_RETURN(EPERM);
++ 	}
++ 
++ 	if (flags & MAP_ANON) {
++@@ -436,7 +472,7 @@
++ 		error = mac_proc_check_map_anon(p, current_cached_proc_cred(p),
++ 		    user_addr, user_size, prot, flags, &maxprot);
++ 		if (error) {
++-			return EINVAL;
+++			PICASSO_PID1_MMAP_RETURN(EINVAL);
++ 		}
++ #endif /* MAC */
++ 
++@@ -456,7 +492,7 @@
++ 
++ 			if (vm_flags != fd) {
++ 				/* reject if there are any extra flags */
++-				return EINVAL;
+++				PICASSO_PID1_MMAP_RETURN(EINVAL);
++ 			}
++ 
++ 			/*
++@@ -497,7 +533,7 @@
++ 		vfs_context_t ctx = vfs_context_current();
++ 
++ 		if (flags & MAP_JIT) {
++-			return EINVAL;
+++			PICASSO_PID1_MMAP_RETURN(EINVAL);
++ 		}
++ 
++ 		/*
++@@ -506,7 +542,7 @@
++ 		 */
++ 		err = fp_lookup(p, fd, &fp, 0);
++ 		if (err) {
++-			return err;
+++			PICASSO_PID1_MMAP_RETURN(err);
++ 		}
++ 		fpref = 1;
++ 		switch (FILEGLOB_DTYPE(fp->fp_glob)) {
++@@ -974,8 +1010,9 @@
++ 	KERNEL_DEBUG_CONSTANT((BSDDBG_CODE(DBG_BSD_SC_EXTENDED_INFO2, SYS_mmap) | DBG_FUNC_NONE), (uint32_t)(*retval >> 32), (uint32_t)(user_size >> 32),
++ 	    (uint32_t)(file_pos >> 32), (uint32_t)file_pos, 0);
++ #endif /* XNU_TARGET_OS_OSX */
++-	return error;
+++	PICASSO_PID1_MMAP_RETURN(error);
++ }
+++#undef PICASSO_PID1_MMAP_RETURN
++ 
++ int
++ msync(__unused proc_t p, struct msync_args *uap, int32_t *retval)
++diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
++--- a/bsd/kern/ubc_subr.c
+++++ b/bsd/kern/ubc_subr.c
++@@ -39,6 +39,7 @@
++ #include <sys/types.h>
++ #include <sys/param.h>
++ #include <sys/systm.h>
+++#include <os/atomic_private.h>
++ #include <sys/lock.h>
++ #include <sys/mman.h>
++ #include <sys/mount_internal.h>
++@@ -5771,6 +5772,22 @@
++ #define CS_NATIVE4K_CHUNK       (1024 * 1024)
++ #define CS_NATIVE4K_UNCACHED    (32 * 1024 * 1024)
++ 
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++/* Saturating tickets also bound concurrent PID 1 callers. */
+++static unsigned
+++picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+++{
+++    unsigned value = os_atomic_load(counter, relaxed);
+++    while (value < limit) {
+++        if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+++        value = os_atomic_load(counter, relaxed);
+++    }
+++    return 0;
+++}
+++#endif
+++/* PICASSO_PREFLIGHT_END */
++ __attribute__((noinline))
++ static int
++ cs_native4k_prepare(vnode_t vp, struct cs_blob *blob)
++@@ -5784,31 +5801,69 @@
++ 	int error = EBADEXEC, ioflags;
++ 	kern_return_t kr;
++ 
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++	static unsigned pid1_n4k_count, pid1_n4k_progress_count;
+++	unsigned pid1_ticket = proc_getpid(current_proc()) == 1 ?
+++	    picasso_pid1_trace_ticket(&pid1_n4k_count, 64) : 0;
+++	uint64_t pid1_thread = pid1_ticket ? thread_tid(current_thread()) : 0;
+++	uint64_t pid1_requested = 0, pid1_authenticated = 0, pid1_derived = 0;
+++	uint64_t pid1_read_ticks = 0, pid1_hash_ticks = 0;
+++	const char *pid1_stage = "gate";
+++	int pid1_resid = 0, pid1_ready = 0, pid1_half = 0;
+++	if (pid1_ticket) printf("PICASSO_PID1 n4k begin s=%u t=%llu base=%llx shift=%u\n",
+++	    pid1_ticket, (unsigned long long)pid1_thread,
+++	    (unsigned long long)blob->csb_base_offset, (unsigned)blob->csb_hash_pageshift);
+++#define PICASSO_PID1_N4K_RETURN(value) do { \
+++	int pid1_error = (value); \
+++	if (pid1_ticket) printf("PICASSO_PID1 n4k end s=%u t=%llu stage=%s errno=%d resid=%d ready=%d req=%llu auth=%llu derived=%llu read_ticks=%llu hash_ticks=%llu\n", \
+++	    pid1_ticket, (unsigned long long)pid1_thread, pid1_stage, pid1_error, pid1_resid, pid1_ready, \
+++	    (unsigned long long)pid1_requested, (unsigned long long)pid1_authenticated, (unsigned long long)pid1_derived, \
+++	    (unsigned long long)pid1_read_ticks, (unsigned long long)pid1_hash_ticks); \
+++	return pid1_error; \
+++} while (0)
+++#define PICASSO_PID1_N4K_PROGRESS(label) do { \
+++	if (picasso_pid1_trace_ticket(&pid1_n4k_progress_count, 96)) \
+++	    printf("PICASSO_PID1 n4k progress s=%u t=%llu stage=%s off=%llx limit=%llx req=%llu auth=%llu derived=%llu\n", \
+++	    pid1_ticket, (unsigned long long)pid1_thread, (label), (unsigned long long)chunk, (unsigned long long)limit, \
+++	    (unsigned long long)pid1_requested, (unsigned long long)pid1_authenticated, (unsigned long long)pid1_derived); \
+++} while (0)
+++#else
+++#define PICASSO_PID1_N4K_RETURN(value) return (value)
+++#endif
+++/* PICASSO_PREFLIGHT_END */
+++
++ 	if (blob->csb_hash_pageshift <= PAGE_SHIFT) {
++-		return 0;
+++		PICASSO_PID1_N4K_RETURN(0);
++ 	}
++ 	if (PAGE_SHIFT != 12 || blob->csb_hash_pageshift != 14 || cd == NULL || md == NULL ||
++ 	    md->cs_size == 0 || md->cs_size > CS_HASH_MAX_SIZE ||
++ 	    md->cs_digest_size > CS_HASH_MAX_SIZE || blob->csb_base_offset < 0 ||
++ 	    (blob->csb_base_offset & PAGE_MASK) || blob->csb_hash_firstlevel_pageshift ||
++ 	    ((ntohl(cd->version) >= CS_SUPPORTSSCATTER) && ntohl(cd->scatterOffset))) {
++-		return ENOTSUP;
+++		PICASSO_PID1_N4K_RETURN(ENOTSUP);
++ 	}
++ 	limit = ntohl(cd->codeLimit);
++ 	if (!limit || ((ntohl(cd->version) >= CS_SUPPORTSCODELIMIT64) &&
++ 	    ntohll(cd->codeLimit64) && ntohll(cd->codeLimit64) != limit) ||
++ 	    ntohl(cd->nCodeSlots) != ((limit + 16383) >> 14)) {
++-		return ENOTSUP;
+++		PICASSO_PID1_N4K_RETURN(ENOTSUP);
++ 	}
++ 	count = (limit + PAGE_MASK) >> PAGE_SHIFT;
++ 	if (os_mul_overflow(count, (vm_size_t)md->cs_size, &allocation) ||
++ 	    round_page_overflow(allocation, &allocation)) {
++-		return EOVERFLOW;
++-	}
+++		PICASSO_PID1_N4K_RETURN(EOVERFLOW);
+++	}
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++	if (pid1_ticket) pid1_stage = "allocate";
+++#endif
+++/* PICASSO_PREFLIGHT_END */
++ 	kr = kmem_alloc(kernel_map, &storage, allocation,
++ 	    KMA_KOBJECT | KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_SECURITY);
++ 	if (kr != KERN_SUCCESS) {
++-		return ENOMEM;
+++		PICASSO_PID1_N4K_RETURN(ENOMEM);
++ 	}
++ 	buffer = kalloc_data(CS_NATIVE4K_CHUNK, Z_WAITOK);
++ 	if (buffer == NULL) {
++@@ -5825,6 +5880,21 @@
++ 			error = EOVERFLOW;
++ 			goto out;
++ 		}
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++		if (pid1_ticket) {
+++			pid1_stage = "read";
+++			/* Three observations per large file at most, 96 across the boot. */
+++			if (limit > CS_NATIVE4K_UNCACHED &&
+++			    (chunk == 0 || (!pid1_half && chunk >= limit / 2))) {
+++				if (chunk != 0) pid1_half = 1;
+++				PICASSO_PID1_N4K_PROGRESS("read");
+++			}
+++			pid1_requested += chunk_length;
+++		}
+++#endif
+++/* PICASSO_PREFLIGHT_END */
++ 		const uint64_t read_start = mach_absolute_time();
++ 		error = vn_rdwr(UIO_READ, vp, (caddr_t)buffer, (int)chunk_length, position,
++ 		    UIO_SYSSPACE, ioflags, vfs_context_ucred(vfs_context_current()),
++@@ -5832,10 +5902,25 @@
++ 		const uint64_t hash_start = mach_absolute_time();
++ 		os_atomic_add(&cs_native4k_read_ticks, hash_start - read_start, relaxed);
++ 		os_atomic_add(&cs_native4k_bytes, (uint64_t)chunk_length, relaxed);
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++		if (pid1_ticket) {
+++			pid1_read_ticks += hash_start - read_start;
+++			pid1_resid = resid;
+++		}
+++#endif
+++/* PICASSO_PREFLIGHT_END */
++ 		if (error || resid) {
++ 			error = error ? error : EIO;
++ 			goto out;
++ 		}
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++		if (pid1_ticket) pid1_stage = "hash";
+++#endif
+++/* PICASSO_PREFLIGHT_END */
++ 		for (size_t block = 0; block < chunk_length; block += 16384) {
++ 			union cs_hash_union ctx;
++ 			uint8_t digest[CS_HASH_MAX_SIZE];
++@@ -5859,6 +5944,12 @@
++ 				goto out;
++ 			}
++ 			os_atomic_inc(&cs_native4k_full_blocks, relaxed);
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++			if (pid1_ticket) pid1_authenticated += length;
+++#endif
+++/* PICASSO_PREFLIGHT_END */
++ 			for (size_t sub = 0; sub < length; sub += PAGE_SIZE) {
++ 				size_t bytes = MIN((size_t)PAGE_SIZE, length - sub);
++ 				vm_size_t index = (offset + sub) >> PAGE_SHIFT;
++@@ -5867,9 +5958,31 @@
++ 				md->cs_final(digest, &ctx);
++ 				memcpy((void *)(storage + index * md->cs_size), digest, md->cs_size);
++ 			}
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++			if (pid1_ticket) pid1_derived += length;
+++#endif
+++/* PICASSO_PREFLIGHT_END */
++ 		}
++ 		os_atomic_add(&cs_native4k_hash_ticks, mach_absolute_time() - hash_start, relaxed);
++-	}
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++		if (pid1_ticket) {
+++			/* Same interval as the exported hash counter, plus its update. */
+++			pid1_hash_ticks += mach_absolute_time() - hash_start;
+++			if (chunk == 0 && limit > CS_NATIVE4K_UNCACHED) PICASSO_PID1_N4K_PROGRESS("hashed");
+++		}
+++#endif
+++/* PICASSO_PREFLIGHT_END */
+++	}
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++	if (pid1_ticket) pid1_stage = "protect";
+++#endif
+++/* PICASSO_PREFLIGHT_END */
++ 	kr = vm_map_protect(kernel_map, storage, storage + allocation, VM_PROT_READ, TRUE);
++ 	if (kr != KERN_SUCCESS) {
++ 		error = EPERM;
++@@ -5880,14 +5993,22 @@
++ 	blob->csb_native4k_hash_count = count;
++ 	storage = 0;
++ 	os_atomic_inc(&cs_native4k_ready_blobs, relaxed);
+++
+++/* PICASSO_PREFLIGHT_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++	if (pid1_ticket) { pid1_ready = 1; pid1_stage = "ready"; }
+++#endif
+++/* PICASSO_PREFLIGHT_END */
++ 	error = 0;
++ out:
++ 	kfree_data(buffer, CS_NATIVE4K_CHUNK);
++ 	if (storage) {
++ 		kmem_free(kernel_map, storage, allocation);
++ 	}
++-	return error;
++-}
+++	PICASSO_PID1_N4K_RETURN(error);
+++}
+++#undef PICASSO_PID1_N4K_RETURN
+++#undef PICASSO_PID1_N4K_PROGRESS
++ #endif
++ static boolean_t
++ cs_validate_hash(

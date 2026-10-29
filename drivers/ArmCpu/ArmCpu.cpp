@@ -88,7 +88,7 @@ public:
 OSDefineMetaClassAndStructors (ArmCpu, IOCPU)
 
 // Selected by the boot CPU before GIC writes; shared with secondary nubs.
-// Sweet uses PPI 19. An absent ADT property keeps upstream's PPI 27.
+// Picasso supplies PPI 19. An absent ADT property keeps upstream's PPI 27.
 static uint32_t gVirtualTimerIntid = 27;
 
 static const uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
@@ -240,6 +240,7 @@ bool ArmCpu::mapGic (void)
     return false;
   }
   gVirtualTimerIntid = timerIntid;
+  IOLog ("ArmCpu: virtual timer INTID=%u (ADT selection, IRQ delivery not yet verified)\n", timerIntid);
   for (unsigned index = 0; index < 4; index += 2) {
     if ((regions[index] < bus[0]) || (regions[index] - bus[0] > bus[2]) ||
         (regions[index + 1] > bus[2] - (regions[index] - bus[0])) ||

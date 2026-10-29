@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..2237fb2
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,2815 @@
+@@ -0,0 +1,2841 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -50,6 +50,8 @@ index 0000000..2237fb2
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +extern uint64_t kvtophys(vm_offset_t va);
 +extern void console_write_unbuffered(char);
++/* Optional when this console patch is used without the ArmCpu archive. */
++extern volatile uint64_t armcpu_timer_interrupts __attribute__((weak_import));
 +
 +/* ------------------------------------------------------------------ */
 +/* Console mirror ring: any context, best effort, never waits.        */
@@ -2317,6 +2319,14 @@ index 0000000..2237fb2
 +	return ns;
 +}
 +
++/* A thread-context RAM snapshot, not a timer-register read. A missing
++ * optional ArmCpu symbol is reported separately from an observed zero. */
++static uint64_t
++ud_timer_irq_snapshot(const volatile uint64_t *counter)
++{
++	return counter != NULL ? *counter : 0;
++}
++
 +/* Only the background thread services the watchdog here. Console writes
 + * can re-enter ud_poll_serialized(), but cannot recurse into this helper.
 + * Time samples are diagnostic only: a stopped clock must not stop pets. */
@@ -2362,8 +2372,10 @@ index 0000000..2237fb2
 +			report = true;
 +		}
 +		if (report) {
-+			printf("PICASSO USB: watchdog pet mono_ns=%llu gap_ns=%llu gap_valid=%u late=%u\n",
-+			    now_ns, gap_ns, gap_valid ? 1u : 0u, late ? 1u : 0u);
++			const volatile uint64_t *timer_irqs = &armcpu_timer_interrupts;
++			printf("PICASSO USB: watchdog pet mono_ns=%llu gap_ns=%llu gap_valid=%u late=%u timer_irqs=%llu timer_irq_valid=%u\n",
++			    now_ns, gap_ns, gap_valid ? 1u : 0u, late ? 1u : 0u,
++			    ud_timer_irq_snapshot(timer_irqs), timer_irqs != NULL ? 1u : 0u);
 +		}
 +	}
 +}
@@ -2373,12 +2385,14 @@ index 0000000..2237fb2
 +{
 +	uint64_t polls = 0;
 +	struct ud_poller_progress progress = { 0 };
++	bool first_yield = true;
++	const volatile uint64_t *timer_irqs = &armcpu_timer_interrupts;
 +
 +	/*
-+	 * The early Picasso timer path is not reliable yet.  A deadline-based
-+	 * poller sleeps once and is never scheduled again, which also makes the
-+	 * host-side bulk OUT endpoint look dead.  Keep the diagnostic console
-+	 * runnable with a bounded spin and explicit yields instead.
++	 * Keep the bounded spin, then allow other runnable work to proceed.
++	 * In this XNU, zero depresses to priority 0 without a restore timeout;
++	 * 1 ms arms the priority-restoration timer. It is not a return deadline
++	 * and still requires working timer IRQ delivery and scheduling.
 +	 */
 +	printf("PICASSO USB: busy poller started\n");
 +	for (;;) {
@@ -2389,7 +2403,19 @@ index 0000000..2237fb2
 +			    polls, ud.events, ud.rx_busy ? 1u : 0u);
 +		}
 +		picasso_usb_busy_wait(100);
-+		thread_yield_internal(0);
++		bool report_yield = first_yield && !ud.panic_mode;
++		first_yield = false;
++		if (report_yield) {
++			printf("PICASSO USB: background first yield begin depress_ms=1 mono_ns=%llu timer_irqs=%llu timer_irq_valid=%u\n",
++			    ud_monotonic_ns(), ud_timer_irq_snapshot(timer_irqs),
++			    timer_irqs != NULL ? 1u : 0u);
++		}
++		thread_yield_internal(1);
++		if (report_yield && !ud.panic_mode) {
++			printf("PICASSO USB: background first yield end mono_ns=%llu timer_irqs=%llu timer_irq_valid=%u\n",
++			    ud_monotonic_ns(), ud_timer_irq_snapshot(timer_irqs),
++			    timer_irqs != NULL ? 1u : 0u);
++		}
 +	}
 +}
 +

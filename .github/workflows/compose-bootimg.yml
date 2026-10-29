@@ -38,6 +38,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Check generated picasso ADT timer binding
+        run: python3 scripts/check-picasso-adt.py --output out/picasso/logs/adt-host-check
+
       - name: Verify firmware volume and DTB are present
         run: |
           test -s uefi/SILICIUM_UEFI.fd || { echo "uefi/SILICIUM_UEFI.fd missing"; exit 1; }
