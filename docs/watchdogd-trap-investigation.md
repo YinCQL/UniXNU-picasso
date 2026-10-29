@@ -1,5 +1,62 @@
 # Watchdogd trap after early boot
 
+## Build 40957387071: original client opens, defaults remains busy
+
+Build 73 at `782a3db50f0227874819b7e4e7bd05d99d52259f` completed successfully.
+Downloaded SDK objects, raw/late watchdog ABI, linked policy and the full
+boot.img-to-FAT-to-kernel byte chain were independently checked. The supplied
+`picasso-windows-20261030-053812-560.log` has kernel UUID
+`4E85E302-0CBA-3576-BE0A-5541F1F0AAB8`, matching that verified kernel.
+The user confirms this newest image and automatic reboot.
+
+The prior open denial is passed: PID 52 matches IOWatchdog, the original
+newUserClient reports `type=1 result=00000000 accepted=1`, and watchdogd
+continues into its registry wait. The new panic is
+`busy timeout[0], (120s): 'defaults' (a,4020001)` in IOService.cpp:5760,
+followed by panic flush and PSHOLD reset. Data is writable and early boot
+completes. SpringBoard, mobiletimerd and powerd also report crashes; this log
+does not contain their causes, so the AES change is not a UI/crash fix claim.
+
+The fixed XNU decodes `0x04020001` as ConfigState, ConfigRunning and busy count
+one. It is not ModuleStallState. Downloaded prelink metadata has exactly one
+personality matching the `defaults` IOPlatformDevice: original AppleImage4.
+The actual original AppleImage4 vtable's start slot 86 points to
+`0xfffffff005a8d1bc`; this calls `0xfffffff005a981c4`, whose path calls
+serviceMatching("IOAESAccelerator") and waitForMatchingService with an
+infinite timeout at `0xfffffff005a98214/0xfffffff005a98220`. The selected
+configuration has no AES provider. This explains the outstanding dependency;
+the panic stack itself is watchdogd's waitQuiet caller, not a captured stack
+of the blocked AppleImage4 thread.
+
+The board now enables the fixed upstream NativeAES software CBC provider.
+Its original interface, NIST known-answer tests, failure semantics and
+hardware-key refusal are retained; two startup messages expose the target
+test result and publication. This uses the existing original
+IOCryptoAcceleratorFamily closure and registered corecrypto implementation.
+No AppleImage4 code, watchdog timeout, panic policy, OS/SystemOS or Sandbox
+rule changes accompany this fix.
+
+The new board builder pins the original image/slide and recorded aliases,
+checks the actual 181-slot native object against original inherited methods,
+and preserves previous archives by moving them. Both workflows check actual
+source/object/archive hashes, superclass and every final linked dispatch slot.
+The fixed recipe already force-loads libNativeAES.a and supplies its IOBSD
+personality; no new XNU patch is needed. The local ArmDTPlatform source was
+checked at its actual pinned revision `0d544705c2e89725caabc0542bb96bc8febd8c70`.
+The newer SoftwareAES tutorial and sheng recipe describe the same software
+provider role but use a newer component layout; that layout is not copied.
+
+Host evidence in `out/defaults-busy-20261030/`: build-v1 passes 15 original
+image/181-slot/linked-schema/builder checks. service-v2 passes 12 scenarios
+each with MSVC ordinary and ASan builds, using production service code and
+real Windows CNG CBC. This includes NIST answers, wrong-answer nonpublication,
+software-key-only acceptance, chunked in-place decryption, descriptor bounds,
+allocation/prepare/read/write/crypto failures and completion cleanup.
+LLVM schemas and CNG are not a new production SDK or Apple corecrypto run.
+The next target log should show `picasso-aes` KAT/interface success and
+publication, then progression beyond the defaults wait. New SDK compilation
+and this target result remain pending.
+
 ## Build 40951382277: service found, open denied
 
 [40951382277](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40951382277)
@@ -76,10 +133,10 @@ Local reports under out/watchdog-open-20261030/:
   the prior production C++. XNU/USB patch hashes still match the saved passing
   replay/backend reports, so those unchanged tests were not repeated.
 
-New SDK/complete prelink and phone behavior remain unverified. The next log
-must show original newUserClient type 1 success and further watchdogd/boot-stage
-progress. Static policy correspondence is not a runtime Sandbox acceptance
-result. The assistant has not dispatched CI or operated the phone.
+At that implementation checkpoint, new SDK/prelink and phone behavior were
+unverified. Build 73 and the device log described above subsequently passed
+the original newUserClient boundary. The assistant has not dispatched CI or
+operated the phone.
 
 ### Tutorial and reference comparison, 2026-10-30
 

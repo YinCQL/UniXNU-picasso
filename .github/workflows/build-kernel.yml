@@ -122,6 +122,11 @@ jobs:
           python3 scripts/check-picasso-data-artifacts.py --tree out/picasso/tree --work out/picasso \
             --output out/picasso/logs/data-artifacts.json
 
+      - name: Verify software AES provider against the original class ABI
+        run: |
+          python3 scripts/check-picasso-aes-artifacts.py --tree out/picasso/tree --work out/picasso \
+            --kernelcache "$UNIXNU_KERNELCACHE" --output out/picasso/logs/aes-artifacts.json
+
       - name: Verify watchdog service policy against the linked native driver
         run: |
           python3 scripts/check-picasso-watchdog-policy.py --verify \
@@ -143,6 +148,10 @@ jobs:
             device/out/picasso/tree/build/sheng-platform-power/*.log
             device/out/picasso/tree/build/sheng-platform-power/*.o
             device/out/picasso/tree/build/sheng-platform-power/*.a
+            device/out/picasso/tree/build/native-aes/*.json
+            device/out/picasso/tree/build/native-aes/*.log
+            device/out/picasso/tree/build/native-aes/*.o
+            device/out/picasso/tree/build/native-aes/*.a
             device/out/picasso/ram-data/*.json
             device/out/picasso/ram-data/data.dbrdisk
             device/out/picasso/.config

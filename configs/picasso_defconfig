@@ -1,7 +1,7 @@
 # picasso first-console kernel configuration.
 #
 # Reaches the XNU video/serial console and reports the genuine missing-driver panic.
-# Minimal native drivers; UFS / AES / VirtIO / display / Adreno are brought up in
+# Native UFS, software AES and volatile Data are selected; VirtIO / display / Adreno follow in
 # later stages once the platform boots.
 
 CONFIG_XNU_BUILD_ARCHIVES=y
@@ -25,7 +25,7 @@ CONFIG_XNU_SHENG_PMGR=y
 # CONFIG_XNU_SOURCE_PTHREAD is not set
 # CONFIG_XNU_SOURCE_MOCKFS is not set
 CONFIG_XNU_NATIVE_UFS=y
-# CONFIG_XNU_NATIVE_AES is not set
+CONFIG_XNU_NATIVE_AES=y
 # CONFIG_XNU_NATIVE_VIRTIO_BLOCK is not set
 # CONFIG_XNU_NATIVE_VIRTIO_CONSOLE is not set
 CONFIG_XNU_NATIVE_RAM_BLOCK=y
