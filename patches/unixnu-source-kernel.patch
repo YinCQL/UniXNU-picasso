@@ -1684,12 +1684,13 @@ diff --git a/patches/xnu/offline-owner-cache-carrier.patch b/patches/xnu/offline
 diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
 --- a/scripts/build-xnu-4k-baseline.sh
 +++ b/scripts/build-xnu-4k-baseline.sh
-@@ -35,7 +35,9 @@ fi
+@@ -35,7 +35,10 @@ fi
  # Remove them first so earlier independent patches retain their idempotent checks.
  # The same holds for the boot-time GPU addon mount and the staged system apps copy (zzy), which edit the owner Data mount function
  # inside the systemos patch. Reverse newest first; the loop below re-applies them in name order.
 -for LATE_PATCH in "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \
-+for LATE_PATCH in "$ROOT/patches/xnu/zzz-picasso-usb-console.patch" \
++for LATE_PATCH in "$ROOT/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch" \
++    "$ROOT/patches/xnu/zzz-picasso-usb-console.patch" \
 +    "$ROOT/patches/xnu/zzz-picasso-console-ring.patch" \
 +    "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \
      "$ROOT/patches/xnu/zzy-native-gpu-addon-mount.patch"; do
@@ -1716,3 +1717,546 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
    exit 1
  fi
  ADRENO_FIRMWARE_PROBE=${XNU_ADRENO_FIRMWARE_PROBE:-0}
+diff --git a/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
+@@ -0,0 +1,538 @@
++diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
++--- a/bsd/vfs/vfs_syscalls.c
+++++ b/bsd/vfs/vfs_syscalls.c
++@@ -122,6 +122,7 @@
++ #include <kern/kern_types.h>
++ #include <kern/kalloc.h>
++ #include <kern/task.h>
+++#include <kern/thread.h>
++ 
++ #include <vm/vm_pageout.h>
++ #include <vm/vm_protos.h>
++@@ -4578,6 +4579,21 @@
++  *
++  * XXX Need to implement uid, gid
++  */
+++
+++#if DEVELOPMENT || DEBUG
+++/* Saturating tickets bound output even when PID 1 has concurrent threads. */
+++static unsigned
+++picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+++{
+++	unsigned value = os_atomic_load(counter, relaxed);
+++	while (value < limit) {
+++		if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+++		value = os_atomic_load(counter, relaxed);
+++	}
+++	return 0;
+++}
+++#endif
+++
++ int
++ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
++     struct vnode_attr *vap, fp_initfn_t fp_init, void *initarg, int32_t *retval, int authfd)
++@@ -4592,6 +4608,26 @@
++ 	struct vfs_context context;
++ 	vnode_t authvp = NULLVP;
++ 
+++#if DEVELOPMENT || DEBUG
+++	static unsigned pid1_open_count;
+++	unsigned pid1_open_ticket = proc_getpid(p) == 1 ?
+++	    picasso_pid1_trace_ticket(&pid1_open_count, 64) : 0;
+++	uint64_t pid1_open_thread = pid1_open_ticket ? thread_tid(vfs_context_thread(ctx)) : 0;
+++	if (pid1_open_ticket) {
+++		printf("PICASSO_PID1 open begin sample=%u thread=%llu flags=%x\n",
+++		    pid1_open_ticket, (unsigned long long)pid1_open_thread, (unsigned)uflags);
+++	}
+++#define PICASSO_PID1_OPEN_RETURN(value) do { \
+++	int pid1_open_error = (value); \
+++	if (pid1_open_ticket) printf("PICASSO_PID1 open end sample=%u thread=%llu errno=%d fd=%d\n", \
+++	    pid1_open_ticket, (unsigned long long)pid1_open_thread, pid1_open_error, \
+++	    pid1_open_error ? -1 : (int)*retval); \
+++	return pid1_open_error; \
+++} while (0)
+++#else
+++#define PICASSO_PID1_OPEN_RETURN(value) return (value)
+++#endif
+++
++ 	oflags = uflags;
++ 
++ 	amode = oflags & O_ACCMODE;
++@@ -4601,7 +4637,7 @@
++ 	 * with FREAD/FWRITE.
++ 	 */
++ 	if ((amode == O_ACCMODE) || (amode && (oflags & O_EXEC))) {
++-		return EINVAL;
+++		PICASSO_PID1_OPEN_RETURN(EINVAL);
++ 	}
++ 
++ 	flags = FFLAGS(uflags);
++@@ -4612,7 +4648,7 @@
++ 	AUDIT_ARG(mode, vap->va_mode);
++ 
++ 	if ((error = falloc_withinit(p, p_cred, ctx, &fp, &indx, fp_init, initarg)) != 0) {
++-		return error;
+++		PICASSO_PID1_OPEN_RETURN(error);
++ 	}
++ 	if (flags & O_CLOEXEC) {
++ 		fp->fp_flags |= FP_CLOEXEC;
++@@ -4636,7 +4672,7 @@
++ 		error = vnode_getfromfd(ctx, authfd, &authvp);
++ 		if (error) {
++ 			fp_free(p, indx, fp);
++-			return error;
+++			PICASSO_PID1_OPEN_RETURN(error);
++ 		}
++ 	}
++ 
++@@ -4647,14 +4683,14 @@
++ 		if ((error == ENODEV || error == ENXIO) && (uu->uu_dupfd >= 0)) {
++ 			if ((error = dupfdopen(p, indx, uu->uu_dupfd, flags, error)) == 0) {
++ 				*retval = indx;
++-				return 0;
+++				PICASSO_PID1_OPEN_RETURN(0);
++ 			}
++ 		}
++ 		if (error == ERESTART) {
++ 			error = EINTR;
++ 		}
++ 		fp_free(p, indx, fp);
++-		return error;
+++		PICASSO_PID1_OPEN_RETURN(error);
++ 	}
++ 
++ 	if (authvp != NULLVP) {
++@@ -4858,7 +4894,7 @@
++ 
++ 	*retval = indx;
++ 
++-	return 0;
+++	PICASSO_PID1_OPEN_RETURN(0);
++ bad:
++ 	context = *vfs_context_current();
++ 	context.vc_ucred = fp->fp_glob->fg_cred;
++@@ -4878,8 +4914,9 @@
++ 	vnode_put(vp);
++ 	fp_free(p, indx, fp);
++ 
++-	return error;
++-}
+++	PICASSO_PID1_OPEN_RETURN(error);
+++}
+++#undef PICASSO_PID1_OPEN_RETURN
++ 
++ /*
++  * While most of the *at syscall handlers can call nameiat() which
++diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
++--- a/bsd/vfs/vfs_lookup.c
+++++ b/bsd/vfs/vfs_lookup.c
++@@ -94,6 +94,55 @@
++ #include <security/mac_framework.h>
++ #endif
++ #include <os/atomic_private.h>
+++#include <kern/thread.h>
+++
+++#if DEVELOPMENT || DEBUG
+++/* Saturating tickets bound output even when PID 1 has concurrent threads. */
+++static unsigned
+++picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+++{
+++	unsigned value = os_atomic_load(counter, relaxed);
+++	while (value < limit) {
+++		if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+++		value = os_atomic_load(counter, relaxed);
+++	}
+++	return 0;
+++}
+++#endif
+++
+++#if DEVELOPMENT || DEBUG
+++/* Only known cache locations and safe cache basenames are printable. The
+++ * caller supplies namei's already copied kernel buffer, never a user pointer. */
+++static void
+++picasso_pid1_cache_path(struct nameidata *ndp, proc_t p, const char *path)
+++{
+++	static unsigned path_count;
+++	static const char *const directories[] = {
+++		"/private/preboot/System/Library/Caches/com.apple.dyld/",
+++		"/System/Library/Caches/com.apple.dyld/",
+++		"/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/"
+++	};
+++	if (!p || proc_getpid(p) != 1 || ndp->ni_op != OP_OPEN) return;
+++	const char *base = path;
+++	for (unsigned i = 0; i < sizeof(directories) / sizeof(directories[0]); ++i) {
+++		size_t length = strlen(directories[i]);
+++		if (!strncmp(path, directories[i], length)) {
+++			base = path + length;
+++			break;
+++		}
+++	}
+++	if (strncmp(base, "dyld_shared_cache", sizeof("dyld_shared_cache") - 1)) return;
+++	for (const char *at = base; *at; ++at) {
+++		if (!((*at >= 'a' && *at <= 'z') || (*at >= 'A' && *at <= 'Z') ||
+++		    (*at >= '0' && *at <= '9') || *at == '_' || *at == '.' || *at == '-')) return;
+++	}
+++	unsigned ticket = picasso_pid1_trace_ticket(&path_count, 64);
+++	if (ticket) {
+++		printf("PICASSO_PID1 open path sample=%u thread=%llu path=%.192s\n", ticket,
+++		    (unsigned long long)thread_tid(vfs_context_thread(ndp->ni_cnd.cn_context)), path);
+++	}
+++}
+++#endif
++ 
++ #include <sys/paths.h>
++ 
++@@ -287,6 +336,11 @@
++ 		goto error_out;
++ 	}
++ 	assert(bytes_copied <= MAXPATHLEN);
+++#if DEVELOPMENT || DEBUG
+++	/* Independent path samples correlate with open begin/end by thread. A
+++	 * copied path is not a successful lookup or a successful open. */
+++	picasso_pid1_cache_path(ndp, p, cnp->cn_pnbuf);
+++#endif
++ 	ndp->ni_pathlen = (u_int)bytes_copied;
++ 	bytes_copied = 0;
++ 
++diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
++--- a/bsd/vm/vm_unix.c
+++++ b/bsd/vm/vm_unix.c
++@@ -2089,6 +2089,21 @@
++  * ENOMEM	shared region is empty
++  * EFAULT	bad address for "start_address"
++  */
+++
+++#if DEVELOPMENT || DEBUG
+++/* Saturating tickets bound output even when PID 1 has concurrent threads. */
+++static unsigned
+++picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+++{
+++	unsigned value = os_atomic_load(counter, relaxed);
+++	while (value < limit) {
+++		if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+++		value = os_atomic_load(counter, relaxed);
+++	}
+++	return 0;
+++}
+++#endif
+++
++ int
++ shared_region_check_np(
++ 	__unused struct proc                    *p,
++@@ -2314,6 +2329,28 @@
++ 	uint32_t                        i;
++ 	struct vm_shared_region         *shared_region = NULL;
++ 	boolean_t                       is_driverkit = task_is_driver(current_task());
+++#if DEVELOPMENT || DEBUG
+++	static unsigned pid1_setup_count;
+++	static unsigned pid1_setup_stage_count;
+++	unsigned pid1_setup_ticket = proc_getpid(p) == 1 ?
+++	    picasso_pid1_trace_ticket(&pid1_setup_count, 16) : 0;
+++	uint64_t pid1_setup_thread = pid1_setup_ticket ? thread_tid(current_thread()) : 0;
+++	unsigned pid1_setup_file = UINT32_MAX;
+++	const char *pid1_setup_stage = "allocation";
+++	if (pid1_setup_ticket) printf("PICASSO_PID1 map_setup begin sample=%u thread=%llu files=%u mappings=%u\n",
+++	    pid1_setup_ticket, (unsigned long long)pid1_setup_thread, files_count, mappings_count);
+++#define PICASSO_PID1_SETUP_STAGE(value) do { \
+++	pid1_setup_stage = (value); \
+++	if (pid1_setup_ticket) { \
+++		unsigned stage_ticket = picasso_pid1_trace_ticket(&pid1_setup_stage_count, 64); \
+++		if (stage_ticket) printf("PICASSO_PID1 map_setup stage sample=%u thread=%llu file=%u stage=%s\n", \
+++		    pid1_setup_ticket, (unsigned long long)pid1_setup_thread, pid1_setup_file, pid1_setup_stage); \
+++		if (stage_ticket == 64) printf("PICASSO_PID1 map_setup stage limit=64 reached; further stage arrivals are quiet\n"); \
+++	} \
+++} while (0)
+++#else
+++#define PICASSO_PID1_SETUP_STAGE(value) do { (void)0; } while (0)
+++#endif
++ 
++ 	SHARED_REGION_TRACE_DEBUG(
++ 		("shared_region: %p [%d(%s)] -> map\n",
++@@ -2349,6 +2386,7 @@
++ 	}
++ 
++ 	/* get the process's shared region (setup in vm_map_exec()) */
+++	PICASSO_PID1_SETUP_STAGE("shared_region");
++ 	shared_region = vm_shared_region_trim_and_get(current_task());
++ 	*shared_region_ptr = shared_region;
++ 	if (shared_region == NULL) {
++@@ -2367,6 +2405,7 @@
++ 	 * avoid tainting the shared region with something that
++ 	 * doesn't quite belong into it.
++ 	 */
+++	PICASSO_PID1_SETUP_STAGE("root_directory");
++ 	struct vnode *sr_vnode = vm_shared_region_root_dir(shared_region);
++ 	if (sr_vnode != NULL ?  rdir_vp != sr_vnode : rdir_vp != rootvnode) {
++ 		SHARED_REGION_TRACE_ERROR(
++@@ -2380,6 +2419,10 @@
++ 	for (srfmp = &(*sr_file_mappings)[0];
++ 	    srfmp < &(*sr_file_mappings)[files_count];
++ 	    srfmp++) {
+++#if DEVELOPMENT || DEBUG
+++		pid1_setup_file = (unsigned)(srfmp - *sr_file_mappings);
+++#endif
+++		PICASSO_PID1_SETUP_STAGE("mapping_file");
++ 		if (srfmp->mappings_count == 0) {
++ 			/* no mappings here... */
++ 			continue;
++@@ -2427,6 +2470,7 @@
++ 		}
++ 
++ 		/* get file structure from file descriptor */
+++		PICASSO_PID1_SETUP_STAGE("file_descriptor");
++ 		error = fp_get_ftype(p, srfmp->fd, DTYPE_VNODE, EINVAL, &srfmp->fp);
++ 		if (error) {
++ 			SHARED_REGION_TRACE_ERROR(
++@@ -2438,6 +2482,7 @@
++ 		}
++ 
++ 		/* we need at least read permission on the file */
+++		PICASSO_PID1_SETUP_STAGE("read_permission");
++ 		if (!(srfmp->fp->fp_glob->fg_flag & FREAD)) {
++ 			SHARED_REGION_TRACE_ERROR(
++ 				("shared_region: %p [%d(%s)] map: "
++@@ -2449,6 +2494,7 @@
++ 		}
++ 
++ 		/* get vnode from file structure */
+++		PICASSO_PID1_SETUP_STAGE("file_vnode");
++ 		error = vnode_getwithref((vnode_t)fp_get_data(srfmp->fp));
++ 		if (error) {
++ 			SHARED_REGION_TRACE_ERROR(
++@@ -2476,6 +2522,7 @@
++ #if CONFIG_MACF
++ 		/* pass in 0 for the offset argument because AMFI does not need the offset
++ 		 *       of the shared cache */
+++		PICASSO_PID1_SETUP_STAGE("mac_mmap");
++ 		error = mac_file_check_mmap(vfs_context_ucred(vfs_context_current()),
++ 		    srfmp->fp->fp_glob, VM_PROT_ALL, MAP_FILE | MAP_PRIVATE | MAP_FIXED, 0, &maxprot);
++ 		if (error) {
++@@ -2544,6 +2591,7 @@
++ root_check:
++ #endif /* XNU_TARGET_OS_OSX && defined(__arm64__) */
++ 
+++		PICASSO_PID1_SETUP_STAGE("root_ownership");
++ 		/* The shared cache file must be owned by root */
++ 		VATTR_INIT(&va);
++ 		VATTR_WANTED(&va, va_uid);
++@@ -2576,6 +2624,7 @@
++ after_root_check:
++ #endif /* XNU_TARGET_OS_OSX && defined(__arm64__) */
++ 
+++		PICASSO_PID1_SETUP_STAGE("mount_authorization");
++ #if CONFIG_CSR
++ 		if (csr_check(CSR_ALLOW_UNRESTRICTED_FS) != 0) {
++ 			VATTR_INIT(&va);
++@@ -2655,6 +2704,7 @@
++ 		}
++ #endif /* CONFIG_CSR */
++ 
+++		PICASSO_PID1_SETUP_STAGE("cache_directory");
++ 		if (scdir_enforce
++ #if defined(XNU_OWNER_CACHE_CARRIER) && XNU_OWNER_CACHE_CARRIER && !CONFIG_CSR
++ 		    && !owner_carrier
++@@ -2701,6 +2751,7 @@
++ scdir_ok:
++ 
++ 		/* get vnode size */
+++		PICASSO_PID1_SETUP_STAGE("file_size");
++ 		error = vnode_size(srfmp->vp, &fs, vfs_context_current());
++ 		if (error) {
++ 			SHARED_REGION_TRACE_ERROR(
++@@ -2716,6 +2767,7 @@
++ 		srfmp->file_size = fs;
++ 
++ 		/* get the file's memory object handle */
+++		PICASSO_PID1_SETUP_STAGE("memory_object");
++ 		srfmp->file_control = ubc_getobject(srfmp->vp, UBC_HOLDOBJECT);
++ 		if (srfmp->file_control == MEMORY_OBJECT_CONTROL_NULL) {
++ 			SHARED_REGION_TRACE_ERROR(
++@@ -2729,6 +2781,7 @@
++ 			goto done;
++ 		}
++ 
+++		PICASSO_PID1_SETUP_STAGE("code_signature");
++ 		/* check that the mappings are properly covered by code signatures */
++ 		if (!cs_system_enforcement()) {
++ 			/* code signing is not enforced: no need to check */
++@@ -2769,8 +2822,13 @@
++ 		*sr_file_mappings = NULL;
++ 		*shared_region_ptr = NULL;
++ 	}
+++#if DEVELOPMENT || DEBUG
+++	if (pid1_setup_ticket) printf("PICASSO_PID1 map_setup end sample=%u thread=%llu file=%u stage=%s errno=%d\n",
+++	    pid1_setup_ticket, (unsigned long long)pid1_setup_thread, pid1_setup_file, pid1_setup_stage, error);
+++#endif
++ 	return error;
++ }
+++#undef PICASSO_PID1_SETUP_STAGE
++ 
++ /*
++  * shared_region_map_np()
++@@ -2795,6 +2853,12 @@
++ 	struct _sr_file_mappings        *sr_file_mappings = NULL;
++ 	struct vnode                    *rdir_vp = NULL;
++ 	struct vm_shared_region         *shared_region = NULL;
+++#if DEVELOPMENT || DEBUG
+++	static unsigned pid1_vm_map_count;
+++	unsigned pid1_vm_map_ticket = proc_getpid(p) == 1 ?
+++	    picasso_pid1_trace_ticket(&pid1_vm_map_count, 16) : 0;
+++	uint64_t pid1_vm_map_thread = pid1_vm_map_ticket ? thread_tid(current_thread()) : 0;
+++#endif
++ 
++ 	/*
++ 	 * Get a reference to the current proc's root dir.
++@@ -2821,7 +2885,15 @@
++ 	}
++ 
++ 	/* map the file(s) into that shared region's submap */
+++#if DEVELOPMENT || DEBUG
+++	if (pid1_vm_map_ticket) printf("PICASSO_PID1 vm_map begin sample=%u thread=%llu files=%u mappings=%u\n",
+++	    pid1_vm_map_ticket, (unsigned long long)pid1_vm_map_thread, files_count, mappings_count);
+++#endif
++ 	kr = vm_shared_region_map_file(shared_region, files_count, sr_file_mappings);
+++#if DEVELOPMENT || DEBUG
+++	if (pid1_vm_map_ticket) printf("PICASSO_PID1 vm_map end sample=%u thread=%llu kr=%x\n",
+++	    pid1_vm_map_ticket, (unsigned long long)pid1_vm_map_thread, (unsigned)kr);
+++#endif
++ 	if (kr != KERN_SUCCESS) {
++ 		SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] map(): "
++ 		    "vm_shared_region_map_file() failed kr=0x%x\n",
++@@ -2974,6 +3046,14 @@
++ 
++ 	files_count = uap->files_count;
++ 	mappings_count = uap->mappings_count;
+++#if DEVELOPMENT || DEBUG
+++	static unsigned pid1_map_count;
+++	unsigned pid1_map_ticket = proc_getpid(p) == 1 ?
+++	    picasso_pid1_trace_ticket(&pid1_map_count, 16) : 0;
+++	uint64_t pid1_map_thread = pid1_map_ticket ? thread_tid(current_thread()) : 0;
+++	if (pid1_map_ticket) printf("PICASSO_PID1 map begin sample=%u thread=%llu files=%u mappings=%u\n",
+++	    pid1_map_ticket, (unsigned long long)pid1_map_thread, files_count, mappings_count);
+++#endif
++ 
++ 	if (files_count == 0) {
++ 		SHARED_REGION_TRACE_INFO(
++@@ -3081,6 +3161,10 @@
++ done:
++ 	kfree_data(shared_files, files_count * sizeof(shared_files[0]));
++ 	kfree_data(mappings, mappings_count * sizeof(mappings[0]));
+++#if DEVELOPMENT || DEBUG
+++	if (pid1_map_ticket) printf("PICASSO_PID1 map end sample=%u thread=%llu result=%d\n",
+++	    pid1_map_ticket, (unsigned long long)pid1_map_thread, kr);
+++#endif
++ 	return kr;
++ }
++ 
++diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
++--- a/bsd/kern/kern_exit.c
+++++ b/bsd/kern/kern_exit.c
++@@ -135,6 +135,7 @@
++ 
++ #include <vm/vm_protos.h>
++ #include <os/log.h>
+++#include <os/atomic_private.h>
++ #include <os/system_event_log.h>
++ 
++ #include <pexpert/pexpert.h>
++@@ -1359,6 +1360,21 @@
++ 
++ #define OS_REASON_TOTAL_USER_FAULTS_PER_PROC  5
++ 
+++
+++#if DEVELOPMENT || DEBUG
+++/* Saturating tickets bound output even when PID 1 has concurrent threads. */
+++static unsigned
+++picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+++{
+++	unsigned value = os_atomic_load(counter, relaxed);
+++	while (value < limit) {
+++		if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+++		value = os_atomic_load(counter, relaxed);
+++	}
+++	return 0;
+++}
+++#endif
+++
++ static int
++ abort_with_payload_internal(proc_t p,
++     uint32_t reason_namespace, uint64_t reason_code,
++@@ -1368,6 +1384,22 @@
++ {
++ 	os_reason_t exit_reason = OS_REASON_NULL;
++ 	kern_return_t kr = KERN_SUCCESS;
+++#if DEVELOPMENT || DEBUG
+++	static unsigned pid1_abort_count;
+++	unsigned ticket = proc_getpid(p) == 1 ? picasso_pid1_trace_ticket(&pid1_abort_count, 8) : 0;
+++	uint64_t pid1_abort_thread = ticket ? thread_tid(current_thread()) : 0;
+++	if (ticket) printf("PICASSO_PID1 abort begin sample=%u thread=%llu namespace=%u code=%llx flags=%llx internal=%x payload_bytes=%u\n",
+++	    ticket, (unsigned long long)pid1_abort_thread, reason_namespace, (unsigned long long)reason_code,
+++	    (unsigned long long)reason_flags, internal_flags, payload_size);
+++#define PICASSO_PID1_ABORT_RETURN(value) do { \
+++	int pid1_abort_error = (value); \
+++	if (ticket) printf("PICASSO_PID1 abort end sample=%u thread=%llu errno=%d\n", \
+++	    ticket, (unsigned long long)pid1_abort_thread, pid1_abort_error); \
+++	return pid1_abort_error; \
+++} while (0)
+++#else
+++#define PICASSO_PID1_ABORT_RETURN(value) return (value)
+++#endif
++ 
++ 	if (internal_flags & OS_REASON_IFLAG_USER_FAULT) {
++ 		uint32_t old_value = atomic_load_explicit(&p->p_user_faults,
++@@ -1375,13 +1407,13 @@
++ 
++ #if DEVELOPMENT || DEBUG
++ 		if (bootarg_disable_user_faults) {
++-			return EQFULL;
+++			PICASSO_PID1_ABORT_RETURN(EQFULL);
++ 		}
++ #endif /* DEVELOPMENT || DEBUG */
++ 
++ 		for (;;) {
++ 			if (old_value >= OS_REASON_TOTAL_USER_FAULTS_PER_PROC) {
++-				return EQFULL;
+++				PICASSO_PID1_ABORT_RETURN(EQFULL);
++ 			}
++ 			// this reloads the value in old_value
++ 			if (atomic_compare_exchange_strong_explicit(&p->p_user_faults,
++@@ -1422,16 +1454,17 @@
++ 
++ 	switch (kr) {
++ 	case KERN_SUCCESS:
++-		return 0;
+++		PICASSO_PID1_ABORT_RETURN(0);
++ 	case KERN_NOT_SUPPORTED:
++-		return ENOTSUP;
+++		PICASSO_PID1_ABORT_RETURN(ENOTSUP);
++ 	case KERN_INVALID_ARGUMENT:
++-		return EINVAL;
+++		PICASSO_PID1_ABORT_RETURN(EINVAL);
++ 	case KERN_RESOURCE_SHORTAGE:
++ 	default:
++-		return EBUSY;
++-	}
++-}
+++		PICASSO_PID1_ABORT_RETURN(EBUSY);
+++	}
+++}
+++#undef PICASSO_PID1_ABORT_RETURN
++ 
++ int
++ abort_with_payload(struct proc *cur_proc, struct abort_with_payload_args *args,
++@@ -1820,6 +1853,15 @@
++ static void
++ proc_handle_critical_exit(proc_t p, int rv)
++ {
+++#if DEVELOPMENT || DEBUG
+++	static unsigned pid1_exit_count;
+++	unsigned ticket = proc_getpid(p) == 1 ? picasso_pid1_trace_ticket(&pid1_exit_count, 8) : 0;
+++	uint64_t pid1_exit_thread = ticket ? thread_tid(current_thread()) : 0;
+++	if (ticket) printf("PICASSO_PID1 critical_exit begin sample=%u thread=%llu rv=%x namespace=%u code=%llx spawned=%d\n",
+++	    ticket, (unsigned long long)pid1_exit_thread, (unsigned)rv,
+++	    p->p_exit_reason ? p->p_exit_reason->osr_namespace : 0,
+++	    (unsigned long long)(p->p_exit_reason ? p->p_exit_reason->osr_code : 0), initproc_spawned);
+++#endif
++ 	if (!proc_should_trigger_panic(p, rv)) {
++ 		// No panic, bail out
++ 		return;

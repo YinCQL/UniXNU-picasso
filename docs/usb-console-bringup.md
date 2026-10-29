@@ -12,6 +12,14 @@ USB debugging. This takes effect in a newly built boot image; it is not a host
 capture-script option. Event processing and the explicit poll/watchdog loop
 continue with tracing disabled. Other startup, control and error logs remain.
 
+The background poller services the 15-second APSS watchdog after every
+completed normal poll, rather than after 1024 passes. A busy poll lock or panic
+mode does not qualify for a background pet. A few initial service timestamps
+and bounded slow-interval records stay visible with tracing off; they help
+diagnose automatic reboots without restoring the periodic heartbeat. See the
+[launchd and reboot investigation](launchd-reboot-investigation.md) for the
+device evidence and limits of this correction.
+
 ### Windows
 
 Double-click **`capture-logs.cmd`** at the repository root before booting the phone.

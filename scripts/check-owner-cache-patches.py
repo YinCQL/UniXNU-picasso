@@ -15,6 +15,10 @@ import subprocess
 import zipfile
 
 DEVICE = Path(__file__).resolve().parents[1]
+REPLAY_SOURCES = (
+    'bsd/kern/kern_exec.c', 'bsd/vm/vm_unix.c', 'bsd/dev/picasso_usb.c',
+    'bsd/kern/kern_exit.c', 'bsd/vfs/vfs_syscalls.c', 'bsd/vfs/vfs_lookup.c',
+)
 
 
 def git(repo, *args, check=True):
@@ -62,6 +66,11 @@ def main():
     export(a.xnu, xnu_rev, xnu)
     late_block = baseline.split('for LATE_PATCH in ', 1)[1].split('; do', 1)[0]
     late = [tree / path for path in re.findall(r'"\$ROOT/([^"\n]+)"', late_block)]
+    # These diagnostics modify functions already touched by the owner and
+    # boot-progress patches. Reverse them first on incremental builds.
+    diagnostics = tree / 'patches/xnu/zzzzz-picasso-launchd-diagnostics.patch'
+    assert diagnostics.is_file(), 'Missing launchd diagnostics patch'
+    assert late[0] == diagnostics, 'Launchd diagnostics must be reversed first'
     prelink = sorted(a.prelink_patches.resolve().glob('*.patch'))
     if not prelink:
         raise RuntimeError('No prelink patches; refusing an incomplete replay')
@@ -77,8 +86,7 @@ def main():
             if git(xnu, 'apply', '--reverse', '--check', patch, check=False).returncode:
                 apply(xnu, patch)
                 applied += 1
-        sources = tuple((xnu / p).read_bytes() for p in
-                        ('bsd/kern/kern_exec.c', 'bsd/vm/vm_unix.c', 'bsd/dev/picasso_usb.c'))
+        sources = tuple((xnu / p).read_bytes() for p in REPLAY_SOURCES)
         if previous_sources is not None:
             assert sources == previous_sources, 'Second pass changed generated source bytes'
         previous_sources = sources
@@ -102,11 +110,13 @@ def main():
     assert '#define PREBOOT_CRYPTEX_PATH "/private/preboot/Cryptexes"' in vm
     assert '&& !owner_carrier' in vm
     # The wrapper must still emit the canonical USB source alongside the
-    # owner patches; this test does not modify that source or its logging.
+    # owner patches. Host execution of watchdog logic is a separate check.
     assert (xnu / 'bsd/dev/picasso_usb.c').is_file()
-    hashes = {str(f.relative_to(xnu)): hashlib.sha256(f.read_bytes()).hexdigest()
-              for f in (xnu / 'bsd/kern/kern_exec.c', xnu / 'bsd/vm/vm_unix.c')}
+    hashes = {p: hashlib.sha256((xnu / p).read_bytes()).hexdigest()
+              for p in REPLAY_SOURCES}
     report = {'upstream': revision, 'xnu': xnu_rev, 'passes': passes, 'source_hashes': hashes,
+              'device_patch_sha256': hashlib.sha256(outer.read_bytes()).hexdigest(),
+              'usb_patch_sha256': hashlib.sha256(usb.encode('utf-8')).hexdigest(),
               'prelink_patches': {f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in prelink},
               'scope': 'patch application and integration only; not compilation or device validation'}
     (out / 'report.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')

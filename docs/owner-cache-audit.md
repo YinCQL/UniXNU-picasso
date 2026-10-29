@@ -1,8 +1,12 @@
 # Owner cache integration audit
 
-The transport issue recorded below was subsequently reproduced and corrected
-in the [UFS NOP investigation](ufs-nop-investigation.md). That follow-up does
-not establish a device root-mount or owner-cache success.
+The transport issue recorded below was subsequently investigated in the
+[UFS NOP investigation](ufs-nop-investigation.md). A later `25e314d` device log
+shows OS/SystemOS mounts and owner-cache preparation succeeding before an
+automatic reboot during early launchd. See the
+[launchd and reboot investigation](launchd-reboot-investigation.md); actual
+shared-cache mapping and stable userspace remain unverified. The audit below
+describes its original source and validation snapshot.
 
 ## Audited inputs
 

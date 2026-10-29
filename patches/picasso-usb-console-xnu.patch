@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..2237fb2
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,2743 @@
+@@ -0,0 +1,2815 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -2259,13 +2259,15 @@ index 0000000..2237fb2
 +	picasso_usb_system_reset();
 +}
 +
-+static void
++static bool
 +ud_poll_serialized(void)
 +{
 +	if (!os_atomic_cmpxchg(&ud.poll_lock, 0, 1, acquire)) {
-+		return;
++		return false;
 +	}
 +	ud_poll();
++	bool normal = !ud.panic_mode && !ud.reboot_pending && !ud.hang_pending &&
++	    !ud.panic_pending && !ud.reset_pending;
 +	os_atomic_store(&ud.poll_lock, 0, release);
 +	if (ud.reboot_pending && !ud.panic_mode) {
 +		ud.reboot_pending = false;
@@ -2283,6 +2285,7 @@ index 0000000..2237fb2
 +		ud.reset_pending = false;
 +		ud_finish_reboot();
 +	}
++	return normal && !ud.panic_mode;
 +}
 +
 +static void
@@ -2294,10 +2297,82 @@ index 0000000..2237fb2
 +	ud_poll_serialized();
 +}
 +
++#define UD_WATCHDOG_INITIAL_REPORTS 4u
++#define UD_WATCHDOG_LATE_REPORTS 8u
++#define UD_WATCHDOG_LATE_NS (1000ULL * NSEC_PER_MSEC)
++
++struct ud_poller_progress {
++	bool started;
++	bool have_pet;
++	unsigned initial_reports;
++	unsigned late_reports;
++	uint64_t last_pet_ns;
++};
++
++static uint64_t
++ud_monotonic_ns(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
++/* Only the background thread services the watchdog here. Console writes
++ * can re-enter ud_poll_serialized(), but cannot recurse into this helper.
++ * Time samples are diagnostic only: a stopped clock must not stop pets. */
++static void
++ud_background_poll(struct ud_poller_progress *progress)
++{
++	bool first = !progress->started;
++	progress->started = true;
++	if (first && !ud.panic_mode) {
++		printf("PICASSO USB: background first poll begin mono_ns=%llu\n",
++		    ud_monotonic_ns());
++	}
++	bool normal = ud_poll_serialized();
++	bool petted = normal && !ud.panic_mode && ud.watchdog_armed && ud.wdt != 0;
++	uint64_t now_ns = 0, gap_ns = 0;
++	bool gap_valid = false;
++	if (petted) {
++		/* Service a completed normal poll before diagnostics or yielding.
++		 * A failed try-lock is not USB progress and must not feed the dog. */
++		picasso_usb_watchdog_pet();
++		now_ns = ud_monotonic_ns();
++		gap_valid = progress->have_pet && now_ns >= progress->last_pet_ns;
++		if (gap_valid) {
++			gap_ns = now_ns - progress->last_pet_ns;
++		}
++		progress->last_pet_ns = now_ns;
++		progress->have_pet = true;
++	}
++	/* All diagnostics run after this pass has released the poll lock. */
++	if (first && !ud.panic_mode) {
++		printf("PICASSO USB: background first poll end normal=%u petted=%u mono_ns=%llu\n",
++		    normal ? 1u : 0u, petted ? 1u : 0u,
++		    petted ? now_ns : ud_monotonic_ns());
++	}
++	if (petted && !ud.panic_mode) {
++		bool late = gap_valid && gap_ns >= UD_WATCHDOG_LATE_NS;
++		bool report = false;
++		if (progress->initial_reports < UD_WATCHDOG_INITIAL_REPORTS) {
++			progress->initial_reports++;
++			report = true;
++		} else if (late && progress->late_reports < UD_WATCHDOG_LATE_REPORTS) {
++			progress->late_reports++;
++			report = true;
++		}
++		if (report) {
++			printf("PICASSO USB: watchdog pet mono_ns=%llu gap_ns=%llu gap_valid=%u late=%u\n",
++			    now_ns, gap_ns, gap_valid ? 1u : 0u, late ? 1u : 0u);
++		}
++	}
++}
++
 +static void
 +ud_thread(void *arg __unused, wait_result_t wr __unused)
 +{
 +	uint64_t polls = 0;
++	struct ud_poller_progress progress = { 0 };
 +
 +	/*
 +	 * The early Picasso timer path is not reliable yet.  A deadline-based
@@ -2307,11 +2382,8 @@ index 0000000..2237fb2
 +	 */
 +	printf("PICASSO USB: busy poller started\n");
 +	for (;;) {
-+		ud_poll_serialized();
++		ud_background_poll(&progress);
 +		polls++;
-+		if ((polls & 0x3ffu) == 0) {
-+			picasso_usb_watchdog_pet();
-+		}
 +		if (ud.trace_polling && (polls % 4096) == 0) {
 +			printf("PICASSO USB: poller heartbeat polls=%llu events=%llu rx_busy=%u\n",
 +			    polls, ud.events, ud.rx_busy ? 1u : 0u);

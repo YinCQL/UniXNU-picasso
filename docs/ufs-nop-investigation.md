@@ -1,5 +1,11 @@
 # UFS root bring-up investigation (2026-10-29)
 
+The later `25e314d` device boot completed delayed UFS reads, mounted OS and
+SystemOS, and reached early launchd before automatically rebooting. See the
+[launchd and reboot investigation](launchd-reboot-investigation.md) for that
+log's identity, the passed stages and the remaining uncertainty. The earlier
+captures below retain their original evidence boundaries.
+
 ## Initial device evidence: NOP not yet observed
 
 The user identified `picasso-windows-20261029-045550-937.log` as a capture from
