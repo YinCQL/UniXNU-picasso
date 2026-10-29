@@ -21,7 +21,8 @@ struct Host { uint8_t *virt; uint64_t phys; bool ready,poisoned; uintptr_t hc; v
 static Host gHost;
 static UfsRootDiagnostics gRootDiagnostic;
 // Runner extracts these functions verbatim from NativeUfs.cpp, including
-// actual DC CIVAC/DC IVAC/DSB and volatile read32/write32. No DMA callbacks.
+// actual DC CIVAC/DC IVAC/DSB, volatile read32/write32 and CPU yield hint.
+// No DMA callbacks or replacement polling-pause implementation.
 #include "RootHardwareExtracted.h"
 static uint64_t mach_absolute_time() {
   uint64_t ticks; asm volatile("mrs %0, cntpct_el0":"=r"(ticks)); return ticks;

@@ -5,62 +5,155 @@
 #include <algorithm>
 #include <string>
 enum class Fault { None, Empty, Type, Tag, Lun, Query, Residual, Underflow,
-  Oversize, SenseLength, CheckCondition, Timeout, Fatal, Stop, Start, HighBase };
+  Oversize, SenseLength, CheckCondition, Timeout, BusyTimeout, Fatal, Stop, Start, HighBase,
+  BoundaryComplete, BoundaryFatal, BoundaryExpired,
+  QueryDelayed, QueryDelayedMismatch, QueryDelayedFatal, QueryDelayedTimeout, QueryDelayedBusyTimeout,
+  TurDelayed, TurDelayedFatal, TurDelayedCompleteFatal, TurDelayedTimeout, TurDelayedBusyTimeout };
 static Fault fault;
 static std::array<uint8_t,kDmaBytes> device;
 static std::array<uint32_t,64> registers;
 static uint64_t now;
-static unsigned writes, releases;
-static bool released;
+static unsigned writes, releases, acquires, doorbellWrites, runStopWrites, pollPauses, commandPauses;
+static unsigned cpuHints, clockReads, legacyWaits;
+static bool released, submitted, frozenClock;
+static constexpr unsigned kFormerKickPoll = 16384;
+static constexpr unsigned kQueryPauseCount = 3;
+static constexpr unsigned kTurPauseCount = 5;
+// Deterministic fixture time per 64-hint batch. This is NOT a timing calibration
+// or a claim that the production CPU hint batch takes ten microseconds.
+static constexpr uint64_t kSimulatedPauseUs = 10;
+
+static bool boundaryFault()
+{
+  return fault==Fault::BoundaryComplete || fault==Fault::BoundaryFatal || fault==Fault::BoundaryExpired;
+}
+
+static bool delayedQueryFault()
+{
+  return fault==Fault::QueryDelayed || fault==Fault::QueryDelayedMismatch ||
+    fault==Fault::QueryDelayedFatal || fault==Fault::QueryDelayedTimeout || fault==Fault::QueryDelayedBusyTimeout;
+}
+
+static bool delayedTurFault()
+{
+  return fault==Fault::TurDelayed || fault==Fault::TurDelayedFatal || fault==Fault::TurDelayedCompleteFatal ||
+    fault==Fault::TurDelayedTimeout || fault==Fault::TurDelayedBusyTimeout;
+}
+
+static void completeResponse()
+{
+  submitted=false;
+  registers[0x58/4]=0;
+  uint8_t *cmd=device.data()+kUcdOffset, *rsp=cmd+kRspOffset;
+  std::fill(rsp,rsp+512,uint8_t(0));
+  memset(device.data()+kDataOffset,0x7b,kDataMax);
+  *reinterpret_cast<uint32_t *>(device.data()+8)=0;
+  if (fault==Fault::Empty) return;
+  memcpy(rsp,cmd,32); rsp[0]=cmd[0]+0x20; rsp[1]=0;
+  if (cmd[0]==1) putBe32(rsp+12,0);
+  if (cmd[0]==0x16) putBe32(rsp+20,0x11);
+  if (fault==Fault::Type) rsp[0]=0x3f;
+  if (fault==Fault::Tag) ++rsp[3];
+  if (fault==Fault::Lun) ++rsp[2];
+  if (fault==Fault::Query || fault==Fault::QueryDelayedMismatch) ++rsp[13];
+  if (fault==Fault::Residual) putBe32(rsp+12,4096);
+  if (fault==Fault::Underflow) rsp[1]=0x20;
+  if (fault==Fault::Oversize) rsp[10]=0xff;
+  if (fault==Fault::SenseLength) { rsp[11]=2; rsp[33]=18; }
+  if (fault==Fault::CheckCondition) {
+    rsp[7]=2; rsp[11]=20; rsp[33]=18; rsp[34]=0x70;
+    rsp[36]=6; rsp[46]=0x29; rsp[47]=0;
+  }
+}
 
 static uint64_t io(unsigned op,uint64_t address,uint64_t value,void *bytes)
 {
   if (op==0) return registers.at(address/4);
   if (op==1) {
     ++writes;
+    if (address==0x60) ++runStopWrites;
     if (address==0x20) registers[address/4]&=~uint32_t(value);
     else if (!(address==0x60 && ((fault==Fault::Stop && !value) || (fault==Fault::Start && value))) &&
              !(address==0x54 && fault==Fault::HighBase)) registers.at(address/4)=uint32_t(value);
     if (address==0x58) {
+      ++doorbellWrites;
       assert(released); released=false;
+      submitted=true; commandPauses=0;
+      if (delayedQueryFault() || delayedTurFault()) {
+        const uint8_t *cmd=device.data()+kUcdOffset;
+        // A later command must replace prior completed OCS/response bytes.
+        // It remains HC-owned until the production pause batches run.
+        if (delayedQueryFault()) {
+          assert(cmd[0]==0x16 && cmd[3]==1 && cmd[5]==1 && cmd[12]==3 && cmd[13]==2);
+          assert(cmd[14]==0 && cmd[15]==0 && loadBe32(cmd+20)==0);
+        } else {
+          assert(cmd[0]==1 && cmd[1]==0 && cmd[2]==0 && cmd[3]==0 && loadBe32(cmd+12)==0);
+          assert(std::all_of(cmd+16,cmd+22,[](uint8_t byte){return byte==0;})); // TUR CDB.
+        }
+        assert(cmd[kRspOffset]==0 && (*reinterpret_cast<uint32_t *>(device.data()+8)&0xff)==15);
+        return 0;
+      }
+      if (boundaryFault() || fault==Fault::BusyTimeout) return 0;
       if (fault==Fault::Fatal) { registers[0x20/4]=0x20000; return 0; }
       registers[0x58/4]=0;
       if (fault==Fault::Timeout) return 0;
-      uint8_t *cmd=device.data()+kUcdOffset, *rsp=cmd+kRspOffset;
-      std::fill(rsp,rsp+512,0);
-      memset(device.data()+kDataOffset,0x7b,kDataMax);
-      *reinterpret_cast<uint32_t *>(device.data()+8)=0;
-      if (fault==Fault::Empty) return 0;
-      memcpy(rsp,cmd,32); rsp[0]=cmd[0]+0x20; rsp[1]=0;
-      if (cmd[0]==1) putBe32(rsp+12,0);
-      if (cmd[0]==0x16) putBe32(rsp+20,0x11);
-      if (fault==Fault::Type) rsp[0]=0x3f;
-      if (fault==Fault::Tag) ++rsp[3];
-      if (fault==Fault::Lun) ++rsp[2];
-      if (fault==Fault::Query) ++rsp[13];
-      if (fault==Fault::Residual) putBe32(rsp+12,4096);
-      if (fault==Fault::Underflow) rsp[1]=0x20;
-      if (fault==Fault::Oversize) rsp[10]=0xff;
-      if (fault==Fault::SenseLength) { rsp[11]=2; rsp[33]=18; }
-      if (fault==Fault::CheckCondition) {
-        rsp[7]=2; rsp[11]=20; rsp[33]=18; rsp[34]=0x70;
-        rsp[36]=6; rsp[46]=0x29; rsp[47]=0;
-      }
+      completeResponse();
     }
   }
   if (op==2 || op==3) {
     assert(address>=gHost.phys && address-gHost.phys+value<=device.size());
     auto at=device.data()+(address-gHost.phys);
     if (op==2) { ++releases; memcpy(at,bytes,value); released=true; }
-    else memcpy(bytes,at,value);
+    else {
+      assert(!(registers[0x58/4]&1)); // Never invalidate descriptors while HC owns the slot.
+      ++acquires; memcpy(bytes,at,value);
+    }
   }
-  if (op==4) return now;
-  if (op==5) now+=value;
+  if (op==4) { ++clockReads; return now; }
+  if (op==5) {
+    ++legacyWaits;
+    assert(!submitted); // Queue setup may use IODelay; command polling may not.
+    now+=value;
+  }
+  if (op==6) {
+    ++cpuHints;
+    if (cpuHints%kUfsPollPauseHintCount!=0) return 0;
+    if (frozenClock) return 0;
+    now+=kSimulatedPauseUs;
+    if (submitted) { ++pollPauses; ++commandPauses; }
+    if (submitted && delayedQueryFault()) {
+      if (commandPauses==kQueryPauseCount) {
+        if (fault==Fault::QueryDelayedFatal) registers[0x20/4]=0x20000;
+        else if (fault==Fault::QueryDelayedTimeout) registers[0x58/4]=0; // OCS stays invalid.
+        else if (fault!=Fault::QueryDelayedBusyTimeout) completeResponse();
+      }
+    }
+    if (submitted && delayedTurFault() && commandPauses==kTurPauseCount) {
+      if (fault==Fault::TurDelayedFatal) registers[0x20/4]=0x20000;
+      else if (fault==Fault::TurDelayedTimeout) registers[0x58/4]=0;
+      else if (fault!=Fault::TurDelayedBusyTimeout) {
+        completeResponse();
+        if (fault==Fault::TurDelayedCompleteFatal) registers[0x20/4]=0x20000;
+      }
+    }
+    if (submitted && boundaryFault() && pollPauses==kFormerKickPoll-1) {
+      // Change hardware state between polls, immediately before the old kick
+      // point. Also expire the deadline: completion/fatal must be observed first.
+      now=200000;
+      registers[0x60/4]=0;
+      if (fault==Fault::BoundaryExpired) registers[0x58/4]=0; // OCS remains invalid.
+      else completeResponse();
+      if (fault==Fault::BoundaryFatal) registers[0x20/4]=0x20000;
+    }
+  }
   return 0;
 }
 static void reset(Fault f=Fault::None)
 {
-  fault=f; device.fill(0); registers.fill(0); now=0; writes=releases=0; released=false;
+  fault=f; device.fill(0); registers.fill(0); now=0;
+  writes=releases=acquires=doorbellWrites=runStopWrites=pollPauses=commandPauses=0;
+  cpuHints=clockReads=legacyWaits=0;
+  released=submitted=frozenClock=false;
   registers[0x34/4]=1; registers[0x30/4]=15; registers[0x60/4]=1;
   ufs_test_reset(io,0x8cb5e9000);
 }
@@ -78,6 +171,116 @@ static void assertQuarantined()
 }
 int main()
 {
+  reset(); frozenClock=true;
+  HardwareTransferPort paused{};
+  paused.tracePoll=1;
+  paused.delay();
+  assert(cpuHints==64 && clockReads==0 && legacyWaits==0 && now==0);
+  assert(writes==0 && releases==0 && acquires==0); // Pause alone has no I/O dependencies.
+  // Only the pause is tested with a frozen clock: transfer deadlines still
+  // depend on clock progress, and are not claimed to expire in this case.
+  for (unsigned blocked: {0x58U,0x20U}) {
+    reset();
+    assert(ufs_test_nop()==kIOReturnSuccess);
+    std::array<uint8_t,kDmaBytes> completedNop;
+    memcpy(completedNop.data(),memory,sizeof(memory));
+    const unsigned nopWrites=writes, nopReleases=releases, nopAcquires=acquires;
+    registers[blocked/4]=blocked==0x58 ? 1U : 0x20000U;
+    uint32_t power=0xabcdef;
+    assert(ufs_test_query(3,2,&power)==kIOReturnNotReady && power==0xabcdef);
+    assert(gRootDiagnostic.command==1); // Preflight rejection is not a second submitted command.
+    assert(writes==nopWrites && releases==nopReleases && acquires==nopAcquires);
+    assert(!memcmp(completedNop.data(),memory,sizeof(memory)));
+    assert(doorbellWrites==1 && runStopWrites==0 && pollPauses==0);
+    assertQuarantined();
+  }
+  for (Fault next: {Fault::QueryDelayed,Fault::QueryDelayedMismatch,Fault::QueryDelayedFatal,
+                   Fault::QueryDelayedTimeout,Fault::QueryDelayedBusyTimeout}) {
+    reset();
+    assert(ufs_test_nop()==kIOReturnSuccess);
+    assert(gRootDiagnostic.command==1 && gRootDiagnostic.polls==1 && pollPauses==0);
+    assert(doorbellWrites==1 && releases==1 && runStopWrites==0);
+    assert(memory[kUcdOffset+kRspOffset]==0x20); // Prior command completed in the same DMA allocation.
+    const unsigned nopAcquires=acquires;
+#ifdef NATIVE_UFS_TEST_TRACE
+    const unsigned nopTraces=ufs_test_trace_calls();
+    assert(nopTraces!=0);
+#endif
+    fault=next;
+    uint32_t power=0xabcdef;
+    IOReturn result=ufs_test_query(3,2,&power);
+    assert(gRootDiagnostic.command==2 && gRootDiagnostic.type==0x16 && gRootDiagnostic.opcode==3);
+    assert(doorbellWrites==2 && releases==2 && runStopWrites==0 && legacyWaits==0);
+    assert(gRootDiagnostic.dbSeen==1 && pollPauses>=kQueryPauseCount);
+#ifdef NATIVE_UFS_TEST_TRACE
+    assert(ufs_test_trace_calls()>nopTraces); // Trace arguments execute; no string matching.
+#endif
+    const bool timedOut=next==Fault::QueryDelayedTimeout || next==Fault::QueryDelayedBusyTimeout;
+    assert(pollPauses==(timedOut ? 200000U/kSimulatedPauseUs : kQueryPauseCount));
+    assert(gRootDiagnostic.polls==pollPauses+1 && now==kSimulatedPauseUs*pollPauses);
+    assert(cpuHints==kUfsPollPauseHintCount*pollPauses);
+    if (next==Fault::QueryDelayed) {
+      assert(result==kIOReturnSuccess && power==0x11 && !ufs_test_poisoned());
+      assert(gRootDiagnostic.ocs==0 && acquires==nopAcquires+2);
+      fault=Fault::None;
+      assert(ufs_test_nop()==kIOReturnSuccess); // A completed Query leaves the queue reusable.
+      assert(doorbellWrites==3 && releases==3 && runStopWrites==0);
+    } else {
+      assert(result==(timedOut ? kIOReturnTimeout : kIOReturnIOError));
+      assert(power==0xabcdef); // Neither transport nor echo failure publishes a value.
+      if (next==Fault::QueryDelayedFatal || next==Fault::QueryDelayedBusyTimeout)
+        assert(acquires==nopAcquires);
+      if (next==Fault::QueryDelayedMismatch) assert(gRootDiagnostic.protocol==5);
+      else assert(gRootDiagnostic.ocs==15);
+      assertQuarantined();
+    }
+  }
+  for (Fault next: {Fault::TurDelayed,Fault::TurDelayedFatal,Fault::TurDelayedCompleteFatal,
+                   Fault::TurDelayedTimeout,Fault::TurDelayedBusyTimeout}) {
+    reset();
+    assert(ufs_test_nop()==kIOReturnSuccess);
+    uint32_t power=0;
+    assert(ufs_test_query(3,2,&power)==kIOReturnSuccess && power==0x11);
+    assert(gRootDiagnostic.command==2 && gRootDiagnostic.polls==1 && cpuHints==0);
+    const unsigned priorAcquires=acquires;
+    fault=next;
+    uint8_t tur[6]={}; uint32_t scsi=0;
+    IOReturn result=ufs_test_scsi(0,tur,6,false,0,&scsi);
+    assert(gRootDiagnostic.command==3 && gRootDiagnostic.type==1 && gRootDiagnostic.opcode==0);
+    assert(doorbellWrites==3 && releases==3 && runStopWrites==0 && legacyWaits==0);
+    assert(gRootDiagnostic.dbSeen==1);
+    const bool timedOut=next==Fault::TurDelayedTimeout || next==Fault::TurDelayedBusyTimeout;
+    assert(pollPauses==(timedOut ? 200000U/kSimulatedPauseUs : kTurPauseCount));
+    assert(gRootDiagnostic.polls==pollPauses+1 && now==kSimulatedPauseUs*pollPauses);
+    assert(cpuHints==kUfsPollPauseHintCount*pollPauses);
+    if (next==Fault::TurDelayed) {
+      assert(result==kIOReturnSuccess && scsi==0 && gRootDiagnostic.ocs==0);
+      assert(acquires==priorAcquires+2 && !ufs_test_poisoned());
+      fault=Fault::None;
+      assert(ufs_test_nop()==kIOReturnSuccess);
+      assert(doorbellWrites==4 && releases==4 && runStopWrites==0);
+    } else {
+      assert(result==(timedOut ? kIOReturnTimeout : kIOReturnIOError));
+      assert(scsi==0xffff && gRootDiagnostic.ocs==15); // No response status parsed on failure.
+      if (next!=Fault::TurDelayedTimeout) assert(acquires==priorAcquires);
+      assertQuarantined();
+    }
+  }
+  for (Fault f: {Fault::BoundaryComplete,Fault::BoundaryFatal,Fault::BoundaryExpired}) {
+    reset(f);
+    IOReturn result=ufs_test_nop();
+    assert(gRootDiagnostic.polls==kFormerKickPoll && now==200000);
+    assert(doorbellWrites==1 && releases==1 && runStopWrites==0);
+    assert(registers[0x60/4]==0); // Never restart a stopped request list while polling.
+    if (f==Fault::BoundaryComplete) {
+      assert(result==kIOReturnSuccess && gRootDiagnostic.ocs==0 && !ufs_test_poisoned());
+    } else {
+      assert(result==(f==Fault::BoundaryFatal ? kIOReturnIOError : kIOReturnTimeout));
+      assert(gRootDiagnostic.ocs==15);
+      if (f==Fault::BoundaryFatal) assert(acquires==0); // Fatal takes precedence over OCS=0.
+      assertQuarantined();
+    }
+  }
   reset(); assert(ufs_test_nop()==0);
   uint32_t value=0; assert(ufs_test_query(3,2,&value)==0 && value==0x11);
   std::array<uint8_t,131072> out;
@@ -89,10 +292,12 @@ int main()
   auto oldWrites=writes;
   assert(ufs_test_read(0,0xffffffffULL,2,out.data())==kIOReturnBadArgument && writes==oldWrites);
   for (Fault f: {Fault::Empty,Fault::Type,Fault::Tag,Fault::Lun,Fault::Residual,
-                Fault::Underflow,Fault::Oversize,Fault::SenseLength,Fault::Timeout,Fault::Fatal}) {
+                Fault::Underflow,Fault::Oversize,Fault::SenseLength,Fault::Timeout,Fault::BusyTimeout,Fault::Fatal}) {
     reset(f); out.fill(0xa5);
     assert(ufs_test_read(0,1,1,out.data())!=0);
     assert(std::all_of(out.begin(),out.end(),[](uint8_t x){return x==0xa5;}));
+    assert(doorbellWrites==1 && releases==1 && runStopWrites==0);
+    if (f==Fault::BusyTimeout) assert(acquires==0); // Do not read HC-owned descriptors.
     assertQuarantined();
   }
   reset(Fault::Query); value=0xabcdef;
@@ -120,5 +325,5 @@ int main()
   reset(Fault::HighBase); assert(ufs_test_stop_queue()); assert(!ufs_test_start_queue());
   reset(); assert(ufs_test_stop_queue() && ufs_test_start_queue());
   assert(registers[0x50/4]==0xcb5e9000 && registers[0x54/4]==8);
-  puts("PASS: actual command/queue path; malformed DMA responses, bounds, short reads, sense, quarantine, queue refusal and full-width DMA");
+  puts("PASS: bounded production pause without clock/legacy wait dependencies; NOP/Query then delayed TUR, timeout/fatal quarantine, no resubmission, DMA ownership and command/queue regressions");
 }

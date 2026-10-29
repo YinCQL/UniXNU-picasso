@@ -38,6 +38,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Check generated picasso ADT timer binding
+        run: python3 scripts/check-picasso-adt.py --output out/picasso/logs/adt-host-check
+
       - name: Verify firmware volume and DTB are present
         run: |
           test -s uefi/SILICIUM_UEFI.fd || { echo "uefi/SILICIUM_UEFI.fd missing"; exit 1; }
@@ -50,6 +53,14 @@ jobs:
         run: |
           TREE=$(python3 ./unixnu --prepare)
           echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
+
+      - name: Check packed Data format and seed validation
+        run: |
+          # Fixtures contain intentional symlinks. Upload only the result JSON.
+          python3 scripts/check-picasso-ram-data.py --output out/picasso/host-checks/data \
+            --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py"
+          mkdir -p out/picasso/logs
+          cp out/picasso/host-checks/data/results.json out/picasso/logs/data-host-check.json
 
       - name: Install host tools and check the SDK
         run: |
@@ -78,15 +89,68 @@ jobs:
           ls -lh "$IPSW"
           echo "UNIXNU_IPSW=$PWD/$IPSW" >> "$GITHUB_ENV"
 
+      # The original static and System trust caches are extracted from the pinned
+      # IPSW here rather than committed; board.toml pins the accepted bundle hash.
+      - name: Bundle the original trust caches
+        run: |
+          mkdir -p out/picasso/logs
+          TREE=$(python3 ./unixnu --prepare)
+          python3 ./unixnu ipsw fetch OS KernelCache StaticTrustCache Cryptex1,SystemTrustCache 2>&1 | tee out/picasso/logs/actions-ipsw.log
+          echo "UNIXNU_KERNELCACHE=$PWD/out/ipsw/21H461/kernelcache.decompressed" >> "$GITHUB_ENV"
+          python3 scripts/prepare-original-trust.py --tree "$TREE" --inputs out/ipsw/21H461 --output out/picasso/original-static-system.bundle 2>&1 | tee out/picasso/logs/actions-trust.log
+
+      - name: Prepare volatile APFS Data from the original OS
+        run: |
+          python3 ./unixnu defconfig picasso_defconfig
+          sudo "$(command -v python3)" scripts/prepare-picasso-ram-data.py \
+            --tree "$UNIXNU_TREE" --source out/ipsw/21H461/044-76040-038.dmg \
+            --output out/picasso/ram-data --config out/picasso/.config \
+            2>&1 | tee out/picasso/logs/actions-ram-data.log
+
       - name: Build kernel + payload
         env:
           GITHUB_TOKEN: ${{ github.token }}
           UNIXNU_UNIQUE_CHIP_ID: "41a551c0dec0de01"
         run: |
-          python3 ./unixnu defconfig picasso_defconfig
           python3 ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
           mkdir -p out/picasso/logs
-          python3 ./unixnu build kernel payload -j 3 2>&1 | tee out/picasso/logs/actions-build.log
+          python3 ./unixnu build kernel payload -j 3 --trust-cache out/picasso/original-static-system.bundle --data-ramdisk out/picasso/ram-data/data.dbrdisk 2>&1 | tee out/picasso/logs/actions-build.log
+
+      - name: Verify Data seed, compiled UUID and payload handoff
+        run: |
+          python3 scripts/check-picasso-data-artifacts.py --tree out/picasso/tree --work out/picasso \
+            --output out/picasso/logs/data-artifacts.json
+
+      - name: Verify software AES provider against the original class ABI
+        run: |
+          python3 scripts/check-picasso-aes-artifacts.py --tree out/picasso/tree --work out/picasso \
+            --kernelcache "$UNIXNU_KERNELCACHE" --output out/picasso/logs/aes-artifacts.json
+
+      - name: Verify watchdog service policy against the linked native driver
+        run: |
+          python3 scripts/check-picasso-watchdog-policy.py --verify \
+            --kernelcache "$UNIXNU_KERNELCACHE" --candidate out/picasso/kernel/kernel.macho \
+            --native-prelink-dir "$UNIXNU_TREE/kits/NativePrelink" \
+            --output out/picasso/logs/watchdog-policy.json
+
+      - name: Verify original Sandbox and IOSurface in the prelinked kernel
+        run: |
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          kernel = Path('out/picasso/kernel/kernel.macho')
+          plan = json.loads(kernel.with_suffix('.json').read_text())
+          if hashlib.sha256(kernel.read_bytes()).hexdigest() != plan['candidate_sha256']:
+              raise SystemExit('Prelink report does not match kernel.macho')
+          for component in ('com.apple.security.sandbox', 'com.apple.kext.AppleMatch', 'com.apple.iokit.IOSurface'):
+              if component not in plan['components']:
+                  raise SystemExit(f'Missing required original component: {component}')
+              start = plan['module_entrypoints'][component]['start_va']
+              if not any(e['module'] == component and e['segment'] == '__TEXT_EXEC'
+                         and e['va'] <= start < e['va'] + e['size'] for e in plan['extents']):
+                  raise SystemExit(f'Missing executable module entry: {component}')
+              print(f'Prelink includes {component}, start={start:#x}')
+          PY
 
       - name: Report kernel/payload sizes
         run: |
@@ -129,10 +193,24 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: picasso-bootimg-${{ github.run_number }}
+          include-hidden-files: true
           path: |
             device/out/picasso/boot/**
             device/out/picasso/kernel/**
             device/out/picasso/payload/**
             device/out/picasso/logs/**
+            device/out/picasso/tree/build/sheng-platform-power/*.json
+            device/out/picasso/tree/build/sheng-platform-power/*.log
+            device/out/picasso/tree/build/sheng-platform-power/*.o
+            device/out/picasso/tree/build/sheng-platform-power/*.a
+            device/out/picasso/tree/build/native-aes/*.json
+            device/out/picasso/tree/build/native-aes/*.log
+            device/out/picasso/tree/build/native-aes/*.o
+            device/out/picasso/tree/build/native-aes/*.a
+            device/out/picasso/tree/build/xnu/**/kern_exec.cpo.json
+            device/out/picasso/tree/build/xnu/**/vfs_syscalls.cpo.json
+            device/out/picasso/ram-data/*.json
+            device/out/picasso/ram-data/data.dbrdisk
+            device/out/picasso/.config
           if-no-files-found: warn
           retention-days: 7

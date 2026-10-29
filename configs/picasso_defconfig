@@ -1,7 +1,7 @@
 # picasso first-console kernel configuration.
 #
 # Reaches the XNU video/serial console and reports the genuine missing-driver panic.
-# Minimal native drivers; UFS / AES / VirtIO / display / Adreno are brought up in
+# Native UFS, software AES and volatile Data are selected; VirtIO / display / Adreno follow in
 # later stages once the platform boots.
 
 CONFIG_XNU_BUILD_ARCHIVES=y
@@ -17,13 +17,18 @@ CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 CONFIG_XNU_EXTRA_LD_ARCHIVES=""
 
+# Publish a bare ApplePMGRNub for the unchanged AMFI: its configuration
+# settings match ApplePMGRNub and OR bit 2 into the always-on state, and the
+# provider field below the nub stays NULL so nothing touches Apple PMGR.
+# package/PicassoPmgr.cpp, run from the sheng-platform-power hook in bsd_init.
+CONFIG_XNU_SHENG_PMGR=y
 # CONFIG_XNU_SOURCE_PTHREAD is not set
 # CONFIG_XNU_SOURCE_MOCKFS is not set
 CONFIG_XNU_NATIVE_UFS=y
-# CONFIG_XNU_NATIVE_AES is not set
+CONFIG_XNU_NATIVE_AES=y
 # CONFIG_XNU_NATIVE_VIRTIO_BLOCK is not set
 # CONFIG_XNU_NATIVE_VIRTIO_CONSOLE is not set
-# CONFIG_XNU_NATIVE_RAM_BLOCK is not set
+CONFIG_XNU_NATIVE_RAM_BLOCK=y
 # CONFIG_XNU_NATIVE_MOBILE_DISPLAY is not set
 # CONFIG_XNU_NATIVE_LEGACY_DISPLAY is not set
 # CONFIG_XNU_NATIVE_ADRENO is not set
@@ -32,11 +37,27 @@ CONFIG_XNU_NATIVE_UFS=y
 # CONFIG_XNU_VERIFIED_ROOT_PROBE is not set
 CONFIG_XNU_OWNER_ROOT_AUDIT=y
 CONFIG_XNU_OWNER_ROOT_TRUST=y
-# CONFIG_XNU_OWNER_CACHE_MOUNT is not set
-# CONFIG_XNU_OWNER_CACHE_STARTUP is not set
-# CONFIG_XNU_OWNER_BOOT_MANIFEST is not set
-# CONFIG_XNU_OWNER_DATA_MOUNT is not set
-# CONFIG_XNU_OWNER_UNION_SYSTEMOS is not set
+# Compose the authenticated SystemOS cryptex read-only over the mounted OS
+# using native union lookup. Standalone libraries such as libobjc-trampolines
+# must be visible at /usr/lib; selecting only the shared-cache directory does
+# not expose these files. The original OS remains the lower layer.
+# CACHE_VOLUME_UUID selects the signed APFS volume, not a variable diskNsM name.
+CONFIG_XNU_OWNER_CACHE_MOUNT=y
+# Select the dyld startup bit so the original ignition sequence does not run a
+# second, unauthenticated cache path; requires the mount above.
+CONFIG_XNU_OWNER_CACHE_STARTUP=y
+# Publish the authenticated boot manifest for the mounted pair; requires the
+# startup selection. Data is a separate volatile APFS volume prepared in CI.
+CONFIG_XNU_OWNER_BOOT_MANIFEST=y
+CONFIG_XNU_OWNER_CACHE_VOLUME_UUID="8846FE78-2910-4297-AF97-D59BB6F8FC16"
+# The shared cache is now on the process root mount, so the additional
+# non-union carrier allowance is unnecessary. Original signature and owner
+# verification remain enabled for both volumes.
+# CONFIG_XNU_OWNER_CACHE_CARRIER is not set
+CONFIG_XNU_OWNER_DATA_MOUNT=y
+CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
 # CONFIG_XNU_BOOT_PROGRESS is not set
 
-CONFIG_XNU_OWNER_DATA_VOLUME_UUID="00000000-0000-0000-0000-000000000000"
+# prepare-picasso-ram-data.py writes the formatted APFS volume's actual UUID
+# into out/picasso/.config before compilation. An unprepared build must fail.
+CONFIG_XNU_OWNER_DATA_VOLUME_UUID=""

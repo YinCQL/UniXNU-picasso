@@ -5,9 +5,24 @@
 #include <cstdio>
 #include <cstring>
 #include <cassert>
+#include <cstdarg>
 #include "../RootDiagnostics.h"
 #include "../TransferPoll.h"
+#ifdef NATIVE_UFS_TEST_TRACE
+static unsigned traceCalls;
+static void ufsTestTrace(const char *format, ...) {
+  char line[1024];
+  va_list arguments;
+  va_start(arguments,format);
+  int length=vsnprintf(line,sizeof(line),format,arguments);
+  va_end(arguments);
+  assert(length>=0 && size_t(length)<sizeof(line));
+  ++traceCalls;
+}
+#define NATIVE_UFS_TRACE(...) ufsTestTrace(__VA_ARGS__)
+#else
 #define NATIVE_UFS_TRACE(...) ((void)0)
+#endif
 using IOReturn = uint32_t;
 constexpr IOReturn kIOReturnSuccess=0, kIOReturnError=0xe00002bc,
   kIOReturnBadArgument=0xe00002c2, kIOReturnIOError=0xe00002ca,
@@ -22,7 +37,8 @@ alignas(4096) static uint8_t memory[kDmaBytes];
 using Callback = uint64_t (*)(unsigned operation, uint64_t address, uint64_t value, void *bytes);
 static Callback callback;
 // 0: MMIO read; 1: ordered MMIO write; 2: release DMA; 3: acquire DMA;
-// 4: monotonic microseconds; 5: delay microseconds. Callbacks must not throw.
+// 4: monotonic microseconds; 5: legacy delay microseconds (queue only);
+// 6: one non-sleeping CPU hint. Callbacks must not throw.
 static uint32_t read32(uintptr_t, unsigned offset) { return uint32_t(callback(0,offset,0,nullptr)); }
 static void hostWrite(unsigned offset, uint32_t value) { callback(1,offset,value,nullptr); }
 static void cacheCivac(const void *start, size_t length) {
@@ -36,6 +52,7 @@ static void clock_interval_to_deadline(uint32_t interval, unsigned scale, uint64
 }
 static uint64_t mach_absolute_time() { return callback(4,0,0,nullptr); }
 static void IODelay(uint32_t us) { callback(5,0,us,nullptr); }
+static void hostCpuRelax() { callback(6,0,0,nullptr); }
 static void IOLockLock(void *) {}
 static void IOLockUnlock(void *) {}
 static IOReturn recordTransport(IOReturn result,uint32_t ocs) {
@@ -47,7 +64,11 @@ extern "C" {
 void ufs_test_reset(Callback cb, uint64_t physical) {
   callback=cb; memset(memory,0,sizeof(memory));
   gHost={memory,physical,true,false,0,nullptr}; gRootDiagnostic=UfsRootDiagnostics{};
+  gRootReadTraceCount=0;
   gStoreOpen=gLogOpen=false; gStoreFirst=gStoreBlocks=gLogFirst=gLogBlocks=0;
+#ifdef NATIVE_UFS_TEST_TRACE
+  traceCalls=0;
+#endif
 }
 uint8_t *ufs_test_memory() { return memory; }
 bool ufs_test_poisoned() { return gHost.poisoned; }
@@ -65,5 +86,8 @@ uint32_t ufs_test_sync() { return hostSyncCache(); }
 uint32_t ufs_test_nop() {
   return hostNop();
 }
+#ifdef NATIVE_UFS_TEST_TRACE
+unsigned ufs_test_trace_calls() { return traceCalls; }
+#endif
 int ufs_test_report(char *out,size_t size) { return formatUfsRootDiagnostics(out,size,gRootDiagnostic,"host harness"); }
 }

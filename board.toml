@@ -24,13 +24,20 @@ fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustC
 
 [ipsw.sha256]
 
-# UserData partition geometry (GPT entry "userdata" of LUN 0). PLACEHOLDER.
-# The silenzio111 branch measured first_lba = 0x200000, last_lba = 0x3A00000 on this
-# board; those values stay unverified here and the kernel/payload steps do not read
-# them, so the safe placeholder is kept until "unixnu build userdata" is brought up.
+# UserData partition geometry (GPT entry "userdata" of LUN 0).
+# Measured on this device: "fastboot getvar partition-size:userdata" =
+# 0xBDEBFB000 = 50,981,744,640 bytes = 47.48 GiB = 12,446,715 x 4-KiB LBA.
+# Only the capacity (last_lba - first_lba + 1) * lba_bytes is consumed, by
+# "unixnu build userdata" (scripts/unixnu/userdata.py), to refuse an image that
+# would not fit the partition; the kernel and payload steps never read it and
+# the image itself is written from offset 0. first_lba stays 0 because it is not
+# derivable from a partition size alone -- fill the real GPT start LBA here if it
+# ever needs to describe the physical layout rather than the capacity.
+# The silenzio111 branch's 0x200000/0x3A00000 encode 224 GiB, i.e. a different
+# partition table; they are not this device's geometry.
 [userdata]
 first_lba = 0x0
-last_lba = 0x0
+last_lba = 0xBDEBFA
 lba_bytes = 4096
 windows = [
   { name = "OS", component = "OS" },
@@ -51,15 +58,25 @@ archives = [
   "build-corecrypto-14.py --namespace",
   "build-arm-driver.py ArmDTPlatform",
   "build-arm-driver.py ArmCpu",
+  # AppleImage4 waits for this real software-key IOAESAccelerator provider.
+  "build-picasso-aes.py",
   # Stage 6: the UFS controller driver. Its board constants (GccUfs.h) carry
   # the SM7250 physical windows; the ADT ufshc/ufsphy nodes only match classes.
   "build-arm-driver.py NativeUfs",
+  # Volatile APFS Data; shares NativeUfs's exact original IOStorage bindings.
+  "build-arm-driver.py NativeRamBlock",
+  # Publishes ApplePMGRNub, the original-policy SM7250 watchdog, and volatile boot-stage storage.
+  # The archive lands in build/sheng-platform-power/libShengPlatformPower.a, the path
+  # build-xnu-4k-baseline.sh force-loads when CONFIG_XNU_SHENG_PMGR=1.
+  "build-picasso-pmgr.py",
 ]
 
 [kernel.prelink]
-tool = "kits/NativePrelink/emit_prelink.py"
+# Retains the stock emitter, then binds watchdogd's single service-class rule
+# to the real native watchdog class before the kernel enters the FAT payload.
+tool = "scripts/prelink-picasso.py"
 kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
-kernelcache_sha256 = ""
+kernelcache_sha256 = "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7"
 slide = "-0x1000000"
 early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
 roots = [
@@ -70,12 +87,18 @@ roots = [
   "com.apple.driver.ApplePMGR",
   "com.apple.filesystems.apfs",
   "com.apple.iokit.IOHIDFamily",
+  # Original IOBSD-matched IOSurfaceRoot, required by graphics/media clients.
+  "com.apple.iokit.IOSurface",
   "com.apple.iokit.IOStorageFamily",
   "com.apple.kec.Libm",
   "com.apple.kec.corecrypto",
   "com.apple.kec.pthread",
   "com.apple.kext.CoreTrust",
   "com.apple.security.AppleImage4",
+  # The original system library queries the Sandbox MAC policy during
+  # _container_init(), before launchd main. Include its genuine handler;
+  # the prelink dependency closure also brings in AppleMatch.
+  "com.apple.security.sandbox",
 ]
 
 # Firmware step: build the picasso Mu-Silicium UEFI firmware via unixnu.
@@ -85,13 +108,11 @@ kernel_offset = 0x8000
 tags_offset = 0x1e00000
 pagesize = 4096
 header_version = 1
-# The ABL loads kernel + ramdisk into one buffer that starts at abl_base
-# (0xB4513000 on this device, derived from the observed initrd address) and ends
-# at 0xB7E00000, so the whole payload window is about 57 MiB. With the default
-# ramdisk_offset of 0x1000000 the ramdisk starts at 0xB5513000 and only 42.6 MiB
-# fit, which truncated the 120 MiB payload: the FAT volume claimed 120 MiB while
-# only the first 42.9 MiB were in memory, and FatPkg faulted at 0xB7BFE000.
-# 0x200000 puts the ramdisk right after the ~2.1 MiB kernel slot, leaving 54.8 MiB.
+# Keep the offset used by the working 55 MiB images. The current committed FD
+# maps Boot Ramdisk Gap at 0xAD000000..0xBC000000; the historical ABL-base estimate
+# puts a 60 MiB ramdisk end at 0xB8313000, within that map. Earlier comments about
+# a hard 0xB7E00000 end described an older failed mapping, not this FD's limit.
+# The new 60 MiB image still needs a device boot; see docs/ram-data-bootstrap-investigation.md.
 ramdisk_offset = 0x200000
 [firmware]
 config = "picasso"                   # Resources/Configs/picasso.toml in the Mu-Silicium checkout (--uefi)
@@ -129,10 +150,9 @@ BUILDID_STRING = "picasso-research"
 # Payload: a FAT volume with UniXNU config + kernel + ADT. Loader (DarwinBoot) is in the firmware.
 [payload]
 volume = "PICASSOESP"
-# The embedded 128-KiB-record manifests add about 2.2 MiB to kernel.macho.
-# 55 MiB keeps the payload below the build driver's 95% content threshold
-# while adding only one MiB to the temporary boot image.
-size_mib = 55
+# Room for the kernel, original trust caches and packed APFS Data seed.
+# The payload builder retains its 95% content limit; CI checks the actual seed.
+size_mib = 60
 loader = "firmware"
 title = "Boot"
 dram_size = "0x80000000"
@@ -150,14 +170,15 @@ kernel_args = [
   "-v",
   "debug=0x14e",
   "cpus=1",
-  # Drive the UFS controller. native-ufs-root=1 is the sheng production
-  # path but upstream's payload guard demands the sheng PMGR shim
-  # (sheng-pmgr=2 + _sheng_pmgr_run linked). native-ufs-probe=12 runs the
-  # SAME startRoot() hardware bring-up from the root-device personality and
-  # panics with the full media report (GPT/userdata geometry) after a
-  # short delay -- the stage-6 data we need, without the shim. If AMFI
-  # then panics "No PMGR", the shim port becomes the next task.
-  "native-ufs-probe=12",
+  # Production root path. native-ufs-root=1 starts the root from the
+  # root-device personality without the diagnostic media-report panic that
+  # native-ufs-probe=12 ends with. Upstream's payload guard (check_native_root)
+  # requires sheng-pmgr=2 and a linked _sheng_pmgr_run for this mode, because
+  # the unchanged target AMFI otherwise panics with "No PMGR?" while looking
+  # for ApplePMGRNub in its configuration settings; package/PicassoPmgr.cpp
+  # publishes that nub, and CONFIG_XNU_SHENG_PMGR links it.
+  "native-ufs-root=1",
+  "sheng-pmgr=2",
   # Let bsd_init start the CDC console before the UFS publication diagnostic
   # runs, so a later UFS panic still has a complete host-side log.
   "native-ufs-start-delay=5",
@@ -165,9 +186,17 @@ kernel_args = [
   # timebase+yield path has been exercised on hardware; scans also yield at
   # every 128 KiB batch so CDC keeps draining.
   "native-ufs-delay-yield=1",
-  # The embedded manifest removes the 9.4 GiB scan, so enable command tracing
-  # for the first hardware qualification of the new bring-up path.
-  "native-ufs-diagnostics=1",
+  # Command tracing stays off. It prints two lines per SCSI/query command
+  # (NATIVE_UFS_NOP clear=begin/end, named for the UCD clear they share), and a
+  # boot that is reading the root volume emits them continuously, which buries
+  # every other message. Set it back to 1 only when the UFS transport itself is
+  # the question.
+  "native-ufs-diagnostics=0",
+  # IOKit matching trace is off for the same reason as the UFS one: it answers
+  # whether a personality matched, which the earlier root and probe=12 runs have
+  # already established, and it prints a very long log while doing so. Turn it
+  # back on when a driver is suspected of never being matched; the bits are
+  # kIOLogMatch(0x10) | kIOLogProbe(0x2) | kIOLogConfig(0x20) | kIOLogCatalogue(0x200).
   # Diagnostic-only: keep console output flowing when an early kernel path
   # logs with interrupts disabled. Without this XNU panics at
   # serial_console.c:175 before CDC can deliver the surrounding context.
@@ -175,13 +204,6 @@ kernel_args = [
   # IOLog has a separate interrupt-context assertion in IOLib.cpp. This
   # diagnostic-only escape hatch lets those messages reach the CDC console.
   "nointr_iolog=1",
-  # IOKit matching trace: kIOLogMatch(0x10) | kIOLogProbe(0x2) |
-  # kIOLogConfig(0x20) | kIOLogCatalogue(0x200). Three silent runs in a row
-  # (root, probe=12 variants) mean start() is never reached; this shows
-  # whether the personalities registered, whether ArmDTPlatform matched the
-  # root nub, and whether NativeUfs::probe was called at all. The log is
-  # long -- capture it in screen photos in sequence.
-  "io=0x232",
   # USB console (usb branch): 1 = state probe only, 2 = run the CDC-ACM
   # console streaming (DWC3 device mode; the PC sees a serial port carrying
   # the last 256 KiB of console text and then live output).
@@ -191,9 +213,10 @@ kernel_args = [
   # this, the read-only guard sees zero matches and deliberately leaves the
   # controller untouched.
   "picasso_usb_smmu=6",
-  # Keep the CDC console alive for the full boot instead of dropping it when
-  # the initial host-open state is observed.
-  "picasso_usb_hold=1",
+  # Let bsd_init continue to root mounting after the CDC poller starts.
+  # hold=1 parks bsd_init indefinitely for USB-only qualification; that mode
+  # cannot exercise this branch's UFS/root/SystemOS path.
+  "picasso_usb_hold=0",
   # The XNU CDC panic/reset path uses PSHOLD as its final fallback and arms the
   # IMEM Fastboot reason before either panic or command reset.
   "picasso_usb_reset=pshold",
@@ -261,30 +284,36 @@ kernel_args = [
 #         "com.apple.kec.libpthread" does not exist and fails the closure);
 #         its pthread_kext_register call fills the function table.
 panic_screen = false
+# The original static and System trust caches, bundled by
+# scripts/prepare-original-trust.py from the pinned IPSW. DarwinBoot copies the
+# bundle into the kernel window and fills the ADT TrustCache placeholder with its
+# address and size; without it the kernel logs "no external trust caches found"
+# and has no original Apple hashes to check userspace binaries against. The
+# allow-list below pins the exact bundle this board accepts, so a mismatched or
+# substituted input fails the payload step instead of booting.
+trust_cache_sha256 = ["7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7"]
 
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"
 chip_id = "7250"
+# DarwinBoot passes only packed nonzero pages; NativeRamBlock allocates pages
+# as needed. The seed is volatile and /chosen/ephemeral-storage remains enabled.
+packed_data_ramdisk = true
+# Declare an iPad-class device: /model iPad7,1, /target-type J120, the J120 panel
+# artwork in /product, no Home button in /buttons, and the dev-board security
+# tuple in /chosen (certificate-security-mode 1). The original AMFI reads that
+# tuple to choose its code-signing trust policy for the platform; under the
+# production policy it rejects the adhoc-signed userspace with "unsuitable CT
+# policy 0", which is the stage 5 blocker. sheng and hummer run the same values
+# on hardware against the same 21H461 userspace.
+ipad_identity = true
 # Select the authenticated OS APFS volume by its published IOMedia UUID. The
 # VerifiedRoot window identity check independently binds this UUID to the
 # owner-signed image before the block device is published.
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
-# DarwinBoot requests one contiguous window of this size from the firmware and
-# hands it to the kernel as boot_args.memSize. The kernel then builds its physmap
-# over exactly that range, so the window has to fit inside a single
-# conventional-memory run.
-#
-# 0x100000000 (4 GiB) cannot fit here. The first DRAM bank is
-# 0x80000000..0xBCC00000 (972 MiB) per the device DT, and picassoPkg's
-# MemoryMapLib exposes only the "Boot Ramdisk Gap" 0xAD000000..0xBCC00000 as
-# SYS_MEM (252 MiB). DarwinBoot still reports success at 4 GiB because
-# AllocatePages only records the range as owned, but arm_vm_init() then builds a
-# 4 GiB physmap starting at the window base 0xC007C000, which runs past the end
-# of real DRAM to 0x1C007C000. Touching that faults with the MMU already on and
-# no console bound yet -- the silent hang after the green bar.
-#
-# 256 MiB is DarwinWindowSizeValid()'s minimum (0x10000000..0x200000000 in 2 MiB
-# steps) and fits inside the 252 MiB SYS_MEM run.
+# Keep the existing 256 MiB contiguous kernel window request. It is separate
+# from the original FAT ramdisk mapping above. Packed Data does not expand it:
+# only resident seed/write pages consume RAM, and peak use needs device testing.
 owned_memory_size = "0x10000000"
 cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
 unique_chip_id = "required"

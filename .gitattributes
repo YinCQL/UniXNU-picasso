@@ -1,0 +1,8 @@
+# The verified-root policy tree is a build input whose bytes are hashed: the
+# SHA-256 of policy.S is recorded in attestation.json, and build-arm-driver.py
+# refuses the tree when the two disagree. Any CRLF conversion on checkout would
+# change that hash, so pin the newline for this directory. The .bin blobs are
+# binary and never converted.
+policy/verified-root-picasso/** text eol=lf
+policy/verified-root-picasso/**/*.bin binary
+policy/verified-root-picasso/*.bin binary

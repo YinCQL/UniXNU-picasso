@@ -7,6 +7,7 @@ SM7250 values taken from the compiled board DT:
   - GICv3 distributor 0x17A00000/0x10000, redistributor 0x17A60000/0x100000
     (arm-io child offsets under an APSS range at 0x17A00000), stride 0x40000
   - CPU timebase 19200000 Hz (Qualcomm SM7250 architectural counter)
+  - Virtual timer GIC_PPI 3: absolute INTID 19, from picasso's live board DT
   - DRAM base 0x80000000; size comes from the actual device observation and
     is cross-checked at build time.
 
@@ -34,6 +35,10 @@ GIC_DIST_SIZE = 0x10000
 GIC_REDIST = 0x17A60000
 GIC_REDIST_SIZE = 0x100000
 TIMEBASE = 19200000
+# /soc/timer interrupts in the picasso board DT: secure, nonsecure, virtual, hyp.
+# The virtual entry is <1 3 0xff08>: GIC_PPI 3 means INTID 16 + 3, not 27.
+# ArmCpu consumes an absolute INTID encoded as a little-endian ADT u32.
+VIRTUAL_TIMER_INTID = 19
 UFS_HC = 0x1d84000
 UFS_HC_SIZE = 0x3000
 UFS_PHY = 0x1d80000
@@ -160,9 +165,18 @@ def main():
                                    ('device_type', b'cpu\0'), ('compatible', b'arm,cortex-a76\0'),
                                    ('timebase-frequency', struct.pack('<I', TIMEBASE))])
             for index, reg in enumerate(cpu_regs)]
+    # hw.product/hw.machine come from the root 'model'/'target-type'. Both are
+    # read by IODTPlatformExpert and end up in MobileGestalt, so the iPad identity
+    # has to replace them together with the /chosen security status below: AMFI
+    # derives its code-signing trust policy for the platform from that status, and
+    # an adhoc-signed userspace binary (launchd) is only accepted under the
+    # dev-board policy that the iPad identity declares.
+    identity = [
+        ('model', b'iPad7,1\0' if args.ipad_identity else b'picasso-first-boot\0'),
+        *([('target-type', b'J120\0')] if args.ipad_identity else []),
+    ]
     tree = node('device-tree', [
-        # hw.product/hw.machine come from the root 'model'/'target-type' (IODTPlatformExpert).
-        ('model', b'picasso-first-boot\0'),
+        *identity,
         # Root compatible strings of the compiled board DT (xiaomi,picasso / qcom,lito).
         ('compatible', b'xiaomi,picasso\0qcom,lito\0qcom,lito-mtp\0'),
         ('#address-cells', struct.pack('<I', 2)),
@@ -176,6 +190,16 @@ def main():
                         # This boots the normal target OS. Volatile Data is
                         # described separately by ephemeral-storage below.
                         ('osenvironment', b'main\0'),
+                        # Security status of a dev-fused, undemoted board (tuple 0,0,1,1),
+                        # as MobileGestalt reads it. AMFI picks its code-signing trust
+                        # policy from certificate-security-mode, and the original
+                        # Apple binary trusts adhoc signatures only in this dev mode:
+                        # without it launchd is rejected with "unsuitable CT policy 0".
+                        # Same values sheng and hummer run with on hardware.
+                        *([('certificate-production-status', struct.pack('<I', 0)),
+                           ('effective-production-status-ap', struct.pack('<I', 0)),
+                           ('certificate-security-mode', struct.pack('<I', 1)),
+                           ('effective-security-mode-sep', struct.pack('<I', 1))] if args.ipad_identity else []),
                         # This property describes the actual volatile Data RAM disk.
                         *([('ephemeral-storage', struct.pack('<I', 1))] if (args.data_ramdisk or args.packed_data_ramdisk) else []),
                         *( [('darwinboot-memory-size', struct.pack('<Q', args.owned_memory_size))]
@@ -206,9 +230,25 @@ def main():
         # Suspend/resume is not implemented for this board. Block CPU parking.
         node('defaults', [('sleep-disabled', struct.pack('<I', 1))]),
         node('options', []),
-        # The original AppleImage4 panics without a product node.
-        node('product', [('product-name', b'Redmi K30 5G\0'),
-                         ('model', b'xiaomi,picasso\0')]),
+        # J120 has no Home button; MobileGestalt reads that from here. Without the
+        # node an iPad identity still advertises a Home button and the userspace
+        # gesture model does not match the panel.
+        *([node('buttons', [('compatible', b'buttons\0'), ('device_type', b'buttons\0'),
+                            ('button-names', b'hold\0voldown\0volup\0'),
+                            ('home-button-type', struct.pack('<I', 2))])] if args.ipad_identity else []),
+        # The original AppleImage4 panics without a product node. Under the iPad
+        # identity this node is what MobileGestalt reports as the hardware: the
+        # artwork fields describe the J120 panel (2732x2048 class, P3, scale 2) so
+        # UIKit and the audio routing database pick iPad behaviour, and
+        # compatible-device-fallback keeps a known device for lookups that use it.
+        node('product', [('product-name', b'iPad Pro (12.9-inch) (2nd generation)\0' if args.ipad_identity else b'Redmi K30 5G\0'),
+                         ('model', b'xiaomi,picasso\0'),
+                         *([('product-description', b'iPad Pro (12.9-inch) (2nd generation)\0'),
+                            ('artwork-device-idiom', b'pad\0'),
+                            ('artwork-device-subtype', struct.pack('<I', 2732)),
+                            ('artwork-scale-factor', struct.pack('<I', 2)),
+                            ('artwork-display-gamut', b'P3\0'),
+                            ('compatible-device-fallback', b'iPad6,7\0')] if args.ipad_identity else [])]),
         node('pram', [('reg', struct.pack('<2Q', PANIC_LOG_PADDR, PANIC_LOG_SIZE))]),
         node('arm-io', [('device_type', b'arm-io\0'),
                         ('#address-cells', struct.pack('<I', 2)),
@@ -218,7 +258,8 @@ def main():
                             ('reg', struct.pack('<4Q',
                                                 GIC_DIST - ARMIO_BASE, GIC_DIST_SIZE,
                                                 GIC_REDIST - ARMIO_BASE, GIC_REDIST_SIZE)),
-                            ('redistributor-stride', struct.pack('<Q', 0x40000))]),
+                            ('redistributor-stride', struct.pack('<Q', 0x40000)),
+                            ('virtual-timer-intid', struct.pack('<I', VIRTUAL_TIMER_INTID))]),
               # The GENI UART (0x988000) also sits below the APSS window, so a bus-offset
               # reg would be negative. Like ufshc below, the node is for class matching
               # only; the driver takes the physical base from the board constants.
@@ -240,7 +281,7 @@ def main():
     ])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(tree)
-    print(f'picasso ADT: {len(tree)} bytes, dram {args.dram_size:#x}, timebase {TIMEBASE}')
+    print(f'picasso ADT: {len(tree)} bytes, dram {args.dram_size:#x}, timebase {TIMEBASE}, virtual timer INTID {VIRTUAL_TIMER_INTID}')
 
 
 if __name__ == '__main__':

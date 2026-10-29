@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 #pragma once
 // Shared production parser. Requires hostRead4k, SHA256, diagnostics and C memory primitives.
+#ifndef NATIVE_UFS_LAYOUT_TRACE
+#define NATIVE_UFS_LAYOUT_TRACE(...) ((void)0)
+#endif
 // ---- LUN 0 GPT and the root-image manifest -------------------------------------------------
 struct RootWindow {
   char name[32];
@@ -60,7 +63,10 @@ static bool findRootLayout (RootLayout *layout, const char **why)
 {
   gRootDiagnostic.stage = "GPT header";
   bzero (layout, sizeof (*layout));
-  if (hostRead4k (0, 1, 1, gScratch) != kIOReturnSuccess) {
+  NATIVE_UFS_LAYOUT_TRACE ("NATIVE_UFS_LAYOUT gpt_header read=begin lba=1 blocks=1\n");
+  IOReturn readResult = hostRead4k (0, 1, 1, gScratch);
+  NATIVE_UFS_LAYOUT_TRACE ("NATIVE_UFS_LAYOUT gpt_header read=end result=%08x\n", static_cast<unsigned> (readResult));
+  if (readResult != kIOReturnSuccess) {
     *why = "GPT header read";
     return false;
   }
@@ -94,8 +100,13 @@ static bool findRootLayout (RootLayout *layout, const char **why)
     *why = "GPT usable range";
     return false;
   }
+  NATIVE_UFS_LAYOUT_TRACE ("NATIVE_UFS_LAYOUT gpt_header valid entries_lba=%llx entries=%u\n",
+                           static_cast<unsigned long long> (entriesLba), count);
   gRootDiagnostic.stage = "GPT entries";
-  if (hostRead4k (0, entriesLba, blocks, gScratch) != kIOReturnSuccess) {
+  NATIVE_UFS_LAYOUT_TRACE ("NATIVE_UFS_LAYOUT gpt_entries read=begin blocks=%u\n", blocks);
+  readResult = hostRead4k (0, entriesLba, blocks, gScratch);
+  NATIVE_UFS_LAYOUT_TRACE ("NATIVE_UFS_LAYOUT gpt_entries read=end result=%08x\n", static_cast<unsigned> (readResult));
+  if (readResult != kIOReturnSuccess) {
     *why = "GPT entries read";
     return false;
   }
@@ -143,9 +154,15 @@ static bool findRootLayout (RootLayout *layout, const char **why)
   }
   gRootDiagnostic.first = layout->userdataFirst;
   gRootDiagnostic.last = layout->userdataLast;
+  NATIVE_UFS_LAYOUT_TRACE ("NATIVE_UFS_LAYOUT userdata first=%llx last=%llx\n",
+                           static_cast<unsigned long long> (layout->userdataFirst),
+                           static_cast<unsigned long long> (layout->userdataLast));
   gRootDiagnostic.stage = "root manifest";
   // First block of the partition: manifest if the root image was flashed, ext4 otherwise.
-  if (hostRead4k (0, layout->userdataFirst, 1, gScratch) != kIOReturnSuccess) {
+  NATIVE_UFS_LAYOUT_TRACE ("NATIVE_UFS_LAYOUT manifest read=begin\n");
+  readResult = hostRead4k (0, layout->userdataFirst, 1, gScratch);
+  NATIVE_UFS_LAYOUT_TRACE ("NATIVE_UFS_LAYOUT manifest read=end result=%08x\n", static_cast<unsigned> (readResult));
+  if (readResult != kIOReturnSuccess) {
     *why = "userdata first block read";
     return false;
   }
@@ -215,5 +232,8 @@ static bool findRootLayout (RootLayout *layout, const char **why)
   gRootDiagnostic.magic1 = layout->magic1;
   gRootDiagnostic.manifest = layout->manifestStatus;
   gRootDiagnostic.windows = layout->windows;
+  NATIVE_UFS_LAYOUT_TRACE ("NATIVE_UFS_LAYOUT manifest parsed status=%u windows=%u image_bytes=%llx magic=%08x/%08x\n",
+                           layout->manifestStatus, layout->windows,
+                           static_cast<unsigned long long> (layout->imageBytes), layout->magic0, layout->magic1);
   return true;
 }

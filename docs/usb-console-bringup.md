@@ -6,6 +6,68 @@ and subsequent kernel output over USB, without a screen photo.
 
 ## Host capture
 
+Bulk-IN EP3 event lines and the periodic poller heartbeat are disabled by
+default. Add the kernel boot argument `picasso_usb_trace=1` to enable them for
+USB debugging. This takes effect in a newly built boot image; it is not a host
+capture-script option. Event processing and the explicit poll/watchdog loop
+continue with tracing disabled. Other startup, control and error logs remain.
+
+The background poller services the 15-second APSS watchdog after every
+completed normal poll, rather than after 1024 passes. A busy poll lock or panic
+mode does not qualify for a background pet. A few initial service timestamps
+and bounded slow-interval records stay visible with tracing off; they help
+diagnose automatic reboots without restoring the periodic heartbeat. See the
+[launchd and reboot investigation](launchd-reboot-investigation.md) for the
+device evidence and limits of this correction.
+
+### Windows
+
+Double-click **`capture-logs.cmd`** at the repository root before booting the phone.
+No port number, Python packages or other setup is needed. The window waits for
+USB VID `1209`, PID `0001` and a `PICASSO` serial identity, captures automatically,
+and reconnects to that same identity if Windows changes its COM number. It does
+not automatically open unrelated serial devices. Only one capture window can
+run at a time.
+
+Close the window or press Ctrl+C to stop. Raw logs are saved continuously under
+`out/picasso/logs/picasso-windows-*.log`; a `.log.session.txt` sidecar records
+connection errors, port identities and the number of received bytes. A zero-byte
+log means no kernel bytes were received, not that the device produced no output.
+Each block is written with `WriteThrough` and `Flush(true)` before being queued
+for asynchronous terminal preview. A slow terminal may skip preview chunks;
+the raw file retains them. Saving does not depend on the final shutdown handler.
+
+The PowerShell entry also supports optional advanced arguments:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/capture-picasso-usb-console.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/capture-picasso-usb-console.ps1 -List
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/capture-picasso-usb-console.ps1 -Duration 180
+```
+
+`-Port COMx` is optional for selecting among multiple devices and pins that COM
+number. `-Wait N` limits the initial wait; the default zero waits indefinitely.
+`-Duration N` starts at the first successful open and includes reconnection time.
+`-Output PATH` selects another file; `-NoStdout` disables kernel text preview.
+`-ExecutionPolicy Bypass` applies only to this PowerShell process.
+
+The native helper uses `CreateFile` and `SetCommTimeouts` for normal capture,
+without adding line-coding, DTR/RTS configuration or purge calls. The Picasso
+bulk-IN pump is gated by USB configuration, not DTR. The old `.NET SerialPort.Open`
+path reported semaphore timeouts on the user's enumerated COM8. On 2026-10-29 the
+minimal native path actually received 9,790 bytes; the automatic launcher also
+opened that same device and captured bytes. This establishes host capture for
+that running device, not a complete boot or an image/commit identity. The exact
+extra initialization request that timed out remains unknown. `-ConfigureLine`
+is an opt-in diagnostic for locating failures in 115200/8N1 setup; ordinary
+capture does not need it.
+
+Start capture early: the device's 256 KiB ring can overwrite older text, and
+reopening a port does not guarantee replay of data already sent to USB. Continuous
+saving protects received blocks, not bytes still in device/USB queues at close.
+
+### macOS
+
 Connect the device to the Mac and check for a CDC serial port:
 
 ```sh

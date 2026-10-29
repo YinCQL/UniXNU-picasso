@@ -71,7 +71,7 @@ def prelink_slide():
     board = Path(os.environ['UNIXNU_DEVICE']) / 'board.toml'
     if not board.is_file():
         raise SystemExit(f'NativeUfs requires the device board.toml, not found at {board}')
-    config = tomllib.loads(board.read_text())
+    config = tomllib.loads(board.read_text(encoding='utf-8'))
     try:
         return int(config['kernel']['prelink']['slide'], 0)
     except (KeyError, TypeError, ValueError) as error:
@@ -113,15 +113,62 @@ def build_storage_bindings(out: Path):
     return object_path
 
 
+def check_ram_storage_imports(source: Path, obj: Path, out: Path):
+    """RAM and UFS must use one set of aliases into the original IOStorage."""
+    ufs = ROOT / 'build/native-ufs'
+    binding_path = ufs / 'storage-bindings.json'
+    binding_object = ufs / 'storage-bindings.o'
+    binding = json.loads(binding_path.read_text())
+    if int(binding['slide'], 0) != prelink_slide():
+        raise SystemExit('Rebuild NativeUfs storage bindings for the current prelink slide')
+    targets = binding['candidate_targets']
+    symbols = subprocess.check_output(['xcrun', 'nm', '-u', str(obj)]).decode('utf-8')
+    imports = sorted({line.split()[-1] for line in symbols.splitlines()
+                      if line.split() and 'IOBlockStorageDevice' in line.split()[-1]})
+    if not imports or any(symbol not in targets for symbol in imports):
+        raise SystemExit(f'NativeRamBlock has uncovered original-storage imports: {imports}')
+    (out / 'storage-imports.json').write_text(json.dumps({
+        'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+        'object_sha256': hashlib.sha256(obj.read_bytes()).hexdigest(),
+        'bindings_sha256': hashlib.sha256(binding_path.read_bytes()).hexdigest(),
+        'binding_object_sha256': hashlib.sha256(binding_object.read_bytes()).hexdigest(),
+        'imports': {symbol: targets[symbol] for symbol in imports},
+        'slide': binding['slide'],
+    }, indent=2) + '\n')
+
+
+# The policy tree is a build input now, not a per-build product: it is 4.4 MiB
+# of hashes plus signatures, it is bound to one exact root image, and
+# regenerating it needs that image and a fresh owner key. devices/picasso keeps
+# it under policy/verified-root-picasso so a clean CI checkout links exactly the
+# tree that was qualified on hardware. build/ stays the generator's scratch
+# output and is tried second, so a local regeneration still wins for a developer.
+# The tree roots scripts/ from the device repository but links only drivers/,
+# kits/, patches/ and refer/ from it, so a committed policy/ tree stays behind in
+# the device checkout. Look for it there first via UNIXNU_DEVICE (the same
+# handle prelink_slide() already uses for board.toml), then in the tree.
+def policy_candidates():
+    candidates = []
+    device = os.environ.get('UNIXNU_DEVICE')
+    if device:
+        candidates.append(Path(device) / 'policy/verified-root-picasso')
+    candidates.append(ROOT / 'policy/verified-root-picasso')
+    candidates.append(ROOT / 'build/verified-root-picasso')
+    return candidates
+
+
 def build_verified_root_policy(record: dict, out: Path, extra_flags: list):
-    policy = ROOT / 'build/verified-root-picasso'
+    policy = next((c for c in policy_candidates()
+                   if (c / 'policy.S').is_file() and (c / 'attestation.json').is_file()),
+                  ROOT / 'policy/verified-root-picasso')
     kit = ROOT / 'kits/VerifiedRoot'
     attestation = policy / 'attestation.json'
     assembly = policy / 'policy.S'
     if not attestation.is_file() or not assembly.is_file():
         raise SystemExit(
             'NativeUfs requires a generated header-only VerifiedRoot policy; run '
-            'scripts/build-picasso-verified-policy.py first'
+            'scripts/build-picasso-verified-policy.py first, or commit the '
+            'qualified tree under policy/verified-root-picasso/'
         )
     audit = json.loads(attestation.read_text())
     embedded = audit.get('kernel_embedded', {})
@@ -154,10 +201,13 @@ def build_verified_root_policy(record: dict, out: Path, extra_flags: list):
         compile_file(source, destination, record, extra_flags, is_c=True)
         objects.append(destination)
     policy_object = out / 'verified-root-policy.o'
+    # policy.S carries relative .incbin operands, so the assembler must run with
+    # the policy directory as its working directory; an absolute operand would
+    # have tied the committed artifact to the machine that generated it.
     subprocess.run(
         ['xcrun', 'clang', '-target', 'arm64-apple-ios17.0',
-         '-c', str(assembly), '-o', str(policy_object)],
-        check=True,
+         '-c', assembly.name, '-o', str(policy_object)],
+        cwd=str(assembly.parent), check=True,
     )
     objects.append(policy_object)
     return objects
@@ -259,6 +309,8 @@ def main():
     if args.component == 'NativeUfs':
         extra_objects.extend(build_verified_root_policy(record, out, extra_flags))
         extra_objects.append(build_storage_bindings(out))
+    elif args.component == 'NativeRamBlock':
+        check_ram_storage_imports(source, destination, out)
 
     archive = out / ('lib' + args.component + '.a')
     archive.unlink(missing_ok=True)

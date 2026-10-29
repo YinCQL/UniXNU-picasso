@@ -4,10 +4,16 @@
 #ifndef NATIVE_UFS_TRACE
 #define NATIVE_UFS_TRACE(...) do { if (gRootDiagnosticEnabled) IOLog(__VA_ARGS__); } while (0)
 #endif
+#ifndef NATIVE_UFS_READ_TRACE
+#define NATIVE_UFS_READ_TRACE(...) NATIVE_UFS_TRACE(__VA_ARGS__)
+#endif
+#include "PollPause.h"
 
 struct HardwareTransferPort {
   uint64_t deadline;
   uint32_t tracePoll;
+  // Polling only observes the submitted slot. Re-ringing or restarting the
+  // request list here can race completion and reuse DMA still owned by the HC.
   void beginPoll (uint32_t poll) {
     tracePoll = poll;
     if (poll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT poll=begin\n");
@@ -29,8 +35,17 @@ struct HardwareTransferPort {
     if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT poll invalidate0 ocs=%x\n", value);
     return value;
   }
-  bool expired () { return mach_absolute_time () >= deadline; }
-  void delay () { IODelay (2); }
+  bool expired () {
+    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT clock=begin\n");
+    uint64_t now = mach_absolute_time ();
+    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT clock=end now=%llx deadline=%llx\n", now, deadline);
+    return now >= deadline;
+  }
+  void delay () {
+    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT delay=begin mode=cpu-yield hints=%u\n", kUfsPollPauseHintCount);
+    ufsPollPause (hostCpuRelax);
+    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT delay=end mode=cpu-yield\n");
+  }
 };
 
 static void putBe32 (uint8_t *at, uint32_t value)
@@ -103,13 +118,15 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
   cacheCivac (gHost.virt, kDataOffset + dataBytes);
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT cache_clean=end\n");
   hostWrite (0x20, 1);  // Acknowledge completion only; preserve error evidence.
-  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT is_ack=end is=%x\n", read32 (gHost.hc, 0x20));
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT is_ack=end\n");
   HardwareTransferPort port;
   port.tracePoll = 0;
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT deadline=begin timeout_us=%u\n", timeoutUs);
   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, &port.deadline);
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT deadline=end value=%llx\n", port.deadline);
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT doorbell=begin\n");
   hostWrite (0x58, 1);
-  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT doorbell=end db=%x\n", read32 (gHost.hc, 0x58));
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT doorbell=end\n");
   UfsTransferPoll state;
   UfsTransferEnd end = pollUfsTransfer (port, state);
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT poll=end result=%u polls=%u ocs=%x db=%x is=%x\n",
@@ -126,33 +143,43 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
     gHost.ready = false;
     return recordTransport (end == UfsTransferEnd::Timeout ? kIOReturnTimeout : kIOReturnIOError, *ocs);
   }
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT response invalidate=begin\n");
   cacheInvalidate (gHost.virt, kDataOffset + dataBytes);
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT response invalidate=end\n");
   gRootDiagnostic.response = loadBe32 (gHost.virt + kUcdOffset + kRspOffset);
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT response read=end word0=%08x\n", gRootDiagnostic.response);
   return recordTransport (*ocs == 0 ? kIOReturnSuccess : kIOReturnIOError, *ocs);
 }
 
 static bool hostClearUcd (void)
 {
-  NATIVE_UFS_TRACE ("NATIVE_UFS_NOP clear=begin\n");
-  if (gHost.poisoned) return false;
+  NATIVE_UFS_TRACE ("NATIVE_UFS_UCD clear=begin\n");
+  if (gHost.poisoned) {
+    NATIVE_UFS_TRACE ("NATIVE_UFS_UCD clear=failed reason=poisoned\n");
+    return false;
+  }
   // Check before touching the command/response area, not just before ringing.
-  if (read32 (gHost.hc, 0x58) != 0) {
+  uint32_t doorbell = read32 (gHost.hc, 0x58);
+  if (doorbell != 0) {
     gHost.poisoned = true;
     gHost.ready = false;
     recordTransport (kIOReturnBusy, 15);
+    NATIVE_UFS_TRACE ("NATIVE_UFS_UCD clear=failed reason=busy db=%x\n", doorbell);
     return false;
   }
-  if (read32 (gHost.hc, 0x20) & kUfsFatalStatus) {
+  uint32_t interrupt = read32 (gHost.hc, 0x20);
+  if (interrupt & kUfsFatalStatus) {
     gHost.poisoned = true;
     gHost.ready = false;
     recordTransport (kIOReturnIOError, 15);
+    NATIVE_UFS_TRACE ("NATIVE_UFS_UCD clear=failed reason=fatal is=%x\n", interrupt);
     return false;
   }
   uint32_t *words = reinterpret_cast<uint32_t *> (gHost.virt + kUcdOffset);
   for (unsigned index = 0; index < (kPrdtOffset + 16) / 4; index++) {
     words[index] = 0;
   }
-  NATIVE_UFS_TRACE ("NATIVE_UFS_NOP clear=end\n");
+  NATIVE_UFS_TRACE ("NATIVE_UFS_UCD clear=end\n");
   return true;
 }
 
@@ -253,7 +280,11 @@ static IOReturn hostScsi (uint8_t lun, const uint8_t *cdb, unsigned cdbLength, b
 static IOReturn hostQueryRead (uint8_t opcode, uint8_t idn, uint32_t *value)
 {
   if (!value || (opcode != 3 && opcode != 5)) return kIOReturnBadArgument;
-  if (!hostClearUcd ()) return kIOReturnNotReady;
+  NATIVE_UFS_TRACE ("NATIVE_UFS_QUERY begin opcode=%02x idn=%02x\n", opcode, idn);
+  if (!hostClearUcd ()) {
+    NATIVE_UFS_TRACE ("NATIVE_UFS_QUERY clear=failed\n");
+    return kIOReturnNotReady;
+  }
   uint8_t *ucd = gHost.virt + kUcdOffset;
   ucd[0] = 0x16;                      // QUERY REQUEST
   ucd[3] = 1;
@@ -261,22 +292,40 @@ static IOReturn hostQueryRead (uint8_t opcode, uint8_t idn, uint32_t *value)
   ucd[12] = opcode;
   ucd[13] = idn;
   uint32_t ocs = 0xf;
+  NATIVE_UFS_TRACE ("NATIVE_UFS_QUERY submit=begin\n");
   IOReturn status = hostSubmit (0, 0, 200000, &ocs);
+  NATIVE_UFS_TRACE ("NATIVE_UFS_QUERY submit=end result=%08x ocs=%x\n",
+                    static_cast<unsigned> (status), ocs);
   if (status != kIOReturnSuccess) {
     return status;
   }
+  NATIVE_UFS_TRACE ("NATIVE_UFS_QUERY response header=begin\n");
   status = hostResponseHeader (0x36, 0, 1);
+  NATIVE_UFS_TRACE ("NATIVE_UFS_QUERY response header=end result=%08x protocol=%u\n",
+                    static_cast<unsigned> (status), gRootDiagnostic.protocol);
   if (status != kIOReturnSuccess) return status;
   const uint8_t *rsp = ucd + kRspOffset;
-  if (rsp[10] || rsp[11]) return hostProtocolError (4);
-  if (rsp[12] != opcode || rsp[13] != idn || rsp[14] || rsp[15]) return hostProtocolError (5);
+  if (rsp[10] || rsp[11]) {
+    NATIVE_UFS_TRACE ("NATIVE_UFS_QUERY response reject=length\n");
+    return hostProtocolError (4);
+  }
+  if (rsp[12] != opcode || rsp[13] != idn || rsp[14] || rsp[15]) {
+    NATIVE_UFS_TRACE ("NATIVE_UFS_QUERY response reject=echo\n");
+    return hostProtocolError (5);
+  }
   if (rsp[6] != 0) {
+    NATIVE_UFS_TRACE ("NATIVE_UFS_QUERY response reject=result code=%02x\n", rsp[6]);
     gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnError);
     return kIOReturnError;
   }
   *value = loadBe32 (rsp + 20);
+  NATIVE_UFS_TRACE ("NATIVE_UFS_QUERY response=end value=%x\n", *value);
   return kIOReturnSuccess;
 }
+
+// Accessed under gHost.lock. Keep boot read boundaries bounded even if APFS
+// performs many requests while looking for the root volume.
+static unsigned gRootReadTraceCount = 0;
 
 // Read `blocks` (<= kDataMax / 4096) 4096-byte blocks of LUN `lun` starting at `lba` into dst.
 static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst)
@@ -285,6 +334,13 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
     return kIOReturnBadArgument;
   }
   IOLockLock (gHost.lock);
+  const bool traceRead = gRootReadTraceCount < 8;
+  if (traceRead) {
+    ++gRootReadTraceCount;
+    NATIVE_UFS_READ_TRACE ("NATIVE_UFS_READ begin sample=%u lun=%u lba=%llx blocks=%u\n",
+                          gRootReadTraceCount, lun, static_cast<unsigned long long> (lba), blocks);
+  }
+  const uint32_t commandBefore = gRootDiagnostic.command;
   gRootDiagnostic.lba = lba;
   uint8_t cdb[10] = { 0x28, 0, uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
@@ -292,6 +348,20 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   IOReturn status = hostScsi (lun, cdb, 10, true, blocks * 4096U, 1000000, &scsi);
   if (status == kIOReturnSuccess) {
     memcpy (dst, gHost.virt + kDataOffset, blocks * 4096U);
+  }
+  if (traceRead || status != kIOReturnSuccess) {
+    if (gRootDiagnostic.command != commandBefore) {
+      NATIVE_UFS_READ_TRACE ("NATIVE_UFS_READ end result=%08x lba=%llx blocks=%u command=%u polls=%u ocs=%x scsi=%x protocol=%u\n",
+                            static_cast<unsigned> (status), static_cast<unsigned long long> (lba), blocks,
+                            gRootDiagnostic.command, gRootDiagnostic.polls, gRootDiagnostic.ocs,
+                            scsi, gRootDiagnostic.protocol);
+    } else {
+      NATIVE_UFS_READ_TRACE ("NATIVE_UFS_READ end result=%08x lba=%llx blocks=%u command_started=0 scsi=%x\n",
+                            static_cast<unsigned> (status), static_cast<unsigned long long> (lba), blocks, scsi);
+    }
+  }
+  if (traceRead && gRootReadTraceCount == 8) {
+    NATIVE_UFS_READ_TRACE ("NATIVE_UFS_READ sample limit reached; further successful reads are quiet\n");
   }
   IOLockUnlock (gHost.lock);
   return status;
