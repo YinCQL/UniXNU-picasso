@@ -70,7 +70,9 @@ archives = [
 ]
 
 [kernel.prelink]
-tool = "kits/NativePrelink/emit_prelink.py"
+# Retains the stock emitter, then binds watchdogd's single service-class rule
+# to the real native watchdog class before the kernel enters the FAT payload.
+tool = "scripts/prelink-picasso.py"
 kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
 kernelcache_sha256 = "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7"
 slide = "-0x1000000"

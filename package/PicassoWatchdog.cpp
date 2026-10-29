@@ -22,8 +22,8 @@ extern kmod_info_t g_kernel_kmod_info;
 void picasso_watchdog_static_init(void) __asm__("__GLOBAL__sub_I_PicassoWatchdog.cpp");
 }
 
-class PicassoWatchdog : public IOWatchdog {
-  OSDeclareDefaultStructors(PicassoWatchdog)
+class PicassoWatchdogDriver : public IOWatchdog {
+  OSDeclareDefaultStructors(PicassoWatchdogDriver)
 
 private:
   IOWorkLoop *watchdogLoop = nullptr;
@@ -54,17 +54,17 @@ public:
 
 // Only the native subclass is registered. Its superclass is the original
 // IOWatchdog::gMetaClass, supplied by the checked original-image binding.
-OSDefineMetaClassAndStructors(PicassoWatchdog, IOWatchdog)
+OSDefineMetaClassAndStructors(PicassoWatchdogDriver, IOWatchdog)
 
-static PicassoWatchdog *gWatchdog;
+static PicassoWatchdogDriver *gWatchdog;
 static uint32_t gRunAttempted;
 
-IOWorkLoop *PicassoWatchdog::getWorkLoop() const
+IOWorkLoop *PicassoWatchdogDriver::getWorkLoop() const
 {
   return watchdogLoop;
 }
 
-IOReturn PicassoWatchdog::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+IOReturn PicassoWatchdogDriver::newUserClient(task_t owningTask, void *securityID, UInt32 type,
                                       OSDictionary *properties, IOUserClient **handler)
 {
   // Keep every original type/root/entitlement/exclusive-open result and the
@@ -79,7 +79,7 @@ IOReturn PicassoWatchdog::newUserClient(task_t owningTask, void *securityID, UIn
   return result;
 }
 
-void PicassoWatchdog::scheduleNextCheck()
+void PicassoWatchdogDriver::scheduleNextCheck()
 {
   // Callers hold watchdogLoop's recursive gate. No timeout is queued until
   // all original state and locks are initialized and the backend is enabled.
@@ -88,10 +88,10 @@ void PicassoWatchdog::scheduleNextCheck()
   }
 }
 
-void PicassoWatchdog::enableWatchdogHardware()
+void PicassoWatchdogDriver::enableWatchdogHardware()
 {
   watchdogLoop->runAction([](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
-    PicassoWatchdog *self = static_cast<PicassoWatchdog *>(owner);
+    PicassoWatchdogDriver *self = static_cast<PicassoWatchdogDriver *>(owner);
     if (!self->backendClaimed || !picasso_watchdog_backend_enable(self)) {
       panic("picasso-watchdog: hardware enable failed after ownership transfer");
     }
@@ -104,10 +104,10 @@ void PicassoWatchdog::enableWatchdogHardware()
   }, this);
 }
 
-void PicassoWatchdog::disableWatchdogHardware()
+void PicassoWatchdogDriver::disableWatchdogHardware()
 {
   watchdogLoop->runAction([](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
-    PicassoWatchdog *self = static_cast<PicassoWatchdog *>(owner);
+    PicassoWatchdogDriver *self = static_cast<PicassoWatchdogDriver *>(owner);
     // Original stop cancels under the same gate as timerFired. Ownership
     // remains installed; client close does not restore USB boot pets.
     self->watchdogTimer->cancelTimeout();
@@ -120,10 +120,10 @@ void PicassoWatchdog::disableWatchdogHardware()
   }, this);
 }
 
-void PicassoWatchdog::petWatchdogHardware()
+void PicassoWatchdogDriver::petWatchdogHardware()
 {
   watchdogLoop->runAction([](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
-    PicassoWatchdog *self = static_cast<PicassoWatchdog *>(owner);
+    PicassoWatchdogDriver *self = static_cast<PicassoWatchdogDriver *>(owner);
     if (!self->backendClaimed || !self->hardwareEnabled || !picasso_watchdog_backend_pet(self)) {
       panic("picasso-watchdog: hardware pet rejected after policy check");
     }
@@ -131,9 +131,9 @@ void PicassoWatchdog::petWatchdogHardware()
   }, this);
 }
 
-void PicassoWatchdog::timerFired(OSObject *owner, IOTimerEventSource *sender)
+void PicassoWatchdogDriver::timerFired(OSObject *owner, IOTimerEventSource *sender)
 {
-  PicassoWatchdog *self = static_cast<PicassoWatchdog *>(owner);
+  PicassoWatchdogDriver *self = static_cast<PicassoWatchdogDriver *>(owner);
   // IOTimerEventSource delivers this action with watchdogLoop's gate held.
   if (sender != self->watchdogTimer || !self->policyReady || !self->hardwareEnabled) {
     return;
@@ -151,7 +151,7 @@ void PicassoWatchdog::timerFired(OSObject *owner, IOTimerEventSource *sender)
   self->scheduleNextCheck();
 }
 
-bool PicassoWatchdog::start(IOService *provider)
+bool PicassoWatchdogDriver::start(IOService *provider)
 {
   if (provider == nullptr || watchdogLoop != nullptr || backendClaimed) {
     return false;
@@ -174,7 +174,7 @@ bool PicassoWatchdog::start(IOService *provider)
   // openGate/closeGate calls are reserved for IOWorkLoop's event-source friends.
   IOReturn result = watchdogLoop->runAction([](OSObject *owner, void *argument,
                                                void *, void *, void *) -> IOReturn {
-    PicassoWatchdog *self = static_cast<PicassoWatchdog *>(owner);
+    PicassoWatchdogDriver *self = static_cast<PicassoWatchdogDriver *>(owner);
     IOService *platform = static_cast<IOService *>(argument);
     if (!picasso_watchdog_backend_claim(self)) {
       return kIOReturnNotReady;
@@ -212,7 +212,7 @@ bool PicassoWatchdog::start(IOService *provider)
   return true;
 }
 
-void PicassoWatchdog::free()
+void PicassoWatchdogDriver::free()
 {
   if (backendClaimed) {
     // The original global, UserClient and backend owner may reference this
@@ -293,7 +293,7 @@ extern "C" void picasso_watchdog_run(void)
     IOLog("picasso-watchdog: existing or unenumerable watchdog service; refusing duplicate policy global\n");
     return;
   }
-  if (lookupMetaClass("PicassoWatchdog") != nullptr) {
+  if (lookupMetaClass("PicassoWatchdogDriver") != nullptr) {
     panic("picasso-watchdog: native metaclass initialized before original parent was qualified");
   }
   void *loadHandle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
@@ -303,8 +303,8 @@ extern "C" void picasso_watchdog_run(void)
   }
   picasso_watchdog_static_init();
   OSReturn registerResult = OSMetaClass::postModLoad(loadHandle);
-  if (registerResult != kOSReturnSuccess || lookupMetaClass("PicassoWatchdog") != &PicassoWatchdog::gMetaClass ||
-      PicassoWatchdog::gMetaClass.getSuperClass() != meta) {
+  if (registerResult != kOSReturnSuccess || lookupMetaClass("PicassoWatchdogDriver") != &PicassoWatchdogDriver::gMetaClass ||
+      PicassoWatchdogDriver::gMetaClass.getSuperClass() != meta) {
     IOLog("picasso-watchdog: native postModLoad/class validation failed result=%08x\n",
           static_cast<unsigned>(registerResult));
     return;
@@ -314,7 +314,7 @@ extern "C" void picasso_watchdog_run(void)
     IOLog("picasso-watchdog: platform provider unavailable\n");
     return;
   }
-  PicassoWatchdog *service = new PicassoWatchdog;
+  PicassoWatchdogDriver *service = new PicassoWatchdogDriver;
   if (service == nullptr) {
     IOLog("picasso-watchdog: allocation failed\n");
     return;

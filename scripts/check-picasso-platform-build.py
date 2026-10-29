@@ -187,7 +187,7 @@ def main():
         schema += f'{initializer}:\nret\n.section __DATA,__const\n.p2align 3\n'
         schema += f'.globl {binding.NATIVE_VTABLE_SYMBOL}\n{binding.NATIVE_VTABLE_SYMBOL}:\n.quad 0, 0\n'
         schema += ''.join(f'.quad {name}\n' for name in slots) + '.quad 0\n'
-        schema += '.globl __ZN15PicassoWatchdog10superClassE\n__ZN15PicassoWatchdog10superClassE:\n'
+        schema += '.globl __ZN21PicassoWatchdogDriver10superClassE\n__ZN21PicassoWatchdogDriver10superClassE:\n'
         schema += '.quad __ZN10IOWatchdog10gMetaClassE\n'
         schema += '.quad __ZN10IOWatchdogC2EPK11OSMetaClass, __ZN10IOWatchdogD2Ev\n'
         schema += '.quad _picasso_original_iowatchdog_policy_start, _picasso_original_iowatchdog_policy_check\n'
@@ -202,8 +202,8 @@ def main():
         passed('171-slot original ABI audit before and after real objcopy')
         for name, mutated in [
             ('wrong inherited stop', schema.replace('.quad ' + slots[87] + '\n', '.quad __ZN9IOService4stopEPS_\n', 1)),
-            ('extra virtual slot', schema.replace('.quad 0\n.globl __ZN15PicassoWatchdog10superClassE',
-                  '.quad _extra_virtual\n.globl __ZN15PicassoWatchdog10superClassE')),
+            ('extra virtual slot', schema.replace('.quad 0\n.globl __ZN21PicassoWatchdogDriver10superClassE',
+                  '.quad _extra_virtual\n.globl __ZN21PicassoWatchdogDriver10superClassE')),
             ('extra initializer', schema + '.quad ' + initializer + '\n')]:
             bad = out / (name.replace(' ', '-') + '.S'); bad.write_text(mutated)
             badobj = bad.with_suffix('.o'); assemble(bad, badobj)

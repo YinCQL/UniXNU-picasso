@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def method(source, name):
-    start = re.search(r'^\S[^\n]*PicassoWatchdog::' + name + r'\(', source, re.M).start()
+    start = re.search(r'^\S[^\n]*PicassoWatchdogDriver::' + name + r'\(', source, re.M).start()
     end = source.index('{', start) + 1
     depth = 1
     while depth:
@@ -52,7 +52,7 @@ def main():
         declarations.append(access + ':\n' + match[0])
     (out / 'workloop-access.inc').write_text('\n'.join(declarations) + '\n', encoding='utf-8')
     source = (ROOT / 'package/PicassoWatchdog.cpp').read_text(encoding='utf-8')
-    production = source[source.index('class PicassoWatchdog'):source.index('// Only the native subclass')]
+    production = source[source.index('class PicassoWatchdogDriver'):source.index('// Only the native subclass')]
     for name in ('getWorkLoop', 'newUserClient', 'scheduleNextCheck', 'enableWatchdogHardware',
                  'disableWatchdogHardware', 'petWatchdogHardware', 'timerFired', 'start', 'free'):
         production += method(source, name)

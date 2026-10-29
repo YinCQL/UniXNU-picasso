@@ -131,7 +131,7 @@ static void fire(IOTimerEventSource *timer) {
 }
 int main(int argc,char **argv) {
   assert(argc==2); failure=std::atoi(argv[1]);
-  PicassoWatchdog service; IOService provider;
+  PicassoWatchdogDriver service; IOService provider;
   bool trapped=false, started=false;
   try { started=service.start(&provider); }
   catch(const std::runtime_error&) { trapped=true; }

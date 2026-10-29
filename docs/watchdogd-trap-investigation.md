@@ -1,5 +1,106 @@
 # Watchdogd trap after early boot
 
+## Build 40951382277: service found, open denied
+
+[40951382277](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40951382277)
+at 70bfbfdcb8d8c04f208868f45cf2a78b3ddaf132 completed successfully. Artifact
+12932766022 / picasso-bootimg-72 is retained in
+out/watchdog-open-20261030/build72/. Its 54,169,600-byte kernel SHA-256 is
+d9293a8318d89f6bddc86e5603e594728e3e97c8ec2452d0d8eb2e9367593e13,
+matching kernel.json. LC_UUID 4A215F1C-E7F3-3ADE-A70F-1AC5D5C00171 matches
+the supplied picasso-windows-20261030-045518-105.log (150,584 bytes, SHA-256
+06bb1f749a976c2b9b8a6d3a465d01a8d38be73cdb449fd83d016dbfe40b6e5e).
+The user confirms this newest image and automatic reboot. The phone's actual
+boot.img has not independently been hashed.
+
+The log proves publication of the boot-stage API, original watchdog policy,
+first policy check/hardware pet, and native instance matching. Data and early
+boot complete again. PID 95 / thread 417 finds IOWatchdog (`kr=0 found=1`),
+then traps at PC 0x1007d7b54, main_header 0x1007cd000. Subtracting the actual
+main slide gives original BRK 0x10000ab54: IOServiceOpen failure. x20 holds
+0xe00002e2, kIOReturnNotPermitted. The matching frame returns map to
+0x10000682c and 0x100008958. This is beyond the prior missing-service trap.
+Original critical-exit panic, flush and PSHOLD reset follow; core-file ENOENT
+is secondary.
+
+There is no original newUserClient diagnostic. In the fixed IOUserClient.cpp,
+mac_iokit_check_open_service runs before newUserClient and returns that error
+directly. The retained Sandbox hook is 0xfffffff0069fb914, operation 64;
+post-client open is operation 63 at 0xfffffff0069ffadc. The actual original
+daemon's embedded entitlements include both IOWatchdogUserClient and
+com.apple.private.iowatchdog.user-access. Its service-class rule in the
+retained Sandbox data still names AppleARMWatchdogTimer, whereas the native
+service is a real IOWatchdog subclass with its own class name.
+
+### Board policy adaptation
+
+The native class is now named **PicassoWatchdogDriver**. Its 21-byte name fits
+the existing service-class literal exactly. This deliberately adapts one
+board-specific Sandbox rule; it does not claim the Sandbox data is unchanged.
+The daemon executable/entitlements, original client rule and original
+root/type/entitlement/exclusive-open checks remain unchanged.
+
+board.toml selects scripts/prelink-picasso.py. It invokes the fixed original
+emitter in memory, qualifies the actual linked native class/superclass and
+metaclass/client dispatch slots, then replaces only the 21 literal bytes in
+the 32-byte atom at original VA 0xfffffff005838818 (candidate 0xfffffff004838818).
+Encoded length, matching operators, alignment and offsets stay identical.
+The neighboring watchdogd path, IOWatchdogUserClient and boot-stage rules are
+checked against the pinned original. An exact original-image hash, slide,
+selected Sandbox extent, unique atom, candidate hash and unmodified context
+are mandatory. Existing candidate/report files and repeated adaptation are
+rejected. Source kernelcache bytes are never modified.
+
+The report records both candidate hashes and both atoms. Verification reverses
+the literal replacement and reproduces the entire result/report. Both workflows
+run that check against the linked driver; the normal payload check binds the
+same kernel into FAT. No IOClassNameOverride, fabricated Apple superclass,
+NativeSandboxGrantProcess, MAC bypass or watchdogd-disable option is added.
+The hardware backend and lifecycle are unchanged; the C++ change is only the
+real class rename. Its source filename/static initializer name remain stable,
+and the 171-slot object audit uses the new mangled class symbols.
+
+Local reports under out/watchdog-open-20261030/:
+
+- policy-v2: 25 checks on actual build-72 policy bytes, wrong/stale/changed
+  inputs, a real linked ARM64 class schema and wrapper output/error behavior.
+  Only the 21 literal bytes differ in the policy test image. Wrapper emission
+  and qualification are explicit stand-ins in the file-integration case;
+  the linked-class gate is tested separately. Sandbox itself is not executed.
+- builder-v1: 29 LLVM Mach-O builder/ABI checks with the new class symbols.
+  These schema objects are not a new production SDK compile.
+- service-v1: ordinary and ASan each pass 10 lifecycle scenarios, including
+  preservation of original client errors; actual workloop declarations and
+  the protected-access negative compile still pass.
+- Python/TOML/YAML checks pass. Reversing the class rename exactly recovers
+  the prior production C++. XNU/USB patch hashes still match the saved passing
+  replay/backend reports, so those unchanged tests were not repeated.
+
+New SDK/complete prelink and phone behavior remain unverified. The next log
+must show original newUserClient type 1 success and further watchdogd/boot-stage
+progress. Static policy correspondence is not a runtime Sandbox acceptance
+result. The assistant has not dispatched CI or operated the phone.
+
+### Tutorial and reference comparison, 2026-10-30
+
+Read the local UniXNU docs at 066c8d8315f83749d28bcae2faf3595718646be5:
+zh/porting/platform.md, drivers.md, concepts/security.md and prelink.md,
+plus the watchdog sections linked from devices/fuxi-mouse233.md. The current
+tutorial describes newer layouts; this board still uses its fixed 75fba878
+upstream and kits/NativePrelink path.
+
+| Reference | Inspected behavior and applicability |
+| --- | --- |
+| UniXNU-sheng, 08cde20e | board.toml and BootWatchdogPolicy.c disable watchdogd; its GPU/audio process-name grants bypass MAC checks. These are not this board's retained-watchdog solution. |
+| UniXNU-sirius, 10f440b6 | Same daemon-disable bring-up policy, with RAM Data improvements. No equivalent original-client open fix found. |
+| UniXNU-guacamole, 6269d315 | mkadt.py adds wdt/no-pmu for the later boot-stage dependency, not the current open-service denial. |
+| UniXNU-hummer, 1322c2ad | Different SM8750/platform configuration; no IOWatchdog implementation or matching policy fix found in the searched tracked sources. |
+| UniXNU-OnePlus-Ace5, aaa100d1 | Selects the original kext in first-entry configuration; no native watchdog archive is selected. Inclusion alone does not publish a working service. |
+| Tutorial-linked unixnu-fuxi, 1d4bfaf1 | RamWatchdog.cpp and watchdog-service.md retain the original base/client with a software backend and late registration. v47 records matching fixes, not qualification of this open-service boundary. |
+
+Reference files were only read. The Picasso SM7250 backend, original-client
+contract and evidence requirements govern this implementation.
+
 ## Build 40948813010: Darwin archive symbol index
 
 [40948813010](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40948813010)
@@ -100,7 +201,7 @@ as `dyld-first`. Use `main_header` for future main-image addresses.
 
 ## Original policy with the SM7250 watchdog
 
-PicassoWatchdog derives from the original 21H461 IOWatchdog (size 0xf8).
+PicassoWatchdogDriver derives from the original 21H461 IOWatchdog (size 0xf8).
 The original AppleARMWatchdogTimer kext remains in the prelink closure: APFS
 depends on its metaclass, global and event handler. Loading that module registers
 the parent and entitled UserClient without attaching the Apple hardware driver
@@ -210,12 +311,10 @@ Local reports are under out/watchdog-integration-20261030/:
   the device log. Python, TOML, YAML and workflow input ordering were checked.
 
 The SDK attempt in build 40945353230 found the protected-method error above.
-Build 40948813010 then compiled all three production services and passed their
-object/late-init guards before the archive-listing false rejection. Complete
-kernel linking and new device qualification remain unverified.
-No CI was dispatched by the assistant and no phone operation was performed.
-The latest successful build remains 40922207086/b67e848, which predates this
-service implementation. A new manual build must complete the remaining stages.
+Build 40948813010 compiled the services before the archive-listing rejection.
+Build 40951382277/70bfbfd subsequently completed the entire build and booted
+through service matching and hardware ownership. Its later open denial and
+the new, still unqualified policy adaptation are described at the top.
 
 The next device log should show original IOWatchdog matching, original
 newUserClient type 1 succeeding, the first original policy check/hardware pet,
@@ -234,6 +333,9 @@ python scripts/check-picasso-boot-state.py --output out/boot-state-NEW
 python scripts/check-picasso-watchdog-service.py --xnu /path/to/replayed/xnu --output out/watchdog-service-NEW
 python scripts/check-picasso-watchdog-backend.py --output out/watchdog-backend-NEW
 python scripts/check-picasso-user-fault.py --xnu /path/to/replayed/xnu --output out/user-fault-NEW
+python scripts/check-picasso-watchdog-policy.py --output out/watchdog-policy-NEW \
+  --kernelcache /path/to/original/kernelcache.macho --candidate /path/to/build72/kernel.macho \
+  --native-prelink-dir /path/to/fixed/NativePrelink --llvm-bin /path/to/llvm/bin
 ~~~
 
 The earlier build 40917708279 failed because BSD read an opaque struct task

@@ -69,19 +69,19 @@ BASE_OVERRIDES = {
     140: 0xfffffff00663ee14,
 }
 APPLE_HARDWARE_SLOTS = [0xfffffff00663dcb4, 0xfffffff00663dd5c, 0xfffffff00663dc7c]
-NATIVE_VTABLE_SYMBOL = '__ZTV15PicassoWatchdog'
+NATIVE_VTABLE_SYMBOL = '__ZTV21PicassoWatchdogDriver'
 NATIVE_INITIALIZER = '__GLOBAL__sub_I_PicassoWatchdog.cpp'
 NATIVE_OVERRIDES = {
-    0: '__ZN15PicassoWatchdogD1Ev',
-    1: '__ZN15PicassoWatchdogD0Ev',
-    7: '__ZNK15PicassoWatchdog12getMetaClassEv',
-    14: '__ZN15PicassoWatchdog4freeEv',
-    86: '__ZN15PicassoWatchdog5startEP9IOService',
-    111: '__ZNK15PicassoWatchdog11getWorkLoopEv',
-    140: '__ZN15PicassoWatchdog13newUserClientEP4taskPvjP12OSDictionaryPP12IOUserClient',
-    168: '__ZN15PicassoWatchdog22enableWatchdogHardwareEv',
-    169: '__ZN15PicassoWatchdog23disableWatchdogHardwareEv',
-    170: '__ZN15PicassoWatchdog19petWatchdogHardwareEv',
+    0: '__ZN21PicassoWatchdogDriverD1Ev',
+    1: '__ZN21PicassoWatchdogDriverD0Ev',
+    7: '__ZNK21PicassoWatchdogDriver12getMetaClassEv',
+    14: '__ZN21PicassoWatchdogDriver4freeEv',
+    86: '__ZN21PicassoWatchdogDriver5startEP9IOService',
+    111: '__ZNK21PicassoWatchdogDriver11getWorkLoopEv',
+    140: '__ZN21PicassoWatchdogDriver13newUserClientEP4taskPvjP12OSDictionaryPP12IOUserClient',
+    168: '__ZN21PicassoWatchdogDriver22enableWatchdogHardwareEv',
+    169: '__ZN21PicassoWatchdogDriver23disableWatchdogHardwareEv',
+    170: '__ZN21PicassoWatchdogDriver19petWatchdogHardwareEv',
 }
 
 
@@ -297,7 +297,7 @@ def audit_object(path, native_dir, bindings):
             require(target == original_pointer(BASE_VPTR + index * 8),
                     f'Inherited native slot {index} changed original behavior: {name}')
 
-    superclass_symbol = '__ZN15PicassoWatchdog10superClassE'
+    superclass_symbol = '__ZN21PicassoWatchdogDriver10superClassE'
     require(superclass_symbol in definitions and
             pointer_relocations.get(definitions[superclass_symbol]['value']) == '__ZN10IOWatchdog10gMetaClassE',
             'Native watchdog superclass is not the original IOWatchdog metaclass')

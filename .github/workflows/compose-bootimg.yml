@@ -121,6 +121,13 @@ jobs:
           python3 scripts/check-picasso-data-artifacts.py --tree out/picasso/tree --work out/picasso \
             --output out/picasso/logs/data-artifacts.json
 
+      - name: Verify watchdog service policy against the linked native driver
+        run: |
+          python3 scripts/check-picasso-watchdog-policy.py --verify \
+            --kernelcache "$UNIXNU_KERNELCACHE" --candidate out/picasso/kernel/kernel.macho \
+            --native-prelink-dir "$UNIXNU_TREE/kits/NativePrelink" \
+            --output out/picasso/logs/watchdog-policy.json
+
       - name: Verify original Sandbox is present in the prelinked kernel
         run: |
           python3 - <<'PY'
