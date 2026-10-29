@@ -1,5 +1,35 @@
 # Watchdogd trap after early boot
 
+## Build 40948813010: Darwin archive symbol index
+
+[40948813010](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40948813010)
+at 0450ea008ba0e18485e6ad9facef9757dc2df6d6 failed in the archive membership
+check. Artifact 12931725696 / picasso-bootimg-71 contains all three successfully
+SDK-compiled service objects, both converted late objects, and successful
+Watchdog raw/late ABI reports. The workloop access fix therefore passed the SDK
+compiler, as did BootState. The final kernel link was not reached.
+
+Apple ar lists its generated symbol index as the first member,
+`__.SYMDEF SORTED`, followed by the exact four intended objects. The builder
+incorrectly compared this listing directly with the four object names.
+The earlier LLVM-based test missed the difference because llvm-ar t hides the
+index. This was a false rejection by the builder, not an extra driver object.
+
+The check now accepts one leading, exact Darwin index name (`__.SYMDEF`,
+`__.SYMDEF SORTED`, `__.SYMDEF_64` or `__.SYMDEF_64 SORTED`) or a listing where
+the tool hides the index. It still requires the same four object names in order,
+and rejects other entries, duplicate indexes, missing/duplicate objects and
+reordering. Build reports retain both the raw listing and the classified index.
+
+31 checks pass in out/watchdog-archive-index-20261030/host-v1/. They include the
+actual failed Apple listing, index/extra-object negatives, a full builder run
+with Apple-style listing output, and preservation of the previous archive.
+The downloaded SDK objects were independently checked against source/report
+hashes, original ABI and late-init guards, then archived with LLVM's Darwin
+writer. Each archived object's bytes equal the corresponding downloaded object.
+No production C++ or XNU patch changed for this fix. A new CI run must still
+verify final kernel linking, prelink and boot-image composition.
+
 ## Build 40945353230: public workloop gate API
 
 [40945353230](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40945353230)
@@ -25,7 +55,8 @@ access specifiers from the fixed XNU IOWorkLoop.h. Ordinary and ASan builds pass
 all ten lifecycle scenarios with those declarations. A direct-access negative
 compile fails with C2248 for both protected methods. Reports are retained in
 out/watchdog-gate-api-20261030/service-v1/. This checks the actual access contract
-with host IOKit/policy stand-ins; another SDK build is still required.
+with host IOKit/policy stand-ins. Build 40948813010 subsequently passed this
+source compilation and the real-object ABI checks.
 
 ## Confirmed missing service in build 40922207086
 
@@ -178,12 +209,13 @@ Local reports are under out/watchdog-integration-20261030/:
 - The downloaded build-69 kernel hash matches metadata and its UUID matches
   the device log. Python, TOML, YAML and workflow input ordering were checked.
 
-The SDK attempt in build 40945353230 subsequently found the protected-method
-error described above, before Watchdog object auditing or BootState compilation.
-No successful production-driver SDK build or new device qualification is claimed.
+The SDK attempt in build 40945353230 found the protected-method error above.
+Build 40948813010 then compiled all three production services and passed their
+object/late-init guards before the archive-listing false rejection. Complete
+kernel linking and new device qualification remain unverified.
 No CI was dispatched by the assistant and no phone operation was performed.
 The latest successful build remains 40922207086/b67e848, which predates this
-service implementation. A new manual SDK build must pass the real-object guards.
+service implementation. A new manual build must complete the remaining stages.
 
 The next device log should show original IOWatchdog matching, original
 newUserClient type 1 succeeding, the first original policy check/hardware pet,
@@ -196,6 +228,8 @@ Reproduction from the device repository, using new output directories:
 python scripts/check-picasso-platform-build.py --output out/platform-build-NEW \
   --kernelcache /path/to/original/kernelcache.macho \
   --native-prelink-dir /path/to/fixed/NativePrelink --llvm-bin /path/to/llvm/bin
+# Add --sdk-objects /path/to/downloaded/tree/build/sheng-platform-power
+# to independently recheck and archive a CI run's real compiled objects.
 python scripts/check-picasso-boot-state.py --output out/boot-state-NEW
 python scripts/check-picasso-watchdog-service.py --xnu /path/to/replayed/xnu --output out/watchdog-service-NEW
 python scripts/check-picasso-watchdog-backend.py --output out/watchdog-backend-NEW

@@ -6,6 +6,7 @@ original-image checks and rejection cases. The schema objects are deliberately
 not an SDK compilation of the platform drivers.
 """
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -31,6 +32,8 @@ def main():
     parser.add_argument('--kernelcache', type=Path, required=True)
     parser.add_argument('--native-prelink-dir', type=Path, required=True)
     parser.add_argument('--llvm-bin', type=Path, required=True)
+    parser.add_argument('--sdk-objects', type=Path,
+                        help='Optional downloaded CI sheng-platform-power directory; audit and archive its real objects')
     args = parser.parse_args()
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -60,12 +63,73 @@ def main():
                         str(source), '-o', str(obj)], check=True, capture_output=True)
 
     try:
+        expected = [Path('PicassoPmgr.o'), Path('PicassoWatchdog.late.o'),
+                    Path('PicassoBootState.late.o'), Path('watchdog-bindings.o')]
+        names = [p.name for p in expected]
+        for index in ('__.SYMDEF', '__.SYMDEF SORTED', '__.SYMDEF_64', '__.SYMDEF_64 SORTED'):
+            checked = builder.check_archive_members([index] + names, expected)
+            assert checked['members'] == names and checked['symbol_table_members'] == [index]
+            passed('Darwin archive index accepted: ' + index)
+        assert builder.check_archive_members(names, expected)['symbol_table_members'] == []
+        passed('LLVM archive listing with hidden symbol index accepted')
+        for name, listed in [
+            ('unknown index rejected', ['__.SYMDEF unexpected'] + names),
+            ('duplicate index rejected', ['__.SYMDEF SORTED', '__.SYMDEF'] + names),
+            ('extra object rejected', ['__.SYMDEF SORTED'] + names + ['stale.o']),
+            ('missing object rejected', ['__.SYMDEF SORTED'] + names[:-1]),
+            ('duplicate object rejected', ['__.SYMDEF SORTED'] + names + [names[0]]),
+            ('reordered objects rejected', ['__.SYMDEF SORTED'] + names[::-1]),
+            ('nonleading index rejected', names[:1] + ['__.SYMDEF SORTED'] + names[1:]),
+            ('index without objects rejected', ['__.SYMDEF SORTED'])]:
+            reject(name, lambda: builder.check_archive_members(listed, expected))
+
         bindings = binding.validate(args.kernelcache.resolve(), -0x1000000, args.native_prelink_dir)
         passed('original identity, class/vtable/function/APFS ABI')
         reject('wrong slide', lambda: binding.validate(args.kernelcache, 0, args.native_prelink_dir))
         corrupted = out / 'corrupt.macho'
         corrupted.write_bytes(b'not the original')
         reject('wrong original identity', lambda: binding.validate(corrupted, -0x1000000, args.native_prelink_dir))
+
+        if args.sdk_objects:
+            sdk = args.sdk_objects.resolve()
+            sdk_report = json.loads((sdk / 'build-report.json').read_text(encoding='utf-8'))
+            actual_listing = (sdk / 'archive-members.log').read_text(encoding='utf-8').splitlines()
+            listing_report = builder.check_archive_members(actual_listing, expected)
+            sdk_audit = {'scope': 'Rechecks existing SDK objects; no recompilation or complete kernel link.',
+                         'archive_listing_sha256': builder.digest(sdk / 'archive-members.log'),
+                         'archive_listing': listing_report, 'objects': {}}
+            for name in builder.SOURCES:
+                entry = sdk_report['objects'][name]
+                source = (ROOT / 'package' / (name + '.cpp')).read_text(encoding='utf-8').encode()
+                assert hashlib.sha256(source).hexdigest() == entry['source_sha256']
+                raw = sdk / (name + '.o')
+                assert builder.digest(raw) == entry['object_sha256']
+                builder.inspect_object(raw, native)
+                if name != 'PicassoPmgr':
+                    late = sdk / (name + '.late.o')
+                    assert builder.digest(late) == entry['late_sha256']
+                    initializer = '__GLOBAL__sub_I_' + name + '.cpp'
+                    assert builder.initializer_state(raw, native, initializer, True) == \
+                           builder.initializer_state(late, native, initializer, False)
+                sdk_audit['objects'][name] = entry
+            for suffix_name in ('.o', '.late.o'):
+                checked = binding.audit_object(sdk / ('PicassoWatchdog' + suffix_name), args.native_prelink_dir, bindings)
+                builder.write_json(out / ('sdk-watchdog' + suffix_name + '.json'), checked)
+            _, _, symbols = builder.inspect_object(sdk / 'watchdog-bindings.o', native)
+            assert {s['name']: hex(s['value']) for s in symbols if s['kind'] == 3} == bindings['candidate_targets']
+            archive = out / 'sdk-platform.a'
+            subprocess.run([ar, '--format=darwin', 'rcs', str(archive),
+                            *[str(sdk / p) for p in expected]], check=True, capture_output=True)
+            listed = subprocess.check_output([ar, 't', str(archive)], text=True).splitlines()
+            builder.check_archive_members(listed, expected)
+            # Verify archived object bytes, not only their names. llvm-ar hides
+            # the index from t; the actual Apple listing above includes it.
+            for objname in names:
+                assert subprocess.check_output([ar, 'p', str(archive), objname]) == (sdk / objname).read_bytes()
+            sdk_audit['archive_sha256'] = builder.digest(archive)
+            builder.write_json(out / 'sdk-objects.json', sdk_audit)
+            passed('actual CI Apple listing and all SDK object hashes/ABI/late-init rechecked')
+            passed('real SDK objects archived in Darwin format with identical object bytes')
 
         # Exercise the real compiler-generated initializer shape, including the
         # explicit asm label used by production. No IOKit declarations are mocked.
@@ -169,9 +233,16 @@ def main():
         archive.write_bytes(b'previous archive retained')
         real_run = builder.run
         def local_run(command, log, cwd=None):
+            list_archive = command[:3] == ['xcrun', 'ar', 't']
             if command[:2] == ['xcrun', 'ar']:
                 command = [ar] + command[2:]
-            return real_run(command, log, cwd)
+            output = real_run(command, log, cwd)
+            if list_archive:
+                # Reproduce the actual Apple ar listing that failed build 71;
+                # llvm-ar itself hides this generated symbol-table entry.
+                output = '__.SYMDEF SORTED\n' + output
+                log.write_text(output, encoding='utf-8')
+            return output
         environment = {'UNIXNU_DEVICE': str(tree), 'UNIXNU_KERNELCACHE': str(args.kernelcache.resolve()),
                        'PATH': str(llvm) + os.pathsep + os.environ['PATH']}
         with patch.object(builder, 'ROOT', tree), patch.object(builder, 'run', local_run), patch.dict(os.environ, environment):
@@ -180,6 +251,8 @@ def main():
             assert built['complete'] and built['members'] == ['PicassoPmgr.o', 'PicassoWatchdog.late.o',
                                                             'PicassoBootState.late.o', 'watchdog-bindings.o']
             assert Path(built['previous_archive']).read_bytes() == b'previous archive retained'
+            assert built['symbol_table_members'] == ['__.SYMDEF SORTED']
+            builder.write_json(out / 'schema-build-success.json', built)
             passed('complete archive build has exactly four qualified objects and preserves previous archive')
             prior = archive.read_bytes()
             with patch.dict(os.environ, {'UNIXNU_KERNELCACHE': str(corrupted)}):

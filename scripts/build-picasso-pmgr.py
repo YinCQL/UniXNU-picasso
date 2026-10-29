@@ -216,6 +216,19 @@ def save_old_archive(archive):
     return None
 
 
+def check_archive_members(listed, objects):
+    # Apple ar lists its generated ranlib index; llvm-ar t hides that entry.
+    # Permit one exact Darwin index name at the front, never arbitrary extras.
+    darwin_indexes = {'__.SYMDEF', '__.SYMDEF SORTED',
+                     '__.SYMDEF_64', '__.SYMDEF_64 SORTED'}
+    indexes = listed[:1] if listed and listed[0] in darwin_indexes else []
+    members = listed[len(indexes):]
+    expected = [obj.name for obj in objects]
+    require(members == expected,
+            f'Unexpected/stale member in platform archive: expected {expected}, listed {listed}')
+    return {'members': members, 'symbol_table_members': indexes, 'listed_members': listed}
+
+
 def main():
     out = ROOT / 'build/sheng-platform-power'
     out.mkdir(parents=True, exist_ok=True)
@@ -273,12 +286,12 @@ def main():
         pending_dir = Path(tempfile.mkdtemp(prefix='qualified-platform-', dir=out))
         pending = pending_dir / 'libShengPlatformPower.a'
         run(['xcrun', 'ar', 'rcs', pending, *objects], out / 'archive.log')
-        members = run(['xcrun', 'ar', 't', pending], out / 'archive-members.log').splitlines()
-        require(members == [p.name for p in objects], 'Unexpected/stale member in platform archive')
+        listed = run(['xcrun', 'ar', 't', pending], out / 'archive-members.log').splitlines()
+        report.update(check_archive_members(listed, objects))
         archive = out / pending.name
         report['previous_archive'] = save_old_archive(archive)
         pending.rename(archive)
-        report.update(archive_sha256=digest(archive), members=members, complete=True)
+        report.update(archive_sha256=digest(archive), complete=True)
         print('picasso platform: -Werror ARM64/iOS17 build, original ABI, late init and archive checks passed')
     except Exception as error:
         report['error'] = str(error)
