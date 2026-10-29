@@ -1,5 +1,8 @@
 # Original Sandbox dependency during launchd startup
 
+Build 40887829724 passes this initialization. The next captured panic is tzinit
+exiting with EROFS because Data is absent; see the [RAM Data investigation](ram-data-bootstrap-investigation.md).
+
 ## Device evidence (2026-10-29)
 
 The user confirms that `picasso-windows-20261029-213238-171.log` comes from

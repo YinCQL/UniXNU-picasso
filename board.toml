@@ -61,6 +61,8 @@ archives = [
   # Stage 6: the UFS controller driver. Its board constants (GccUfs.h) carry
   # the SM7250 physical windows; the ADT ufshc/ufsphy nodes only match classes.
   "build-arm-driver.py NativeUfs",
+  # Volatile APFS Data; shares NativeUfs's exact original IOStorage bindings.
+  "build-arm-driver.py NativeRamBlock",
   # Publishes the ApplePMGRNub the unchanged AMFI looks for (package/PicassoPmgr.cpp).
   # The archive lands in build/sheng-platform-power/libShengPlatformPower.a, the path
   # build-xnu-4k-baseline.sh force-loads when CONFIG_XNU_SHENG_PMGR=1.
@@ -100,13 +102,11 @@ kernel_offset = 0x8000
 tags_offset = 0x1e00000
 pagesize = 4096
 header_version = 1
-# The ABL loads kernel + ramdisk into one buffer that starts at abl_base
-# (0xB4513000 on this device, derived from the observed initrd address) and ends
-# at 0xB7E00000, so the whole payload window is about 57 MiB. With the default
-# ramdisk_offset of 0x1000000 the ramdisk starts at 0xB5513000 and only 42.6 MiB
-# fit, which truncated the 120 MiB payload: the FAT volume claimed 120 MiB while
-# only the first 42.9 MiB were in memory, and FatPkg faulted at 0xB7BFE000.
-# 0x200000 puts the ramdisk right after the ~2.1 MiB kernel slot, leaving 54.8 MiB.
+# Keep the offset used by the working 55 MiB images. The current committed FD
+# maps Boot Ramdisk Gap at 0xAD000000..0xBC000000; the historical ABL-base estimate
+# puts a 60 MiB ramdisk end at 0xB8313000, within that map. Earlier comments about
+# a hard 0xB7E00000 end described an older failed mapping, not this FD's limit.
+# The new 60 MiB image still needs a device boot; see docs/ram-data-bootstrap-investigation.md.
 ramdisk_offset = 0x200000
 [firmware]
 config = "picasso"                   # Resources/Configs/picasso.toml in the Mu-Silicium checkout (--uefi)
@@ -144,10 +144,9 @@ BUILDID_STRING = "picasso-research"
 # Payload: a FAT volume with UniXNU config + kernel + ADT. Loader (DarwinBoot) is in the firmware.
 [payload]
 volume = "PICASSOESP"
-# The embedded 128-KiB-record manifests add about 2.2 MiB to kernel.macho.
-# 55 MiB keeps the payload below the build driver's 95% content threshold
-# while adding only one MiB to the temporary boot image.
-size_mib = 55
+# Room for the kernel, original trust caches and packed APFS Data seed.
+# The payload builder retains its 95% content limit; CI checks the actual seed.
+size_mib = 60
 loader = "firmware"
 title = "Boot"
 dram_size = "0x80000000"
@@ -291,6 +290,9 @@ trust_cache_sha256 = ["7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"
 chip_id = "7250"
+# DarwinBoot passes only packed nonzero pages; NativeRamBlock allocates pages
+# as needed. The seed is volatile and /chosen/ephemeral-storage remains enabled.
+packed_data_ramdisk = true
 # Declare an iPad-class device: /model iPad7,1, /target-type J120, the J120 panel
 # artwork in /product, no Home button in /buttons, and the dev-board security
 # tuple in /chosen (certificate-security-mode 1). The original AMFI reads that
@@ -303,22 +305,9 @@ ipad_identity = true
 # VerifiedRoot window identity check independently binds this UUID to the
 # owner-signed image before the block device is published.
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
-# DarwinBoot requests one contiguous window of this size from the firmware and
-# hands it to the kernel as boot_args.memSize. The kernel then builds its physmap
-# over exactly that range, so the window has to fit inside a single
-# conventional-memory run.
-#
-# 0x100000000 (4 GiB) cannot fit here. The first DRAM bank is
-# 0x80000000..0xBCC00000 (972 MiB) per the device DT, and picassoPkg's
-# MemoryMapLib exposes only the "Boot Ramdisk Gap" 0xAD000000..0xBCC00000 as
-# SYS_MEM (252 MiB). DarwinBoot still reports success at 4 GiB because
-# AllocatePages only records the range as owned, but arm_vm_init() then builds a
-# 4 GiB physmap starting at the window base 0xC007C000, which runs past the end
-# of real DRAM to 0x1C007C000. Touching that faults with the MMU already on and
-# no console bound yet -- the silent hang after the green bar.
-#
-# 256 MiB is DarwinWindowSizeValid()'s minimum (0x10000000..0x200000000 in 2 MiB
-# steps) and fits inside the 252 MiB SYS_MEM run.
+# Keep the existing 256 MiB contiguous kernel window request. It is separate
+# from the original FAT ramdisk mapping above. Packed Data does not expand it:
+# only resident seed/write pages consume RAM, and peak use needs device testing.
 owned_memory_size = "0x10000000"
 cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
 unique_chip_id = "required"

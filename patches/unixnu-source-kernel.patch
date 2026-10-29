@@ -1598,7 +1598,7 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
   #include <mach/exclaves.h>
   
 -@@ -7013,8 +7013,256 @@
-+@@ -7013,8 +7013,267 @@
++@@ -7013,8 +7013,278 @@
    *		word width of the kernel. Once the self-exec completes, the
    *		initproc might be different.
    */
@@ -1661,6 +1661,102 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
  +	native_owner_cache_checkpoint(error, cache_authorized);
  +	return error;
  +}
+@@ -205,7 +216,9 @@
+ +	int error = EINVAL;
+ +	vnode_t data_root = NULLVP;
+ +	char device_path[64] = "/dev/md0";
+++	printf("NATIVE_OWNER_DATA begin mount=/private/var\n");
+ +#if defined(XNU_NATIVE_RAM_BLOCK) && XNU_NATIVE_RAM_BLOCK
+++	printf("NATIVE_OWNER_DATA provider=ram uuid=%s\n", XNU_OWNER_DATA_VOLUME_UUID);
+ +	/* The typed provider supplies logical seed identity for both dense and
+ +	 * sparse media. A sparse disk has no contiguous logical-byte address. */
+ +	if (!native_ram_block_volume_seed(XNU_OWNER_DATA_VOLUME_UUID, &device, device_path,
+@@ -213,6 +226,7 @@
+ +	/* The typed provider's disk may be far larger than 2 GiB (a persistent Data disk keeps only its seed's nonzero pages). */
+ +	if (!size || size > UINT64_C(0x10000000000) || (size & 4095)) goto done;
+ +#else
+++	printf("NATIVE_OWNER_DATA provider=md index=0\n");
+ +	device = mdevlookup(0);
+ +	if (device == NODEV || mdevgetrange(0, &base, &size) || base < VM_MIN_KERNEL_ADDRESS ||
+ +	    !size || size > UINT64_C(0x80000000) || (base & 4095) || (size & 4095)) goto done;
+@@ -225,6 +239,8 @@
+ +	native_owner_data_seed_size = size;
+ +	native_owner_data_stage = 1;
+ +	strlcpy(native_owner_data_device_path, device_path, sizeof(native_owner_data_device_path));
+++	printf("NATIVE_OWNER_DATA stage=1 selected=%x path=%s logical_bytes=%llu seed_base=%llx\n",
+++	    (unsigned)device, device_path, (unsigned long long)size, (unsigned long long)base);
+ +	uint8_t payload[0x150] = {0};
+ +	user64_addr_t spec = scratch + 0x160;
+ +	uint16_t mode = 1;
+@@ -241,10 +257,14 @@
+ +	    (error = copyout(device_path, spec, strlen(device_path) + 1)) ||
+ +	    (error = copyout(payload, request.data, sizeof(payload)))) goto done;
+ +	native_owner_data_stage = 2;
+++	printf("NATIVE_OWNER_DATA stage=2 mount begin path=/private/var flags=0\n");
+ +	error = mount(p, &request, &result);
+++	printf("NATIVE_OWNER_DATA mount returned error=%d\n", error);
+ +	if (error) goto done;
+ +	native_owner_data_stage = 3;
+++	printf("NATIVE_OWNER_DATA stage=3 lookup mountpoint\n");
+ +	error = vnode_lookup("/private/var", 0, &data_root, vfs_context_current());
+++	printf("NATIVE_OWNER_DATA lookup returned error=%d\n", error);
+ +	if (error) goto done;
+ +	mount_t data_mount = vnode_mount(data_root);
+ +	vnode_t device_node = vfs_devvp(data_mount);
+@@ -258,6 +278,8 @@
+ +done:
+ +	if (data_root) vnode_put(data_root);
+ +	native_owner_data_status = error;
+++	printf("NATIVE_OWNER_DATA done stage=%d error=%d readonly=%d device=%x path=%s\n",
+++	    native_owner_data_stage, error, native_owner_data_readonly, (unsigned)native_owner_data_device, device_path);
+ +	return error;
+ +}
+ +#endif
+@@ -267,7 +289,7 @@
+  {
+  	int retval[2];
+  	int error;
+-@@ -7086,7 +7329,7 @@
++@@ -7086,7 +7356,7 @@
+  	 */
+  	init_exec_args.fname = argv0;
+  	init_exec_args.argp = scratch_addr;
+@@ -276,7 +298,7 @@
+  
+  	/*
+  	 * So that init task is set with uid,gid 0 token
+-@@ -7148,6 +7391,15 @@
++@@ -7148,6 +7418,15 @@
+  	mach_vm_size_t map_page_size = vm_map_page_size(map);
+  
+  	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size, VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_NONE);
+@@ -292,7 +314,7 @@
+  #if CONFIG_MEMORYSTATUS
+  	(void) memorystatus_init_at_boot_snapshot();
+  #endif /* CONFIG_MEMORYSTATUS */
+-@@ -7162,7 +7414,7 @@
++@@ -7162,7 +7441,7 @@
+  
+  		if (is_release_suffix) {
+  			printf("load_init_program: attempting to load /sbin/launchd\n");
+@@ -301,7 +323,7 @@
+  			if (!error) {
+  				return;
+  			}
+-@@ -7173,7 +7425,7 @@
++@@ -7173,7 +7452,7 @@
+  			strlcat(launchd_path, launchd_suffix, sizeof(launchd_path));
+  
+  			printf("load_init_program: attempting to load %s\n", launchd_path);
+@@ -310,7 +332,7 @@
+  			if (!error) {
+  				return;
+  			} else if (error != ENOENT) {
+-@@ -7186,7 +7438,7 @@
++@@ -7186,7 +7465,7 @@
+  	error = ENOENT;
+  	for (i = 0; i < sizeof(init_programs) / sizeof(init_programs[0]); i++) {
+  		printf("load_init_program: attempting to load %s\n", init_programs[i]);
 diff --git a/patches/xnu/offline-owner-cache-carrier.patch b/patches/xnu/offline-owner-cache-carrier.patch
 --- a/patches/xnu/offline-owner-cache-carrier.patch
 +++ b/patches/xnu/offline-owner-cache-carrier.patch
@@ -1684,7 +1780,7 @@ diff --git a/patches/xnu/offline-owner-cache-carrier.patch b/patches/xnu/offline
 diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
 --- a/scripts/build-xnu-4k-baseline.sh
 +++ b/scripts/build-xnu-4k-baseline.sh
-@@ -35,7 +35,10 @@ fi
+@@ -35,7 +35,10 @@
  # Remove them first so earlier independent patches retain their idempotent checks.
  # The same holds for the boot-time GPU addon mount and the staged system apps copy (zzy), which edit the owner Data mount function
  # inside the systemos patch. Reverse newest first; the loop below re-applies them in name order.
@@ -1696,7 +1792,25 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
      "$ROOT/patches/xnu/zzy-native-gpu-addon-mount.patch"; do
    if git -C .cache/xnu-work apply --reverse --check "$LATE_PATCH" >/dev/null 2>&1; then
      git -C .cache/xnu-work apply --reverse "$LATE_PATCH"
-@@ -257,5 +257,6 @@
+@@ -180,8 +183,12 @@
+   exit 1
+ fi
+ if [ "$NATIVE_RAM_BLOCK" = 1 ]; then
+-  if [ "${XNU_NATIVE_AES:-0}" != 1 ]; then
+-    echo 'NativeRamBlock requires the qualified original storage/AES prelink closure' >&2
++  # RAM storage imports IOBlockStorageDevice and SHA-256, not IOAESAccelerator.
++  # Picasso's NativeUfs archive already binds the same original storage class;
++  # its RAM archive builder checks those imports against the actual UFS bindings.
++  if [ "${XNU_NATIVE_AES:-0}" != 1 ] && { [ "${XNU_NATIVE_UFS:-0}" != 1 ] ||
++      [ "$CRYPTO_BOOTSTRAP_MODE" != prelinked ] || [ "${XNU_SOURCE_CORECRYPTO14:-0}" != 1 ]; }; then
++    echo 'NativeRamBlock requires original storage/SHA-256 via NativeAES or NativeUfs with prelinked corecrypto' >&2
+     exit 1
+   fi
+   PERSONALITY_CFLAGS="$PERSONALITY_CFLAGS -DXNU_NATIVE_RAM_BLOCK=1"
+@@ -254,8 +261,9 @@
+   echo 'XNU_OWNER_ROOT_AUDIT must be 0 or 1' >&2
+   exit 1
+ fi
 -if [ "$OWNER_ROOT_AUDIT" = 1 ] && [ "$OWNER_ROOT_PROBE" != 1 ]; then
 -  echo 'The root-binding audit requires real owner-verified block crypto' >&2
 +if [ "$OWNER_ROOT_AUDIT" = 1 ] && [ "$OWNER_ROOT_PROBE" != 1 ] && \
@@ -1705,7 +1819,7 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
    exit 1
  fi
  OWNER_ROOT_TRUST=${XNU_OWNER_ROOT_TRUST:-0}
-@@ -263,8 +264,9 @@
+@@ -263,8 +271,9 @@
    echo 'XNU_OWNER_ROOT_TRUST must be 0 or 1' >&2
    exit 1
  fi
@@ -1717,6 +1831,41 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
    exit 1
  fi
  ADRENO_FIRMWARE_PROBE=${XNU_ADRENO_FIRMWARE_PROBE:-0}
+@@ -400,7 +409,10 @@
+ text = '/* Scratch Data IOKit selection disabled. */\n'
+ if sys.argv[2:4] == ['1', '1']:
+     try:
+-        value = str(uuid.UUID(sys.argv[4])).upper()
++        observed = uuid.UUID(sys.argv[4])
++        if observed.int == 0:
++            raise ValueError('The scratch Data volume UUID must not be zero')
++        value = str(observed).upper()
+     except ValueError:
+         raise SystemExit('Set XNU_OWNER_DATA_VOLUME_UUID to the actual observed scratch APFS volume UUID')
+     text = '#define XNU_OWNER_DATA_VOLUME_UUID "' + value + '"\n'
+@@ -417,9 +429,19 @@
+     path.write_text(text)
+ PY_DATA_UUID
+ OWNER_DATA_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-data-mount-mode
+-if [ "$(cat "$OWNER_DATA_STAMP" 2>/dev/null || echo 0)" != "$OWNER_DATA_MOUNT:$NATIVE_RAM_BLOCK:${XNU_OWNER_CACHE_VOLUME_UUID:-}" ]; then
+-  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o"
+-  printf '%s\n' "$OWNER_DATA_MOUNT:$NATIVE_RAM_BLOCK:${XNU_OWNER_CACHE_VOLUME_UUID:-}" > "$OWNER_DATA_STAMP"
++OWNER_DATA_MODE="$OWNER_DATA_MOUNT:$NATIVE_RAM_BLOCK:${XNU_OWNER_DATA_VOLUME_UUID:-}:${XNU_OWNER_CACHE_VOLUME_UUID:-}"
++if [ "$(cat "$OWNER_DATA_STAMP" 2>/dev/null || echo 0)" != "$OWNER_DATA_MODE" ]; then
++  python3 - "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o" "$ROOT/build/xnu/stale-owner-data" <<'PY_DATA_STALE'
++from pathlib import Path
++import sys
++import tempfile
++source, retained = map(Path, sys.argv[1:])
++if source.exists():
++    retained.mkdir(parents=True, exist_ok=True)
++    destination = Path(tempfile.mkdtemp(prefix='kern-exec-', dir=retained))
++    source.rename(destination / source.name)
++PY_DATA_STALE
++  printf '%s\n' "$OWNER_DATA_MODE" > "$OWNER_DATA_STAMP"
+ fi
+ OWNER_CRYPTEX_FILES=${XNU_OWNER_CRYPTEX_FILES:-0}
+ if [ "$OWNER_CRYPTEX_FILES" != 0 ] && [ "$OWNER_CRYPTEX_FILES" != 1 ]; then
 diff --git a/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
 new file mode 100644
 --- /dev/null

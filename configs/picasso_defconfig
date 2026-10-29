@@ -28,7 +28,7 @@ CONFIG_XNU_NATIVE_UFS=y
 # CONFIG_XNU_NATIVE_AES is not set
 # CONFIG_XNU_NATIVE_VIRTIO_BLOCK is not set
 # CONFIG_XNU_NATIVE_VIRTIO_CONSOLE is not set
-# CONFIG_XNU_NATIVE_RAM_BLOCK is not set
+CONFIG_XNU_NATIVE_RAM_BLOCK=y
 # CONFIG_XNU_NATIVE_MOBILE_DISPLAY is not set
 # CONFIG_XNU_NATIVE_LEGACY_DISPLAY is not set
 # CONFIG_XNU_NATIVE_ADRENO is not set
@@ -50,7 +50,7 @@ CONFIG_XNU_OWNER_CACHE_MOUNT=y
 # second, unauthenticated cache path; requires the mount above.
 CONFIG_XNU_OWNER_CACHE_STARTUP=y
 # Publish the authenticated boot manifest for the mounted pair; requires the
-# startup selection. OWNER_DATA_MOUNT stays off until the Data seed is wired.
+# startup selection. Data is a separate volatile APFS volume prepared in CI.
 CONFIG_XNU_OWNER_BOOT_MANIFEST=y
 CONFIG_XNU_OWNER_CACHE_VOLUME_UUID="8846FE78-2910-4297-AF97-D59BB6F8FC16"
 # The SystemOS carrier is mounted at /private/preboot, not unioned onto /.
@@ -60,8 +60,10 @@ CONFIG_XNU_OWNER_CACHE_VOLUME_UUID="8846FE78-2910-4297-AF97-D59BB6F8FC16"
 # OWNER_CACHE_STARTUP. A first shared_region_check_np() returning an empty
 # region is not by itself evidence that the subsequent mapping failed.
 CONFIG_XNU_OWNER_CACHE_CARRIER=y
-# CONFIG_XNU_OWNER_DATA_MOUNT is not set
+CONFIG_XNU_OWNER_DATA_MOUNT=y
 # CONFIG_XNU_OWNER_UNION_SYSTEMOS is not set
 # CONFIG_XNU_BOOT_PROGRESS is not set
 
-CONFIG_XNU_OWNER_DATA_VOLUME_UUID="00000000-0000-0000-0000-000000000000"
+# prepare-picasso-ram-data.py writes the formatted APFS volume's actual UUID
+# into out/picasso/.config before compilation. An unprepared build must fail.
+CONFIG_XNU_OWNER_DATA_VOLUME_UUID=""

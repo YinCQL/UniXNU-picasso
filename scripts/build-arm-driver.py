@@ -71,7 +71,7 @@ def prelink_slide():
     board = Path(os.environ['UNIXNU_DEVICE']) / 'board.toml'
     if not board.is_file():
         raise SystemExit(f'NativeUfs requires the device board.toml, not found at {board}')
-    config = tomllib.loads(board.read_text())
+    config = tomllib.loads(board.read_text(encoding='utf-8'))
     try:
         return int(config['kernel']['prelink']['slide'], 0)
     except (KeyError, TypeError, ValueError) as error:
@@ -111,6 +111,30 @@ def build_storage_bindings(out: Path):
     subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-c',
                     str(assembly), '-o', str(object_path)], check=True)
     return object_path
+
+
+def check_ram_storage_imports(source: Path, obj: Path, out: Path):
+    """RAM and UFS must use one set of aliases into the original IOStorage."""
+    ufs = ROOT / 'build/native-ufs'
+    binding_path = ufs / 'storage-bindings.json'
+    binding_object = ufs / 'storage-bindings.o'
+    binding = json.loads(binding_path.read_text())
+    if int(binding['slide'], 0) != prelink_slide():
+        raise SystemExit('Rebuild NativeUfs storage bindings for the current prelink slide')
+    targets = binding['candidate_targets']
+    symbols = subprocess.check_output(['xcrun', 'nm', '-u', str(obj)]).decode('utf-8')
+    imports = sorted({line.split()[-1] for line in symbols.splitlines()
+                      if line.split() and 'IOBlockStorageDevice' in line.split()[-1]})
+    if not imports or any(symbol not in targets for symbol in imports):
+        raise SystemExit(f'NativeRamBlock has uncovered original-storage imports: {imports}')
+    (out / 'storage-imports.json').write_text(json.dumps({
+        'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+        'object_sha256': hashlib.sha256(obj.read_bytes()).hexdigest(),
+        'bindings_sha256': hashlib.sha256(binding_path.read_bytes()).hexdigest(),
+        'binding_object_sha256': hashlib.sha256(binding_object.read_bytes()).hexdigest(),
+        'imports': {symbol: targets[symbol] for symbol in imports},
+        'slide': binding['slide'],
+    }, indent=2) + '\n')
 
 
 # The policy tree is a build input now, not a per-build product: it is 4.4 MiB
@@ -285,6 +309,8 @@ def main():
     if args.component == 'NativeUfs':
         extra_objects.extend(build_verified_root_policy(record, out, extra_flags))
         extra_objects.append(build_storage_bindings(out))
+    elif args.component == 'NativeRamBlock':
+        check_ram_storage_imports(source, destination, out)
 
     archive = out / ('lib' + args.component + '.a')
     archive.unlink(missing_ok=True)

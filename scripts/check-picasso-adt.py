@@ -70,6 +70,14 @@ def main():
                         '--dram-size', str(board['dram_size']), *extra], check=True)
         data = target.read_bytes()
         nodes = decode(data)
+        memory_map = nodes['/chosen/memory-map']
+        if name == 'board-with-data':
+            assert memory_map.get('PackedRAMDisk') == bytes(16)
+            assert 'RAMDisk' not in memory_map
+            assert nodes['/chosen'].get('ephemeral-storage') == struct.pack('<I', 1)
+        else:
+            assert 'PackedRAMDisk' not in memory_map and 'RAMDisk' not in memory_map
+            assert 'ephemeral-storage' not in nodes['/chosen']
         intc = nodes['/arm-io/intc']
         assert intc.get('virtual-timer-intid') == b'\x13\0\0\0', \
             'picasso requires /arm-io/intc/virtual-timer-intid as LE u32 19'
