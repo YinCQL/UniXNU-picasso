@@ -109,6 +109,46 @@ def audit_object(platform, native, path, original, aliases, slots):
             'native_overrides': sorted(OVERRIDES), 'original_superclass_verified': True}
 
 
+def linked_native_methods(native, data, image, wanted):
+    """Resolve exact method definitions, including inline methods made local by ld.
+
+    native.exports intentionally excludes local symbols for prelink rebinding.
+    A native vtable can still point at them; require unique, backed executable
+    N_SECT definitions instead of changing the upstream export semantics.
+    """
+    tables = [at for cmd, at, size in image['commands'] if cmd == 2 and size == 24]
+    require(len(tables) == 1, 'Expected one linked AES symbol table')
+    symoff, count, stroff, strsize = struct.unpack_from('<4I', data, tables[0] + 8)
+    require(symoff + count * 16 <= len(data) and stroff + strsize <= len(data),
+            'Invalid linked AES symbol table')
+    strings = data[stroff:stroff + strsize]
+    sections = [section for segment in image['segments'] for section in segment['sections']]
+    result, local = {}, set()
+    for index in range(count):
+        strx, kind, section_index, _, address = struct.unpack_from('<IBBHQ', data, symoff + index * 16)
+        if kind & 0xe0:  # Debug entries are not definitions.
+            continue
+        end = strings.find(b'\0', strx)
+        require(strx < strsize and end >= 0, 'Invalid linked AES symbol name')
+        name = strings[strx:end].decode()
+        if name not in wanted:
+            continue
+        require(name not in result, 'Ambiguous linked AES method: ' + name)
+        require(kind & 0x0e == 0x0e and 0 < section_index <= len(sections),
+                'Expected linked AES section definition: ' + name)
+        section = sections[section_index - 1]
+        flags = struct.unpack_from('<I', data, section['command_offset'] + 64)[0]
+        require(flags & 0x80000400 and address % 4 == 0 and
+                section['va'] <= address < address + 4 <= section['va'] + section['size'],
+                'Linked AES method is not executable: ' + name)
+        read(native, data, image, address, 4)
+        result[name] = address
+        if not kind & 1:
+            local.add(name)
+    require(set(result) == wanted, 'Missing linked AES methods: ' + ', '.join(sorted(wanted - result.keys())))
+    return result, local
+
+
 def verify_kernel(native, original, kernel, plan, audit, aliases, slots):
     require(sha(original) == ORIGINAL_SHA, 'Wrong original AES kernelcache')
     require(plan['original_sha256'] == ORIGINAL_SHA and plan['slide'] == SLIDE and
@@ -118,16 +158,20 @@ def verify_kernel(native, original, kernel, plan, audit, aliases, slots):
     symbols = names(native, kernel, image)
     require('__ZTV9NativeAES' in symbols, 'Missing linked AES subclass')
     require(len(audit['slot_names']) == 181, 'Incomplete AES object audit')
+    methods, local = linked_native_methods(native, kernel, image,
+        {audit['slot_names'][index] for index in OVERRIDES})
     pointer = lambda address: struct.unpack('<Q', read(native, kernel, image, address, 8))[0]
     require(pointer(symbols['__ZN9NativeAES10superClassE']) == BASE_META + SLIDE, 'Wrong linked AES superclass')
     for index, name in enumerate(audit['slot_names']):
-        require(name in symbols and pointer(symbols['__ZTV9NativeAES'] + 16 + index * 8) == symbols[name],
+        target = methods.get(name) if index in OVERRIDES else symbols.get(name)
+        require(target is not None and pointer(symbols['__ZTV9NativeAES'] + 16 + index * 8) == target,
                 f'Wrong linked AES dispatch slot {index}')
         if name in aliases:
             require(symbols[name] == aliases[name], f'Wrong linked original AES alias {name}')
     require(b"'IOClass'         = NativeAES;" in kernel, 'NativeAES personality is disabled')
     require(b'NativeAESSoftwareKeysOnly\0' in kernel, 'Missing software-key capability marker')
     return {'kernel_sha256': sha(kernel), 'virtual_slots': 181, 'actual_native_superclass_verified': True,
+            'local_native_dispatch_slots': [i for i, name in enumerate(audit['slot_names']) if name in local],
             'software_keys_only': True, 'runtime_qualified': False}
 
 

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 from unittest.mock import patch
 
@@ -54,11 +55,13 @@ def main():
                     for i, group in enumerate(expected)]
     initializer = '__GLOBAL__sub_I_NativeAES.cpp'
 
-    def schema(tag, slot_names, superclass='__ZN16IOAESAccelerator10gMetaClassE'):
+    def schema(tag, slot_names, superclass='__ZN16IOAESAccelerator10gMetaClassE', local_names=frozenset()):
         source = out / (tag + '.S')
         obj = out / (tag + '.o')
         definitions = sorted({native_names[i] for i in aes.OVERRIDES} | {initializer})
-        source.write_text('.text\n' + ''.join(f'.globl {name}\n{name}:\nret\n' for name in definitions) +
+        source.write_text('.text\n' + ''.join(f'.globl {name}\n' +
+            (f'.private_extern {name}\n.weak_definition {name}\n' if name in local_names else '') +
+            f'{name}:\nret\n' for name in definitions) +
             '.section __DATA,__const\n.p2align 3\n.globl __ZTV9NativeAES\n__ZTV9NativeAES:\n.quad 0,0\n' +
             ''.join(f'.quad {name}\n' for name in slot_names) +
             '.quad 0\n.globl __ZN9NativeAES10superClassE\n__ZN9NativeAES10superClassE:\n.quad '+superclass+'\n' +
@@ -98,6 +101,60 @@ def main():
     reject('missing original component rejected',lambda:aes.verify_kernel(native,original,data,{**plan,'components':[]},audit,aliases,slots))
     bad_audit={**audit,'slot_names':[native_names[1]]+audit['slot_names'][1:]}
     reject('changed linked dispatch rejected',lambda:aes.verify_kernel(native,original,data,plan,bad_audit,aliases,slots))
+
+    # Apple ld localizes the five inline weak methods in the real SDK build.
+    # Reproduce that with an actual link; their vtable pointers remain valid.
+    local_slots = {111, 117, 168, 171, 172}
+    local_obj, _ = schema('inline-local', native_names,
+                          local_names={native_names[i] for i in local_slots})
+    local_audit = aes.audit_object(platform, native, local_obj, original, aliases, slots)
+    local_linked = out / 'inline-local.dylib'
+    subprocess.run([ld,'-arch','arm64','-platform_version','ios','17.0','17.0','-dylib',
+                    '-o',str(local_linked),str(local_obj),str(binding_obj)],check=True,capture_output=True)
+    local_data = local_linked.read_bytes()
+    local_image = native.macho(local_data)
+    local_exports = aes.names(native, local_data, local_image)
+    assert all(native_names[i] not in local_exports for i in local_slots)
+
+    def verify_local(candidate):
+        return aes.verify_kernel(native, original, candidate,
+            {**plan, 'candidate_sha256': aes.sha(candidate)}, local_audit, aliases, slots)
+
+    report = verify_local(local_data)
+    assert report['local_native_dispatch_slots'] == sorted(local_slots)
+    checks.append('real link localizes five inline methods; all 181 dispatch slots still verified')
+    for index in sorted(local_slots):
+        broken = bytearray(local_data)
+        at = native.backed_offset(local_image['segments'],
+            local_exports['__ZTV9NativeAES'] + 16 + index * 8, 8, len(broken))
+        struct.pack_into('<Q', broken, at, local_exports[native_names[0]])
+        reject(f'wrong pointer to local method at slot {index} rejected',
+               lambda broken=broken: verify_local(bytes(broken)))
+
+    symcmd = next(at for cmd, at, _ in local_image['commands'] if cmd == 2)
+    symoff, count, stroff, strsize = struct.unpack_from('<4I', local_data, symcmd + 8)
+    strings = local_data[stroff:stroff + strsize]
+    records = {}
+    for index in range(count):
+        at = symoff + index * 16
+        strx = struct.unpack_from('<I', local_data, at)[0]
+        records[strings[strx:strings.find(b'\0', strx)].decode()] = at
+    method_at = records[native_names[111]]
+    for tag, kind in [('undefined', 0), ('absolute', 2), ('debug-only', 0x2e)]:
+        broken = bytearray(local_data)
+        broken[method_at + 4] = kind
+        reject(f'{tag} local method rejected', lambda broken=broken: verify_local(bytes(broken)))
+    broken = bytearray(local_data)
+    struct.pack_into('<I', broken, records[initializer], struct.unpack_from('<I', broken, method_at)[0])
+    reject('ambiguous local method rejected', lambda: verify_local(bytes(broken)))
+    broken = bytearray(local_data)
+    table_at = records['__ZTV9NativeAES']
+    broken[method_at + 5] = broken[table_at + 5]
+    struct.pack_into('<Q', broken, method_at + 8, local_exports['__ZTV9NativeAES'])
+    reject('method symbol in non-executable data rejected', lambda: verify_local(bytes(broken)))
+    broken = bytearray(local_data)
+    broken[method_at + 5] = 0
+    reject('invalid local method section rejected', lambda: verify_local(bytes(broken)))
 
     # Full builder path with an explicit schema compiler substitution.
     tree = out / 'tree'

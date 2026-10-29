@@ -1,5 +1,42 @@
 # Watchdogd trap after early boot
 
+## Build 40962648495: fix local inline-method lookup in the AES verifier
+
+Build 74 at `4d2482b32a036a18cbb4d5082ada0308c91725c5` completed the
+production SDK compile, final kernel link and payload generation. The Data
+artifact check passed, then AES verification reported `Wrong linked AES
+dispatch slot 111`; boot.img composition was therefore skipped.
+
+The downloaded artifact `12937510679` / `picasso-bootimg-74` proves this was
+a verifier error. Its kernel SHA-256 is
+`298d94faba571e2f3edb400d1c730f314b35208b1ba409c479881d3fe0267761`.
+Slot 111 points to `0xfffffff007bc4af4`, the exact definition of
+`NativeAES::getWorkLoop`. Apple ld made this inline method a local N_SECT
+symbol (`n_type=0x0e`), which the prelink export helper intentionally omits.
+The inline overrides at slots 117, 168, 171 and 172 are also local and have
+correct pointers.
+
+The verifier now resolves native overrides from both local and external
+definitions in LC_SYMTAB. It requires an exact, unique N_SECT symbol in a
+backed executable section, then checks every vtable pointer. The original
+export helper and inherited-method/alias checks retain their existing
+semantics. No driver source or kernel bytes change for this correction.
+
+`out/defaults-busy-20261030/build-v2-local-symbols/results.json` passes 27
+checks, including a real LLVM link that localizes all five inline methods,
+wrong pointers at each of those slots, undefined/absolute/debug-only symbols,
+duplicate definitions and invalid/non-executable sections. The unchanged
+downloaded SDK objects and archive match the committed sources. The original
+verifier reproduces the exact failure on this kernel; the corrected artifact
+command passes all 181 slots on the same bytes. Reports are retained in
+`ci74-aes-delivery.json` and `ci74-aes-artifacts-verified.json`. The downloaded
+platform objects, linked watchdog policy and Sandbox/AppleMatch entrypoints
+also pass independent checks.
+
+A complete CI run through boot.img composition and a new phone log are still
+required. The successful local artifact recheck does not turn failed build
+74 into a successful build or establish that the phone's reboot is fixed.
+
 ## Build 40957387071: original client opens, defaults remains busy
 
 Build 73 at `782a3db50f0227874819b7e4e7bd05d99d52259f` completed successfully.
@@ -54,8 +91,9 @@ software-key-only acceptance, chunked in-place decryption, descriptor bounds,
 allocation/prepare/read/write/crypto failures and completion cleanup.
 LLVM schemas and CNG are not a new production SDK or Apple corecrypto run.
 The next target log should show `picasso-aes` KAT/interface success and
-publication, then progression beyond the defaults wait. New SDK compilation
-and this target result remain pending.
+publication, then progression beyond the defaults wait. Production SDK
+compilation subsequently passed in build 74, as described above; the target
+result remains pending.
 
 ## Build 40951382277: service found, open denied
 
