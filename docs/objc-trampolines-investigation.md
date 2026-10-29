@@ -1,5 +1,10 @@
 # Standalone Objective-C library missing from the root view
 
+Update: [build 77](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40974341838)
+at `726e4b6b1620df9e605365126f0db5edc4601998` passes the Apple SDK build,
+linked artifact checks and boot-image composition. Device validation of the
+union change is still pending; the latest device log below is from build 76.
+
 Build 76 / [40970250344](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40970250344)
 at `342b707f24e7178eec0a58c7e35e979ff700bd9a` completed successfully. Its
 downloaded artifact is `12939683361` / `picasso-bootimg-76`. The kernel UUID
@@ -98,8 +103,9 @@ Evidence resides in `out/objc-trampolines-20261030/`:
   The historical callback reproduces the reference undercount. Earlier fixture
   builds had naming errors; only the fixture declarations were corrected.
 
-These use host VFS/owner/copyout stand-ins. New Apple SDK compilation and device
-execution remain pending. The next device log should show `composition union=1`,
+The local tests use host VFS/owner/copyout stand-ins. Build 77 now passes Apple
+SDK compilation; device execution of the union change remains pending. The
+next device log should show `composition union=1`,
 three `NATIVE_OWNER_UNION ... error=0 source_match=1` lines, normal Data/cache
 startup, and whether the missing-library abort disappears. Continue from the
 actual remaining service exits/checkins; do not infer a usable display.
