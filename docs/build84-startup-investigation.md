@@ -141,8 +141,9 @@ Evidence under `out/build84-stall-20261030` includes:
   host/replayed-source equality, and pinned tutorial/reference source hashes.
 
 Compose now checks the conversion against its actual patched XNU tree after
-the kernel/payload build. This change has not received a new Compose SDK build
-or a new device run. No CI dispatch or phone operation was performed here.
+the kernel/payload build. At the close of the build84 investigation, this change
+had no new Compose SDK build or device run; the later build85 result is below.
+No CI dispatch or phone operation was performed during the investigation.
 
 On the next image, require normalized microtime and absence of repeated
 rollover-related negative APFS durations. Record whether the UI advances and
@@ -151,3 +152,28 @@ inspect supplemental `PICASSO_IOKIT` samples 13-24 and obtain the actual blocked
 service stack or migration lifecycle; a generic startup health failure still
 does not identify its substep. Preserve watchdog, Jetsam, APFS integrity, owner
 and AMFI checks, and explicit failures for unsupported key operations.
+
+## Build85: correct the Compose check's source directory
+
+[Compose run 41082334132](https://github.com/YinCQL/UniXNU-picasso/actions/runs/41082334132),
+build85 at `94df96fa084bc46235fe4f9a2f4ffe535cda33f5`, passes kernel/payload
+compilation and the Data artifact guard, then fails in the new
+microtime host check with `FileNotFoundError`. The check mistakenly used
+`$UNIXNU_TREE/.cache/xnu-work`. That variable points to the preparation cache;
+the kernel builder runs in `ctx.tree`, which is `ctx.work / 'tree'`.
+The actual patched source is `out/picasso/tree/.cache/xnu-work`.
+
+Compose now passes that build directory explicitly, consistent with the existing
+Data, AES and display artifact checks. The arithmetic checks, kernel patch and
+result upload remain unchanged. The earlier isolated Clang run verified the
+conversion, but did not verify the workflow's two-directory layout; the earlier
+scope audit checked the build script's relative path without following `ctx.tree`.
+
+`out/ci-microtime-path-v1` retains the failed CI log, the preceding Memory and
+`layout-check.json`. The layout check creates separate preparation and build
+directories, places the actual replayed rtclock.c only in the build directory,
+extracts the revised workflow arguments and runs the real checker with installed
+Clang. Ordinary and ASan runs pass, and the result is copied to the workflow's
+logs path. This is a Windows host/layout check; the corrected workflow still
+requires a new Compose run for native macOS validation. No CI dispatch or
+device operation was performed for this correction.
