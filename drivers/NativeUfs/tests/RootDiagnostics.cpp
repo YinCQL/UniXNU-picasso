@@ -27,6 +27,13 @@ int main(int argc, char **)
   d.sense = 0x062900;
   d.publicationPhase = 5;
   d.publicationWindow = 1;
+  d.startTick = 0x111111110;
+  d.lastTick = d.deadlineTick = 0x111211110;
+  d.timeoutUs = 1000000;
+  d.deadlineSample = d.submitted = 1;
+  d.dbLast = 1;
+  d.isLast = 0x20000;
+  d.faultSampleMask = 7;
   char full[2500];
   int length = formatUfsRootDiagnostics(full, sizeof(full), d, "transport timeout fixture");
   assert(length > 0 && length < 2000 && size_t(length) == strlen(full));
@@ -39,6 +46,9 @@ int main(int argc, char **)
   assert(strstr(full, "dme=80000001"));
   assert(strstr(full, "reject=6 residual=4096 sense=062900"));
   assert(strstr(full, "pubPhase=5 window=1"));
+  assert(strstr(full, "submitted=1 timeout_us=1000000 start=111111110 last=111211110 deadline=111211110"));
+  assert(strstr(full, "final_sample=1 dbLast=1 isLast=20000"));
+  assert(strstr(full, "sample_mask=7 (HC=1 SMMU=2 CB=4)"));
   char passive[2500];
   formatUfsRootDiagnostics(passive,sizeof(passive),d,"cached values; not a new HW fault sample","UFS CACHED SNAPSHOT");
   assert(strstr(passive,"UFS CACHED SNAPSHOT:") == passive && !strstr(passive,"UFS ROOT FAILURE"));

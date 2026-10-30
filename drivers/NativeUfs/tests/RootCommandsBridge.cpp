@@ -31,15 +31,25 @@ constexpr IOReturn kIOReturnSuccess=0, kIOReturnError=0xe00002bc,
 constexpr unsigned kMicrosecondScale=1;
 constexpr unsigned kMillisecondScale=1000;
 static UfsRootDiagnostics gRootDiagnostic;
-struct Host { uint8_t *virt; uint64_t phys; bool ready, poisoned; uintptr_t hc; void *lock; };
+static bool gRootDiagnosticEnabled;
+struct Host {
+  uint8_t *virt; uint64_t phys; bool ready, poisoned; uintptr_t hc; void *lock;
+  uintptr_t smmu = 0, cb = 0;
+};
 static Host gHost;
+static unsigned testLock;
+static unsigned failureLogs;
+static char failureLog[2048];
 alignas(4096) static uint8_t memory[kDmaBytes];
 using Callback = uint64_t (*)(unsigned operation, uint64_t address, uint64_t value, void *bytes);
 static Callback callback;
 // 0: MMIO read; 1: ordered MMIO write; 2: release DMA; 3: acquire DMA;
 // 4: monotonic microseconds; 5: legacy delay microseconds (queue only);
-// 6: one non-sleeping CPU hint. Callbacks must not throw.
-static uint32_t read32(uintptr_t, unsigned offset) { return uint32_t(callback(0,offset,0,nullptr)); }
+// 6: one non-sleeping CPU hint; 7/8: lock/unlock;
+// 9: SMMU/CB status read (value=2/4). Callbacks must not throw.
+static uint32_t read32(uintptr_t base, unsigned offset) {
+  return uint32_t(callback(base==gHost.hc ? 0 : 9,offset,base==gHost.smmu ? 2 : 4,nullptr));
+}
 static void hostWrite(unsigned offset, uint32_t value) { callback(1,offset,value,nullptr); }
 static void cacheCivac(const void *start, size_t length) {
   callback(2,gHost.phys+uint64_t(static_cast<const uint8_t *>(start)-memory),length,const_cast<void *>(start));
@@ -53,17 +63,25 @@ static void clock_interval_to_deadline(uint32_t interval, unsigned scale, uint64
 static uint64_t mach_absolute_time() { return callback(4,0,0,nullptr); }
 static void IODelay(uint32_t us) { callback(5,0,us,nullptr); }
 static void hostCpuRelax() { callback(6,0,0,nullptr); }
-static void IOLockLock(void *) {}
-static void IOLockUnlock(void *) {}
-static IOReturn recordTransport(IOReturn result,uint32_t ocs) {
-  gRootDiagnostic.result=result; gRootDiagnostic.ocs=ocs; return result;
+static void IOLockLock(void *) { callback(7,0,0,nullptr); }
+static void IOLockUnlock(void *) { callback(8,0,0,nullptr); }
+static void IOLog(const char *format, ...) {
+  va_list arguments;
+  va_start(arguments,format);
+  const int length=vsnprintf(failureLog,sizeof(failureLog),format,arguments);
+  va_end(arguments);
+  assert(length>=0 && size_t(length)<sizeof(failureLog));
+  ++failureLogs;
 }
+#include "../RootTransportDiagnostics.h"
 #include "../RootCommands.h"
 #include "../RootQueue.h"
 extern "C" {
 void ufs_test_reset(Callback cb, uint64_t physical) {
   callback=cb; memset(memory,0,sizeof(memory));
-  gHost={memory,physical,true,false,0,nullptr}; gRootDiagnostic=UfsRootDiagnostics{};
+  gHost={memory,physical,true,false,1,&testLock}; gRootDiagnostic=UfsRootDiagnostics{};
+  gRootDiagnosticEnabled=gRootTransportFailureReported=false;
+  failureLogs=0; failureLog[0]=0;
   gRootReadTraceCount=0;
   gStoreOpen=gLogOpen=false; gStoreFirst=gStoreBlocks=gLogFirst=gLogBlocks=0;
 #ifdef NATIVE_UFS_TEST_TRACE

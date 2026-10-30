@@ -19,6 +19,7 @@ constexpr IOReturn kIOReturnSuccess=0, kIOReturnError=0xe00002bc,
 constexpr unsigned kMicrosecondScale=1, kMillisecondScale=1000;
 struct Host { uint8_t *virt; uint64_t phys; bool ready,poisoned; uintptr_t hc; void *lock; };
 static Host gHost;
+static unsigned testLock;
 static UfsRootDiagnostics gRootDiagnostic;
 // Runner extracts these functions verbatim from NativeUfs.cpp, including
 // actual DC CIVAC/DC IVAC/DSB, volatile read32/write32 and CPU yield hint.
@@ -111,7 +112,7 @@ extern "C" void guest_main() {
   asm volatile("at s1e1r, %0; isb"::"r"(uint64_t(0x50000000+kDmaBytes)):"memory");
   asm volatile("mrs %0, par_el1":"=r"(state)); check(state&1,"4K guard page");
 
-  gHost={reinterpret_cast<uint8_t *>(0x50000000),physical,true,false,0x10000000,nullptr};
+  gHost={reinterpret_cast<uint8_t *>(0x50000000),physical,true,false,0x10000000,&testLock};
   for (unsigned i=0;i<kDmaBytes;++i) gHost.virt[i]=0;
   cacheCivac(gHost.virt,kDmaBytes);
   constexpr uintptr_t pci=0x3f008000;

@@ -3,8 +3,10 @@
 Build [77](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40974341838)
 at `726e4b6b1620df9e605365126f0db5edc4601998` reaches the authenticated union
 root and writable Data, then kills system services for VM-page shortage.
-The next change requests 768 MiB of actual loader-owned memory, up from
-256 MiB. Its device allocation and subsequent service progress remain untested.
+Build78 at `f9fc2a108192df7d3a57d050e6f563731de49fe8` confirms 768 MiB
+of actual loader-owned memory, up from 256 MiB. The latest capture has no
+Jetsam exits; it instead encounters a UFS read timeout and subsequent SIGBUS
+exits. See the [current UFS investigation](ufs-pagein-investigation.md).
 
 ## Captured evidence
 
@@ -83,9 +85,10 @@ Inspection of its decompressed ARM64 PE modules confirms the active paths:
   It derives banks and exclusions from the supplied DT and existing GCD map.
 
 The board now requests `0x30000000` (768 MiB), leaving headroom below that
-firmware pool limit for other allocations and alignment. Runtime fragmentation
-is still unknown: this is a request, not a claim that 768 MiB has been obtained.
-If no suitable run exists, firmware allocation must fail.
+firmware pool limit for other allocations and alignment. Build78's captured
+handoff confirms this allocation at `phys_base=c007c000` with both size fields
+equal to `30000000`. This verifies this boot's allocation, not all future
+firmware fragmentation states. If no suitable run exists, allocation must fail.
 
 Sheng's `0x130000000` means **4.75 GiB**. It is valid for the generic loader
 parser but cannot be satisfied by Picasso's current firmware memory map.
@@ -110,7 +113,7 @@ Local evidence is retained in `out/memory-pressure-20261030/`.
 
 `PicassoPmgr` now emits one `PICASSO_MEMORY boot` line after console startup,
 reporting the actual physical base, `memSize`, `memSizeActual` and data end.
-The next successful allocation should show `bytes=30000000 actual=30000000`.
-Then check for page-shortage exits and renewed watchdog checkins. No new
-device result is available yet. No watchdog, Jetsam, authentication or system
-service policy is relaxed, and no phone operation or CI dispatch was performed.
+Build78 shows `bytes=30000000 actual=30000000`; its complete CI and independently
+checked payload also pass. The new device failure is documented separately.
+No watchdog, Jetsam, authentication or system service policy is relaxed, and
+no phone operation or CI dispatch was performed.

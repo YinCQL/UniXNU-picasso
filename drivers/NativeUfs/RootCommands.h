@@ -10,7 +10,7 @@
 #include "PollPause.h"
 
 struct HardwareTransferPort {
-  uint64_t deadline;
+  uint64_t deadline, lastClock;
   uint32_t tracePoll;
   // Polling only observes the submitted slot. Re-ringing or restarting the
   // request list here can race completion and reuse DMA still owned by the HC.
@@ -38,6 +38,7 @@ struct HardwareTransferPort {
   bool expired () {
     if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT clock=begin\n");
     uint64_t now = mach_absolute_time ();
+    lastClock = now;
     if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT clock=end now=%llx deadline=%llx\n", now, deadline);
     return now >= deadline;
   }
@@ -123,9 +124,14 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
   port.tracePoll = 0;
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT deadline=begin timeout_us=%u\n", timeoutUs);
   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, &port.deadline);
+  port.lastClock = mach_absolute_time ();
+  gRootDiagnostic.startTick = port.lastClock;
+  gRootDiagnostic.deadlineTick = port.deadline;
+  gRootDiagnostic.timeoutUs = timeoutUs;
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT deadline=end value=%llx\n", port.deadline);
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT doorbell=begin\n");
   hostWrite (0x58, 1);
+  gRootDiagnostic.submitted = 1;
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT doorbell=end\n");
   UfsTransferPoll state;
   UfsTransferEnd end = pollUfsTransfer (port, state);
@@ -135,6 +141,10 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
   gRootDiagnostic.polls = state.polls;
   gRootDiagnostic.dbSeen = state.doorbellSeen;
   gRootDiagnostic.isSeen = state.interruptSeen;
+  gRootDiagnostic.dbLast = state.doorbellLast;
+  gRootDiagnostic.isLast = state.interruptLast;
+  gRootDiagnostic.deadlineSample = state.deadlineSample;
+  gRootDiagnostic.lastTick = port.lastClock;
   *ocs = state.ocs;
   if (end != UfsTransferEnd::Completed) {
     // No cancel/reset/retry: the controller may still own the buffer, even
@@ -158,6 +168,13 @@ static bool hostClearUcd (void)
     NATIVE_UFS_TRACE ("NATIVE_UFS_UCD clear=failed reason=poisoned\n");
     return false;
   }
+  // Preflight may reject before a new command is submitted. Do not label the
+  // previous command's timing/poll samples as belonging to this attempt.
+  gRootDiagnostic.submitted = 0;
+  gRootDiagnostic.polls = gRootDiagnostic.dbSeen = gRootDiagnostic.isSeen = 0;
+  gRootDiagnostic.dbLast = gRootDiagnostic.isLast = gRootDiagnostic.deadlineSample = 0;
+  gRootDiagnostic.startTick = gRootDiagnostic.lastTick = gRootDiagnostic.deadlineTick = 0;
+  gRootDiagnostic.timeoutUs = 0;
   // Check before touching the command/response area, not just before ringing.
   uint32_t doorbell = read32 (gHost.hc, 0x58);
   if (doorbell != 0) {
@@ -330,10 +347,17 @@ static unsigned gRootReadTraceCount = 0;
 // Read `blocks` (<= kDataMax / 4096) 4096-byte blocks of LUN `lun` starting at `lba` into dst.
 static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst)
 {
-  if (!gHost.ready || !dst || !blocks || blocks > kDataMax / 4096 || lba > 0xffffffffULL - (blocks - 1)) {
+  if (!dst || !blocks || blocks > kDataMax / 4096 || lba > 0xffffffffULL - (blocks - 1)) {
     return kIOReturnBadArgument;
   }
+  if (!gHost.lock) return kIOReturnNotReady;
   IOLockLock (gHost.lock);
+  // A preceding request may have quarantined the host while this reader
+  // waited for the lock. Do not touch its DMA or misreport a parameter error.
+  if (!gHost.ready || gHost.poisoned) {
+    IOLockUnlock (gHost.lock);
+    return kIOReturnNotReady;
+  }
   const bool traceRead = gRootReadTraceCount < 8;
   if (traceRead) {
     ++gRootReadTraceCount;
@@ -403,10 +427,15 @@ static bool hostStoreOpen (uint64_t first, uint64_t blocks)
 // WRITE(10) of `blocks` 4096-byte blocks from src to lba on LUN 0; the range must lie inside one open window.
 static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua = false)
 {
-  if (!gHost.ready || !src || !blocks || blocks > kDataMax / 4096 || lun != 0 || !hostInWindow (lba, blocks)) {
+  if (!src || !blocks || blocks > kDataMax / 4096 || lun != 0 || !hostInWindow (lba, blocks)) {
     return kIOReturnBadArgument;
   }
+  if (!gHost.lock) return kIOReturnNotReady;
   IOLockLock (gHost.lock);
+  if (!gHost.ready || gHost.poisoned) {
+    IOLockUnlock (gHost.lock);
+    return kIOReturnNotReady;
+  }
   gRootDiagnostic.lba = lba;
   memcpy (gHost.virt + kDataOffset, src, blocks * 4096U);
   uint8_t cdb[10] = { 0x2a, uint8_t (fua ? 0x08 : 0), uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
@@ -420,8 +449,12 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
 // SYNCHRONIZE CACHE(10) for the whole LUN: everything written so far is on the medium when this returns.
 static IOReturn hostSyncCache (void)
 {
-  if (!gHost.ready || (!gStoreOpen && !gLogOpen)) return kIOReturnNotReady;
+  if (!gHost.lock || (!gStoreOpen && !gLogOpen)) return kIOReturnNotReady;
   IOLockLock (gHost.lock);
+  if (!gHost.ready || gHost.poisoned) {
+    IOLockUnlock (gHost.lock);
+    return kIOReturnNotReady;
+  }
   uint8_t cdb[10] = { 0x35 };
   uint32_t scsi = 0;
   IOReturn status = hostScsiDir (0, cdb, 10, 0, 0, 10000000, &scsi);

@@ -1,5 +1,9 @@
 # UFS root bring-up investigation (2026-10-29)
 
+Build78 now reaches early userspace with 768 MiB, then fails a UFS READ.
+See the [2026-10-30 read-timeout investigation](ufs-pagein-investigation.md)
+for the current capture, deadline fix and validation boundary.
+
 The later `25e314d` device boot completed delayed UFS reads, mounted OS and
 SystemOS, and reached early launchd before automatically rebooting. See the
 [launchd and reboot investigation](launchd-reboot-investigation.md) for that

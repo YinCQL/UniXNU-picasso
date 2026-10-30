@@ -865,32 +865,7 @@ struct UfsHost {
 };
 UfsHost gHost = { OSSharedPtr<IOMemoryMap> (), OSSharedPtr<IOMemoryMap> (), 0, nullptr, nullptr, 0, nullptr, false };
 
-static IOReturn recordTransport (IOReturn result, uint32_t ocs)
-{
-  gRootDiagnostic.result = static_cast<uint32_t> (result);
-  gRootDiagnostic.ocs = ocs;
-  if (result != kIOReturnSuccess && gRootDiagnosticEnabled) {
-    // Read only the already mapped HC's status/registers used by this driver.
-    gRootDiagnostic.hcs = read32 (gHost.hc, 0x30);
-    gRootDiagnostic.hce = read32 (gHost.hc, 0x34);
-    gRootDiagnostic.doorbell = read32 (gHost.hc, 0x58);
-    gRootDiagnostic.interrupt = read32 (gHost.hc, 0x20);
-    gRootDiagnostic.list = uint64_t (read32 (gHost.hc, 0x50)) |
-                          (uint64_t (read32 (gHost.hc, 0x54)) << 32);
-    gRootDiagnostic.runStop = read32 (gHost.hc, 0x60);
-    gRootDiagnostic.ahit = read32 (gHost.hc, 0x18);
-    for (unsigned i = 0; i < 5; ++i) gRootDiagnostic.uic[i] = read32 (gHost.hc, 0x38 + 4 * i);
-    if (gHost.smmu && gHost.cb) {
-      gRootDiagnostic.gfsr = read32 (gHost.smmu, 0x48);
-      gRootDiagnostic.gsyn = read32 (gHost.smmu, 0x54);
-      gRootDiagnostic.fsr = read32 (gHost.cb, 0x58);
-      gRootDiagnostic.fsyn = read32 (gHost.cb, 0x68);
-      gRootDiagnostic.far = uint64_t (read32 (gHost.cb, 0x60)) |
-                            (uint64_t (read32 (gHost.cb, 0x64)) << 32);
-    }
-  }
-  return result;
-}
+#include "RootTransportDiagnostics.h"
 
 static void cacheCivac (const void *start, size_t length)
 {

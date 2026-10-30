@@ -207,7 +207,7 @@ assert after[479*4096:480*4096] == bytes([0x5a]) * 4096 and after[448*4096:449*4
 results.append({'image_after': 'only blocks %d..%d of the two windows changed' % (changed[0], changed[-1])})
 report = {'qemu': version, 'pci_id': hex(pci_id), 'cap': hex(cap), 'version': hex(ver),
     'results': results, 'source_sha256': {str(f.relative_to(source.parent)): hashlib.sha256(f.read_bytes()).hexdigest()
-        for f in [source.parent / 'RootDiagnostics.h', source.parent / 'RootCommands.h', source.parent / 'RootQueue.h', source.parent / 'RootTransportLayout.h', source.parent / 'TransferPoll.h', source.parent / 'PollPause.h', source / 'RootCommandsBridge.cpp', source / 'RootPathBridge.cpp', source / 'root_path_fixture.py', source.parent / 'RootLayout.h', source.parent / 'RootWindowRead.h']},
+        for f in [source.parent / 'RootDiagnostics.h', source.parent / 'RootTransportDiagnostics.h', source.parent / 'RootCommands.h', source.parent / 'RootQueue.h', source.parent / 'RootTransportLayout.h', source.parent / 'TransferPoll.h', source.parent / 'PollPause.h', source / 'RootCommandsBridge.cpp', source / 'RootPathBridge.cpp', source / 'root_path_fixture.py', source.parent / 'RootLayout.h', source.parent / 'RootWindowRead.h']},
     'verified_root_sha256': {name: hashlib.sha256((verified_root/name).read_bytes()).hexdigest() for name in ('src/verified_root.c','tests/openssl_provider.c','include/verified_root.h')},
     'scope': 'Production layout/window/command code, actual portable VerifiedRoot with OpenSSL / generic QEMU UFS DMA; not XNU, CPU cache, SM8550, SMMU or hardware timing'}
 (out / 'report.json').write_text(json.dumps(report, indent=2) + '\n')

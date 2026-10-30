@@ -18,6 +18,9 @@ struct UfsRootDiagnostics {
   uint32_t smmuId2 = 0, cba2r = 0, uic[5] = {};
   uint32_t smmuId1 = 0, smmuSlot = 0xffffffff;
   uint32_t publicationPhase = 0, publicationWindow = 0xffffffff;
+  uint64_t startTick = 0, lastTick = 0, deadlineTick = 0;
+  uint32_t timeoutUs = 0, deadlineSample = 0, dbLast = 0, isLast = 0;
+  uint32_t submitted = 0, faultSampleMask = 0;
 };
 
 static inline int formatUfsRootDiagnostics(char *buffer, size_t capacity,
@@ -31,6 +34,8 @@ static inline int formatUfsRootDiagnostics(char *buffer, size_t capacity,
     "CMD n=%u type=%02x op=%02x lun=%02x ocs=%02x rsp=%08x scsi=%04x power=%02x\n"
     "PROTOCOL reject=%u residual=%u sense=%06x SMMU slot=%u id1=%x\n"
     "QUEUE rsr=%x ahit=%x polls=%u dbSeen=%x isSeen=%x isBefore=%x contiguous=%llx\n"
+    "DEADLINE submitted=%u timeout_us=%u start=%llx last=%llx deadline=%llx final_sample=%u dbLast=%x isLast=%x\n"
+    "FAULT sample_mask=%x (HC=1 SMMU=2 CB=4)\n"
     "FAULT global=%x->%x syn=%x cb=%x->%x syn=%x far=%llx id2=%x cba2r=%x\n"
     "UIC pa=%08x dl=%08x net=%08x tr=%08x dme=%08x\n"
     "GPT/read lba=%llx userdata=%llx..%llx magic=%08x %08x manifest=%u\n"
@@ -41,6 +46,8 @@ static inline int formatUfsRootDiagnostics(char *buffer, size_t capacity,
     d.command, d.type, d.opcode, d.lun, d.ocs, d.response, d.scsi, d.power,
     d.protocol, d.residual, d.sense, d.smmuSlot, d.smmuId1,
     d.runStop, d.ahit, d.polls, d.dbSeen, d.isSeen, d.isBefore, (unsigned long long)d.contiguous,
+    d.submitted, d.timeoutUs, (unsigned long long)d.startTick, (unsigned long long)d.lastTick,
+    (unsigned long long)d.deadlineTick, d.deadlineSample, d.dbLast, d.isLast, d.faultSampleMask,
     d.gfsrBefore, d.gfsr, d.gsyn, d.fsrBefore, d.fsr, d.fsyn, (unsigned long long)d.far,
     d.smmuId2, d.cba2r, d.uic[0], d.uic[1], d.uic[2], d.uic[3], d.uic[4],
     (unsigned long long)d.lba, (unsigned long long)d.first, (unsigned long long)d.last,

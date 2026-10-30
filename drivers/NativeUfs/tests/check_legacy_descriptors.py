@@ -87,7 +87,8 @@ int main() {
     report={'cases':14,'passed':True,'scope':'UTRD 32 bytes and UCD/response/PRDT 1040 bytes before doorbell; '
             'does not compare allocation, coherence, queue takeover or controller behavior',
             'source_sha256':{name:hashlib.sha256((source.parent/name).read_bytes()).hexdigest()
-                for name in ('NativeUfs.cpp','RootCommands.h','PollPause.h','RootTransportLayout.h','tests/RootCommandsBridge.cpp')},
+                for name in ('NativeUfs.cpp','RootCommands.h','PollPause.h','RootTransportLayout.h',
+                             'RootDiagnostics.h','RootTransportDiagnostics.h','TransferPoll.h','tests/RootCommandsBridge.cpp')},
             'extracted_prefix_sha256':[hashlib.sha256(p.encode()).hexdigest() for p in prefixes]}
     (out/'report.json').write_text(json.dumps(report,indent=2)+'\n')
 
