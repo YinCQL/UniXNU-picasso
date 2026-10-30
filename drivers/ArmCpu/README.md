@@ -13,6 +13,11 @@ SMP remains opt-in through upstream's `sheng-smp` argument. Picasso boots
 with `cpus=1`; describing eight CPU nodes does not enable SMP. No new-kernel
 SMP result is claimed.
 
+The boot CPU installs its interrupt dispatch directly, matching the secondary
+path. The shared `IOCPUInterruptController::registerInterrupt` path waits for
+every CPU described by the device tree to enable interrupts; that cannot
+complete for a `cpus=1` boot with an eight-CPU ADT, before `initCPU()` runs.
+
 Run `python scripts/check-picasso-adt.py --output out/adt-check-NEW` from the
 device checkout to generate and decode minimal, configured and Data-enabled
 trees. Compose runs the same check before building. The check validates the
