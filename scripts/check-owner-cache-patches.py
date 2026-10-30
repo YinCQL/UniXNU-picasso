@@ -21,7 +21,7 @@ REPLAY_SOURCES = (
     'bsd/kern/sys_generic.c', 'bsd/kern/kern_descrip.c',
     'bsd/kern/kern_mman.c', 'bsd/kern/ubc_subr.c',
     'osfmk/arm64/sleh.c', 'iokit/Kernel/IOUserClient.cpp',
-    'bsd/vfs/vfs_attrlist.c', 'bsd/kern/bsd_init.c',
+    'bsd/vfs/vfs_attrlist.c', 'bsd/kern/bsd_init.c', 'osfmk/arm/rtclock.c',
 )
 
 

@@ -1871,7 +1871,7 @@ diff --git a/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch b/patches/xnu/z
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
-@@ -0,0 +1,1715 @@
+@@ -0,0 +1,1754 @@
 +diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 +--- a/bsd/vfs/vfs_syscalls.c
 ++++ b/bsd/vfs/vfs_syscalls.c
@@ -3355,14 +3355,14 @@ new file mode 100644
 + #include <sys/kauth.h>
 + #include <sys/codesign.h>
 + #include <sys/code_signing.h>
-+@@ -2694,6 +2697,83 @@
++@@ -2694,6 +2697,122 @@
 + 	return internal_io_service_match_property_table(service, matching, matchingCnt, matches);
 + }
 + 
 ++/* PICASSO_SERVICE_TRACE_BEGIN */
 ++#if DEVELOPMENT || DEBUG
 ++/* No iterator consumption or serialized user-data logging. Counters are per
-++ * process name and operation, shared across restarts, with at most 12 pairs. */
+++ * process name and operation, shared across restarts, with at most 24 begin/end pairs. */
 ++struct picasso_service_trace {
 ++	unsigned ticket, operation;
 ++	int pid;
@@ -3383,6 +3383,41 @@ new file mode 100644
 ++	OSObject *object = dict ? dict->getObject(key) : NULL;
 ++	OSString *text = OSDynamicCast(OSString, object);
 ++	picasso_trace_text(out, size, text ? text->getCStringNoCopy() : object ? "<non-string>" : NULL);
+++}
+++/* Repeated missing-camera lookups can consume the first twelve samples.
+++ * Keep twelve further distinct bounded labels per name/operation. A single
+++ * try-lock never waits, allocates, or touches an iterator/RPC result. */
+++static unsigned
+++picasso_trace_late_ticket(unsigned name, unsigned operation, unsigned type,
+++    const char *provider, const char *match, const char *resource, const char *detail)
+++{
+++	struct signature { unsigned type; char text[4][64]; };
+++	struct budget { unsigned lock, count; signature seen[12]; };
+++	static budget budgets[5][4];
+++	budget *b = &budgets[name][operation];
+++	unsigned expected = 0;
+++	if (!__atomic_compare_exchange_n(&b->lock, &expected, 1, false,
+++	    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
+++	const char *text[] = {provider, match, resource, detail};
+++	unsigned ticket = 0;
+++	for (unsigned i = 0; i < b->count; ++i) {
+++		bool same = b->seen[i].type == type;
+++		for (unsigned j = 0; j < 4 && same; ++j) {
+++			same = strcmp(b->seen[i].text[j], text[j]) == 0;
+++		}
+++		if (same) goto out;
+++	}
+++	if (b->count < 12) {
+++		signature *s = &b->seen[b->count];
+++		s->type = type;
+++		for (unsigned j = 0; j < 4; ++j) {
+++			picasso_trace_text(s->text[j], sizeof(s->text[j]), text[j]);
+++		}
+++		ticket = 13 + b->count++;
+++	}
+++out:
+++	__atomic_store_n(&b->lock, 0, __ATOMIC_RELEASE);
+++	return ticket;
 ++}
 ++static picasso_service_trace
 ++picasso_service_begin(unsigned operation, OSDictionary *dict, const char *detail, unsigned type)
@@ -3405,14 +3440,18 @@ new file mode 100644
 ++				break;
 ++			}
 ++		}
-++		if (!trace.ticket) return trace;
-++		trace.operation = operation; trace.pid = pid;
-++		trace.tid = thread_tid(current_thread()); trace.name = names[index];
 ++		char provider[64], match[64], resource[64], extra[64];
 ++		picasso_trace_property(dict, "IOProviderClass", provider, sizeof(provider));
 ++		picasso_trace_property(dict, "IONameMatch", match, sizeof(match));
 ++		picasso_trace_property(dict, "IOResourceMatch", resource, sizeof(resource));
 ++		picasso_trace_text(extra, sizeof(extra), detail);
+++		if (!trace.ticket) {
+++			trace.ticket = picasso_trace_late_ticket(index, operation, type,
+++			    provider, match, resource, extra);
+++		}
+++		if (!trace.ticket) return trace;
+++		trace.operation = operation; trace.pid = pid;
+++		trace.tid = thread_tid(current_thread()); trace.name = names[index];
 ++		/* Each formatted line fits the console's 256-byte buffer, even with
 ++		 * all four matching values at their maximum length. */
 ++		printf("PICASSO_IOKIT begin op=%u sample=%u pid=%d name=%s thread=%llu type=%u\n",
@@ -3662,3 +3701,27 @@ new file mode 100644
 + 	}
 + 	if (fdp->fd_rdir == olddp) {
 + 		old_rvp = olddp;
+
+diff --git a/patches/xnu/picasso-timebase-microtime.patch b/patches/xnu/picasso-timebase-microtime.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/picasso-timebase-microtime.patch
+@@ -0,0 +1,18 @@
++--- a/osfmk/arm/rtclock.c
+++++ b/osfmk/arm/rtclock.c
++@@ -468,7 +468,12 @@
++ 	*secs = t64 = abstime / rtclock_sec_divisor;
++ 	abstime -= (t64 * rtclock_sec_divisor);
++-
+++
++-	*microsecs = (uint32_t)(abstime / rtclock_usec_divisor);
+++	/* Native counters need not have an integral number of ticks per usec.
+++	 * At 19.2 MHz, dividing by floor(19.2) produces usecs above 999999 and
+++	 * makes the timestamp go backwards at each second boundary. Scale the
+++	 * subsecond remainder instead; it is below the u32 second divisor, so
+++	 * its u64 product with USEC_PER_SEC cannot overflow. */
+++	*microsecs = (clock_usec_t)((abstime * USEC_PER_SEC) / rtclock_sec_divisor);
++ }
++-
+++
++ void

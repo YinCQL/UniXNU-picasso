@@ -126,6 +126,12 @@ jobs:
           python3 scripts/check-picasso-data-artifacts.py --tree out/picasso/tree --work out/picasso \
             --output out/picasso/logs/data-artifacts.json
 
+      - name: Check native counter microtime conversion
+        run: |
+          python3 scripts/check-picasso-microtime.py --xnu "$UNIXNU_TREE/.cache/xnu-work" \
+            --output out/picasso/host-checks/microtime
+          cp out/picasso/host-checks/microtime/results.json out/picasso/logs/microtime-host-check.json
+
       - name: Verify software AES provider against the original class ABI
         run: |
           python3 scripts/check-picasso-aes-artifacts.py --tree out/picasso/tree --work out/picasso \

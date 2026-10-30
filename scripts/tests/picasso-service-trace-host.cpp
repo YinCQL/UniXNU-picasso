@@ -13,7 +13,10 @@
 #ifdef _MSC_VER
 #include <intrin.h>
 #define __ATOMIC_RELAXED 0
+#define __ATOMIC_ACQUIRE 2
+#define __ATOMIC_RELEASE 3
 #define __atomic_load_n(p,o) ((unsigned)_InterlockedCompareExchange((volatile long *)(p),0,0))
+#define __atomic_store_n(p,v,o) ((void)_InterlockedExchange((volatile long *)(p),(long)(v)))
 static bool host_compare(unsigned *p, unsigned *expected, unsigned desired) {
     unsigned actual = (unsigned)_InterlockedCompareExchange((volatile long *)p, (long)desired, (long)*expected);
     if (actual == *expected) return true;
@@ -88,9 +91,9 @@ int main(int argc, char **argv) {
             }
         });
         for (auto &t : workers) t.join();
-        assert(lines == 960); contains("sample=12"); assert(output.find("sample=13") == std::string::npos);
+        assert(lines == 1040); contains("sample=13"); assert(output.find("sample=14") == std::string::npos);
         for (const char *name : {"backboardd", "SpringBoard", "mediaserverd", "audiomxd", "CommCenter"}) for (unsigned op = 0; op < 4; ++op) {
-            for (unsigned sample = 1; sample <= 12; ++sample) {
+            for (unsigned sample = 1; sample <= 13; ++sample) {
                 std::string key = "op=" + std::to_string(op) + " sample=" + std::to_string(sample) + " pid=115 name=" + name + " ";
                 size_t at=0;
                 for(unsigned n=0;n<4;++n){at=output.find(key,at);assert(at!=std::string::npos);++at;}
@@ -130,6 +133,53 @@ int main(int argc, char **argv) {
         picasso_trace_text(nullptr, 0, bounded_source);
         text[0] = 'X'; picasso_trace_text(text, 1, bounded_source); assert(!text[0]);
         assert(!lines && !dict.reads);
+    } else if (scenario == 7) {
+        process_name = "mediaserverd";
+        OSString camera("AppleH16CamIn"); dict = {&camera, nullptr, nullptr};
+        // Early retries exhaust the general quota. Further equal labels use
+        // only one late slot, leaving room for the next startup dependencies.
+        for (unsigned i = 0; i < 100; ++i) {
+            auto trace = picasso_service_begin(0, &dict, nullptr, 0);
+            picasso_service_end(trace, 0xe00002f0U, 0xe00002f0U, false);
+        }
+        assert(lines == 52);
+        for (const char *name : {"AppleH13CamIn", "AppleH10CamIn", "IOAudioEngine", "IOSurfaceRoot"}) {
+            OSString next(name); dict.provider = &next;
+            auto trace = picasso_service_begin(0, &dict, nullptr, 0);
+            assert(trace.ticket >= 14 && trace.ticket <= 17);
+            picasso_service_end(trace, 0, 0, true);
+        }
+        contains("provider=IOAudioEngine"); contains("provider=IOSurfaceRoot");
+        assert(lines == 68);
+        // Client type is part of the signature. The table copies the labels
+        // and retains no caller-owned string or dictionary pointer.
+        dict.provider = &camera;
+        auto typed = picasso_service_begin(0, &dict, nullptr, 1);
+        assert(typed.ticket == 18); picasso_service_end(typed, 0, 0, true);
+        for (unsigned i = 0; i < 100; ++i) {
+            std::string name = "Dependency" + std::to_string(i);
+            OSString next(name.c_str()); dict.provider = &next;
+            auto trace = picasso_service_begin(0, &dict, nullptr, 0);
+            picasso_service_end(trace, 0, 0, true);
+        }
+        assert(lines == 96); contains("sample=24");
+        assert(output.find("sample=25") == std::string::npos);
+    } else if (scenario == 8) {
+        std::vector<std::thread> workers;
+        for (unsigned t = 0; t < 40; ++t) workers.emplace_back([t]() {
+            const char *names[]={"backboardd","SpringBoard","mediaserverd","audiomxd","CommCenter"};
+            process_name = names[t % 5]; thread_id = t + 100;
+            for (unsigned i = 0; i < 100; ++i) {
+                std::string text = "Dependency" + std::to_string(t * 100 + i);
+                for (unsigned op = 0; op < 4; ++op) {
+                    auto trace = picasso_service_begin(op, nullptr, text.c_str(), i);
+                    picasso_service_end(trace, 0, 0, true);
+                }
+            }
+        });
+        for (auto &t : workers) t.join();
+        assert(lines == 1920); contains("sample=24");
+        assert(output.find("sample=25") == std::string::npos);
     } else assert(false);
     unsigned newlines = 0; for (char c : output) if (c == '\n') ++newlines;
     assert(newlines == lines);

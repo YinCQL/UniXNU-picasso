@@ -1,5 +1,8 @@
 # Build82: CommCenter startup and offline launch policy
 
+For the newer build84 manual-interruption capture and microtime conversion
+repair, see [the build84 investigation](build84-startup-investigation.md).
+
 The latest capture is `picasso-windows-20261030-140559-341.log`. The user
 reports an automatic device reboot. The preserved snapshot is
 `out/build82-reboot-20261030/capture.log`, 161,695 bytes, SHA256
