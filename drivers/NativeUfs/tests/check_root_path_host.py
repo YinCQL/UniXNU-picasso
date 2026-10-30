@@ -13,7 +13,7 @@ args=parser.parse_args()
 source=Path(__file__).resolve().parent
 out=args.output.resolve();out.mkdir(parents=True,exist_ok=True)
 openssl=args.openssl_prefix or Path(subprocess.check_output(['brew','--prefix','openssl@3'],text=True).strip())
-for name in ('RootLayout','RootWindowRead','RootDiagnostics','RootPublication'):
+for name in ('RootLayout','RootWindowRead','RootVerifiedCache','RootDiagnostics','RootPublication'):
     binary=out/name
     command=['clang++','-std=c++17','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-g',str(source/(name+'.cpp')),'-o',str(binary)]
     if name=='RootLayout':command+=['-I',str(openssl/'include'),'-L',str(openssl/'lib'),'-lcrypto']

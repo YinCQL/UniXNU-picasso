@@ -1389,6 +1389,7 @@ class NativeUfsBlock : public IOBlockStorageDevice {
   uint32_t verifiedRecordBytes = 0;
   vm_offset_t verifiedStorage = 0;
   vm_size_t verifiedStorageBytes = 0;
+  UfsVerifiedRecordCache verifiedCache = {};
   bool configureVerification ();
 #endif
 public:
@@ -1546,6 +1547,7 @@ static constexpr uint32_t kEmbeddedAuthRecordBytes = 128 * 1024;
 
 bool NativeUfsBlock::configureVerification ()
 {
+  verifiedCache = {};
   gRootDiagnostic.stage = "policy selection";
   gRootDiagnostic.windowBytes = bytes;
   gRootDiagnostic.policyCount = verified_root_policy_count;
@@ -2002,6 +2004,7 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
     const vr_view *view;
     uint32_t recordBytes;
+    UfsVerifiedReadStats *stats;
 #endif
     void lock () { IOLockLock (mutex); }
     void unlock () { IOLockUnlock (mutex); }
@@ -2009,7 +2012,9 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
       uint64_t t0 = timerTicks ();
       IOReturn r = hostRead4k (0, lba, blocks, out);
-      __atomic_fetch_add (&native_ufs_read_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
+      uint64_t elapsed = timerTicks () - t0;
+      stats->readTicks += elapsed;
+      __atomic_fetch_add (&native_ufs_read_ticks, elapsed, __ATOMIC_RELAXED);
 #else
       IOReturn r = hostRead4k (0, lba, blocks, out);
 #endif
@@ -2021,7 +2026,9 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
       bool verifiedRecord = verifyEmbeddedRecord (
         view, recordBytes, index, data, length
       );
-      __atomic_fetch_add (&native_ufs_verify_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
+      uint64_t elapsed = timerTicks () - t0;
+      stats->verifyTicks += elapsed;
+      __atomic_fetch_add (&native_ufs_verify_ticks, elapsed, __ATOMIC_RELAXED);
       if (!verifiedRecord) {
         gRootDiagnostic.stage = "read block integrity";
         gRootDiagnostic.verify = VR_BLOCK;
@@ -2042,13 +2049,20 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     }
   } operations = { windowLock, buffer
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
-    , &verified, verifiedRecordBytes
+    , &verified, verifiedRecordBytes, &verifiedCache.stats
 #endif
   };
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+  UfsVerifiedReadStats report = {};
   UfsWindowResult outcome = ufsReadVerifiedRecords (
-    operations, absolute, bytes, block, count, bounce, verifiedRecordBytes
+    operations, absolute, bytes, block, count, bounce, verifiedRecordBytes, verifiedCache, &report
   );
+  if (report.requests) {
+    IOLog ("NATIVE_UFS_CACHE window=%s requests=%llu requested_bytes=%llu hits=%llu misses=%llu read_bytes=%llu\n",
+           label, report.requests, report.requestedBytes, report.hits, report.misses, report.readBytes);
+    IOLog ("NATIVE_UFS_CACHE time window=%s requests=%llu read_ticks=%llu verify_ticks=%llu\n",
+           label, report.requests, report.readTicks, report.verifyTicks);
+  }
 #else
   UfsWindowResult outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounce);
 #endif
@@ -2066,6 +2080,7 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
 void NativeUfsBlock::free ()
 {
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+  verifiedCache = {};
   if (verifiedStorage) {
     kmem_free (kernel_map, verifiedStorage, verifiedStorageBytes);
     verifiedStorage = 0;

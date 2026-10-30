@@ -227,7 +227,7 @@ kernel_args = [
   # background poller and UFS probe. This is long enough for the host tty to
   # attach and issue status/reboot-fastboot; everything in this window pets the
   # watchdog, and the boot continues automatically when it expires.
-  "picasso_usb_control_ms=60000",
+  "picasso_usb_control_ms=10000",
   # The XNU CDC panic/reset path uses PSHOLD as its final fallback and arms the
   # IMEM Fastboot reason before either panic or command reset.
   "picasso_usb_reset=pshold",
