@@ -32,6 +32,7 @@ extern "C" bool native_legacy_prepare_scanout(void);
 extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
 extern "C" void native_legacy_retirement_observed(IOService *);
+extern "C" void native_legacy_retirement_failed(IOService *);
 // Display refresh tick (boot-arg sheng-vsync=<Hz>, 0 or absent: off). The original family sends the compositor's vsync message (type 5)
 // through native_legacy_vsync_notify, the unchanged original sender, but only a platform subclass calls it from the panel's vblank and
 // that subclass is not part of this port: without it the render server never saw a vsync. The GOP scanout has no vblank interrupt, so a
@@ -304,7 +305,7 @@ public:
     void finishTransfer(const OriginalLegacySwapRequest *request) {
         // Only after the real copy and store barrier: select the actual pending head and let the unchanged family release it and wake
         // waiters. This reports memory scanout completion, not a panel vblank or hardware fence.
-        if(!retireSwap(request))return;
+        if(!retireSwap(request)){native_legacy_retirement_failed(this);return;}
         // The unchanged family has retired this generation and released its current reference. Permit the next independently validated
         // single pending frame. Keep the latch set while completion can reenter this method, and whenever retirement remains disabled.
         transferred=false;

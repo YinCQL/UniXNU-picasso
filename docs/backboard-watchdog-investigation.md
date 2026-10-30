@@ -1,5 +1,8 @@
 # Userspace watchdog after AES startup
 
+For build80's Apple logo and the expanded bounded service descriptions, see
+[the keystore-state investigation](keystore-state-investigation.md).
+
 Build 76's service-exit diagnostics identify a missing standalone Objective-C
 library. See [the SystemOS union investigation](objc-trampolines-investigation.md)
 for the current change and validation limits. The build-75 work below is historical.

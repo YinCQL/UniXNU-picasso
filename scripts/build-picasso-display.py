@@ -195,6 +195,11 @@ def verify_kernel(aes, native, original, kernel, plan, audit):
                     for e in plan['extents']), 'Display alias outside retained original component ' + name)
     for name in ('_native_legacy_display_probe', '_native_legacy_display_late_probe'):
         require(name in symbols, 'Missing display lifecycle ' + name)
+    for name in ('_picasso_keystore_probe', '_picasso_aks_state_enabled', '_picasso_aks_observed',
+                 '_native_keyevents_allocate', '__GLOBAL__sub_I_NativeKeyStoreEvents.cpp',
+                 '__ZN13AppleKeyStore10gMetaClassE', '__ZN23AppleKeyStoreUserClient10gMetaClassE'):
+        require(name in symbols, 'Missing state-service lifecycle ' + name)
+    require('com.apple.driver.AppleSEPKeyStore' not in plan['components'], 'Conflicting original keystore')
     return dict(kernel_sha256=sha(kernel), virtual_slots=358, owned_entries=OWNED, local_methods=len(local), runtime_qualified=False)
 
 
@@ -204,6 +209,10 @@ def main():
     device = Path(os.environ['UNIXNU_DEVICE']).resolve()
     board = tomllib.loads((device / 'board.toml').read_text())
     require(board['kernel']['prelink']['kernelcache_sha256'] == ORIGINAL_SHA, 'Wrong configured original')
+    require(board['ipsw']['product'] == 'iPad7,1' and board['ipsw']['build'] == '21H461', 'Unqualified state-query ABI')
+    require(board['payload']['adt'].get('packed_data_ramdisk') is True and
+            not board['payload']['adt'].get('persistent_data') and
+            'picasso-aks-state=1' in board['payload']['kernel_args'], 'State service requires explicit RAM Data policy')
     original = Path(os.environ['UNIXNU_KERNELCACHE']).read_bytes()
     slots, aliases, names = qualify(native, original, int(board['kernel']['prelink']['slide'], 0))
     out = ROOT / 'build/native-legacy-display'
@@ -213,7 +222,8 @@ def main():
     generated.write_text(header((source_dir / 'OriginalLegacyFramebufferBase.h.in').read_text()))
     record = json.loads((ROOT / platform.RECORD).read_text().strip().rstrip(','))
     objects = []
-    sources = [source_dir / 'NativeLegacyDisplay.cpp', ROOT / 'kits/picasso/PicassoDisplay.cpp']
+    sources = [source_dir / 'NativeLegacyDisplay.cpp', ROOT / 'kits/picasso/PicassoDisplay.cpp',
+               ROOT / 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp', ROOT / 'kits/picasso/PicassoKeyStore.cpp']
     audit = None
     for source in sources:
         obj = out / (source.stem + '.o')
@@ -222,10 +232,11 @@ def main():
         if source.stem == 'NativeLegacyDisplay':
             audit = audit_object(platform, native, obj, slots, aliases, names)
             platform.write_json(out / 'object-audit.json', audit)
-            late = out / 'NativeLegacyDisplay.late.o'
+        if source.stem in ('NativeLegacyDisplay', 'NativeKeyStoreEvents'):
+            late = out / (source.stem + '.late.o')
             objcopy = shutil.which('llvm-objcopy')
             require(objcopy, 'llvm-objcopy required')
-            platform.make_late(obj, late, native, objcopy, '__GLOBAL__sub_I_NativeLegacyDisplay.cpp')
+            platform.make_late(obj, late, native, objcopy, '__GLOBAL__sub_I_' + source.name)
             objects.append(late)
         else:
             objects.append(obj)

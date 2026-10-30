@@ -14,6 +14,7 @@
 extern "C" {
 extern kmod_info_t g_kernel_kmod_info;
 void native_legacy_display_static_init(void) __asm__("__GLOBAL__sub_I_NativeLegacyDisplay.cpp");
+void picasso_keystore_probe(void);
 IOService *native_legacy_display_allocate(void);
 kern_return_t OSKextLoadKextWithIdentifier(const char *);
 }
@@ -22,7 +23,7 @@ static IOService *pendingDisplay;
 static IOService *activeDisplay;
 static IOPlatformDevice *activeNub;
 static bool initialized, screenReleased;
-static unsigned reportCounts[12];
+static unsigned reportCounts[12][2];
 static IORegistryEntry *displayChosen;
 static bool scaleAdded, rotationAdded;
 
@@ -36,12 +37,12 @@ static unsigned takeReport(unsigned *counter) {
 }
 
 // Bounded per-event output, including failures, without logging every frame.
-static void report(unsigned event, uint64_t a, uint64_t b, uint64_t c) {
+static void report(unsigned event, uint64_t a, uint64_t b, uint64_t c, bool failed = false) {
     if (event >= 12) return;
-    unsigned sample = takeReport(&reportCounts[event]);
+    unsigned sample = takeReport(&reportCounts[event][failed ? 1 : 0]);
     if (!sample) return;
-    IOLog("PICASSO_DISPLAY event=%u sample=%u a=%llx b=%llx c=%llx\n",
-        event, sample, a, b, c);
+    IOLog("PICASSO_DISPLAY event=%u sample=%u a=%llx b=%llx c=%llx failure=%u\n",
+        event, sample, a, b, c, failed);
 }
 
 extern "C" bool native_legacy_prepare_scanout(void) {
@@ -63,13 +64,13 @@ extern "C" void native_legacy_registration_observed(IOService *display) {
 }
 extern "C" void native_legacy_client_enter(task_t, uint32_t type) { report(3, type, 0, 0); }
 extern "C" void native_legacy_client_observed(IOReturn status, IOUserClient *client) {
-    report(4, status, client != nullptr, 0);
+    report(4, status, client != nullptr, 0, status != kIOReturnSuccess);
 }
 extern "C" void native_legacy_pm_observed(unsigned stage, IOReturn status, unsigned long state) {
-    report(5, stage, status, state);
+    report(5, stage, status, state, status != kIOReturnSuccess);
 }
 extern "C" void native_legacy_swap_validation_observed(bool ok, unsigned reason, const void *, const void *) {
-    report(6, ok, reason, 0);
+    report(6, ok, reason, 0, !ok);
 }
 extern "C" void native_legacy_surface_rejected(uint64_t width, uint64_t height, uint32_t format,
     uint32_t planes, uint64_t stride, uint64_t allocation, uint64_t length) {
@@ -77,7 +78,8 @@ extern "C" void native_legacy_surface_rejected(uint64_t width, uint64_t height, 
     if (takeReport(&count)) IOLog("PICASSO_DISPLAY surface rejected width=%llu height=%llu format=%x planes=%u stride=%llu allocation=%llu length=%llu\n",
         width, height, format, planes, stride, allocation, length);
 }
-extern "C" void native_legacy_transfer_observed(IOReturn status, const void *, uint64_t bytes) { report(7, status, bytes, 0); }
+extern "C" void native_legacy_transfer_observed(IOReturn status, const void *, uint64_t bytes) { report(7, status, bytes, 0, status != kIOReturnSuccess); }
+extern "C" void native_legacy_retirement_failed(IOService *) { report(9, 0, 0, 0, true); }
 extern "C" void native_legacy_retirement_observed(IOService *) { report(9, 1, 0, 0); }
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t bytes) { report(10, ticks, bytes, 0); }
 extern "C" void native_legacy_vsync_observed(unsigned event, unsigned hz) { report(11, event, hz, 0); }
@@ -144,6 +146,7 @@ extern "C" void native_legacy_display_probe(void) {
 }
 
 extern "C" void native_legacy_display_late_probe(void) {
+    picasso_keystore_probe();
     IOService *display = pendingDisplay;
     if (!display) return;
     pendingDisplay = nullptr;

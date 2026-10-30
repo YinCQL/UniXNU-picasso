@@ -1871,7 +1871,7 @@ diff --git a/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch b/patches/xnu/z
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
-@@ -0,0 +1,1677 @@
+@@ -0,0 +1,1711 @@
 +diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 +--- a/bsd/vfs/vfs_syscalls.c
 ++++ b/bsd/vfs/vfs_syscalls.c
@@ -2318,7 +2318,7 @@ new file mode 100644
 + 
 + #if SYSV_SHM
 + #include <sys/shm_internal.h>   /* shmexit */
-+@@ -1359,6 +1364,203 @@
++@@ -1359,6 +1364,237 @@
 + 
 + #define OS_REASON_TOTAL_USER_FAULTS_PER_PROC  5
 + 
@@ -2494,23 +2494,57 @@ new file mode 100644
 ++
 ++/* PICASSO_SERVICE_EXIT_BEGIN */
 ++static void
+++picasso_service_description(proc_t p, int rv, unsigned ticket)
+++{
+++	const char *source = NULL;
+++	uint32_t available = 0;
+++	os_reason_t reason = p->p_exit_reason;
+++	if (reason && reason->osr_kcd_buf && reason->osr_bufsize) {
+++		kcdata_iter_t iter = kcdata_iter(reason->osr_kcd_buf, reason->osr_bufsize);
+++		if (kcdata_iter_valid(iter) && kcdata_iter_type(iter) == KCDATA_BUFFER_BEGIN_OS_REASON) {
+++			iter = kcdata_iter_find_type(iter, EXIT_REASON_USER_DESC);
+++			if (kcdata_iter_valid(iter)) {
+++				source = (const char *)kcdata_iter_payload(iter);
+++				available = kcdata_iter_size(iter);
+++			}
+++		}
+++	}
+++	/* Bound reads by the actual description item, even if it has no NUL.
+++	 * Split output into short lines so the console formatter cannot lose the
+++	 * vital-task name after the watchdog's common 160-byte prefix. */
+++	uint32_t limit = available < 960 ? available : 960;
+++	uint32_t length = 0;
+++	while (length < limit && source[length]) ++length;
+++	for (uint32_t offset = 0; offset < length || offset == 0; offset += 160) {
+++		char part[161] = {0};
+++		uint32_t bytes = length - offset;
+++		if (bytes > 160) bytes = 160;
+++		if (bytes) memcpy(part, source + offset, bytes);
+++		picasso_fault_printable(part, sizeof(part));
+++		if (!offset) {
+++			printf("PICASSO_SERVICE exit sample=%u pid=%d name=%s rv=%x status=%d description_bytes=%u capped=%u description=%.160s\n",
+++			    ticket, proc_getpid(p), p->p_name, (unsigned)rv, WEXITSTATUS(rv), length,
+++			    length == limit && available > limit, part);
+++		} else {
+++			printf("PICASSO_SERVICE description sample=%u pid=%d name=%s offset=%u text=%.160s\n",
+++			    ticket, proc_getpid(p), p->p_name, offset, part);
+++		}
+++	}
+++}
+++
+++static void
 ++picasso_report_service_exit(proc_t p, int rv)
 ++{
 ++	static const char * const names[] = {
 ++		"backboardd", "SpringBoard", "mediaserverd", "audiomxd",
-++		"CommCenter", "powerd", "mobiletimerd"
+++		"CommCenter", "powerd", "mobiletimerd", "liveactivitiesd"
 ++	};
-++	static unsigned counts[7];
-++	for (unsigned index = 0; index < 7; ++index) {
+++	static unsigned counts[8];
+++	for (unsigned index = 0; index < 8; ++index) {
 ++		if (strncmp(p->p_name, names[index], sizeof(p->p_name))) continue;
 ++		unsigned ticket = picasso_pid1_trace_ticket(&counts[index], 4);
 ++		if (!ticket) return;
-++		char description[161] = {0};
-++		const char *source = p->p_exit_reason ? exit_reason_get_string_desc(p->p_exit_reason) : NULL;
-++		if (source) snprintf(description, sizeof(description), "%.160s", source);
-++		picasso_fault_printable(description, sizeof(description));
-++		printf("PICASSO_SERVICE exit sample=%u pid=%d name=%s rv=%x status=%d description=%.160s\n",
-++		    ticket, proc_getpid(p), names[index], (unsigned)rv, WEXITSTATUS(rv), description);
+++		picasso_service_description(p, rv, ticket);
 ++		picasso_report_user_fault(p, rv, ticket, "SERVICE");
 ++		return;
 ++	}
@@ -2522,7 +2556,7 @@ new file mode 100644
 + static int
 + abort_with_payload_internal(proc_t p,
 +     uint32_t reason_namespace, uint64_t reason_code,
-+@@ -1368,6 +1570,22 @@
++@@ -1368,6 +1604,22 @@
 + {
 + 	os_reason_t exit_reason = OS_REASON_NULL;
 + 	kern_return_t kr = KERN_SUCCESS;
@@ -2545,7 +2579,7 @@ new file mode 100644
 + 
 + 	if (internal_flags & OS_REASON_IFLAG_USER_FAULT) {
 + 		uint32_t old_value = atomic_load_explicit(&p->p_user_faults,
-+@@ -1375,13 +1593,13 @@
++@@ -1375,13 +1627,13 @@
 + 
 + #if DEVELOPMENT || DEBUG
 + 		if (bootarg_disable_user_faults) {
@@ -2561,7 +2595,7 @@ new file mode 100644
 + 			}
 + 			// this reloads the value in old_value
 + 			if (atomic_compare_exchange_strong_explicit(&p->p_user_faults,
-+@@ -1422,16 +1640,17 @@
++@@ -1422,16 +1674,17 @@
 + 
 + 	switch (kr) {
 + 	case KERN_SUCCESS:
@@ -2585,7 +2619,7 @@ new file mode 100644
 + 
 + int
 + abort_with_payload(struct proc *cur_proc, struct abort_with_payload_args *args,
-+@@ -1820,6 +2039,15 @@
++@@ -1820,6 +2073,15 @@
 + static void
 + proc_handle_critical_exit(proc_t p, int rv)
 + {
@@ -2601,7 +2635,7 @@ new file mode 100644
 + 	if (!proc_should_trigger_panic(p, rv)) {
 + 		// No panic, bail out
 + 		return;
-+@@ -1834,6 +2062,9 @@
++@@ -1834,6 +2096,9 @@
 + 	}
 + #endif /* DEVELOPMENT */
 + 
@@ -2611,7 +2645,7 @@ new file mode 100644
 + 	char *exit_reason_desc = exit_reason_get_string_desc(p->p_exit_reason);
 + 
 + 	if (p->p_exit_reason == OS_REASON_NULL) {
-+@@ -1901,6 +2132,12 @@
++@@ -1901,6 +2166,12 @@
 + 	boot_progress_exit(proc_getpid(p),p->p_name,rv,
 + 	    p->p_exit_reason ? p->p_exit_reason->osr_namespace : 0,
 + 	    p->p_exit_reason ? p->p_exit_reason->osr_code : 0);

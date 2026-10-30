@@ -39,11 +39,17 @@ def check(tree, work, kernelcache, output):
     builder.require(platform.initializer_state(directory / 'NativeLegacyDisplay.o', native, initializer, True) ==
                     platform.initializer_state(directory / 'NativeLegacyDisplay.late.o', native, initializer, False),
                     'Late conversion changed display instructions')
+    initializer = '__GLOBAL__sub_I_NativeKeyStoreEvents.cpp'
+    builder.require(platform.initializer_state(directory / 'NativeKeyStoreEvents.o', native, initializer, True) ==
+                    platform.initializer_state(directory / 'NativeKeyStoreEvents.late.o', native, initializer, False),
+                    'Late conversion changed state-service instructions')
     archive = directory / 'libNativeLegacyDisplay.late.a'
     builder.require(builder.sha(archive.read_bytes()) == build['archive_sha256'], 'Stale display archive')
     for name in build['members']:
         member = subprocess.check_output(['llvm-ar', 'p', str(archive), name])
         builder.require(member == (directory / name).read_bytes(), 'Stale display archive member ' + name)
+    builder.require(set(build['members']) == {'NativeLegacyDisplay.late.o', 'PicassoDisplay.o',
+        'NativeKeyStoreEvents.late.o', 'PicassoKeyStore.o', 'original-bindings.o'}, 'Wrong display/state archive members')
     kernel = work / 'kernel/kernel.macho'
     plan = json.loads(kernel.with_suffix('.json').read_text())
     report = builder.verify_kernel(aes, native, original, kernel.read_bytes(), plan, audit)

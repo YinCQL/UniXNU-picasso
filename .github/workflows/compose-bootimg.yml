@@ -62,6 +62,11 @@ jobs:
           mkdir -p out/picasso/logs
           cp out/picasso/host-checks/data/results.json out/picasso/logs/data-host-check.json
 
+      - name: Check ephemeral keystore state boundaries
+        run: |
+          python3 scripts/check-picasso-keystore.py --output out/picasso/host-checks/keystore
+          cp out/picasso/host-checks/keystore/results.json out/picasso/logs/keystore-host-check.json
+
       - name: Install host tools and check the SDK
         run: |
           # lld is a separate Homebrew formula now; the llvm bottle no longer

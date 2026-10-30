@@ -1,5 +1,11 @@
 # Missing main CADisplay after build79
 
+Build80 has now passed the full SDK display build and shows real CPU copies and
+retirement on the phone. The user sees an Apple logo and manually disconnects
+the capture. See [the keystore-state investigation](keystore-state-investigation.md)
+for this newer evidence and the current repair. The build79 account below is
+the earlier checkpoint.
+
 The user supplied `picasso-windows-20261030-091846-628.log` and confirmed that
 the latest image rebooted automatically. The shared-read snapshot is preserved
 at `out/display-gop-20261030/capture.log` (129,349 bytes, SHA-256

@@ -232,6 +232,8 @@ kernel_args = [
   "offline-legacy-validate=1",
   "offline-legacy-transfer=1",
   "offline-legacy-cpu-present=1",
+  # State queries only for unprotected RAM Data; no keybag/key operations.
+  "picasso-aks-state=1",
   # Software refresh notifications only; panel timing remains firmware-owned.
   "sheng-vsync=60",
 ]
