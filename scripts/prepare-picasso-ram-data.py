@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a volatile APFS Data seed from the unchanged 21H461 OS (macOS/root).
+"""Prepare a volatile APFS Data seed from the unchanged iPhone X OS (macOS/root).
 
 Copies original private/var, adds empty runtime directories and the board's
 explicit offline launch policy. The original OS remains mounted read-only.
@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tomllib
 import uuid
+from picasso_target import OS_SHA256, LAUNCHD_SHA256, BUILD
 
 
 # build81 exhausted APFS transaction headroom in the 256 MiB logical volume.
@@ -28,8 +29,6 @@ DATA_BYTES = 512 * 1024**2
 PAGE = 4096
 MAX_PACKED = 4 * 1024**2
 MAX_LOGICAL = 2 * 1024**3  # Larger disks select the persistent-store driver path.
-OS_SHA256 = '3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d'
-LAUNCHD_SHA256 = '8cec9a3c44a443b08e977ccc5d577850316ad428c575dc01f09b018dbd5b6a25'
 DATA_UUID_KEY = 'CONFIG_XNU_OWNER_DATA_VOLUME_UUID'
 OFFLINE_POLICY_DIR = 'db/com.apple.xpc.launchd'
 DIRECTORIES = (
@@ -211,8 +210,9 @@ def offline_policy_contents(jobs):
         return {}
     return {
         'disabled.plist': plistlib.dumps({job: True for job in jobs}, fmt=plistlib.FMT_XML),
-        # The original 21H461 loader uses this marker to select its modern
-        # override database instead of migrating the legacy overrides.
+        # The previously qualified 21H461 loader uses this marker to select its
+        # modern override database. The 20H392 loader still needs qualification;
+        # the migration build gate remains closed while that work is pending.
         'disabled.migrated': b'',
     }
 
@@ -381,7 +381,7 @@ def prepare(tree, source, output, config):
     packer_path = tree / 'drivers/DarwinBoot/Test/packed_ramdisk.py'
     pack = runpy.run_path(str(packer_path))['pack']
     if sha256(source) != OS_SHA256:
-        raise ValueError('Original 21H461 OS image SHA256 mismatch')
+        raise ValueError(f'Original {BUILD} OS image SHA256 mismatch')
     output.mkdir(parents=True, exist_ok=False)
     image = output / 'data.cdr'
     packed = output / 'data.dbrdisk'

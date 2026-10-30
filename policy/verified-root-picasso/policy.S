@@ -18,9 +18,9 @@ _verified_root_systemos_manifest:
 .globl _verified_root_policies
 _verified_root_policies:
 .quad _verified_root_os_manifest
-.quad 1484352
+.quad 1376320
 .quad _verified_root_systemos_manifest
-.quad 806944
+.quad 670240
 .balign 8
 .globl _verified_root_policy_count
 _verified_root_policy_count:

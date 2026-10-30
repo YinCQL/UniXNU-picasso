@@ -74,6 +74,8 @@ def main():
     board_args += ['--unique-chip-id', '1', '--trust-cache']
     if adt.get('ipad_identity'):
         board_args += ['--ipad-identity']
+    if adt.get('iphone_identity'):
+        board_args += ['--iphone-identity']
     results = []
     for name, extra in [('minimal', []), ('board', board_args),
                         ('board-with-data', board_args + ['--packed-data-ramdisk'])]:

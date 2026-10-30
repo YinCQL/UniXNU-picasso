@@ -1,10 +1,10 @@
 {
   "schema": "picasso-verified-root-policy-v1",
   "root_image": {
-    "name": "_userdata-root.img",
-    "bytes": 9382658048,
-    "sha256": "fd43ee7035ce185ce4215ac93fdc006fd784a54b3b7442e21457c226cbe03093",
-    "manifest_sha256": "bc908a6cf66491055077798550660f40128bfe6dce2fdc0db56e6af96511208d"
+    "name": "userdata-root.img",
+    "bytes": 8380219392,
+    "sha256": "2c2aca3feb7585c91b80ec6b50cc1888ac9315f4c77d981566de5dd902eabefa",
+    "manifest_sha256": "6d7ac29abd2a32e8a378728c27e6ddf9884efe5f2e5c876f45b4d17a248f40b9"
   },
   "trust": {
     "algorithm": "RSA3072-PKCS1v1.5-SHA256",
@@ -15,50 +15,50 @@
   },
   "windows": [
     {
-      "image_bytes": 6077580800,
+      "image_bytes": 5635081728,
       "auth_record_bytes": 131072,
-      "block_count": 46369,
-      "volume_uuid": "04769D26-2CA0-4825-B443-E2E5F88300F2",
+      "block_count": 42993,
+      "volume_uuid": "DADD93F8-DBBF-4B17-A1DF-0F11E64172F7",
       "generation": 1,
-      "image_sha256": "e5634d04a8ac35f024845f583394e0a35deb26a04cb0c00286a8674e25a9a4f2",
-      "hash_table_sha256": "bf35b66f98e49d859f75bc1b6910fb6150b1e726a740d798e6ddff61984a2fc8",
-      "signed_header_signature_sha256": "ffd4f26baa8bafa886a5feaa57db9437dd331de5b8471b17fffc9e10f23853bd",
+      "image_sha256": "6e87bfcaa8eca952e00b719f333d1f1060715a63566112267ad8730e1ed98906",
+      "hash_table_sha256": "589ffbe502b6c706c880dd20aac09697ee881398293f6dcaf79afb0122db3f01",
+      "signed_header_signature_sha256": "82f8f41c77749b881a786b43a1dc3c7d2e92b72466f02c8c12e0c04523490438",
       "header_signature_bytes": 544,
-      "manifest_bytes": 1484352,
+      "manifest_bytes": 1376320,
       "openssl_signature_verified": true,
       "name": "OS",
       "offset": 1048576,
-      "size": 6077580800,
-      "manifest_sha256": "8bc305e2cd92081d24048254647e8dc34fa1315811203ff5d78b774204629a4c"
+      "size": 5635081728,
+      "manifest_sha256": "ea790d344b4823654ec32795790155d45d864ae2aa4a2a855c0b38b0e5d170f7"
     },
     {
-      "image_bytes": 3303014400,
+      "image_bytes": 2743074816,
       "auth_record_bytes": 131072,
-      "block_count": 25200,
-      "volume_uuid": "8846FE78-2910-4297-AF97-D59BB6F8FC16",
+      "block_count": 20928,
+      "volume_uuid": "96096B28-B6DC-4BC7-9D3A-2632A0FE53F1",
       "generation": 1,
-      "image_sha256": "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f",
-      "hash_table_sha256": "493f5c1f302ac4fa98eac2ac47744e2a0555926f864c80ab2ddc14a128a2a430",
-      "signed_header_signature_sha256": "83676ff4932cc48453e497c5eb3fc695a67c6ca050c138ae6ddc59d37ae06561",
+      "image_sha256": "9cd738f3b0169055549df84ad6d8d13e50a2da39af618ce0522ca4e06df86849",
+      "hash_table_sha256": "7389d79051d6b7958200e7a1c551d309c43b4e21c800eb2641759288612347dd",
+      "signed_header_signature_sha256": "dfa17f025457d75f6344f262be220f0a4942ab17615101fa4b507e253efdb20f",
       "header_signature_bytes": 544,
-      "manifest_bytes": 806944,
+      "manifest_bytes": 670240,
       "openssl_signature_verified": true,
       "name": "SystemOS",
-      "offset": 6079643648,
-      "size": 3303014400,
-      "manifest_sha256": "179663ff55de975c1e8510e1b6a7d56a6a9924b45bd434b6ee9120d1d4471d7d"
+      "offset": 5637144576,
+      "size": 2743074816,
+      "manifest_sha256": "0933f17be6a4a7917c261fa9664ad97d976c7af4275ffad1fd0402e48330b174"
     }
   ],
   "kernel_embedded": {
     "auth_record_bytes": 131072,
     "bytes_per_window": {
-      "OS": 1484352,
-      "SystemOS": 806944
+      "OS": 1376320,
+      "SystemOS": 670240
     },
     "hash_tables_embedded": true,
     "runtime_scan_required": false
   },
-  "policy_assembly_sha256": "7155c8880d63fadf2c2b5aefd85bb89abe5bc8ad739d24718cb1dc66a327d4dc",
+  "policy_assembly_sha256": "411a085bd889faf0a7986204fe310834ca8f11c15e843dcea4cf9e9c7d549ff6",
   "policy_object_sha256": null,
   "root_image_modified": false,
   "partition_write_operations": false,

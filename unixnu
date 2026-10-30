@@ -58,6 +58,17 @@ def prepare(device=DEVICE, source=None):
 
 
 def main():
+    # Stop before preparing/building a mixed Darwin 23/iOS 16 artifact. Fetch,
+    # defconfig and direct ADT/input checks remain available for migration work.
+    # All build forms include implicit/default steps (for example `build -j 4`
+    # and `build all`), and prelink alone can reuse stale Darwin 23 objects.
+    if sys.argv[1:2] and sys.argv[1] in ('build', 'kernel', 'payload', 'prelink', 'bootimg'):
+        sys.path.insert(0, str(DEVICE / 'scripts'))
+        from picasso_target import require_build_ready
+        try:
+            require_build_ready()
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
     tree = prepare()
     if sys.argv[1:] == ['--prepare']:
         print(tree)

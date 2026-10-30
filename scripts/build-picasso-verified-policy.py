@@ -12,17 +12,18 @@ emits a Mach-O data object. It never writes the root image or a partition.
 """
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
 import stat
 import struct
 import subprocess
 import tempfile
 import uuid
+from picasso_target import ROOT_IMAGE_SHA256, ROOT_WINDOWS
 
 
 HEADER_BYTES = 160
@@ -30,25 +31,8 @@ SIGNATURE_BYTES = 384
 KEY_BYTES = 395
 BLOCK_BYTES = 4096
 AUTH_RECORD_BYTES = 128 * 1024
-KNOWN_ROOT_IMAGE_SHA256 = (
-    'fd43ee7035ce185ce4215ac93fdc006fd784a54b3b7442e21457c226cbe03093'
-)
-ROLES = (
-    {
-        'name': 'OS',
-        'directory': 'os',
-        'volume_uuid': uuid.UUID('04769D26-2CA0-4825-B443-E2E5F88300F2'),
-        'size': 6077580800,
-        'sha256': 'e5634d04a8ac35f024845f583394e0a35deb26a04cb0c00286a8674e25a9a4f2',
-    },
-    {
-        'name': 'SystemOS',
-        'directory': 'systemos',
-        'volume_uuid': uuid.UUID('8846FE78-2910-4297-AF97-D59BB6F8FC16'),
-        'size': 3303014400,
-        'sha256': 'b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f',
-    },
-)
+KNOWN_ROOT_IMAGE_SHA256 = ROOT_IMAGE_SHA256
+ROLES = tuple(dict(role, volume_uuid=uuid.UUID(role['volume_uuid'])) for role in ROOT_WINDOWS)
 
 
 def find_tree_root():
@@ -82,7 +66,7 @@ def parse_args():
     parser.add_argument('--image', type=Path, default=default_image(),
                         help='exact userdata-root.img; defaults to the existing build output')
     parser.add_argument('--output', type=Path, default=ROOT / 'build/verified-root-picasso',
-                        help='ignored policy/audit output')
+                        help='new policy/audit directory; existing outputs are retained')
     parser.add_argument('--keys', type=Path, default=ROOT / 'build/verified-root-host/keys',
                         help='ignored RSA owner key directory')
     parser.add_argument('--verified-root', type=Path, default=ROOT / 'kits/VerifiedRoot',
@@ -109,6 +93,14 @@ def regular_file(path, label):
         raise SystemExit(f'{label} does not exist: {path}')
     if not stat.S_ISREG(mode):
         raise SystemExit(f'{label} must be a regular file: {path}')
+
+
+@contextmanager
+def retained_staging(parent, name):
+    # Signing failures are evidence. Keep the staging directory on failure;
+    # success renames it to the new output directory without deleting a tree.
+    staging = Path(tempfile.mkdtemp(prefix=name + '.', dir=parent))
+    yield staging
 
 
 def parse_root_manifest(image):
@@ -344,6 +336,8 @@ def main():
     output = args.output.expanduser().resolve()
     keys = args.keys.expanduser().resolve()
     verified_root = args.verified_root.expanduser().resolve()
+    if output.exists():
+        raise SystemExit('Policy output already exists; use a new directory and retain the previous policy')
     regular_file(image, 'root image')
     regular_file(verified_root / 'tools/manifest.py', 'VerifiedRoot signer')
 
@@ -365,7 +359,7 @@ def main():
         raise SystemExit('the owner public key did not encode as a 395-byte VerifiedRoot anchor')
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=output.name + '.', dir=output.parent) as temporary:
+    with retained_staging(output.parent, output.name) as temporary:
         staging = Path(temporary)
         records = []
         role_files = []
@@ -391,20 +385,7 @@ def main():
                 role_files.append(expected['directory'])
         anchor_path = staging / 'trusted-key.bin'
         anchor_path.write_bytes(anchor)
-        # Regenerating into a committed tree must not delete files this tool does
-        # not own: policy/verified-root-picasso/ also carries its README. Replace
-        # only the generated payload, then drop anything stale that the previous
-        # run wrote.
-        staged = sorted(staging.iterdir())
-        output.mkdir(parents=True, exist_ok=True)
-        for entry in staged:
-            destination = output / entry.name
-            if destination.is_dir():
-                shutil.rmtree(destination)
-            elif destination.exists():
-                destination.unlink()
-            shutil.move(str(entry), str(destination))
-        staging.rmdir()
+        staging.rename(output)
 
     final_roles = [
         (role, output / role / 'manifest.bin',
@@ -420,12 +401,10 @@ def main():
     # object is built by scripts/build-arm-driver.py on the machine that links the
     # kernel. --skip-object makes that split explicit for host-agnostic runs.
     if args.skip_object:
-        if object_path.exists():
-            object_path.unlink()
         print('policy object skipped (--skip-object): the kernel build compiles policy.S', flush=True)
     else:
         subprocess.run(
-            ['xcrun', 'clang', '-target', 'arm64-apple-ios17.0',
+            ['xcrun', 'clang', '-target', 'arm64-apple-ios16.0',
              '-c', str(assembly.name), '-o', str(object_path)],
             cwd=str(assembly.parent), check=True,
         )

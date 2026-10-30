@@ -8,21 +8,26 @@ soc = "SM7250"
 description = "Redmi K30 5G"
 kit = "picasso"
 
-# Target OS image. PLACEHOLDER   select an IPSW whose ARM version is compatible with
-# SM7250 (ARMv8.2 / Cortex-A76). Only needed for the kernel step, not for firmware.
+# iPhone X firmware target. This migration branch is not yet build-ready:
+# the retained source patches and native ABI bindings still target Darwin 23.
+# See docs/iphone-x-migration.md before building a kernel or payload.
 [ipsw]
-# Same unchanged iPad7,1 iPadOS 17.7.11 image uke (SM7675) and sheng (SM8550) use.
-# SM7250 (ARMv8.2 / Cortex-A76) is instruction-compatible with this kernel source.
-url = "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
-product = "iPad7,1"
-version = "17.7.11"
-build = "21H461"
-device_class = "j120ap"
-chip_id = 0x8011
-board_id = 12
+url = "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
+product = "iPhone10,3"
+version = "16.7.16"
+build = "20H392"
+device_class = "d22ap"
+chip_id = 0x8015
+board_id = 0x06
 fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache"]
 
 [ipsw.sha256]
+"087-86698-044.dmg" = "80f426d5b8fca8552f95be427434f1911dbb4c2c6d28aad94f2426ddd0c92483"
+"087-86593-047.dmg" = "9cd738f3b0169055549df84ad6d8d13e50a2da39af618ce0522ca4e06df86849"
+"kernelcache.release.iphone10b" = "2d6a13d040aaf87cec09bb6906d43e9bd8cea951e43d1aa1cd62707dfdc5aaec"
+"DeviceTree.d22ap.im4p" = "480e8b0888949b4128b7aa2cd254497581c69e1bafa596a760b2fa955a8a6368"
+"087-86698-044.dmg.trustcache" = "63e01c03b31e1532a5581a24865490673f0b5c297b0199fe0095637c6100ef4b"
+"087-86593-047.dmg.trustcache" = "9cc478fe3525e2683b5b9ea1eea0851eaebebdab21d206556233400e59d2e361"
 
 # UserData partition geometry (GPT entry "userdata" of LUN 0).
 # Measured on this device: "fastboot getvar partition-size:userdata" =
@@ -78,9 +83,9 @@ archives = [
 # to the real native watchdog class before the kernel enters the FAT payload.
 tool = "scripts/prelink-picasso.py"
 kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
-kernelcache_sha256 = "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7"
+kernelcache_sha256 = "2ec297bac95bcba01046fd0148e97e7e5885c05a6c18827f39f534ba375c1221"
 slide = "-0x1000000"
-early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
+# early_security_init must be recovered from 20H392; the old 21H461 VA is invalid.
 roots = [
   "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib",
   "com.apple.driver.AppleARMPlatform",
@@ -315,7 +320,7 @@ panic_screen = false
 # and has no original Apple hashes to check userspace binaries against. The
 # allow-list below pins the exact bundle this board accepts, so a mismatched or
 # substituted input fails the payload step instead of booting.
-trust_cache_sha256 = ["7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7"]
+trust_cache_sha256 = ["eb1475f643f45a974ebd40596f6e2b1cdf40205d2ca3c6094d774886099399c3"]
 
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"
@@ -323,18 +328,14 @@ chip_id = "7250"
 # DarwinBoot passes only packed nonzero pages; NativeRamBlock allocates pages
 # as needed. The seed is volatile and /chosen/ephemeral-storage remains enabled.
 packed_data_ramdisk = true
-# Declare an iPad-class device: /model iPad7,1, /target-type J120, the J120 panel
-# artwork in /product, no Home button in /buttons, and the dev-board security
-# tuple in /chosen (certificate-security-mode 1). The original AMFI reads that
-# tuple to choose its code-signing trust policy for the platform; under the
-# production policy it rejects the adhoc-signed userspace with "unsuitable CT
-# policy 0", which is the stage 5 blocker. sheng and hummer run the same values
-# on hardware against the same 21H461 userspace.
-ipad_identity = true
+# Matching iPhone X identity from the original d22ap ADT and MobileGestalt guide.
+# Root compatible remains Qualcomm/Picasso; artwork uses phone/2436/3/P3.
+# The existing dev-board security tuple is preserved; no key/activation stubs.
+iphone_identity = true
 # Select the authenticated OS APFS volume by its published IOMedia UUID. The
 # VerifiedRoot window identity check independently binds this UUID to the
 # owner-signed image before the block device is published.
-root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
+root_match_volume_uuid = "DADD93F8-DBBF-4B17-A1DF-0F11E64172F7"
 # Build77 reaches Jetsam VM-page shortage with the old 256 MiB window.
 # Request 768 MiB of real contiguous conventional memory for XNU and volatile
 # Data. DarwinBoot must allocate the entire range before setting boot_args;

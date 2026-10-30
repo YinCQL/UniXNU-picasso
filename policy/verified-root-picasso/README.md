@@ -1,62 +1,45 @@
-# policy/verified-root-picasso/
+# iPhone X root policy
 
-The qualified VerifiedRoot policy tree for picasso. **This is a build input, not
-a build product.** It is committed because it cannot be regenerated in CI:
+This is the host-verified signed policy for the 20H392 migration branch.
+It is a build input, but the Darwin 22 port is incomplete and builds are gated.
+See [the migration status](../../docs/iphone-x-migration.md).
 
 | Property | Value |
 | --- | --- |
-| Root image | the 21H461 `userdata-root.img`, SHA-256 `fd43ee70...03093` |
-| Size | 9,382,658,048 bytes (8.74 GiB) |
-| Windows | `OS` 6,077,580,800 B, `SystemOS` 3,303,014,400 B |
-| Volume UUIDs | `04769D26-2CA0-4825-B443-E2E5F88300F2` (OS), `8846FE78-2910-4297-AF97-D59BB6F8FC16` (SystemOS) |
-| Auth record | 128 KiB, SHA-256 per record |
-| Records | 46,369 (OS) + 25,200 (SystemOS) |
-| Signatures | RSA-3072 PKCS#1 v1.5 SHA-256, one per window |
-| Total | 4.38 MiB / 15 generated files |
+| Root image SHA256 | `2c2aca3feb7585c91b80ec6b50cc1888ac9315f4c77d981566de5dd902eabefa` |
+| Image bytes | 8,380,219,392 |
+| OS whole disk | 5,635,081,728 bytes, including original GPT |
+| SystemOS | 2,743,074,816 bytes |
+| OS UUID | `DADD93F8-DBBF-4B17-A1DF-0F11E64172F7` |
+| SystemOS UUID | `96096B28-B6DC-4BC7-9D3A-2632A0FE53F1` |
+| Authentication record | 128 KiB, SHA256 |
+| Records | 42,993 (OS) + 20,928 (SystemOS) |
+| Signatures | RSA-3072 PKCS#1 v1.5 SHA256, independently verified with OpenSSL |
+| Owner anchor | Existing key retained; SHA256 `68c19aa4796e89fb48e0cc2f8243131fe23d31d3cf59554f7298a6cf8882e704` |
 
-Regenerating it needs the 8.74 GiB root image **and the owner private key that
-signed it** (the anchor in `trusted-key.bin` is that key's public half). A fresh
-key produces a different anchor, so a regenerated tree will not match any
-manifest that was already qualified.
+The Windows reconstruction checks the original UDIF block CRCs and rereads
+all output windows. Native hdiutil comparison, SDK compilation and device
+root authentication remain pending. The attestation correctly records
+`hardware_tested: false`, `boot_root_authenticated: false`, and no policy object.
+The unchanged Apple images and private key are not committed.
 
-## Layout
+`policy.S` embeds the public anchor and the two complete manifests with relative
+`.incbin` paths. Each manifest contains a 160-byte header, 384-byte signature and
+ordered SHA256 table. Split headers, signatures and hash tables are retained
+for independent checking. `scripts/check-picasso-target.py` pins both complete
+signed manifests and verifies the split files and target identity.
 
-```
-policy.S                     the assembly that embeds the blobs below
-trusted-key.bin              the 395-byte owner anchor (public key)
-os/manifest.bin              160 B header + 384 B signature + 46,369 x 32 B hashes
-os/hashes.bin                the 1,483,808-byte hash table alone
-os/{header,signature,header-signature}.bin   the signed pieces, kept for audit
-systemos/...                 the same five files for SystemOS
-attestation.json             what was checked, by what, and the digests
-```
+`scripts/build-arm-driver.py NativeUfs` takes the device policy directory first,
+then the assembled-tree policy, then `build/verified-root-picasso`. A scratch
+policy does not override a present device policy. The build compiles `policy.S`
+from this directory so the relative paths stay valid.
 
-`.incbin` operands in `policy.S` are **relative to this directory**, so the tree
-keeps working after a checkout on any machine. `scripts/build-arm-driver.py`
-assembles it with this directory as the working directory.
+Regenerate into a **new** directory with `scripts/build-picasso-verified-policy.py`
+and the exact root image and existing owner key. On Windows use `--skip-object`.
+Existing outputs are rejected, and failed staging directories are retained.
+After validation, back up the previous policy and copy the generated files into
+this directory; keep this README. Do not hand-edit signed artifacts.
 
-## Consumers
-
-- `scripts/build-arm-driver.py NativeUfs` — reads this tree first
-  (`POLICY_COMMITTED`), and falls back to `build/verified-root-picasso/` so a
-  developer regeneration still takes effect locally.
-- `scripts/build-picasso-verified-policy.py` — regenerates the tree. Run it with
-  `--output policy/verified-root-picasso` to refresh the committed copy, and
-  `--skip-object` on a host without the Apple cross toolchain (the object is
-  built by `build-arm-driver.py` when the kernel links). Regeneration replaces
-  only the generated payload and keeps this README.
-
-## Rules
-
-- **Never commit the owner private key.** It lives in
-  `build/verified-root-host/keys/owner.pem` on the build host; `build/` is
-  ignored. Losing it means no future tree can extend this anchor.
-- **Never hand-edit** `policy.S`, `*.bin` or `attestation.json`.
-  `build-arm-driver.py` refuses a tree whose `policy.S` digest disagrees with
-  `attestation.json`, so an edit fails the build rather than weakening the check.
-- The attestation records `hardware_tested: false` and
-  `boot_root_authenticated: false`; the policy was signed and self-verified, but
-  a real boot against it still has to be observed on device.
-- Produced on Windows from the retail 21H461 IPSW: the LZFSE chunks of the OS
-  disk image decode with the `lzfse` PyPI wheel, so the generator no longer
-  needs a macOS host for the hashing and signing half.
+The previous 21H461 policy is retained in local evidence at
+`out/iphone-x-migration-20261031/policy-before/` and in Git history.
+The owner private key stays in ignored `build/verified-root-host/keys/owner.pem`.

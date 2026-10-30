@@ -129,8 +129,11 @@ def main():
     parser.add_argument('--unique-chip-id', type=lambda value: int(value, 16), default=None,
                         help='/chosen/unique-chip-id (8 bytes) and --chip-id (4 bytes) seed XNU IOPlatformUUID; software identity seeds, not Apple silicon IDs')
     parser.add_argument('--chip-id', type=lambda value: int(value, 16), default=None)
-    parser.add_argument('--ipad-identity', action='store_true',
+    identity_options = parser.add_mutually_exclusive_group()
+    identity_options.add_argument('--ipad-identity', action='store_true',
                         help='/product and /buttons describe an iPad-class device without a Home button (MobileGestalt reads these from the tree)')
+    identity_options.add_argument('--iphone-identity', action='store_true',
+                                  help='iPhone10,3 / D22 / iPhone X identity for the matching iOS userland')
     parser.add_argument('--cpu-regs', default='0',
                         help='Comma-separated CPU MPIDR affinity values (the /cpus reg of each core); the first is the running boot CPU. '
                              'SM7250 numbers its cores 0x000..0x700 in Affinity1. More than one adds /psci')
@@ -165,15 +168,13 @@ def main():
                                    ('device_type', b'cpu\0'), ('compatible', b'arm,cortex-a76\0'),
                                    ('timebase-frequency', struct.pack('<I', TIMEBASE))])
             for index, reg in enumerate(cpu_regs)]
-    # hw.product/hw.machine come from the root 'model'/'target-type'. Both are
-    # read by IODTPlatformExpert and end up in MobileGestalt, so the iPad identity
-    # has to replace them together with the /chosen security status below: AMFI
-    # derives its code-signing trust policy for the platform from that status, and
-    # an adhoc-signed userspace binary (launchd) is only accepted under the
-    # dev-board policy that the iPad identity declares.
+    # The guide requires a matching root model, target and product family.
+    # Keep Qualcomm compatible strings: D22AP there would match Apple hardware
+    # drivers. These properties do not replace the OS or qualify a kernel ABI.
+    apple_identity = args.ipad_identity or args.iphone_identity
     identity = [
-        ('model', b'iPad7,1\0' if args.ipad_identity else b'picasso-first-boot\0'),
-        *([('target-type', b'J120\0')] if args.ipad_identity else []),
+        ('model', b'iPhone10,3\0' if args.iphone_identity else b'iPad7,1\0' if args.ipad_identity else b'picasso-first-boot\0'),
+        *([('target-type', b'D22\0' if args.iphone_identity else b'J120\0')] if apple_identity else []),
     ]
     tree = node('device-tree', [
         *identity,
@@ -199,7 +200,10 @@ def main():
                         *([('certificate-production-status', struct.pack('<I', 0)),
                            ('effective-production-status-ap', struct.pack('<I', 0)),
                            ('certificate-security-mode', struct.pack('<I', 1)),
-                           ('effective-security-mode-sep', struct.pack('<I', 1))] if args.ipad_identity else []),
+                           ('effective-security-mode-sep', struct.pack('<I', 1))] if apple_identity else []),
+                        # Firmware has a placeholder 0; the selected phone artwork
+                        # uses 3. This is not the physical scanout stride or size.
+                        *([('display-scale', struct.pack('<I', 3))] if args.iphone_identity else []),
                         # This property describes the actual volatile Data RAM disk.
                         *([('ephemeral-storage', struct.pack('<I', 1))] if (args.data_ramdisk or args.packed_data_ramdisk) else []),
                         *( [('darwinboot-memory-size', struct.pack('<Q', args.owned_memory_size))]
@@ -230,25 +234,22 @@ def main():
         # Suspend/resume is not implemented for this board. Block CPU parking.
         node('defaults', [('sleep-disabled', struct.pack('<I', 1))]),
         node('options', []),
-        # J120 has no Home button; MobileGestalt reads that from here. Without the
-        # node an iPad identity still advertises a Home button and the userspace
-        # gesture model does not match the panel.
+        # The selected port gesture model has no Home button. Publish only
+        # Picasso's three buttons; do not invent the iPhone's ringer switch.
         *([node('buttons', [('compatible', b'buttons\0'), ('device_type', b'buttons\0'),
                             ('button-names', b'hold\0voldown\0volup\0'),
-                            ('home-button-type', struct.pack('<I', 2))])] if args.ipad_identity else []),
-        # The original AppleImage4 panics without a product node. Under the iPad
-        # identity this node is what MobileGestalt reports as the hardware: the
-        # artwork fields describe the J120 panel (2732x2048 class, P3, scale 2) so
-        # UIKit and the audio routing database pick iPad behaviour, and
-        # compatible-device-fallback keeps a known device for lookups that use it.
-        node('product', [('product-name', b'iPad Pro (12.9-inch) (2nd generation)\0' if args.ipad_identity else b'Redmi K30 5G\0'),
+                            ('home-button-type', struct.pack('<I', 2))])] if apple_identity else []),
+        # Artwork values come from the original d22ap product node. The native
+        # display still needs separate logical-geometry/ABI qualification.
+        node('product', [('product-name', b'iPhone X\0' if args.iphone_identity else b'iPad Pro (12.9-inch) (2nd generation)\0' if args.ipad_identity else b'Redmi K30 5G\0'),
                          ('model', b'xiaomi,picasso\0'),
-                         *([('product-description', b'iPad Pro (12.9-inch) (2nd generation)\0'),
-                            ('artwork-device-idiom', b'pad\0'),
-                            ('artwork-device-subtype', struct.pack('<I', 2732)),
-                            ('artwork-scale-factor', struct.pack('<I', 2)),
+                         *([('product-description', b'iPhone X\0' if args.iphone_identity else b'iPad Pro (12.9-inch) (2nd generation)\0'),
+                            ('artwork-device-idiom', b'phone\0' if args.iphone_identity else b'pad\0'),
+                            ('artwork-device-subtype', struct.pack('<I', 2436 if args.iphone_identity else 2732)),
+                            ('artwork-scale-factor', struct.pack('<I', 3 if args.iphone_identity else 2)),
                             ('artwork-display-gamut', b'P3\0'),
-                            ('compatible-device-fallback', b'iPad6,7\0')] if args.ipad_identity else [])]),
+                            ('compatible-device-fallback', b'iPhone9,2\0' if args.iphone_identity else b'iPad6,7\0')] if apple_identity else []),
+                         *([('thin-bezel', struct.pack('<I', 1))] if args.iphone_identity else [])]),
         node('pram', [('reg', struct.pack('<2Q', PANIC_LOG_PADDR, PANIC_LOG_SIZE))]),
         node('arm-io', [('device_type', b'arm-io\0'),
                         ('#address-cells', struct.pack('<I', 2)),

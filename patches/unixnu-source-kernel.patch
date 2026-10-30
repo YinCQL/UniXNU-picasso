@@ -3861,3 +3861,15 @@ new file mode 100644
 +-
 ++
 + void
+diff --git a/scripts/unixnu/payload.py b/scripts/unixnu/payload.py
+--- a/scripts/unixnu/payload.py
++++ b/scripts/unixnu/payload.py
+@@ -161,6 +161,8 @@
+         command.append('--gpu-addon')
+     if adt.get('ipad_identity'):
+         command.append('--ipad-identity')
++    if adt.get('iphone_identity'):
++        command.append('--iphone-identity')
+     if data and adt.get('persistent_data'):
+         command.append('--persistent-data')
+     # Fixups of signed text (patches/xnu/native-text-fixup.patch) travel in /chosen/text-fixups, outside the 1000-byte command line.
