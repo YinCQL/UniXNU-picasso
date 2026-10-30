@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Check iPhone X userland configuration and the retained Darwin 23 backend.
 
---require-build-ready fails while cross-version userspace qualification remains
-incomplete. Input/ADT checks alone do not qualify a boot image.
+Input errors stop the build. Runtime validation is reported separately so SDK
+compilation and artifact checks can proceed; this does not qualify a boot image.
 """
 import argparse
 import hashlib
@@ -115,21 +115,22 @@ def main():
     parser.add_argument('--ipsw', type=Path)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--github-env', type=Path)
-    parser.add_argument('--require-build-ready', action='store_true')
+    parser.add_argument('--require-build-inputs', '--require-build-ready', action='store_true',
+                        help='check build inputs (the old option name remains an alias; runtime validation is separate)')
     args = parser.parse_args()
     check_board()
     if args.ipsw:
         check_ipsw(args.ipsw)
-    report = dict(input_configuration_valid=True, product=target.PRODUCT, version=target.VERSION,
+    report = dict(input_configuration_valid=True, build_inputs_valid=True,
+                  product=target.PRODUCT, version=target.VERSION,
                   build=target.BUILD, retail_firmware_darwin=22, kernel_darwin=23,
-                  backend_build=target.BACKEND_IPSW['build'], build_ready=False,
-                  blockers=target.BUILD_BLOCKERS, ipsw_checked=args.ipsw is not None)
+                  backend_build=target.BACKEND_IPSW['build'], runtime_qualified=False,
+                  pending_runtime_validation=target.RUNTIME_VALIDATION_PENDING,
+                  ipsw_checked=args.ipsw is not None)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open('x', encoding='utf-8') as stream:
             json.dump(report, stream, indent=2); stream.write('\n')
-    if args.require_build_ready:
-        target.require_build_ready()
     if args.github_env:
         values = dict(PICASSO_IPSW_FILE=target.FILENAME, PICASSO_IPSW_URL=target.URL,
                       PICASSO_IPSW_BUILD=target.BUILD, PICASSO_OS_MEMBER=target.OS_MEMBER,

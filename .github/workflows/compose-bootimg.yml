@@ -8,6 +8,7 @@ name: Compose Boot Image (FD + kernel + payload)
 #
 # Produces boot.img ready for "fastboot boot" (or "fastboot flash boot" when the
 # payload is sized to fit the boot partition).
+# iPhone userland is experimental; successful composition is not runtime qualification.
 
 on:
   workflow_dispatch:
@@ -38,13 +39,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check iPhone X migration readiness
+      - name: Check iPhone X inputs and retained kernel backend
         run: |
-          python3 scripts/check-picasso-target.py --require-build-ready \
+          python3 scripts/check-picasso-target.py --require-build-inputs \
             --output out/picasso/logs/target-readiness.json --github-env "$GITHUB_ENV"
 
       - name: Check generated picasso ADT timer binding
         run: python3 scripts/check-picasso-adt.py --output out/picasso/logs/adt-host-check
+
+      - name: Check root input verifier failure paths
+        run: |
+          python3 scripts/check-picasso-root-inputs-host.py --output out/picasso/host-checks/root-inputs
+          cp out/picasso/host-checks/root-inputs/results.json out/picasso/logs/root-inputs-host.json
 
       - name: Verify firmware volume and DTB are present
         run: |
@@ -106,8 +112,14 @@ jobs:
         run: |
           mkdir -p out/picasso/logs
           TREE=$(python3 ./unixnu --prepare)
-          python3 ./unixnu ipsw fetch OS StaticTrustCache Cryptex1,SystemTrustCache 2>&1 | tee out/picasso/logs/actions-ipsw.log
+          python3 ./unixnu ipsw fetch OS Cryptex1,SystemOS StaticTrustCache Cryptex1,SystemTrustCache 2>&1 | tee out/picasso/logs/actions-ipsw.log
           python3 scripts/prepare-original-trust.py --tree "$TREE" --inputs "out/ipsw/$PICASSO_IPSW_BUILD" --output out/picasso/original-static-system.bundle 2>&1 | tee out/picasso/logs/actions-trust.log
+
+      - name: Verify native macOS root disks against the signed policy
+        run: |
+          sudo "$(command -v python3)" scripts/check-picasso-root-inputs.py \
+            --inputs "out/ipsw/$PICASSO_IPSW_BUILD" \
+            --output out/picasso/logs/root-inputs.json
 
       - name: Prepare the retained Darwin 23 native kext donor
         run: |

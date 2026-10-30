@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import tomllib
 
 from importlib.util import module_from_spec, spec_from_file_location
 
@@ -22,6 +23,9 @@ def check(tree, work, kernelcache, output):
     native = load(tree / 'kits/NativePrelink/native_prelink.py')
     directory = tree / 'build/native-legacy-display'
     build = json.loads((directory / 'build-report.json').read_text())
+    board = tomllib.loads((Path(__file__).resolve().parents[1] / 'board.toml').read_text(encoding='utf-8'))
+    profile = builder.build_profile(board)
+    builder.require(build.get('build_profile') == profile, 'Display build profile differs from the selected inputs')
     builder.require(build['complete'], 'Incomplete display build')
     for name, digest in build['source_sha256'].items():
         builder.require(builder.sha((tree / name).read_bytes()) == digest, 'Stale display source ' + name)
@@ -56,7 +60,8 @@ def check(tree, work, kernelcache, output):
     config = (work / '.config').read_text()
     builder.require(config.splitlines().count('CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y') == 1, 'Display disabled in actual config')
     builder.require('CONFIG_XNU_NATIVE_ADRENO=y' not in config, 'Unexpected GPU configuration')
-    report.update(scope='Actual SDK build and final linked dispatch; runtime not qualified', archive_sha256=build['archive_sha256'])
+    report.update(scope='Actual SDK build and final linked dispatch; runtime not qualified',
+                  archive_sha256=build['archive_sha256'], build_profile=profile)
     output.write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
 

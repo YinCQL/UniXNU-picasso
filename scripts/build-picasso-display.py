@@ -14,6 +14,7 @@ import shutil
 import struct
 import tempfile
 import tomllib
+import picasso_target as target
 
 ROOT = Path(__file__).resolve().parents[1]
 ORIGINAL_SHA = 'f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7'
@@ -203,16 +204,33 @@ def verify_kernel(aes, native, original, kernel, plan, audit):
     return dict(kernel_sha256=sha(kernel), virtual_slots=358, owned_entries=OWNED, local_methods=len(local), runtime_qualified=False)
 
 
+def build_profile(board):
+    # Pin the two independent inputs. The retained native ABI is qualified
+    # below against its original bytes; compiling this selected userland does
+    # not imply that its runtime calls have been qualified on a phone.
+    require(board['kernel']['prelink']['kernelcache_sha256'] == ORIGINAL_SHA,
+            'Wrong configured original')
+    require(board['kernel']['prelink']['ipsw'] == target.BACKEND_IPSW,
+            'Wrong native display backend')
+    require(all(board['ipsw'].get(k) == v for k, v in dict(
+        product=target.PRODUCT, version=target.VERSION, build=target.BUILD,
+        device_class=target.DEVICE_CLASS, chip_id=target.CHIP_ID, board_id=target.BOARD_ID).items()),
+        'Unsupported display/state userland profile')
+    require(board['payload']['adt'].get('packed_data_ramdisk') is True and
+            not board['payload']['adt'].get('persistent_data') and
+            'picasso-aks-state=1' in board['payload']['kernel_args'],
+            'State service requires explicit RAM Data policy')
+    return dict(userland_product=target.PRODUCT, userland_build=target.BUILD,
+                backend_build=target.BACKEND_IPSW['build'], runtime_qualified=False,
+                pending_runtime_validation=list(target.RUNTIME_VALIDATION_PENDING))
+
+
 def main():
     platform = load(ROOT / 'scripts/build-picasso-pmgr.py')
     native = load(ROOT / 'kits/NativePrelink/native_prelink.py')
     device = Path(os.environ['UNIXNU_DEVICE']).resolve()
     board = tomllib.loads((device / 'board.toml').read_text())
-    require(board['kernel']['prelink']['kernelcache_sha256'] == ORIGINAL_SHA, 'Wrong configured original')
-    require(board['ipsw']['product'] == 'iPad7,1' and board['ipsw']['build'] == '21H461', 'Unqualified state-query ABI')
-    require(board['payload']['adt'].get('packed_data_ramdisk') is True and
-            not board['payload']['adt'].get('persistent_data') and
-            'picasso-aks-state=1' in board['payload']['kernel_args'], 'State service requires explicit RAM Data policy')
+    profile = build_profile(board)
     original = Path(os.environ['UNIXNU_KERNELCACHE']).read_bytes()
     slots, aliases, names = qualify(native, original, int(board['kernel']['prelink']['slide'], 0))
     out = ROOT / 'build/native-legacy-display'
@@ -255,11 +273,13 @@ def main():
     platform.save_old_archive(archive)
     pending.rename(archive)
     sources += [source_dir / n for n in ('PicassoGop.h', 'NativeLegacyRequest.h', 'OriginalLegacyFramebufferBase.h.in')]
-    sources += [ROOT / 'scripts/build-picasso-display.py', ROOT / 'scripts/build-picasso-pmgr.py']
+    sources += [ROOT / 'scripts/build-picasso-display.py', ROOT / 'scripts/build-picasso-pmgr.py',
+                ROOT / 'scripts/picasso_target.py']
     platform.write_json(out / 'build-report.json', dict(complete=True, archive_sha256=sha(archive.read_bytes()),
         source_sha256={str(p.relative_to(ROOT)): sha(p.read_bytes()) for p in sources},
         generated_abi_sha256=sha(generated.read_bytes()), original_sha256=sha(original),
-        object_audit_sha256=sha((out / 'object-audit.json').read_bytes()), **members, runtime_qualified=False))
+        object_audit_sha256=sha((out / 'object-audit.json').read_bytes()), **members,
+        build_profile=profile, runtime_qualified=False))
     print('Picasso CPU display: SDK objects, original 358-slot ABI and late archive verified')
 
 

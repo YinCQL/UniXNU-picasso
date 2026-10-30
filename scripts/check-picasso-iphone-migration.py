@@ -9,6 +9,7 @@ import ast
 import copy
 import hashlib
 import importlib.util
+from importlib.machinery import SourceFileLoader
 import json
 from pathlib import Path
 import shutil
@@ -146,24 +147,70 @@ def main():
     result = subprocess.run([sys.executable, str(root / 'scripts/make-picasso-adt.py'), '--output',
                              str(out / 'conflicting.adt'), '--ipad-identity', '--iphone-identity'], capture_output=True, text=True)
     assert result.returncode != 0 and not (out / 'conflicting.adt').exists()
-    gates = []
-    for command in ([sys.executable, str(root / 'scripts/check-picasso-target.py'), '--require-build-ready'],
-                    [sys.executable, str(root / 'unixnu'), 'build', 'kernel', 'payload'],
-                    [sys.executable, str(root / 'unixnu'), 'build'],
-                    [sys.executable, str(root / 'unixnu'), 'build', 'all'],
-                    [sys.executable, str(root / 'unixnu'), 'build', '-j', '4'],
-                    [sys.executable, str(root / 'unixnu'), 'build', 'prelink'],
-                    [sys.executable, str(root / 'unixnu'), 'bootimg']):
-        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
-        assert result.returncode != 0 and 'migration is not build-ready' in result.stderr
-        gates.append(command[1:])
+    for option in ('--require-build-inputs', '--require-build-ready'):
+        env_path, report_path = out / (option[2:] + '.env'), out / (option[2:] + '.json')
+        result = subprocess.run([sys.executable, str(root / 'scripts/check-picasso-target.py'), option,
+                                 '--output', str(report_path), '--github-env', str(env_path)],
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        status = json.loads(report_path.read_text())
+        assert status['build_inputs_valid'] and status['runtime_qualified'] is False
+        assert status['pending_runtime_validation']
+        env = dict(line.split('=', 1) for line in env_path.read_text().splitlines())
+        assert env['PICASSO_IPSW_BUILD'] == '20H392' and env['PICASSO_BACKEND_BUILD'] == '21H461'
+
+    # Stop immediately at preparation: exercise the real wrapper's input check
+    # without fetching a tree, compiling an SDK kernel or touching the device.
+    loader = SourceFileLoader('migration_wrapper', str(root / 'unixnu'))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    wrapper = importlib.util.module_from_spec(spec); loader.exec_module(wrapper)
+    class ReachedPreparation(Exception): pass
+    def preparation(): raise ReachedPreparation()
+    wrapper.prepare = preparation
+    previous_argv = sys.argv
+    commands = [('build', 'kernel', 'payload'), ('build',), ('build', 'all'),
+                ('build', '-j', '4'), ('build', 'prelink'), ('bootimg',)]
+    try:
+        for command in commands:
+            sys.argv = [str(root / 'unixnu'), *command]
+            try: wrapper.main()
+            except ReachedPreparation: pass
+            else: raise AssertionError('Expected the wrapper to reach preparation')
+        fixture = out / 'wrong-backend-device'
+        (fixture / 'scripts').mkdir(parents=True)
+        shutil.copy2(root / 'scripts/check-picasso-target.py', fixture / 'scripts')
+        (fixture / 'board.toml').write_text((root / 'board.toml').read_text().replace(target.BACKEND_KERNEL_SHA256, target.KERNEL_SHA256))
+        wrapper.DEVICE = fixture
+        sys.argv = [str(root / 'unixnu'), 'build', 'kernel', 'payload']
+        try: wrapper.main()
+        except SystemExit as error: assert 'qualified 21H461' in str(error)
+        else: raise AssertionError('Wrong backend passed wrapper input check')
+    finally:
+        sys.argv = previous_argv
+
+    display = load(root / 'scripts/build-picasso-display.py')
+    profile = display.build_profile(board)
+    assert profile['userland_build'] == '20H392' and profile['runtime_qualified'] is False
+    profile_rejected = []
+    for case in ('backend', 'userland', 'persistent-data', 'missing-packed-data', 'missing-state-opt-in'):
+        bad = copy.deepcopy(board)
+        if case == 'backend': bad['kernel']['prelink']['kernelcache_sha256'] = target.KERNEL_SHA256
+        elif case == 'userland': bad['ipsw']['build'] = 'unknown'
+        elif case == 'persistent-data': bad['payload']['adt']['persistent_data'] = True
+        elif case == 'missing-packed-data': bad['payload']['adt']['packed_data_ramdisk'] = False
+        else: bad['payload']['kernel_args'].remove('picasso-aks-state=1')
+        try: display.build_profile(bad)
+        except ValueError: profile_rejected.append(case)
+        else: raise AssertionError('Invalid display/state profile accepted: ' + case)
     report = dict(passed=True, scope=__doc__, adt_cases=cases, rejected_trust_inputs=rejected,
                   rejected_policy_inputs=policy_rejected,
                   retained_backend_checks=backend_checks,
-                  conflicting_identity_rejected=True, incomplete_migration_gates=gates,
+                  conflicting_identity_rejected=True, wrapper_reaches_preparation=commands,
+                  wrong_backend_rejected_before_preparation=True,
+                  display_profile_rejections=profile_rejected, runtime_still_unqualified=True,
                   original_trust_bytes=len(bundle), payload_source_sha256=hashlib.sha256(source.encode()).hexdigest())
     (out / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
-    print('PASS: actual payload flag forwarding, phone/iPad ADTs, original trust inputs and incomplete-migration gates')
+    print('PASS: payload identity, signed inputs, build entry points and retained runtime-validation status')
 
 
 if __name__ == '__main__':

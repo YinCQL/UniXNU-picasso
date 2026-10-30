@@ -4,6 +4,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -58,16 +59,15 @@ def prepare(device=DEVICE, source=None):
 
 
 def main():
-    # Cross-version userspace checks must finish before building this target.
-    # Retaining Darwin 23 is intentional; it is not itself a build blocker.
+    # Validate concrete inputs before preparing the tree. Runtime qualification
+    # is reported separately and cannot be a prerequisite for compiling a port.
     # All build forms include implicit/default steps (for example `build -j 4`
     # and `build all`), and prelink alone can reuse stale Darwin 23 objects.
     if sys.argv[1:2] and sys.argv[1] in ('build', 'kernel', 'payload', 'prelink', 'bootimg'):
         sys.path.insert(0, str(DEVICE / 'scripts'))
-        from picasso_target import require_build_ready
         try:
-            require_build_ready()
-        except ValueError as error:
+            runpy.run_path(str(DEVICE / 'scripts/check-picasso-target.py'))['check_board'](DEVICE)
+        except (ValueError, OSError, KeyError) as error:
             raise SystemExit(str(error)) from error
     tree = prepare()
     if sys.argv[1:] == ['--prepare']:
