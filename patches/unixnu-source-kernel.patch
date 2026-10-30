@@ -1871,7 +1871,7 @@ diff --git a/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch b/patches/xnu/z
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
-@@ -0,0 +1,1754 @@
+@@ -0,0 +1,1890 @@
 +diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 +--- a/bsd/vfs/vfs_syscalls.c
 ++++ b/bsd/vfs/vfs_syscalls.c
@@ -2318,7 +2318,7 @@ new file mode 100644
 + 
 + #if SYSV_SHM
 + #include <sys/shm_internal.h>   /* shmexit */
-+@@ -1359,6 +1364,236 @@
++@@ -1359,6 +1364,260 @@
 + 
 + #define OS_REASON_TOTAL_USER_FAULTS_PER_PROC  5
 + 
@@ -2552,10 +2552,34 @@ new file mode 100644
 ++#endif
 ++/* PICASSO_USER_FAULT_END */
 ++
+++/* PICASSO_SERVICE_WAIT_BSD_BEGIN */
+++#if __arm64__ && (DEVELOPMENT || DEBUG)
+++extern void picasso_service_wait_snapshot(task_t, int, uint64_t, unsigned);
+++static void
+++picasso_report_service_wait(proc_t p, int rv)
+++{
+++	static const char * const names[] = {
+++		"backboardd", "SpringBoard", "mediaserverd", "audiomxd"
+++	};
+++	static unsigned counts[4];
+++	if (p != current_proc() || proc_task(p) != current_task() ||
+++	    !WIFSIGNALED(rv) || WTERMSIG(rv) != SIGKILL || !p->p_exit_reason ||
+++	    p->p_exit_reason->osr_namespace != OS_REASON_WATCHDOG ||
+++	    p->p_exit_reason->osr_code != 1) return;
+++	for (unsigned i = 0; i < 4; ++i) {
+++		if (strncmp(p->p_name, names[i], sizeof(p->p_name))) continue;
+++		unsigned ticket = picasso_pid1_trace_ticket(&counts[i], 2);
+++		if (ticket) picasso_service_wait_snapshot(proc_task(p), proc_getpid(p), proc_uniqueid(p), ticket);
+++		return;
+++	}
+++}
+++#endif
+++/* PICASSO_SERVICE_WAIT_BSD_END */
+++
 + static int
 + abort_with_payload_internal(proc_t p,
 +     uint32_t reason_namespace, uint64_t reason_code,
-+@@ -1368,6 +1603,22 @@
++@@ -1368,6 +1627,22 @@
 + {
 + 	os_reason_t exit_reason = OS_REASON_NULL;
 + 	kern_return_t kr = KERN_SUCCESS;
@@ -2578,7 +2602,7 @@ new file mode 100644
 + 
 + 	if (internal_flags & OS_REASON_IFLAG_USER_FAULT) {
 + 		uint32_t old_value = atomic_load_explicit(&p->p_user_faults,
-+@@ -1375,13 +1626,13 @@
++@@ -1375,13 +1650,13 @@
 + 
 + #if DEVELOPMENT || DEBUG
 + 		if (bootarg_disable_user_faults) {
@@ -2594,7 +2618,7 @@ new file mode 100644
 + 			}
 + 			// this reloads the value in old_value
 + 			if (atomic_compare_exchange_strong_explicit(&p->p_user_faults,
-+@@ -1422,16 +1673,17 @@
++@@ -1422,16 +1697,17 @@
 + 
 + 	switch (kr) {
 + 	case KERN_SUCCESS:
@@ -2618,7 +2642,7 @@ new file mode 100644
 + 
 + int
 + abort_with_payload(struct proc *cur_proc, struct abort_with_payload_args *args,
-+@@ -1820,6 +2072,15 @@
++@@ -1820,6 +2096,15 @@
 + static void
 + proc_handle_critical_exit(proc_t p, int rv)
 + {
@@ -2634,7 +2658,7 @@ new file mode 100644
 + 	if (!proc_should_trigger_panic(p, rv)) {
 + 		// No panic, bail out
 + 		return;
-+@@ -1834,6 +2095,9 @@
++@@ -1834,6 +2119,9 @@
 + 	}
 + #endif /* DEVELOPMENT */
 + 
@@ -2644,7 +2668,7 @@ new file mode 100644
 + 	char *exit_reason_desc = exit_reason_get_string_desc(p->p_exit_reason);
 + 
 + 	if (p->p_exit_reason == OS_REASON_NULL) {
-+@@ -1901,6 +2165,12 @@
++@@ -1901,6 +2189,13 @@
 + 	boot_progress_exit(proc_getpid(p),p->p_name,rv,
 + 	    p->p_exit_reason ? p->p_exit_reason->osr_namespace : 0,
 + 	    p->p_exit_reason ? p->p_exit_reason->osr_code : 0);
@@ -2652,6 +2676,7 @@ new file mode 100644
 ++/* PICASSO_SERVICE_TRACE_BEGIN */
 ++#if __arm64__ && (DEVELOPMENT || DEBUG)
 ++	picasso_report_service_exit(p, rv);
+++	picasso_report_service_wait(p, rv);
 ++#endif
 ++/* PICASSO_SERVICE_TRACE_END */
 + 
@@ -3626,6 +3651,117 @@ new file mode 100644
 + 	return err;
 + }
 + 
++diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
++--- a/osfmk/kern/task.c
+++++ b/osfmk/kern/task.c
++@@ -110,6 +110,11 @@
++ #include <kern/mach_param.h>
++ #include <kern/misc_protos.h>
++ #include <kern/task.h>
+++#if __arm64__ && (DEVELOPMENT || DEBUG)
+++#include <kern/backtrace.h>
+++#include <arm/thread.h>
+++#include <arm/proc_reg.h>
+++#endif
++ #include <kern/thread.h>
++ #include <kern/coalition.h>
++ #include <kern/zalloc.h>
++@@ -10285,3 +10290,95 @@
++ 	char *name = proc_best_name(task_get_proc_raw(task));
++ 	strlcpy(buf, name, size);
++ }
+++
+++/* PICASSO_SERVICE_WAIT_TASK_BEGIN */
+++#if __arm64__ && (DEVELOPMENT || DEBUG)
+++/* Called only by the selected watchdog victim in ordinary proc_prepareexit,
+++ * before task_terminate_internal. Never walk another live thread's user stack.
+++ * Keep task layout access here, out of the BSD translation unit. */
+++void picasso_service_wait_snapshot(task_t, int, uint64_t, unsigned);
+++
+++static errno_t
+++picasso_wait_copy(void *ctx, void *dst, user_addr_t src, size_t size)
+++{
+++	(void)ctx;
+++	/* As in sys_ulock's locked copyin, a nonzero preemption level makes
+++	 * vm_fault fail instead of paging in or waiting for VM operations.
+++	 * backtrace_user bounds the number of copies; no string/payload reads. */
+++	disable_preemption();
+++	int error = copyin(src, dst, size);
+++	enable_preemption();
+++	return error;
+++}
+++
+++void
+++picasso_service_wait_snapshot(task_t task, int pid, uint64_t uniqueid, unsigned sample)
+++{
+++	if (!task || task != current_task()) return;
+++	thread_t self = current_thread();
+++	uint64_t tid = thread_tid(self);
+++	struct {
+++		uint64_t tid;
+++		unsigned valid, state, hint;
+++	} rows[16] = {0};
+++	unsigned count = 0, total = 0, locked = 0;
+++	uint64_t main_header = 0, slide = 0;
+++	/* One try per lock. Copy scalars under locks; print only after release.
+++	 * Task lock stabilizes the queue/lifetimes. Scheduler lock protects state
+++	 * and block_hint. A busy row is explicitly invalid, never a fake wait. */
+++	if (task_lock_try(task)) {
+++		locked = 1;
+++		total = task->thread_count;
+++		main_header = task->mach_header_vm_address;
+++		slide = task->task_shared_region_slide;
+++		thread_t thread;
+++		queue_iterate(&task->threads, thread, thread_t, task_threads) {
+++			if (count == 16) break;
+++			rows[count].tid = thread_tid(thread);
+++			spl_t level = splsched();
+++			if (simple_lock_try(&thread->sched_lock, &thread_lck_grp)) {
+++				rows[count].valid = 1;
+++				rows[count].state = thread->state;
+++				if (thread->state & TH_WAIT) rows[count].hint = thread->block_hint;
+++				thread_unlock(thread);
+++			}
+++			splx(level);
+++			++count;
+++		}
+++		task_unlock(task);
+++	}
+++	printf("PICASSO_WAIT task pid=%d unique=%llu sample=%u thread=%llu locked=%u total=%u sampled=%u main_header=%llx cache_slide=%llx\n",
+++	    pid, (unsigned long long)uniqueid, sample, (unsigned long long)tid,
+++	    locked, total, count, (unsigned long long)main_header, (unsigned long long)slide);
+++	for (unsigned i = 0; i < count; ++i) {
+++		printf("PICASSO_WAIT state pid=%d unique=%llu sample=%u thread=%llu valid=%u state=%x hint=%u\n",
+++		    pid, (unsigned long long)uniqueid, sample, (unsigned long long)rows[i].tid,
+++		    rows[i].valid, rows[i].state, rows[i].hint);
+++	}
+++	arm_saved_state_t *state = get_user_regs(self);
+++	if (!state || !is_saved_state64(state) || !PSR64_IS_USER64(get_saved_state_cpsr(state))) {
+++		printf("PICASSO_WAIT stack pid=%d unique=%llu sample=%u thread=%llu unavailable=user-state\n",
+++		    pid, (unsigned long long)uniqueid, sample, (unsigned long long)tid);
+++		return;
+++	}
+++	printf("PICASSO_WAIT regs pid=%d unique=%llu sample=%u thread=%llu pc=%llx lr=%llx sp=%llx fp=%llx\n",
+++	    pid, (unsigned long long)uniqueid, sample, (unsigned long long)tid,
+++	    (unsigned long long)get_saved_state_pc(state), (unsigned long long)get_saved_state_lr(state),
+++	    (unsigned long long)get_saved_state_sp(state), (unsigned long long)get_saved_state_fp(state));
+++	uintptr_t frames[12] = {0};
+++	struct backtrace_control ctl = BTCTL_INIT;
+++	struct backtrace_user_info info = BTUINFO_INIT;
+++	ctl.btc_user_copy = picasso_wait_copy;
+++	unsigned depth = backtrace_user(frames, 12, &ctl, &info);
+++	printf("PICASSO_WAIT stack pid=%d unique=%llu sample=%u thread=%llu frames=%u error=%d flags=%x scope=exiting-thread\n",
+++	    pid, (unsigned long long)uniqueid, sample, (unsigned long long)tid,
+++	    depth, info.btui_error, (unsigned)info.btui_info);
+++	for (unsigned i = 0; i < depth && i < 12; i += 4) {
+++		printf("PICASSO_WAIT frames pid=%d unique=%llu sample=%u thread=%llu offset=%u %llx %llx %llx %llx\n",
+++		    pid, (unsigned long long)uniqueid, sample, (unsigned long long)tid, i,
+++		    (unsigned long long)frames[i], (unsigned long long)frames[i + 1],
+++		    (unsigned long long)frames[i + 2], (unsigned long long)frames[i + 3]);
+++	}
+++}
+++#endif
+++/* PICASSO_SERVICE_WAIT_TASK_END */
 diff --git a/patches/xnu/zzzz-picasso-systemos-union.patch b/patches/xnu/zzzz-picasso-systemos-union.patch
 new file mode 100644
 --- /dev/null
