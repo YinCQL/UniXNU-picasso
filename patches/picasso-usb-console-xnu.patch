@@ -12,10 +12,9 @@ index 19b4065..b22147f 100644
  
 diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
 new file mode 100644
-index 0000000..4cddf14
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,3046 @@
+@@ -0,0 +1,3160 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -112,6 +111,7 @@ index 0000000..4cddf14
 +void picasso_usb_panic_write(const char *text, int size);
 +void picasso_usb_panic_flush(void);
 +void picasso_usb_panic_reset(void);
++void picasso_usb_panic_stackshot(const void *, unsigned);
 +bool picasso_watchdog_backend_claim(const void *owner);
 +bool picasso_watchdog_backend_enable(const void *owner);
 +bool picasso_watchdog_backend_disable(const void *owner);
@@ -2404,6 +2404,119 @@ index 0000000..4cddf14
 +	os_atomic_store(&pup_flush_lock, 0, release);
 +}
 +
++/* PICASSO_STACKSHOT_EXPORT_BEGIN
++ * Export only the already-completed panic stackshot. No allocation, new task
++ * walk, faulting, watchdog pet or change to the original panic buffer. The
++ * terminal panic owner serializes the ring; both USB locks are try-only.
++ */
++#define PICASSO_STACKSHOT_MAX_BYTES (512u * 1024u)
++#define PICASSO_STACKSHOT_CHUNK 96u
++#define PICASSO_STACKSHOT_BATCH_LINES 16u
++#define PICASSO_STACKSHOT_MAX_NS 3000000000ULL
++#define PICASSO_STACKSHOT_MAX_POLLS 100000u
++static uint32_t _Atomic pu_stackshot_claimed;
++
++static bool
++picasso_stackshot_drain(uint64_t start, unsigned *polls)
++{
++	for (;;) {
++		uint64_t elapsed;
++		absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsed);
++		if (elapsed >= PICASSO_STACKSHOT_MAX_NS ||
++		    *polls >= PICASSO_STACKSHOT_MAX_POLLS || !ud.live || !ud.configured) {
++			return false;
++		}
++		if (!ud.tx_busy && pup_ring.total == pup_pos) {
++			return true;
++		}
++		++*polls;
++		ud_poll();
++		picasso_usb_busy_wait(1);
++	}
++}
++
++void
++picasso_usb_panic_stackshot(const void *data, unsigned size)
++{
++	if (!pu_panic_active || data == NULL || size == 0 ||
++	    !os_atomic_cmpxchg(&pu_stackshot_claimed, 0, 1, acquire)) {
++		return;
++	}
++	if (size > PICASSO_STACKSHOT_MAX_BYTES) {
++		static const char skipped[] = "PICASSO_STACKSHOT skipped reason=size-limit\n";
++		picasso_usb_panic_write(skipped, (int)sizeof(skipped) - 1);
++		return;
++	}
++	if (!ud.live || !ud.configured ||
++	    !os_atomic_cmpxchg(&pup_flush_lock, 0, 1, acquire)) {
++		return;
++	}
++	if (!os_atomic_cmpxchg(&ud.poll_lock, 0, 1, acquire)) {
++		os_atomic_store(&pup_flush_lock, 0, release);
++		return;
++	}
++	uint64_t start = mach_absolute_time();
++	unsigned polls = 0, offset = 0, batch_lines = 0;
++	uint32_t crc = 0xffffffffu;
++	char line[256];
++	const unsigned char *bytes = data;
++	static const char hex[] = "0123456789abcdef";
++	/* Drain existing panic text before publishing a begin marker. */
++	if (!picasso_stackshot_drain(start, &polls)) {
++		goto release_locks;
++	}
++	int length = snprintf(line, sizeof(line),
++	    "PICASSO_STACKSHOT begin v=1 bytes=%u encoding=hex chunk=96 crc=crc32-ieee\r\n", size);
++	if (length <= 0 || (unsigned)length >= sizeof(line)) {
++		goto release_locks;
++	}
++	pup_puts(line, length);
++	while (offset < size) {
++		/* At most 16 lines (<4 KiB) per drain, instead of one short USB
++		 * transfer per line. The deadline is checked between batches/polls. */
++		if (batch_lines == 0 && !picasso_stackshot_drain(start, &polls)) {
++			goto aborted;
++		}
++		unsigned count = size - offset;
++		if (count > PICASSO_STACKSHOT_CHUNK) count = PICASSO_STACKSHOT_CHUNK;
++		length = snprintf(line, sizeof(line), "PICASSO_STACKSHOT data offset=%08x hex=", offset);
++		if (length <= 0 || (unsigned)length + count * 2 + 2 > sizeof(line)) {
++			goto aborted;
++		}
++		for (unsigned i = 0; i < count; i++) {
++			unsigned char value = bytes[offset + i];
++			line[length++] = hex[value >> 4];
++			line[length++] = hex[value & 15];
++			crc ^= value;
++			for (unsigned bit = 0; bit < 8; bit++) {
++				crc = (crc >> 1) ^ ((0u - (crc & 1u)) & 0xedb88320u);
++			}
++		}
++		line[length++] = '\r';
++		line[length++] = '\n';
++		pup_puts(line, length);
++		offset += count;
++		batch_lines = (batch_lines + 1) % PICASSO_STACKSHOT_BATCH_LINES;
++	}
++	if (!picasso_stackshot_drain(start, &polls)) {
++		goto aborted;
++	}
++	length = snprintf(line, sizeof(line), "PICASSO_STACKSHOT end bytes=%u crc32=%08x\r\n", size, crc ^ 0xffffffffu);
++	if (length > 0 && (unsigned)length < sizeof(line)) {
++		/* All data has drained. A missing footer is rejected by the host. */
++		pup_puts(line, length);
++		(void)picasso_stackshot_drain(start, &polls);
++	}
++	goto release_locks;
++aborted:
++	length = snprintf(line, sizeof(line), "PICASSO_STACKSHOT aborted queued=%u reason=transport-budget\r\n", offset);
++	if (length > 0 && (unsigned)length < sizeof(line)) pup_puts(line, length);
++release_locks:
++	os_atomic_store(&ud.poll_lock, 0, release);
++	os_atomic_store(&pup_flush_lock, 0, release);
++}
++/* PICASSO_STACKSHOT_EXPORT_END */
++
 +void
 +picasso_usb_panic_reset(void)
 +{
@@ -3218,3 +3331,20 @@ index 7addbb3..de3d6bb 100644
  	    debug_mode_active() || !gCPUsRunning,
  	    "IOLog called with interrupts disabled");
  }
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -737,6 +737,13 @@
+ 				panic_info->eph_stackshot_offset = PE_get_offset_into_panic_region(stackshot_begin_loc);
+ 				panic_info->eph_stackshot_len = bytes_traced;
+ 
++				/* PICASSO_STACKSHOT_HOOK_BEGIN: immutable, completed buffer only. */
++				{
++					extern void picasso_usb_panic_stackshot(const void *, unsigned);
++					picasso_usb_panic_stackshot(stackshot_begin_loc, (unsigned)bytes_traced);
++				}
++				/* PICASSO_STACKSHOT_HOOK_END */
++
+ 				panic_info->eph_other_log_offset = PE_get_offset_into_panic_region(debug_buf_ptr);
+ #if CONFIG_EXCLAVES
+ 				panic_report_exclaves_stackshot();
