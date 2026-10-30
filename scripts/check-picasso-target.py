@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Check iPhone X input configuration and report unfinished kernel migration.
+"""Check iPhone X userland configuration and the retained Darwin 23 backend.
 
---require-build-ready deliberately fails until the Darwin 22 backend and signed
-root policy have been ported. Input/ADT checks alone do not qualify a boot image.
+--require-build-ready fails while cross-version userspace qualification remains
+incomplete. Input/ADT checks alone do not qualify a boot image.
 """
 import argparse
 import hashlib
@@ -30,10 +30,11 @@ def check_board(root=ROOT):
         raise ValueError('board.toml does not select the audited d22ap Erase identity')
     if spec['sha256'] != {Path(p).name: digest for p, digest in target.COMPONENTS.values()}:
         raise ValueError('IPSW member pins differ from the audited inputs')
-    if board['kernel']['prelink']['kernelcache_sha256'] != target.KERNEL_SHA256:
-        raise ValueError('Board kernelcache pin does not match iPhone X')
-    if 'early_security_init' in board['kernel']['prelink']:
-        raise ValueError('iPhone X AMFI initializer is not qualified; do not reuse the iPad address')
+    prelink = board['kernel']['prelink']
+    if prelink['kernelcache_sha256'] != target.BACKEND_KERNEL_SHA256 or prelink['ipsw'] != target.BACKEND_IPSW:
+        raise ValueError('The native backend must retain the qualified 21H461 kernelcache')
+    if prelink.get('early_security_init') != target.BACKEND_EARLY_SECURITY_INIT:
+        raise ValueError('Retained 21H461 backend requires its audited AMFI initializer')
     adt = board['payload']['adt']
     if adt.get('iphone_identity') is not True or adt.get('ipad_identity'):
         raise ValueError('Require only the iPhone identity in the payload')
@@ -120,7 +121,8 @@ def main():
     if args.ipsw:
         check_ipsw(args.ipsw)
     report = dict(input_configuration_valid=True, product=target.PRODUCT, version=target.VERSION,
-                  build=target.BUILD, kernel_darwin=22, build_ready=False,
+                  build=target.BUILD, retail_firmware_darwin=22, kernel_darwin=23,
+                  backend_build=target.BACKEND_IPSW['build'], build_ready=False,
                   blockers=target.BUILD_BLOCKERS, ipsw_checked=args.ipsw is not None)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -130,7 +132,8 @@ def main():
         target.require_build_ready()
     if args.github_env:
         values = dict(PICASSO_IPSW_FILE=target.FILENAME, PICASSO_IPSW_URL=target.URL,
-                      PICASSO_IPSW_BUILD=target.BUILD, PICASSO_OS_MEMBER=target.OS_MEMBER)
+                      PICASSO_IPSW_BUILD=target.BUILD, PICASSO_OS_MEMBER=target.OS_MEMBER,
+                      PICASSO_BACKEND_BUILD=target.BACKEND_IPSW['build'])
         with args.github_env.open('a', encoding='utf-8') as stream:
             for name, value in values.items():
                 stream.write(f'{name}={value}\n')

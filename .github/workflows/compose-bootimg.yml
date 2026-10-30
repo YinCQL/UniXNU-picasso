@@ -106,9 +106,15 @@ jobs:
         run: |
           mkdir -p out/picasso/logs
           TREE=$(python3 ./unixnu --prepare)
-          python3 ./unixnu ipsw fetch OS KernelCache StaticTrustCache Cryptex1,SystemTrustCache 2>&1 | tee out/picasso/logs/actions-ipsw.log
-          echo "UNIXNU_KERNELCACHE=$PWD/out/ipsw/$PICASSO_IPSW_BUILD/kernelcache.decompressed" >> "$GITHUB_ENV"
+          python3 ./unixnu ipsw fetch OS StaticTrustCache Cryptex1,SystemTrustCache 2>&1 | tee out/picasso/logs/actions-ipsw.log
           python3 scripts/prepare-original-trust.py --tree "$TREE" --inputs "out/ipsw/$PICASSO_IPSW_BUILD" --output out/picasso/original-static-system.bundle 2>&1 | tee out/picasso/logs/actions-trust.log
+
+      - name: Prepare the retained Darwin 23 native kext donor
+        run: |
+          python3 scripts/prepare-picasso-kernelcache.py --tree "$UNIXNU_TREE" \
+            --output "out/ipsw/$PICASSO_BACKEND_BUILD" 2>&1 | tee out/picasso/logs/actions-kernel-donor.log
+          cp "out/ipsw/$PICASSO_BACKEND_BUILD/report.json" out/picasso/logs/kernel-donor.json
+          echo "UNIXNU_KERNELCACHE=$PWD/out/ipsw/$PICASSO_BACKEND_BUILD/kernelcache.decompressed" >> "$GITHUB_ENV"
 
       - name: Prepare volatile APFS Data from the original OS
         run: |

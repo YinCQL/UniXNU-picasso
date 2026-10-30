@@ -404,7 +404,7 @@ def main():
         print('policy object skipped (--skip-object): the kernel build compiles policy.S', flush=True)
     else:
         subprocess.run(
-            ['xcrun', 'clang', '-target', 'arm64-apple-ios16.0',
+            ['xcrun', 'clang', '-target', 'arm64-apple-ios17.0',
              '-c', str(assembly.name), '-o', str(object_path)],
             cwd=str(assembly.parent), check=True,
         )

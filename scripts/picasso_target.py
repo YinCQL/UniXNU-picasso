@@ -1,4 +1,4 @@
-"""Audited iPhone X firmware inputs; these are not a Darwin 22 ABI qualification.
+"""Audited iPhone X userland inputs with the retained Darwin 23 kernel backend.
 
 Hashes were recomputed from the local retail IPSW and the d22ap Erase identity.
 Keep downloaded Apple data and owner private keys outside Git.
@@ -14,6 +14,17 @@ URL = ('https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/'
        '1158E502-D76D-4226-AA06-ED5E30CD1111/' + FILENAME)
 IPSW_SHA256 = 'ece1194f7e233e9109c5790a8d23a4564a10a254e15ec5b09978a343265568fb'
 KERNEL_SHA256 = '2ec297bac95bcba01046fd0148e97e7e5885c05a6c18827f39f534ba375c1221'
+# KERNEL_SHA256 above identifies the retail iPhone kernel for input auditing.
+# The port continues to build XNU 10063 and retains its qualified 21H461 kexts.
+BACKEND_KERNEL_SHA256 = 'f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7'
+BACKEND_EARLY_SECURITY_INIT = 'com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0'
+BACKEND_IPSW = dict(
+    product='iPad7,1', device_class='j120ap', version='17.7.11', build='21H461',
+    chip_id=0x8011, board_id=12,
+    url='https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw',
+    kernel_member='kernelcache.release.ipad7',
+    kernel_member_sha256='13b97fa2c5ce97f04408dcc28c41fb6b0d60b9440065197879acf44b2572bf7b',
+)
 OS_MEMBER = '087-86698-044.dmg'
 OS_SHA256 = '80f426d5b8fca8552f95be427434f1911dbb4c2c6d28aad94f2426ddd0c92483'
 LAUNCHD_SHA256 = '12370e5ee35bf28ae479b6c4b4455f4f4693ab803e37c5eb3032537c18cac61c'
@@ -46,11 +57,10 @@ POLICY_MANIFEST_SHA256 = {
     'SystemOS': '0933f17be6a4a7917c261fa9664ad97d976c7af4275ffad1fd0402e48330b174',
 }
 
-# Removing this gate requires actual source/ABI/policy migration, not a hash
-# substitution. The existing 21H461 backend is retained for porting reference.
+# Changing userland does not require downgrading XNU. The remaining gate concerns
+# the new userland's contracts with the retained backend, not Darwin 22 sources.
 BUILD_BLOCKERS = (
-    'unixnu.lock and patches/unixnu-source-kernel.patch still target XNU 10063 / Darwin 23; the firmware is XNU 8796 / Darwin 22',
-    'IOStorage, AES, IOWatchdog, Sandbox/AMFI and display bindings are still qualified only for 21H461',
+    'iOS 16 userspace contracts with the retained Darwin 23 / 21H461 kext backend need qualification, including MobileGraphics/IOSurface user-client dispatch',
     'the Windows whole-disk reconstruction for the new signed iPhone root policy still needs native hdiutil comparison',
     'AppleKeyStore state ABI, launchd override loading and logical display geometry need iOS 16 qualification',
 )

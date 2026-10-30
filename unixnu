@@ -58,8 +58,8 @@ def prepare(device=DEVICE, source=None):
 
 
 def main():
-    # Stop before preparing/building a mixed Darwin 23/iOS 16 artifact. Fetch,
-    # defconfig and direct ADT/input checks remain available for migration work.
+    # Cross-version userspace checks must finish before building this target.
+    # Retaining Darwin 23 is intentional; it is not itself a build blocker.
     # All build forms include implicit/default steps (for example `build -j 4`
     # and `build all`), and prelink alone can reuse stale Darwin 23 objects.
     if sys.argv[1:2] and sys.argv[1] in ('build', 'kernel', 'payload', 'prelink', 'bootimg'):
@@ -75,6 +75,11 @@ def main():
         return
     os.environ.setdefault('UNIXNU_DEVICE', str(DEVICE))
     os.environ.setdefault('UNIXNU_OUT', str(DEVICE / 'out'))
+    sys.path.insert(0, str(DEVICE / 'scripts'))
+    from picasso_target import BACKEND_IPSW
+    # No fallback to the iPhone IPSW's Darwin 22 kernelcache. Prepare this donor
+    # with scripts/prepare-picasso-kernelcache.py before building.
+    os.environ.setdefault('UNIXNU_KERNELCACHE', str(DEVICE / 'out/ipsw' / BACKEND_IPSW['build'] / 'kernelcache.decompressed'))
     uefi = DEVICE.parent / 'Mu-Silicium'
     if uefi.is_dir():
         output = DEVICE / 'out/picasso/uefi-build'

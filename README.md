@@ -2,8 +2,9 @@
 
 > **This branch stages iPhone X / iOS 16.7.16 (20H392). It is not build-ready.**
 > Firmware inputs, ADT identity and the owner-signed root policy have been updated.
-> The Darwin 22 kernel/driver migration is incomplete; builds stop with a list
-> of blockers. See [the migration status](docs/iphone-x-migration.md).
+> XNU 10063 / Darwin 23 and its qualified native kexts are retained. iOS 16
+> userspace compatibility checks are incomplete; builds stop with a list of
+> blockers. See [the migration status](docs/iphone-x-migration.md).
 > Device results below describe the previous iPadOS branch.
 
 > **Status: original early userspace runs; service startup is still incomplete.**

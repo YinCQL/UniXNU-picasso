@@ -8,8 +8,8 @@ soc = "SM7250"
 description = "Redmi K30 5G"
 kit = "picasso"
 
-# iPhone X firmware target. This migration branch is not yet build-ready:
-# the retained source patches and native ABI bindings still target Darwin 23.
+# iPhone X userland target. Retain XNU 10063 / Darwin 23 and the qualified
+# 21H461 native kext backend. Cross-version userspace qualification is pending.
 # See docs/iphone-x-migration.md before building a kernel or payload.
 [ipsw]
 url = "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
@@ -19,7 +19,7 @@ build = "20H392"
 device_class = "d22ap"
 chip_id = 0x8015
 board_id = 0x06
-fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache"]
+fetch = ["DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache"]
 
 [ipsw.sha256]
 "087-86698-044.dmg" = "80f426d5b8fca8552f95be427434f1911dbb4c2c6d28aad94f2426ddd0c92483"
@@ -83,9 +83,9 @@ archives = [
 # to the real native watchdog class before the kernel enters the FAT payload.
 tool = "scripts/prelink-picasso.py"
 kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
-kernelcache_sha256 = "2ec297bac95bcba01046fd0148e97e7e5885c05a6c18827f39f534ba375c1221"
+kernelcache_sha256 = "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7"
 slide = "-0x1000000"
-# early_security_init must be recovered from 20H392; the old 21H461 VA is invalid.
+early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
 roots = [
   "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib",
   "com.apple.driver.AppleARMPlatform",
@@ -108,6 +108,19 @@ roots = [
   # the prelink dependency closure also brings in AppleMatch.
   "com.apple.security.sandbox",
 ]
+
+# The native kext donor is separate from [ipsw], which supplies the iPhone OS,
+# SystemOS, trust caches and Data. Never feed the iPhone kernel to these bindings.
+[kernel.prelink.ipsw]
+url = "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
+product = "iPad7,1"
+version = "17.7.11"
+build = "21H461"
+device_class = "j120ap"
+chip_id = 0x8011
+board_id = 12
+kernel_member = "kernelcache.release.ipad7"
+kernel_member_sha256 = "13b97fa2c5ce97f04408dcc28c41fb6b0d60b9440065197879acf44b2572bf7b"
 
 # Firmware step: build the picasso Mu-Silicium UEFI firmware via unixnu.
 [bootimg.image]

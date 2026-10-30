@@ -1,7 +1,8 @@
 # iPhone X root policy
 
 This is the host-verified signed policy for the 20H392 migration branch.
-It is a build input, but the Darwin 22 port is incomplete and builds are gated.
+It is a build input, but iOS 16 userspace qualification against the retained
+Darwin 23 backend is incomplete and builds are gated.
 See [the migration status](../../docs/iphone-x-migration.md).
 
 | Property | Value |

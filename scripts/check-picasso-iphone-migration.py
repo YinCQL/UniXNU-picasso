@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tomllib
 from types import SimpleNamespace
+import zipfile
 
 import picasso_target as target
 
@@ -32,6 +33,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tree', type=Path, required=True)
     parser.add_argument('--inputs', type=Path, required=True)
+    parser.add_argument('--backend-ipsw', type=Path, help='original 21H461 IPSW for separate-donor checks')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
@@ -40,6 +42,31 @@ def main():
     trust_builder = load(root / 'scripts/prepare-original-trust.py')
     target_checker = load(root / 'scripts/check-picasso-target.py')
     board = target_checker.check_board(root)
+    backend_checks = []
+    if args.backend_ipsw:
+        backend = load(root / 'scripts/prepare-picasso-kernelcache.py')
+        report = backend.prepare(args.tree, str(args.backend_ipsw), out / 'backend')
+        assert report['kernelcache_sha256'] == target.BACKEND_KERNEL_SHA256
+        backend_checks.append('original-21H461-extraction')
+        with zipfile.ZipFile(args.backend_ipsw) as archive:
+            backend_manifest = archive.read('BuildManifest.plist')
+        member = (out / 'backend' / target.BACKEND_IPSW['kernel_member']).read_bytes()
+        for case, manifest, contents in (
+                ('wrong-userland-donor', (args.inputs / 'BuildManifest.plist').read_bytes(), member),
+                ('corrupt-donor', backend_manifest, member[:-1] + bytes([member[-1] ^ 1]))):
+            fixture = out / (case + '.ipsw')
+            with zipfile.ZipFile(fixture, 'x') as archive:
+                archive.writestr('BuildManifest.plist', manifest)
+                archive.writestr(target.BACKEND_IPSW['kernel_member'], contents)
+            destination = out / (case + '-output')
+            try: backend.prepare(args.tree, str(fixture), destination)
+            except ValueError: backend_checks.append(case + '-rejected')
+            else: raise AssertionError('Invalid native kernel donor accepted')
+            assert not destination.exists()
+        try: backend.prepare(args.tree, str(args.backend_ipsw), out / 'backend')
+        except FileExistsError: backend_checks.append('existing-output-retained')
+        else: raise AssertionError('Existing native kernel donor overwritten')
+        assert hashlib.sha256((out / 'backend/kernelcache.decompressed').read_bytes()).hexdigest() == target.BACKEND_KERNEL_SHA256
     policy_rejected = []
     for case in ('manifest', 'split-table', 'assembly', 'uuid', 'old-root'):
         policy = out / ('bad-policy-' + case)
@@ -132,6 +159,7 @@ def main():
         gates.append(command[1:])
     report = dict(passed=True, scope=__doc__, adt_cases=cases, rejected_trust_inputs=rejected,
                   rejected_policy_inputs=policy_rejected,
+                  retained_backend_checks=backend_checks,
                   conflicting_identity_rejected=True, incomplete_migration_gates=gates,
                   original_trust_bytes=len(bundle), payload_source_sha256=hashlib.sha256(source.encode()).hexdigest())
     (out / 'results.json').write_text(json.dumps(report, indent=2) + '\n')

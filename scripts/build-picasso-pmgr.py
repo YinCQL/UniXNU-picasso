@@ -238,7 +238,7 @@ def main():
         board = tomllib.loads((device / 'board.toml').read_text(encoding='utf-8'))
         prelink = board['kernel']['prelink']
         kernelcache = Path(os.environ.get('UNIXNU_KERNELCACHE',
-                           str(device / 'out/ipsw' / board['ipsw']['build'] / 'kernelcache.decompressed'))).resolve()
+                           str(device / 'out/ipsw' / prelink['ipsw']['build'] / 'kernelcache.decompressed'))).resolve()
         binding_script = ROOT / 'scripts/prepare-picasso-watchdog-bindings.py'
         spec = importlib.util.spec_from_file_location('picasso_watchdog_bindings', binding_script)
         binding = importlib.util.module_from_spec(spec)
