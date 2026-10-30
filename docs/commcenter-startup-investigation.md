@@ -107,3 +107,27 @@ to keep checking in, and the UI to advance. Whether the watchdog stops requiring
 the excluded job and whether another UI dependency remains are device checks.
 The Apple-logo stall is not yet declared solved. No CI dispatch or device
 operation was performed for this source change.
+
+## Build83 host fixture failure
+
+Compose run [41015328143](https://github.com/YinCQL/UniXNU-picasso/actions/runs/41015328143)
+failed at the packed Data host check for `2812f15`, before APFS preparation or
+kernel compilation. The new policy fixture directories belonged to the ordinary
+macOS runner, but the host check simulated root ownership only on Windows.
+The production directory guard correctly rejected those non-root directories.
+
+The host fixture now simulates policy ownership on every host. Only its ancestors
+start as root; newly created files gain simulated root ownership through the
+installer's chown calls. Skipping those calls still fails readback. POSIX hosts
+retain real modes and the existing copy tests retain native ownership calls.
+Production preparation, raw APFS readback, workflow privilege boundaries and the
+CommCenter-only policy are unchanged.
+
+Evidence is retained under `out/ci83-policy-fixtures-20261030`: 85 Windows host
+cases pass with the retained DarwinBoot packer. The non-root POSIX fixture model
+reproduces the original error at UID 501/GID 20 and passes all 37 policy cases
+after the fix without invoking native root chown. Each of the three policy
+ancestors is checked independently for type, owner, group and writable modes.
+This model uses Windows file operations and simulated POSIX ownership/modes;
+it does not establish native macOS or APFS acceptance. A new Compose build and
+device verification remain pending; the Apple-logo stall is still unresolved.

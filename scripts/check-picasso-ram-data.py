@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Host regression for seed format, copy/metadata checks and UUID configuration.
 
-All generated inputs remain in --output. Windows checks filesystem contents and
-uses mocked chown calls; only macOS/root preparation validates APFS and ownership.
+All generated inputs remain in --output. Offline policy fixtures simulate root
+ownership on every host so unprivileged CI can run; POSIX copy checks retain real
+ownership calls. Only macOS/root preparation validates APFS policy ownership.
 """
 import argparse
 from contextlib import nullcontext
@@ -145,31 +146,49 @@ def main():
         rejected('offline policy requires volatile packed media ' + str(adt),
                  lambda adt=adt: data.offline_jobs({**payload, 'adt': adt}))
     policy_root = out / 'policy-data'
-    policy_dir = policy_root / data.OFFLINE_POLICY_DIR
-    policy_dir.mkdir(parents=True)
     actual_metadata = data.metadata
+    policy_owners = {}
+
+    def policy_fixture(root):
+        directory = root / data.OFFLINE_POLICY_DIR
+        directory.mkdir(parents=True)
+        current = root
+        for part in ('', *Path(data.OFFLINE_POLICY_DIR).parts):
+            if part:
+                current = current / part
+            os.chmod(current, 0o755)
+            policy_owners[current] = (0, 0)
+        return directory
+
+    policy_dir = policy_fixture(policy_root)
 
     def policy_metadata(path):
         result = actual_metadata(path)
+        # Only fixture ancestors start as root. Created files remain non-root
+        # until the production installer calls the mocked chown below.
+        result['uid'], result['gid'] = policy_owners.get(Path(path), (501, 20))
         if os.name == 'nt':
-            # Windows has no APFS/POSIX ownership model. Only this part is
-            # substituted; real bytes, exclusive creation and fsync run.
-            result.update(uid=0, gid=0, mode=0o755 if result['type'] == 'directory' else 0o644)
+            # Windows also lacks POSIX modes. POSIX hosts read real modes;
+            # real bytes, types, exclusive creation and fsync run everywhere.
+            result['mode'] = 0o755 if result['type'] == 'directory' else 0o644
         return result
 
+    def policy_chown(path, uid, gid, *, follow_symlinks):
+        assert follow_symlinks is False
+        policy_owners[Path(path)] = (uid, gid)
+
     with mock.patch.object(data, 'metadata', side_effect=policy_metadata), \
-            (mock.patch.object(data.os, 'chown', create=True) if os.name == 'nt' else nullcontext()) as policy_chown:
+            mock.patch.object(data.os, 'chown', side_effect=policy_chown, create=True) as chown:
         saved_policy = data.install_offline_policy(policy_root, ['com.apple.CommCenter'])
         assert saved_policy['disabled_jobs'] == ['com.apple.CommCenter']
         assert saved_policy['watchdogd_disabled'] is False and len(saved_policy['files']) == 2
         assert plistlib.loads((policy_dir / 'disabled.plist').read_bytes()) == {'com.apple.CommCenter': True}
         assert (policy_dir / 'disabled.migrated').read_bytes() == b''
         assert data.verify_offline_policy(policy_root, ['com.apple.CommCenter']) == saved_policy
-        if os.name == 'nt':
-            assert policy_chown.call_count == 2
-            assert all(call.args[1:] == (0, 0) and call.kwargs == {'follow_symlinks': False}
-                       for call in policy_chown.call_args_list)
-        cases.append({'case': 'real offline files, modern marker, bounded scope and ownership calls', 'result': 'pass'})
+        assert chown.call_count == 2
+        assert all(call.args[1:] == (0, 0) and call.kwargs == {'follow_symlinks': False}
+                   for call in chown.call_args_list)
+        cases.append({'case': 'real offline files, modern marker and simulated root ownership calls', 'result': 'pass'})
         rejected('never overwrite existing policy',
                  lambda: data.install_offline_policy(policy_root, ['com.apple.CommCenter']))
         (policy_dir / 'disabled.migrated').write_bytes(b'invalid marker')
@@ -187,20 +206,37 @@ def main():
         (policy_dir / 'disabled.plist').write_bytes(plistlib.dumps({'com.apple.watchdogd': True}))
         rejected('actual policy excludes watchdog',
                  lambda: data.verify_offline_policy(policy_root, ['com.apple.CommCenter']))
-    for field, value in [('type', 'symlink'), ('type', 'file'), ('uid', 501), ('gid', 501), ('mode', 0o777)]:
-        with mock.patch.object(data, 'metadata', return_value=dict(type='directory', uid=0, gid=0, mode=0o755) | {field: value}):
-            rejected('policy ancestor ' + field + '=' + str(value),
-                     lambda: data.install_offline_policy(policy_root, ['com.apple.CommCenter']))
-    failed_root = out / 'failed-policy-data'
-    failed_dir = failed_root / data.OFFLINE_POLICY_DIR
-    failed_dir.mkdir(parents=True)
+    for ancestor in (policy_root, policy_root / 'db', policy_dir):
+        for field, value in [('type', 'symlink'), ('type', 'file'), ('uid', 501),
+                             ('gid', 20), ('mode', 0o775), ('mode', 0o757)]:
+            def mismatched_ancestor(path, ancestor=ancestor, field=field, value=value):
+                entry = policy_metadata(path)
+                return {**entry, field: value} if Path(path) == ancestor else entry
+
+            with mock.patch.object(data, 'metadata', side_effect=mismatched_ancestor):
+                rejected('policy ancestor ' + ancestor.relative_to(out).as_posix()
+                         + ' ' + field + '=' + str(value),
+                         lambda: data.offline_policy_directory(policy_root))
+    unowned_root = out / 'unowned-policy-data'
+    unowned_dir = policy_fixture(unowned_root)
     with mock.patch.object(data, 'metadata', side_effect=policy_metadata), \
+            mock.patch.object(data.os, 'chown', create=True) as chown:
+        rejected('policy files must acquire root ownership before readback',
+                 lambda: data.install_offline_policy(unowned_root, ['com.apple.CommCenter']))
+        assert chown.call_count == 2
+        assert (unowned_dir / 'disabled.plist').is_file()
+        assert (unowned_dir / 'disabled.migrated').is_file()
+    failed_root = out / 'failed-policy-data'
+    failed_dir = policy_fixture(failed_root)
+    with mock.patch.object(data, 'metadata', side_effect=policy_metadata), \
+            mock.patch.object(data.os, 'chown', side_effect=policy_chown, create=True) as chown, \
             mock.patch.object(data.os, 'fsync', side_effect=OSError('simulated sync failure')):
         try:
             data.install_offline_policy(failed_root, ['com.apple.CommCenter'])
         except OSError:
             assert (failed_dir / 'disabled.plist').is_file()
             assert not (failed_dir / 'disabled.migrated').exists()
+            chown.assert_not_called()
             cases.append({'case': 'sync failure aborts installation and retains incomplete files', 'result': 'pass'})
         else:
             raise AssertionError('Offline policy ignored sync failure')
@@ -349,7 +385,9 @@ def main():
     mount_case('seed failure still detaches', readonly_info, True, 1, body_error=True)
     report = dict(scope='Host format/config/content regression; no APFS mount or device validation',
                   host=os.name, source_sha256=data.sha256(ROOT / 'scripts/prepare-picasso-ram-data.py'),
-                  native_posix_ownership_tested=os.name != 'nt', cases=cases)
+                  native_posix_ownership_tested=os.name != 'nt',
+                  offline_policy_ownership='simulated on every host; chown updates fixture metadata',
+                  offline_policy_native_modes_tested=os.name != 'nt', cases=cases)
     (out / 'results.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     print(f'PASS: {len(cases)} seed cases; outputs retained in {out}')
 
