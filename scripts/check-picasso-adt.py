@@ -5,6 +5,7 @@ Keep all generated trees in --output. This checks the board-to-driver ABI,
 including property placement, width and byte order; it cannot prove IRQ delivery.
 """
 import argparse
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -43,6 +44,17 @@ def decode(data):
     return nodes
 
 
+def check_owned_memory(nodes, requested):
+    """Validate the actual loader request; this does not prove an allocation."""
+    if not 0x10000000 <= requested <= 0x200000000 or requested % 0x200000:
+        raise ValueError('Invalid DarwinBoot owned-memory request')
+    key = 'darwinboot-memory-size'
+    if (nodes['/chosen'].get(key) != struct.pack('<Q', requested)
+            or sum(key in node for node in nodes.values()) != 1):
+        raise ValueError('ADT owned-memory request missing, misplaced or different from board')
+    return requested
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
@@ -70,6 +82,11 @@ def main():
                         '--dram-size', str(board['dram_size']), *extra], check=True)
         data = target.read_bytes()
         nodes = decode(data)
+        owned = None
+        if name != 'minimal':
+            owned = check_owned_memory(nodes, int(str(adt['owned_memory_size']), 0))
+        else:
+            assert not any('darwinboot-memory-size' in node for node in nodes.values())
         memory_map = nodes['/chosen/memory-map']
         if name == 'board-with-data':
             assert memory_map.get('PackedRAMDisk') == bytes(16)
@@ -89,12 +106,36 @@ def main():
         assert len(cpu_nodes) == (1 if name == 'minimal' else len(adt['cpu_regs'].split(',')))
         assert all(node['timebase-frequency'] == struct.pack('<I', 19200000) for node in cpu_nodes)
         results.append({'case': name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
-                        'timer_intid': 19, 'cpu_nodes': len(cpu_nodes)})
+                        'timer_intid': 19, 'cpu_nodes': len(cpu_nodes),
+                        'owned_memory_request_bytes': owned})
+    # Exercise the guard used on FAT-extracted bytes, including the old request
+    # that would silently retain the undersized window if propagation broke.
+    requested = int(str(adt['owned_memory_size']), 0)
+    key = 'darwinboot-memory-size'
+    rejected = []
+    bad_values = [('missing', None), ('old-256MiB', struct.pack('<Q', 0x10000000)),
+                  ('big-endian', struct.pack('>Q', requested)),
+                  ('u32', struct.pack('<I', requested & 0xffffffff))]
+    for case, value in [*bad_values, ('misplaced', None), ('duplicate', None)]:
+        candidate = copy.deepcopy(nodes)
+        if case in ('misplaced', 'duplicate'):
+            candidate[''][key] = candidate['/chosen'][key]
+        if case != 'duplicate':
+            if value is None:
+                candidate['/chosen'].pop(key)
+            else:
+                candidate['/chosen'][key] = value
+        try:
+            check_owned_memory(candidate, requested)
+        except ValueError:
+            rejected.append(case)
+        else:
+            raise AssertionError(f'Accepted incorrect memory request: {case}')
     report = {'scope': 'generated ADT ABI only; no payload build or hardware IRQ test',
               'generator_sha256': hashlib.sha256(args.generator.read_bytes()).hexdigest(),
-              'cases': results}
+              'cases': results, 'rejected_memory_handoffs': rejected}
     (out / 'results.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
-    print('PASS: picasso ADT timer INTID, encoding, GIC layout and CPU timebase')
+    print('PASS: picasso ADT memory request, timer INTID, encoding, GIC layout and CPU timebase')
 
 
 if __name__ == '__main__':

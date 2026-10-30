@@ -119,8 +119,9 @@ def check(work, tree, output):
     entry = next(e for e in entries if e['id'] == 'xnu')
     require(entry['initrd'] == 'Payloads/scratch-data.img', 'Loader lacks Data initrd')
     require(entry['args'] == payload_report['kernel_args'], 'FAT boot arguments mismatch')
-    decode = runpy.run_path(str(ROOT / 'scripts/check-picasso-adt.py'))['decode']
-    nodes = decode((files / 'kernel.macho.adt').read_bytes())
+    adt_check = runpy.run_path(str(ROOT / 'scripts/check-picasso-adt.py'))
+    nodes = adt_check['decode']((files / 'kernel.macho.adt').read_bytes())
+    owned = adt_check['check_owned_memory'](nodes, int(str(spec['adt']['owned_memory_size']), 0))
     memory_map = nodes['/chosen/memory-map']
     require(memory_map.get('PackedRAMDisk') == bytes(16) and 'RAMDisk' not in memory_map,
             'ADT must use exactly one packed placeholder')
@@ -132,6 +133,7 @@ def check(work, tree, output):
                   volume_uuid=identity, packed=packed, payload_bytes=payload.stat().st_size,
                   content_bytes=content, content_budget_bytes=payload.stat().st_size * 95 // 100,
                   kernel_sha256=digest(kernel), storage_imports=imports['imports'],
+                  owned_memory_request_bytes=owned,
                   persistent=False, hardware_tested=False)
     output.write_text(json.dumps(report, indent=2) + '\n')
     return report

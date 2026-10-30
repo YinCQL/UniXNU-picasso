@@ -311,9 +311,11 @@ ipad_identity = true
 # VerifiedRoot window identity check independently binds this UUID to the
 # owner-signed image before the block device is published.
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
-# Keep the existing 256 MiB contiguous kernel window request. It is separate
-# from the original FAT ramdisk mapping above. Packed Data does not expand it:
-# only resident seed/write pages consume RAM, and peak use needs device testing.
-owned_memory_size = "0x10000000"
+# Build77 reaches Jetsam VM-page shortage with the old 256 MiB window.
+# Request 768 MiB of real contiguous conventional memory for XNU and volatile
+# Data. DarwinBoot must allocate the entire range before setting boot_args;
+# failure stays in firmware. This is separate from dram_size and FAT capacity.
+# See docs/memory-pressure-investigation.md for the firmware audit and limits.
+owned_memory_size = "0x30000000"
 cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
 unique_chip_id = "required"

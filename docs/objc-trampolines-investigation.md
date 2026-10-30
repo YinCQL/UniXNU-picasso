@@ -2,8 +2,11 @@
 
 Update: [build 77](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40974341838)
 at `726e4b6b1620df9e605365126f0db5edc4601998` passes the Apple SDK build,
-linked artifact checks and boot-image composition. Device validation of the
-union change is still pending; the latest device log below is from build 76.
+linked artifact checks and boot-image composition. Its latest device log
+`075201-502` matches the downloaded kernel UUID: all three union paths pass,
+and the missing-library SIGABRTs are absent. The new failure is
+[VM-page shortage followed by watchdogd timeout](memory-pressure-investigation.md).
+The build76 evidence below describes the original failure.
 
 Build 76 / [40970250344](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40970250344)
 at `342b707f24e7178eec0a58c7e35e979ff700bd9a` completed successfully. Its

@@ -39,10 +39,28 @@ static const OSMetaClass *nubMetaClass(void)
   return meta;
 }
 
+// Report the loader's actual handoff after the CDC console becomes available.
+// pexpert.h selects the native ARM64 boot_args layout; these are observations,
+// not replacements for the memory bounds consumed by arm_vm_init.
+static void picasso_log_boot_memory(void)
+{
+  const boot_args *args = static_cast<const boot_args *>(PE_state.bootArgs);
+  if (args == nullptr) {
+    IOLog("PICASSO_MEMORY boot args=missing\n");
+    return;
+  }
+  IOLog("PICASSO_MEMORY boot phys_base=%llx bytes=%llx actual=%llx top=%llx\n",
+        static_cast<unsigned long long>(args->physBase),
+        static_cast<unsigned long long>(args->memSize),
+        static_cast<unsigned long long>(args->memSizeActual),
+        static_cast<unsigned long long>(args->topOfKernelData));
+}
+
 extern "C" void sheng_pmgr_run(void)
 {
   // BSD initialization runs after IOKit and the USB hardware watchdog setup,
   // before launchd can ask for the platform watchdog and boot-stage services.
+  picasso_log_boot_memory();
   picasso_boot_state_run();
   picasso_watchdog_run();
   unsigned mode = 0;

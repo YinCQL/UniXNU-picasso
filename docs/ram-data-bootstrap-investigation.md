@@ -1,7 +1,10 @@
 # Writable Data for original launchd boot tasks
 
-Build 40901155087 now mounts Data writable and reaches early boot completion.
-The next captured panic is [watchdogd's SIGTRAP](watchdogd-trap-investigation.md).
+Data now mounts writable and reaches early boot completion. Build77 later
+hits [VM-page shortage](memory-pressure-investigation.md); the next change
+raises the real loader memory request to 768 MiB, pending device validation.
+The original mount and [watchdogd SIGTRAP](watchdogd-trap-investigation.md)
+investigations below are retained as earlier evidence.
 
 ## Device evidence
 
@@ -52,8 +55,9 @@ erase that identity and is intentionally rejected by the kernel build.
 The packed seed is capped at 4 MiB. NativeRamBlock's fixed `d4d22d9` implementation
 uses sparse pages for logical disks up to 2 GiB; larger disks require a persistent
 store and are excluded here. A 256 MiB logical size is not a 256 MiB allocation at
-boot. Resident seed pages, new write pages and metadata still consume the existing
-256 MiB kernel memory window, so later memory pressure needs device measurement.
+boot. Resident seed pages, new write pages and metadata consume the kernel's
+owned memory window. Build77 used 256 MiB and reached page shortage; the
+current 768 MiB request still needs allocation and peak-use measurements.
 **Data is volatile: guest changes are lost after reboot.** OS/SystemOS remain
 read-only. No userdata layout changes or UFS persistence options are enabled.
 
