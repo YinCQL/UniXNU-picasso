@@ -20,9 +20,14 @@ See [the migration status](../../docs/iphone-x-migration.md).
 | Owner anchor | Existing key retained; SHA256 `68c19aa4796e89fb48e0cc2f8243131fe23d31d3cf59554f7298a6cf8882e704` |
 
 The Windows reconstruction checks the original UDIF block CRCs and rereads
-all output windows. Native hdiutil comparison, SDK compilation and device
-root authentication remain pending. The attestation correctly records
-`hardware_tested: false`, `boot_root_authenticated: false`, and no policy object.
+all output windows. Compose build90 (`dc27ec2`, run `41143293184`) verified every
+signed record and both whole-disk hashes using native read-only hdiutil access,
+then built the kernel and payload with the Apple SDK. It failed at a stale Data
+source-hash assertion, before completing artifact checks or composing boot.img.
+Device root authentication remains pending. The generation-time attestation
+records `hardware_tested: false`, `boot_root_authenticated: false`, and no policy
+object; the later CI evidence is in
+`out/ci90-data-provenance-20261031/artifact/logs/root-inputs.json`.
 The unchanged Apple images and private key are not committed.
 
 `policy.S` embeds the public anchor and the two complete manifests with relative

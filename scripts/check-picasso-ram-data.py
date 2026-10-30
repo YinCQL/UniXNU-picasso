@@ -131,6 +131,45 @@ def main():
 
     passes('512 MiB logical empty disk hashes without dense allocation', verify_sparse)
 
+    # Drive the production artifact checker through its provenance checks with
+    # producer-derived metadata. Stop at the real mount boundary: this fixture
+    # is a packed-format specimen, not a formatted APFS volume or SDK artifact.
+    artifact_spec = importlib.util.spec_from_file_location('data_artifacts', ROOT / 'scripts/check-picasso-data-artifacts.py')
+    artifact = importlib.util.module_from_spec(artifact_spec); artifact_spec.loader.exec_module(artifact)
+    class ReachedPolicyMount(Exception): pass
+    def artifact_source_case(name, launchd_sha, os_sha, error=None):
+        work = out / name
+        seed_dir = work / 'ram-data'; seed_dir.mkdir(parents=True)
+        (seed_dir / 'data.dbrdisk').write_bytes(empty_data.read_bytes())
+        source_manifest = seed_dir / 'source-var-manifest.json'
+        source_manifest.write_text('{}\n')
+        seed = dict(schema='picasso-ram-data-v1', **data.inspect_packed(seed_dir / 'data.dbrdisk'),
+                    persistent=False, ownership_preserved=True, os_inputs_modified=False,
+                    source_launchd_sha256=launchd_sha, source_sha256=os_sha,
+                    source_manifest_sha256=data.sha256(source_manifest))
+        (seed_dir / 'seed.json').write_text(json.dumps(seed))
+        output = work / 'report.json'
+        def stop_at_mount(image, mountpoint, readonly):
+            assert image == seed_dir / 'data.cdr' and mountpoint == output.with_suffix('.policy-mount')
+            assert readonly is True
+            raise ReachedPolicyMount()
+        preparation = dict(vars(data), mounted=stop_at_mount)
+        with mock.patch.object(artifact.runpy, 'run_path', return_value=preparation) as run_path:
+            try: artifact.check(work, work / 'tree', output)
+            except ReachedPolicyMount: assert error is None
+            except ValueError as failure:
+                assert error is not None and error in str(failure), str(failure)
+            else: raise AssertionError('Expected policy mount boundary or provenance rejection')
+            run_path.assert_called_once_with(str(ROOT / 'scripts/prepare-picasso-ram-data.py'))
+        cases.append({'case': name, 'result': 'rejected as expected' if error else 'pass'})
+
+    old_launchd = '8cec9a3c44a443b08e977ccc5d577850316ad428c575dc01f09b018dbd5b6a25'
+    old_os = '3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d'
+    artifact_source_case('artifact accepts current producer provenance', data.LAUNCHD_SHA256, data.OS_SHA256)
+    artifact_source_case('artifact rejects old launchd', old_launchd, data.OS_SHA256, 'launchd')
+    artifact_source_case('artifact rejects old OS', data.LAUNCHD_SHA256, old_os, 'OS image')
+    artifact_source_case('artifact rejects old OS and launchd', old_launchd, old_os, 'launchd')
+
     payload = {'offline_disabled_jobs': ['com.apple.CommCenter'],
                'adt': {'packed_data_ramdisk': True}}
     def verify_policy_config():

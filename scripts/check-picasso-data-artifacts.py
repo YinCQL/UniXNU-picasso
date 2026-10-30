@@ -13,6 +13,7 @@ import struct
 import subprocess
 import tomllib
 import uuid
+import picasso_target as firmware
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -50,12 +51,10 @@ def check(work, tree, output):
     require(packed['packed_bytes'] <= 4 * 1024**2, 'Packed seed exceeds its memory/payload budget')
     require(seed['persistent'] is False and seed['ownership_preserved'] is True
             and seed['os_inputs_modified'] is False, 'Unsafe seed provenance')
-    require(seed['source_launchd_sha256'] ==
-            '8cec9a3c44a443b08e977ccc5d577850316ad428c575dc01f09b018dbd5b6a25',
-            'Unexpected source OS')
-    require(seed['source_sha256'] ==
-            '3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d',
-            'Unexpected source OS image hash')
+    require(seed['source_launchd_sha256'] == firmware.LAUNCHD_SHA256,
+            f'Data seed launchd does not match {firmware.BUILD}')
+    require(seed['source_sha256'] == firmware.OS_SHA256,
+            f'Data seed OS image does not match {firmware.BUILD}')
     require(digest(seed_dir / 'source-var-manifest.json') == seed['source_manifest_sha256'],
             'Source manifest hash mismatch')
     jobs = preparation['offline_jobs'](spec)
