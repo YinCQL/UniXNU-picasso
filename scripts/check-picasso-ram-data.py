@@ -130,6 +130,85 @@ def main():
 
     passes('512 MiB logical empty disk hashes without dense allocation', verify_sparse)
 
+    payload = {'offline_disabled_jobs': ['com.apple.CommCenter'],
+               'adt': {'packed_data_ramdisk': True}}
+    def verify_policy_config():
+        assert data.offline_jobs(payload) == ['com.apple.CommCenter']
+
+    passes('explicit volatile telephony job policy', verify_policy_config)
+    for name, jobs in [('watchdog exclusion', ['com.apple.watchdogd']),
+                       ('multiple services', ['com.apple.CommCenter', 'com.apple.mediaserverd']),
+                       ('duplicate service', ['com.apple.CommCenter'] * 2),
+                       ('wrong policy type', 'com.apple.CommCenter')]:
+        rejected(name, lambda jobs=jobs: data.offline_jobs({**payload, 'offline_disabled_jobs': jobs}))
+    for adt in ({}, {'packed_data_ramdisk': False}, {'packed_data_ramdisk': True, 'persistent_data': True}):
+        rejected('offline policy requires volatile packed media ' + str(adt),
+                 lambda adt=adt: data.offline_jobs({**payload, 'adt': adt}))
+    policy_root = out / 'policy-data'
+    policy_dir = policy_root / data.OFFLINE_POLICY_DIR
+    policy_dir.mkdir(parents=True)
+    actual_metadata = data.metadata
+
+    def policy_metadata(path):
+        result = actual_metadata(path)
+        if os.name == 'nt':
+            # Windows has no APFS/POSIX ownership model. Only this part is
+            # substituted; real bytes, exclusive creation and fsync run.
+            result.update(uid=0, gid=0, mode=0o755 if result['type'] == 'directory' else 0o644)
+        return result
+
+    with mock.patch.object(data, 'metadata', side_effect=policy_metadata), \
+            (mock.patch.object(data.os, 'chown', create=True) if os.name == 'nt' else nullcontext()) as policy_chown:
+        saved_policy = data.install_offline_policy(policy_root, ['com.apple.CommCenter'])
+        assert saved_policy['disabled_jobs'] == ['com.apple.CommCenter']
+        assert saved_policy['watchdogd_disabled'] is False and len(saved_policy['files']) == 2
+        assert plistlib.loads((policy_dir / 'disabled.plist').read_bytes()) == {'com.apple.CommCenter': True}
+        assert (policy_dir / 'disabled.migrated').read_bytes() == b''
+        assert data.verify_offline_policy(policy_root, ['com.apple.CommCenter']) == saved_policy
+        if os.name == 'nt':
+            assert policy_chown.call_count == 2
+            assert all(call.args[1:] == (0, 0) and call.kwargs == {'follow_symlinks': False}
+                       for call in policy_chown.call_args_list)
+        cases.append({'case': 'real offline files, modern marker, bounded scope and ownership calls', 'result': 'pass'})
+        rejected('never overwrite existing policy',
+                 lambda: data.install_offline_policy(policy_root, ['com.apple.CommCenter']))
+        (policy_dir / 'disabled.migrated').write_bytes(b'invalid marker')
+        rejected('migration marker content mismatch',
+                 lambda: data.verify_offline_policy(policy_root, ['com.apple.CommCenter']))
+        (policy_dir / 'disabled.migrated').write_bytes(b'')
+        for field, value in [('type', 'symlink'), ('uid', 501), ('gid', 501), ('mode', 0o666)]:
+            def mismatched_file(path, field=field, value=value):
+                entry = policy_metadata(path)
+                return {**entry, field: value} if Path(path).name == 'disabled.plist' else entry
+
+            with mock.patch.object(data, 'metadata', side_effect=mismatched_file):
+                rejected('policy file ' + field + '=' + str(value),
+                         lambda: data.verify_offline_policy(policy_root, ['com.apple.CommCenter']))
+        (policy_dir / 'disabled.plist').write_bytes(plistlib.dumps({'com.apple.watchdogd': True}))
+        rejected('actual policy excludes watchdog',
+                 lambda: data.verify_offline_policy(policy_root, ['com.apple.CommCenter']))
+    for field, value in [('type', 'symlink'), ('type', 'file'), ('uid', 501), ('gid', 501), ('mode', 0o777)]:
+        with mock.patch.object(data, 'metadata', return_value=dict(type='directory', uid=0, gid=0, mode=0o755) | {field: value}):
+            rejected('policy ancestor ' + field + '=' + str(value),
+                     lambda: data.install_offline_policy(policy_root, ['com.apple.CommCenter']))
+    failed_root = out / 'failed-policy-data'
+    failed_dir = failed_root / data.OFFLINE_POLICY_DIR
+    failed_dir.mkdir(parents=True)
+    with mock.patch.object(data, 'metadata', side_effect=policy_metadata), \
+            mock.patch.object(data.os, 'fsync', side_effect=OSError('simulated sync failure')):
+        try:
+            data.install_offline_policy(failed_root, ['com.apple.CommCenter'])
+        except OSError:
+            assert (failed_dir / 'disabled.plist').is_file()
+            assert not (failed_dir / 'disabled.migrated').exists()
+            cases.append({'case': 'sync failure aborts installation and retains incomplete files', 'result': 'pass'})
+        else:
+            raise AssertionError('Offline policy ignored sync failure')
+    empty = data.install_offline_policy(out / 'absent-empty-policy', [])
+    assert empty == dict(disabled_jobs=[], watchdogd_disabled=False, files=[])
+    assert not (out / 'absent-empty-policy').exists()
+    cases.append({'case': 'empty policy creates no filesystem objects', 'result': 'pass'})
+
     identity = '10203040-5060-7080-9010-203040506070'
     config = ('# preserve this comment\nCONFIG_XNU_NATIVE_RAM_BLOCK=y\n'
               'CONFIG_XNU_OWNER_DATA_MOUNT=y\nCONFIG_XNU_OWNER_BOOT_MANIFEST=y\n'

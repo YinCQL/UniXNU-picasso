@@ -39,7 +39,8 @@ def check(work, tree, output):
 
     seed_dir = work / 'ram-data'
     seed = json.loads((seed_dir / 'seed.json').read_text())
-    inspect = runpy.run_path(str(ROOT / 'scripts/prepare-picasso-ram-data.py'))['inspect_packed']
+    preparation = runpy.run_path(str(ROOT / 'scripts/prepare-picasso-ram-data.py'))
+    inspect = preparation['inspect_packed']
     packed = inspect(seed_dir / 'data.dbrdisk')
     require(seed['schema'] == 'picasso-ram-data-v1', 'Unknown Data report')
     for key in ('logical_bytes', 'packed_bytes', 'packed_sha256', 'raw_sha256',
@@ -57,6 +58,10 @@ def check(work, tree, output):
             'Unexpected source OS image hash')
     require(digest(seed_dir / 'source-var-manifest.json') == seed['source_manifest_sha256'],
             'Source manifest hash mismatch')
+    jobs = preparation['offline_jobs'](spec)
+    with preparation['mounted'](seed_dir / 'data.cdr', output.with_suffix('.policy-mount'), readonly=True):
+        policy = preparation['verify_offline_policy'](output.with_suffix('.policy-mount'), jobs)
+    require(seed.get('offline_launch_policy') == policy, 'Actual APFS offline policy differs from report')
     identity = str(uuid.UUID(seed['volume_uuid'])).upper()
     require(uuid.UUID(identity).int != 0, 'Zero Data UUID')
     config = (work / '.config').read_text()
@@ -134,6 +139,7 @@ def check(work, tree, output):
                   content_bytes=content, content_budget_bytes=payload.stat().st_size * 95 // 100,
                   kernel_sha256=digest(kernel), storage_imports=imports['imports'],
                   owned_memory_request_bytes=owned,
+                  offline_launch_policy=policy,
                   persistent=False, hardware_tested=False)
     output.write_text(json.dumps(report, indent=2) + '\n')
     return report

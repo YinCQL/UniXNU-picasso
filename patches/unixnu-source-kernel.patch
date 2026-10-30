@@ -3388,13 +3388,13 @@ new file mode 100644
 ++picasso_service_begin(unsigned operation, OSDictionary *dict, const char *detail, unsigned type)
 ++{
 ++	picasso_service_trace trace = {};
-++	static const char * const names[] = {"backboardd", "SpringBoard", "mediaserverd", "audiomxd"};
-++	static unsigned counters[4][4];
+++	static const char * const names[] = {"backboardd", "SpringBoard", "mediaserverd", "audiomxd", "CommCenter"};
+++	static unsigned counters[5][4];
 ++	char name[32] = {0};
 ++	int pid = proc_selfpid();
 ++	proc_name(pid, name, sizeof(name));
 ++	if (operation >= 4) return trace;
-++	for (unsigned index = 0; index < 4; ++index) {
+++	for (unsigned index = 0; index < 5; ++index) {
 ++		if (strcmp(name, names[index])) continue;
 ++		unsigned *counter = &counters[index][operation];
 ++		unsigned value = __atomic_load_n(counter, __ATOMIC_RELAXED);

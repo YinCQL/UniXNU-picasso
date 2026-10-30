@@ -1,5 +1,8 @@
 # Build81: startup dependencies and volatile Data headroom
 
+For the newer build82 automatic reboot and its CommCenter launch-policy change,
+see [the CommCenter investigation](commcenter-startup-investigation.md).
+
 The user supplied `D:/App/picasso-bootimg-81.zip` after removing its GitHub run,
 and identifies `picasso-windows-20261030-123539-981.log` as this image. The screen
 shows the Apple logo without reaching a usable interface. The user manually

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Prepare a volatile APFS Data seed from the unchanged 21H461 OS (macOS/root).
 
-Only the original private/var and missing empty runtime directories are copied.
-The source is mounted read-only; no launch policy, preferences or keys are edited.
+Copies original private/var, adds empty runtime directories and the board's
+explicit offline launch policy. The original OS remains mounted read-only.
 All output, including failed preparations and mountpoint directories, is retained.
 """
 import argparse
@@ -18,6 +18,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tomllib
 import uuid
 
 
@@ -30,6 +31,7 @@ MAX_LOGICAL = 2 * 1024**3  # Larger disks select the persistent-store driver pat
 OS_SHA256 = '3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d'
 LAUNCHD_SHA256 = '8cec9a3c44a443b08e977ccc5d577850316ad428c575dc01f09b018dbd5b6a25'
 DATA_UUID_KEY = 'CONFIG_XNU_OWNER_DATA_VOLUME_UUID'
+OFFLINE_POLICY_DIR = 'db/com.apple.xpc.launchd'
 DIRECTORIES = (
     'db/dslocal/nodes/Default/users', 'db/dslocal/nodes/Default/groups',
     'db/dslocal/nodes/Default/config', 'containers/Bundle',
@@ -191,6 +193,82 @@ def add_directories(target):
     return created
 
 
+def offline_jobs(payload):
+    """Only the unavailable telephony job may be excluded on volatile Data."""
+    jobs = payload.get('offline_disabled_jobs', [])
+    if not isinstance(jobs, list) or jobs not in ([], ['com.apple.CommCenter']):
+        raise ValueError('Offline policy permits only com.apple.CommCenter once')
+    adt = payload.get('adt', {})
+    if jobs and (adt.get('packed_data_ramdisk') is not True or adt.get('persistent_data')):
+        raise ValueError('Offline launch policy requires packed volatile Data')
+    return jobs
+
+
+def offline_policy_contents(jobs):
+    if jobs not in ([], ['com.apple.CommCenter']):
+        raise ValueError('Unexpected offline job list')
+    if not jobs:
+        return {}
+    return {
+        'disabled.plist': plistlib.dumps({job: True for job in jobs}, fmt=plistlib.FMT_XML),
+        # The original 21H461 loader uses this marker to select its modern
+        # override database instead of migrating the legacy overrides.
+        'disabled.migrated': b'',
+    }
+
+
+def offline_policy_directory(target):
+    current = target
+    for part in ('', *Path(OFFLINE_POLICY_DIR).parts):
+        if part:
+            current = current / part
+        entry = metadata(current)
+        if (entry['type'] != 'directory' or entry['uid'] != 0 or entry['gid'] != 0
+                or entry['mode'] & 0o022):
+            raise ValueError('Offline policy requires real root-owned protected directories')
+    return current
+
+
+def verify_offline_policy(target, jobs):
+    report = dict(disabled_jobs=jobs, watchdogd_disabled=False, files=[])
+    contents = offline_policy_contents(jobs)
+    if not contents:
+        return report
+    current = offline_policy_directory(target)
+    for name, blob in contents.items():
+        path = current / name
+        expected = dict(type='file', uid=0, gid=0, mode=0o644,
+                        bytes=len(blob), sha256=hashlib.sha256(blob).hexdigest())
+        # Check lstat metadata before reading to avoid following a symlink.
+        if metadata(path) != expected or path.read_bytes() != blob:
+            raise ValueError('Offline policy content/ownership readback mismatch')
+        report['files'].append(dict(path=path.relative_to(target).as_posix(), **expected))
+    return report
+
+
+def install_offline_policy(target, jobs):
+    """Create new root-owned overrides without editing any copied OS object."""
+    contents = offline_policy_contents(jobs)
+    if not contents:
+        return verify_offline_policy(target, jobs)
+    current = offline_policy_directory(target)
+    for name in contents:
+        if os.path.lexists(current / name):
+            raise ValueError('Offline policy refuses existing objects: ' + name)
+    for name, blob in contents.items():
+        path = current / name
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+        fd = os.open(path, flags, 0o600)
+        with os.fdopen(fd, 'wb') as stream:
+            if stream.write(blob) != len(blob):
+                raise ValueError('Short offline policy write')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chown(path, 0, 0, follow_symlinks=False)
+        os.chmod(path, 0o644)
+    return verify_offline_policy(target, jobs)
+
+
 def inspect_packed(path, raw=None):
     """Validate DBRDISK1 and hash its reconstruction, optionally checking raw bytes.
 
@@ -298,6 +376,8 @@ def prepare(tree, source, output, config):
     original_config = config.read_text(encoding='utf-8')
     # Validate its shape without changing it before touching any output.
     configured_text(original_config, '11111111-1111-4111-8111-111111111111')
+    board = tomllib.loads((Path(__file__).resolve().parents[1] / 'board.toml').read_text(encoding='utf-8'))
+    jobs = offline_jobs(board['payload'])
     packer_path = tree / 'drivers/DarwinBoot/Test/packed_ramdisk.py'
     pack = runpy.run_path(str(packer_path))['pack']
     if sha256(source) != OS_SHA256:
@@ -323,6 +403,8 @@ def prepare(tree, source, output, config):
             copy_var(source_var, target, manifest)
             created = add_directories(target)
             verify_var(target, manifest)
+            launch_policy = install_offline_policy(target, jobs)
+            verify_var(target, manifest)
             if inventory(source_var) != manifest:
                 raise ValueError('Original var changed during preparation')
     if sha256(source) != OS_SHA256:
@@ -346,6 +428,7 @@ def prepare(tree, source, output, config):
         source_regular_files=len(files), source_regular_bytes=sum(entry['bytes'] for entry in files),
         source_manifest_sha256=sha256(manifest_path), original_paths=source_paths,
         created_directories=created, packer_sha256=sha256(packer_path),
+        offline_launch_policy=launch_policy,
         guest_mutable=True, persistent=False, ownership_preserved=True,
         os_inputs_modified=False, hardware_tested=False,
         excluded=['private/var/staged_system_apps'],

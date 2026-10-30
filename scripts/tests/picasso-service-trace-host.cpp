@@ -72,24 +72,24 @@ int main(int argc, char **argv) {
         assert(lines == 4 && dict.reads == 3);
         contains("provider=IOSurfaceRoot match=display");contains("resource=IOBSD detail=<absent>"); contains("rpc=0 result=0 object=1");
     } else if (scenario == 1) {
-        for (const char *name : {"watchdogd", "backboardd-helper", "SpringBoardX", "mediaserverd-helper", "audiomxd-helper", "springboard", ""}) {
+        for (const char *name : {"watchdogd", "backboardd-helper", "SpringBoardX", "mediaserverd-helper", "audiomxd-helper", "CommCenter-helper", "commcenter", "springboard", ""}) {
             process_name = name; auto trace = picasso_service_begin(0, &dict, nullptr, 0);
             picasso_service_end(trace, 0, 0, true); assert(!trace.ticket);
         }
         assert(!lines && !dict.reads);
     } else if (scenario == 2) {
         std::vector<std::thread> workers;
-        for (unsigned t = 0; t < 32; ++t) workers.emplace_back([t]() {
-            const char *names[]={"backboardd","SpringBoard","mediaserverd","audiomxd"};
-            process_name = names[t & 3]; thread_id = t + 100;
+        for (unsigned t = 0; t < 40; ++t) workers.emplace_back([t]() {
+            const char *names[]={"backboardd","SpringBoard","mediaserverd","audiomxd","CommCenter"};
+            process_name = names[t % 5]; thread_id = t + 100;
             for (unsigned i = 0; i < 100; ++i) for (unsigned op = 0; op < 4; ++op) {
                 auto trace = picasso_service_begin(op, nullptr, nullptr, 0);
                 picasso_service_end(trace, 0, 0, true);
             }
         });
         for (auto &t : workers) t.join();
-        assert(lines == 768); contains("sample=12"); assert(output.find("sample=13") == std::string::npos);
-        for (const char *name : {"backboardd", "SpringBoard", "mediaserverd", "audiomxd"}) for (unsigned op = 0; op < 4; ++op) {
+        assert(lines == 960); contains("sample=12"); assert(output.find("sample=13") == std::string::npos);
+        for (const char *name : {"backboardd", "SpringBoard", "mediaserverd", "audiomxd", "CommCenter"}) for (unsigned op = 0; op < 4; ++op) {
             for (unsigned sample = 1; sample <= 12; ++sample) {
                 std::string key = "op=" + std::to_string(op) + " sample=" + std::to_string(sample) + " pid=115 name=" + name + " ";
                 size_t at=0;

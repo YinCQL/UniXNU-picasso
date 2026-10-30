@@ -153,6 +153,9 @@ BUILDID_STRING = "picasso-research"
 # Payload: a FAT volume with UniXNU config + kernel + ADT. Loader (DarwinBoot) is in the firmware.
 [payload]
 volume = "PICASSOESP"
+# No native telephony backend is selected. A fresh volatile Data seed skips
+# both stock CommCenter variants by their shared label; watchdogd stays enabled.
+offline_disabled_jobs = ["com.apple.CommCenter"]
 # Room for the kernel, original trust caches and packed APFS Data seed.
 # The payload builder retains its 95% content limit; CI checks the actual seed.
 size_mib = 60
