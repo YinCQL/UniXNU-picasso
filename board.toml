@@ -69,6 +69,8 @@ archives = [
   # The archive lands in build/sheng-platform-power/libShengPlatformPower.a, the path
   # build-xnu-4k-baseline.sh force-loads when CONFIG_XNU_SHENG_PMGR=1.
   "build-picasso-pmgr.py",
+  # CPU/GOP scanout using the exact original MobileGraphics/IOSurface ABI.
+  "build-picasso-display.py",
 ]
 
 [kernel.prelink]
@@ -89,6 +91,7 @@ roots = [
   "com.apple.iokit.IOHIDFamily",
   # Original IOBSD-matched IOSurfaceRoot, required by graphics/media clients.
   "com.apple.iokit.IOSurface",
+  "com.apple.iokit.IOMobileGraphicsFamily",
   "com.apple.iokit.IOStorageFamily",
   "com.apple.kec.Libm",
   "com.apple.kec.corecrypto",
@@ -220,6 +223,17 @@ kernel_args = [
   # The XNU CDC panic/reset path uses PSHOLD as its final fallback and arms the
   # IMEM Fastboot reason before either panic or command reset.
   "picasso_usb_reset=pshold",
+  # Existing fixed-pin early class init and post-IOBSD display lifecycle.
+  "offline-mobile-graphics-load=1",
+  "offline-legacy-register=1",
+  "offline-legacy-phase=4",
+  "offline-legacy-gop=1",
+  "offline-legacy-pm=1",
+  "offline-legacy-validate=1",
+  "offline-legacy-transfer=1",
+  "offline-legacy-cpu-present=1",
+  # Software refresh notifications only; panel timing remains firmware-owned.
+  "sheng-vsync=60",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself

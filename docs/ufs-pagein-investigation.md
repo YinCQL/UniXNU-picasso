@@ -1,5 +1,12 @@
 # UFS read timeout after early boot (2026-10-30)
 
+Update: build79's 09:18 capture matches the repaired kernel and contains no
+failed UFS READ or `NATIVE_UFS_FAILURE`. The first selected service failure is
+now SpringBoard's missing main CADisplay, followed by a mediaserverd watchdog
+panic. See [the display investigation](display-gop-investigation.md). One boot
+without the old failure does not establish long-term storage stability.
+The build78 analysis and original repair evidence below are historical.
+
 Build78 allocates the requested 768 MiB and reaches early userspace. The first
 captured storage failure is a UFS READ timeout, followed by failed APFS reads,
 SIGBUS exits and watchdog reboot. This differs from build77's Jetsam exits.

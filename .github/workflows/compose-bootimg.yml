@@ -133,6 +133,11 @@ jobs:
             --native-prelink-dir "$UNIXNU_TREE/kits/NativePrelink" \
             --output out/picasso/logs/watchdog-policy.json
 
+      - name: Verify CPU GOP display against the original class ABI
+        run: |
+          python3 scripts/check-picasso-display-artifacts.py --tree out/picasso/tree --work out/picasso \
+            --kernelcache "$UNIXNU_KERNELCACHE" --output out/picasso/logs/display-artifacts.json
+
       - name: Verify original Sandbox and IOSurface in the prelinked kernel
         run: |
           python3 - <<'PY'
@@ -207,6 +212,11 @@ jobs:
             device/out/picasso/tree/build/native-aes/*.log
             device/out/picasso/tree/build/native-aes/*.o
             device/out/picasso/tree/build/native-aes/*.a
+            device/out/picasso/tree/build/native-legacy-display/*.json
+            device/out/picasso/tree/build/native-legacy-display/*.log
+            device/out/picasso/tree/build/native-legacy-display/*.o
+            device/out/picasso/tree/build/native-legacy-display/*.a
+            device/out/picasso/tree/build/native-legacy-display/*.h
             device/out/picasso/tree/build/xnu/**/kern_exec.cpo.json
             device/out/picasso/tree/build/xnu/**/vfs_syscalls.cpo.json
             device/out/picasso/ram-data/*.json
