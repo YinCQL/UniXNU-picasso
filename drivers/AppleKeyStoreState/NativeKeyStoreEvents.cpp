@@ -8,7 +8,7 @@
 #include <IOKit/IOLib.h>
 
 extern "C" bool picasso_aks_state_enabled(void);
-extern "C" void picasso_aks_observed(unsigned selector, IOReturn result);
+extern "C" void picasso_aks_observed(unsigned selector, IOReturn result, bool hasContext, uint64_t context);
 
 // The original 21H461 decoder accepts a SET of UTF8String/INTEGER pairs.
 // ss=4: unlocked since boot; sls=3: no passcode. Remaining state is absent.
@@ -43,7 +43,9 @@ public:
     IOReturn externalMethod(uint32_t selector,IOExternalMethodArguments *args,
         IOExternalMethodDispatch *,OSObject *,void *) override {
         IOReturn rc=query(selector,args);
-        picasso_aks_observed(selector,rc);return rc;
+        bool state=selector==7 || selector==17 || selector==35;
+        bool hasContext=state && args && args->scalarInputCount==1 && args->scalarInput;
+        picasso_aks_observed(selector,rc,hasContext,hasContext?args->scalarInput[0]:0);return rc;
     }
 private:
     IOReturn query(uint32_t selector,IOExternalMethodArguments *args) {
@@ -110,7 +112,7 @@ public:
         registerService();return true;
     }
     IOReturn newUserClient(task_t t,void *s,UInt32 type,OSDictionary *p,IOUserClient **out) override {
-        IOReturn rc=openState(t,s,type,p,out);picasso_aks_observed(256,rc);return rc;
+        IOReturn rc=openState(t,s,type,p,out);picasso_aks_observed(256,rc,false,0);return rc;
     }
     IOReturn newUserClient(task_t t,void *s,UInt32 type,IOUserClient **out) override {
         return newUserClient(t,s,type,nullptr,out);

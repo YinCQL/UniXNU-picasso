@@ -54,7 +54,7 @@ static unsigned lines;
 static int host_log(const char *format, ...) {
     char text[1024]; va_list args; va_start(args, format);
     int count = vsnprintf(text, sizeof(text), format, args); va_end(args);
-    assert(count > 0 && size_t(count) < sizeof(text));
+    assert(count > 0 && count < 256);
     std::lock_guard<std::mutex> lock(output_lock); output += text; ++lines;
     return count;
 }
@@ -69,10 +69,10 @@ int main(int argc, char **argv) {
     if (scenario == 0) {
         auto trace = picasso_service_begin(0, &dict, nullptr, 0);
         picasso_service_end(trace, 0, 0, true);
-        assert(lines == 2 && dict.reads == 3);
-        contains("provider=IOSurfaceRoot match=display resource=IOBSD"); contains("rpc=0 result=0 object=1");
+        assert(lines == 4 && dict.reads == 3);
+        contains("provider=IOSurfaceRoot match=display");contains("resource=IOBSD detail=<absent>"); contains("rpc=0 result=0 object=1");
     } else if (scenario == 1) {
-        for (const char *name : {"watchdogd", "backboardd-helper", "SpringBoardX", "springboard", ""}) {
+        for (const char *name : {"watchdogd", "backboardd-helper", "SpringBoardX", "mediaserverd-helper", "audiomxd-helper", "springboard", ""}) {
             process_name = name; auto trace = picasso_service_begin(0, &dict, nullptr, 0);
             picasso_service_end(trace, 0, 0, true); assert(!trace.ticket);
         }
@@ -80,20 +80,21 @@ int main(int argc, char **argv) {
     } else if (scenario == 2) {
         std::vector<std::thread> workers;
         for (unsigned t = 0; t < 32; ++t) workers.emplace_back([t]() {
-            process_name = (t & 1) ? "backboardd" : "SpringBoard"; thread_id = t + 100;
+            const char *names[]={"backboardd","SpringBoard","mediaserverd","audiomxd"};
+            process_name = names[t & 3]; thread_id = t + 100;
             for (unsigned i = 0; i < 100; ++i) for (unsigned op = 0; op < 4; ++op) {
                 auto trace = picasso_service_begin(op, nullptr, nullptr, 0);
                 picasso_service_end(trace, 0, 0, true);
             }
         });
         for (auto &t : workers) t.join();
-        assert(lines == 192); contains("sample=12"); assert(output.find("sample=13") == std::string::npos);
-        for (const char *name : {"backboardd", "SpringBoard"}) for (unsigned op = 0; op < 4; ++op) {
+        assert(lines == 768); contains("sample=12"); assert(output.find("sample=13") == std::string::npos);
+        for (const char *name : {"backboardd", "SpringBoard", "mediaserverd", "audiomxd"}) for (unsigned op = 0; op < 4; ++op) {
             for (unsigned sample = 1; sample <= 12; ++sample) {
                 std::string key = "op=" + std::to_string(op) + " sample=" + std::to_string(sample) + " pid=115 name=" + name + " ";
-                auto a = output.find(key); assert(a != std::string::npos);
-                auto b = output.find(key, a + 1); assert(b != std::string::npos);
-                assert(output.find(key, b + 1) == std::string::npos);
+                size_t at=0;
+                for(unsigned n=0;n<4;++n){at=output.find(key,at);assert(at!=std::string::npos);++at;}
+                assert(output.find(key, at) == std::string::npos);
             }
         }
     } else if (scenario == 3) {
@@ -102,16 +103,19 @@ int main(int argc, char **argv) {
         dict = {&long_string, &non_string, nullptr};
         auto trace = picasso_service_begin(2, &dict, "notify\nvalue", 0);
         picasso_service_end(trace, 0, 0, true);
-        contains("provider=AA??");contains("match=<non-string> resource=<absent> detail=notify?value");
+        contains("provider=AA??");contains("match=<non-string>");contains("resource=<absent> detail=notify?value");
         auto at = output.find("provider=") + 9; assert(output.find(' ', at) - at == 63);
-        assert(lines == 2);
+        assert(lines == 4);
+        dict={&long_string,&long_string,&long_string};
+        trace=picasso_service_begin(2,&dict,long_text.c_str(),UINT32_MAX);
+        picasso_service_end(trace,UINT32_MAX,UINT32_MAX,true);assert(lines==8);
     } else if (scenario == 4) {
         auto trace = picasso_service_begin(3, nullptr, "IOSurfaceRoot", 7);
         picasso_service_end(trace, 0, 0xe00002e2U, false);
-        contains("detail=IOSurfaceRoot type=7");contains("rpc=0 result=e00002e2 object=0");
+        contains("detail=IOSurfaceRoot");contains("type=7\n");contains("rpc=0 result=e00002e2 object=0");
         auto denied = picasso_service_begin(3, nullptr, "IOSurfaceRoot", 7);
         picasso_service_end(denied, 0xe00002e2U, 0xe00002e2U, false);
-        contains("rpc=e00002e2 result=e00002e2 object=0");assert(lines == 4);
+        contains("rpc=e00002e2 result=e00002e2 object=0");assert(lines == 8);
     } else if (scenario == 5) {
         for (unsigned op : {4U, 99U, UINT32_MAX}) {
             auto trace = picasso_service_begin(op, &dict, nullptr, 0);

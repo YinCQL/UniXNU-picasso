@@ -88,13 +88,22 @@ and refuses persistent storage configuration.
 
 ## Diagnostics and verification
 
-Service descriptions now read at most 960 bytes, bounded by the actual kcdata
-description item, and print in at most six 160-byte pieces. Each exact service
+Service descriptions read at most 960 bytes, bounded by the actual kcdata
+description item. After build81 they print metadata separately and use at most
+eight 128-byte pieces to fit the observed capture limit. Each exact service
 name retains four report tickets across restarts. liveactivitiesd is added to
 the selected names. The watchdog policy and exit control flow are unchanged.
 Display failures have a separate four-report allowance, and failed retirement
 is observable after a copy. Successful frames cannot consume the failure budget.
-AKS logging is limited to 48 lines and carries selector/result only.
+AKS logging now has separate 24-line budgets for SpringBoard, keybagd, securityd
+and other callers (96 total). It records caller/selector/result and the integer
+context only for state queries. Key-operation payloads are never logged.
+
+Build81 confirms service publication, SpringBoard matching/open and successful
+state queries. Its startup remains incomplete. Current findings, new Data
+headroom and diagnostic verification are in the
+[build81 investigation](build81-startup-investigation.md); the checks below
+retain the preceding change's evidence.
 
 Completed local checks:
 

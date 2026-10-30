@@ -21,7 +21,9 @@ import sys
 import uuid
 
 
-DATA_BYTES = 256 * 1024**2
+# build81 exhausted APFS transaction headroom in the 256 MiB logical volume.
+# Sparse pages still allocate only on writes; this is not a RAM reservation.
+DATA_BYTES = 512 * 1024**2
 PAGE = 4096
 MAX_PACKED = 4 * 1024**2
 MAX_LOGICAL = 2 * 1024**3  # Larger disks select the persistent-store driver path.
@@ -334,7 +336,7 @@ def prepare(tree, source, output, config):
     pack(image, packed)
     packed_info = inspect_packed(packed, raw=image)
     if packed_info['logical_bytes'] != DATA_BYTES:
-        raise ValueError('Expected exactly 256 MiB of logical volatile Data')
+        raise ValueError('Expected exactly 512 MiB of logical volatile Data')
     manifest_path = output / 'source-var-manifest.json'
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8')
     files = [entry for entry in manifest.values() if entry['type'] == 'file']

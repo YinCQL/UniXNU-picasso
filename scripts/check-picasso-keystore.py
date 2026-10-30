@@ -20,6 +20,10 @@ def main():
     for name in ('IOService', 'IOUserClient', 'IOMemoryDescriptor', 'IOLib'):
         (out / 'IOKit' / (name + '.h')).write_text('// API supplied by the host fixture.\n')
     source = ROOT / 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp'
+    logger_source = (ROOT / 'package/PicassoKeyStore.cpp').read_text()
+    logger = logger_source.split('extern "C" void picasso_aks_observed(', 1)[1].split('extern "C" void picasso_keystore_probe', 1)[0]
+    logger = 'extern "C" void picasso_aks_observed(' + logger
+    (out / 'observed.inc').write_text(logger)
     fixture = ROOT / 'scripts/tests/picasso-keystore-host.cpp'
     text = fixture.read_text()
     # Windows atomics use MSVC intrinsics. Clang has the same production builtins.
@@ -30,7 +34,8 @@ def main():
     (out / 'test.cpp').write_text(text)
     spec = importlib.util.spec_from_file_location('host', ROOT / 'scripts/check-picasso-user-fault.py')
     host = importlib.util.module_from_spec(spec); spec.loader.exec_module(host)
-    report = {'scope': __doc__, 'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(), 'runs': []}
+    report = {'scope': __doc__, 'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+              'logger_sha256': hashlib.sha256(logger.encode()).hexdigest(), 'runs': []}
     for asan in (False, True):
         name = 'state-asan' if asan else 'state'
         if os.name == 'nt':

@@ -1871,7 +1871,7 @@ diff --git a/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch b/patches/xnu/z
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
-@@ -0,0 +1,1711 @@
+@@ -0,0 +1,1715 @@
 +diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 +--- a/bsd/vfs/vfs_syscalls.c
 ++++ b/bsd/vfs/vfs_syscalls.c
@@ -2318,7 +2318,7 @@ new file mode 100644
 + 
 + #if SYSV_SHM
 + #include <sys/shm_internal.h>   /* shmexit */
-+@@ -1359,6 +1364,237 @@
++@@ -1359,6 +1364,236 @@
 + 
 + #define OS_REASON_TOTAL_USER_FAULTS_PER_PROC  5
 + 
@@ -2515,20 +2515,19 @@ new file mode 100644
 ++	uint32_t limit = available < 960 ? available : 960;
 ++	uint32_t length = 0;
 ++	while (length < limit && source[length]) ++length;
-++	for (uint32_t offset = 0; offset < length || offset == 0; offset += 160) {
-++		char part[161] = {0};
+++	/* The console formatter has a 256-byte buffer including the prefix.
+++	 * Print metadata separately; each 128-byte part stays below that bound. */
+++	printf("PICASSO_SERVICE exit sample=%u pid=%d name=%s rv=%x status=%d description_bytes=%u capped=%u\n",
+++	    ticket, proc_getpid(p), p->p_name, (unsigned)rv, WEXITSTATUS(rv), length,
+++	    length == limit && available > limit);
+++	for (uint32_t offset = 0; offset < length || offset == 0; offset += 128) {
+++		char part[129] = {0};
 ++		uint32_t bytes = length - offset;
-++		if (bytes > 160) bytes = 160;
+++		if (bytes > 128) bytes = 128;
 ++		if (bytes) memcpy(part, source + offset, bytes);
 ++		picasso_fault_printable(part, sizeof(part));
-++		if (!offset) {
-++			printf("PICASSO_SERVICE exit sample=%u pid=%d name=%s rv=%x status=%d description_bytes=%u capped=%u description=%.160s\n",
-++			    ticket, proc_getpid(p), p->p_name, (unsigned)rv, WEXITSTATUS(rv), length,
-++			    length == limit && available > limit, part);
-++		} else {
-++			printf("PICASSO_SERVICE description sample=%u pid=%d name=%s offset=%u text=%.160s\n",
-++			    ticket, proc_getpid(p), p->p_name, offset, part);
-++		}
+++		printf("PICASSO_SERVICE description sample=%u pid=%d name=%s offset=%u text=%.128s\n",
+++		    ticket, proc_getpid(p), p->p_name, offset, part);
 ++	}
 ++}
 ++
@@ -2556,7 +2555,7 @@ new file mode 100644
 + static int
 + abort_with_payload_internal(proc_t p,
 +     uint32_t reason_namespace, uint64_t reason_code,
-+@@ -1368,6 +1604,22 @@
++@@ -1368,6 +1603,22 @@
 + {
 + 	os_reason_t exit_reason = OS_REASON_NULL;
 + 	kern_return_t kr = KERN_SUCCESS;
@@ -2579,7 +2578,7 @@ new file mode 100644
 + 
 + 	if (internal_flags & OS_REASON_IFLAG_USER_FAULT) {
 + 		uint32_t old_value = atomic_load_explicit(&p->p_user_faults,
-+@@ -1375,13 +1627,13 @@
++@@ -1375,13 +1626,13 @@
 + 
 + #if DEVELOPMENT || DEBUG
 + 		if (bootarg_disable_user_faults) {
@@ -2595,7 +2594,7 @@ new file mode 100644
 + 			}
 + 			// this reloads the value in old_value
 + 			if (atomic_compare_exchange_strong_explicit(&p->p_user_faults,
-+@@ -1422,16 +1674,17 @@
++@@ -1422,16 +1673,17 @@
 + 
 + 	switch (kr) {
 + 	case KERN_SUCCESS:
@@ -2619,7 +2618,7 @@ new file mode 100644
 + 
 + int
 + abort_with_payload(struct proc *cur_proc, struct abort_with_payload_args *args,
-+@@ -1820,6 +2073,15 @@
++@@ -1820,6 +2072,15 @@
 + static void
 + proc_handle_critical_exit(proc_t p, int rv)
 + {
@@ -2635,7 +2634,7 @@ new file mode 100644
 + 	if (!proc_should_trigger_panic(p, rv)) {
 + 		// No panic, bail out
 + 		return;
-+@@ -1834,6 +2096,9 @@
++@@ -1834,6 +2095,9 @@
 + 	}
 + #endif /* DEVELOPMENT */
 + 
@@ -2645,7 +2644,7 @@ new file mode 100644
 + 	char *exit_reason_desc = exit_reason_get_string_desc(p->p_exit_reason);
 + 
 + 	if (p->p_exit_reason == OS_REASON_NULL) {
-+@@ -1901,6 +2166,12 @@
++@@ -1901,6 +2165,12 @@
 + 	boot_progress_exit(proc_getpid(p),p->p_name,rv,
 + 	    p->p_exit_reason ? p->p_exit_reason->osr_namespace : 0,
 + 	    p->p_exit_reason ? p->p_exit_reason->osr_code : 0);
@@ -3356,7 +3355,7 @@ new file mode 100644
 + #include <sys/kauth.h>
 + #include <sys/codesign.h>
 + #include <sys/code_signing.h>
-+@@ -2694,6 +2697,78 @@
++@@ -2694,6 +2697,83 @@
 + 	return internal_io_service_match_property_table(service, matching, matchingCnt, matches);
 + }
 + 
@@ -3389,13 +3388,13 @@ new file mode 100644
 ++picasso_service_begin(unsigned operation, OSDictionary *dict, const char *detail, unsigned type)
 ++{
 ++	picasso_service_trace trace = {};
-++	static const char * const names[] = {"backboardd", "SpringBoard"};
-++	static unsigned counters[2][4];
+++	static const char * const names[] = {"backboardd", "SpringBoard", "mediaserverd", "audiomxd"};
+++	static unsigned counters[4][4];
 ++	char name[32] = {0};
 ++	int pid = proc_selfpid();
 ++	proc_name(pid, name, sizeof(name));
 ++	if (operation >= 4) return trace;
-++	for (unsigned index = 0; index < 2; ++index) {
+++	for (unsigned index = 0; index < 4; ++index) {
 ++		if (strcmp(name, names[index])) continue;
 ++		unsigned *counter = &counters[index][operation];
 ++		unsigned value = __atomic_load_n(counter, __ATOMIC_RELAXED);
@@ -3414,9 +3413,14 @@ new file mode 100644
 ++		picasso_trace_property(dict, "IONameMatch", match, sizeof(match));
 ++		picasso_trace_property(dict, "IOResourceMatch", resource, sizeof(resource));
 ++		picasso_trace_text(extra, sizeof(extra), detail);
-++		printf("PICASSO_IOKIT begin op=%u sample=%u pid=%d name=%s thread=%llu provider=%s match=%s resource=%s detail=%s type=%u\n",
-++		    operation, trace.ticket, pid, trace.name, (unsigned long long)trace.tid,
-++		    provider, match, resource, extra, type);
+++		/* Each formatted line fits the console's 256-byte buffer, even with
+++		 * all four matching values at their maximum length. */
+++		printf("PICASSO_IOKIT begin op=%u sample=%u pid=%d name=%s thread=%llu type=%u\n",
+++		    operation, trace.ticket, pid, trace.name, (unsigned long long)trace.tid, type);
+++		printf("PICASSO_IOKIT match op=%u sample=%u pid=%d name=%s provider=%s match=%s\n",
+++		    operation, trace.ticket, pid, trace.name, provider, match);
+++		printf("PICASSO_IOKIT detail op=%u sample=%u pid=%d name=%s resource=%s detail=%s\n",
+++		    operation, trace.ticket, pid, trace.name, resource, extra);
 ++		return trace;
 ++	}
 ++	return trace;
@@ -3435,7 +3439,7 @@ new file mode 100644
 + static kern_return_t
 + internal_io_service_get_matching_services(
 + 	mach_port_t main_port,
-+@@ -2713,9 +2788,19 @@
++@@ -2713,9 +2793,19 @@
 + 	obj = OSUnserializeXML(matching, matching_size);
 + 
 + 	if ((dict = OSDynamicCast( OSDictionary, obj))) {
@@ -3455,7 +3459,7 @@ new file mode 100644
 + 	} else {
 + 		kr = kIOReturnBadArgument;
 + 	}
-+@@ -2777,6 +2862,20 @@
++@@ -2777,6 +2867,20 @@
 + }
 + 
 + 
@@ -3476,7 +3480,7 @@ new file mode 100644
 + static kern_return_t
 + internal_io_service_get_matching_service(
 + 	mach_port_t main_port,
-+@@ -2796,9 +2895,28 @@
++@@ -2796,9 +2900,28 @@
 + 	obj = OSUnserializeXML(matching, matching_size);
 + 
 + 	if ((dict = OSDynamicCast( OSDictionary, obj))) {
@@ -3505,7 +3509,7 @@ new file mode 100644
 + 	} else {
 + 		kr = kIOReturnBadArgument;
 + 	}
-+@@ -2878,6 +2996,12 @@
++@@ -2878,6 +3001,12 @@
 + 	OSDictionary *              dict;
 + 	IOReturn                    err;
 + 	natural_t                   userMsgType;
@@ -3518,7 +3522,7 @@ new file mode 100644
 + 
 + 	if (main_port != main_device_port) {
 + 		return kIOReturnNotPrivileged;
-+@@ -2901,6 +3025,11 @@
++@@ -2901,6 +3030,11 @@
 + 			err = kIOReturnBadArgument;
 + 			continue;
 + 		}
@@ -3530,7 +3534,7 @@ new file mode 100644
 + 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
 + 
 + 		if ((sym == gIOPublishNotification)
-+@@ -2952,6 +3081,11 @@
++@@ -2952,6 +3086,11 @@
 + 		obj->release();
 + 	}
 + 
@@ -3542,7 +3546,7 @@ new file mode 100644
 + 	return err;
 + }
 + 
-+@@ -4386,13 +4520,28 @@
++@@ -4386,13 +4525,28 @@
 + 		return kIOReturnBadArgument;
 + 	}
 + 
@@ -3571,7 +3575,7 @@ new file mode 100644
 + 			return kIOReturnUnsupported;
 + 		}
 + #if 0
-+@@ -4594,6 +4743,11 @@
++@@ -4594,6 +4748,11 @@
 + 	*connection = client;
 + 	*result = res;
 + 

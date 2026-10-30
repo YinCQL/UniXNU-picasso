@@ -45,7 +45,7 @@ def check(work, tree, output):
     for key in ('logical_bytes', 'packed_bytes', 'packed_sha256', 'raw_sha256',
                 'page_size', 'extent_count'):
         require(seed[key] == packed[key], f'Data report mismatch: {key}')
-    require(packed['logical_bytes'] == 256 * 1024**2, 'Expected 256 MiB sparse logical disk')
+    require(packed['logical_bytes'] == 512 * 1024**2, 'Expected 512 MiB sparse logical disk')
     require(packed['packed_bytes'] <= 4 * 1024**2, 'Packed seed exceeds its memory/payload budget')
     require(seed['persistent'] is False and seed['ownership_preserved'] is True
             and seed['os_inputs_modified'] is False, 'Unsafe seed provenance')

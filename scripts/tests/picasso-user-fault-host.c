@@ -115,6 +115,7 @@ static int host_log(const char *format,...) {
  va_list args;va_start(args,format);
  int n=vsnprintf(output+host_bytes,sizeof(output)-host_bytes,format,args);
  va_end(args);assert(n>0 && (unsigned)n<sizeof(output)-host_bytes);
+ if(strstr(format,"PICASSO_SERVICE exit") || strstr(format,"PICASSO_SERVICE description"))assert(n<256);
  host_bytes+=(unsigned)n;++lines;return n;
 }
 #define printf host_log
@@ -127,7 +128,7 @@ static struct mapping *find(user_addr_t address) {
  return NULL;
 }
 static int copyin(user_addr_t address,void *destination,size_t n) {
- assert(picasso_fault_lock==0 && (scenario>=56 ? lines%7==4 : lines%6==3));++reads;
+ assert(picasso_fault_lock==0 && (scenario>=56 ? lines%8==5 : lines%6==3));++reads;
  if((scenario==25 && address==0x1000) ||
     (scenario==28 && address==UINT64_C(0x10000ab0c)) ||
     (scenario==29 && address==0x9000) ||
@@ -140,7 +141,7 @@ static int copyin(user_addr_t address,void *destination,size_t n) {
  memcpy(destination,m->data,n); return 0;
 }
 static int copyinstr(user_addr_t address,char *destination,size_t capacity,size_t *copied) {
- assert(picasso_fault_lock==0 && (scenario>=56 ? lines%7==4 : lines%6==3));++reads;
+ assert(picasso_fault_lock==0 && (scenario>=56 ? lines%8==5 : lines%6==3));++reads;
  if((scenario==33 && address==0xb000) || (scenario==34 && address==0x8000)) return EFAULT;
  struct mapping *m=find(address);
  if(!m) return EFAULT;
@@ -221,34 +222,34 @@ int main(int argc,char **argv) {
   if(scenario==56) {
    picasso_report_service_exit(&proc,rv);
    contains("PICASSO_SERVICE exit sample=1 pid=95 name=backboardd");
-   contains("description=reason?line??");contains("record=breakpoint-snapshot");
-   assert(lines==7 && reads<=8);goto pass;
+   contains("offset=0 text=reason?line??");contains("record=breakpoint-snapshot");
+   assert(lines==8 && reads<=8);goto pass;
   }
   if(scenario==57) {strcpy(proc.p_name,"backboardd-helper");picasso_report_service_exit(&proc,rv);assert(!lines && !reads);goto pass;}
-  if(scenario==58) {rv=78<<8;picasso_report_service_exit(&proc,rv);contains("status=78");contains("record=not-breakpoint-exit");assert(lines==2 && !reads);goto pass;}
-  if(scenario==59) {reason.osr_code=9;picasso_report_service_exit(&proc,9);contains("exit_signal=9 namespace=2 code=9");contains("record=not-breakpoint-exit");assert(lines==2 && !reads);goto pass;}
-  if(scenario==60) {++thread.tid;picasso_report_service_exit(&proc,rv);contains("record=missing");assert(lines==2 && !reads);goto pass;}
-  if(scenario==61) {proc.p_exit_reason=NULL;picasso_report_service_exit(&proc,rv);contains("description=\n");contains("namespace=0 code=0");assert(lines==2 && !reads);goto pass;}
+  if(scenario==58) {rv=78<<8;picasso_report_service_exit(&proc,rv);contains("status=78");contains("record=not-breakpoint-exit");assert(lines==3 && !reads);goto pass;}
+  if(scenario==59) {reason.osr_code=9;picasso_report_service_exit(&proc,9);contains("exit_signal=9 namespace=2 code=9");contains("record=not-breakpoint-exit");assert(lines==3 && !reads);goto pass;}
+  if(scenario==60) {++thread.tid;picasso_report_service_exit(&proc,rv);contains("record=missing");assert(lines==3 && !reads);goto pass;}
+  if(scenario==61) {proc.p_exit_reason=NULL;picasso_report_service_exit(&proc,rv);contains("offset=0 text=\n");contains("namespace=0 code=0");assert(lines==3 && !reads);goto pass;}
   if(scenario==62) {
    const char *names[]={"backboardd","SpringBoard","mediaserverd","audiomxd","CommCenter","powerd","mobiletimerd","liveactivitiesd"};
    for(unsigned n=0;n<8;++n) {
     strcpy(proc.p_name,names[n]);
     for(unsigned i=0;i<20;++i) {++proc.pid;picasso_report_service_exit(&proc,0);}
    }
-   assert(lines==64 && !reads);contains("sample=4");assert(!strstr(output,"sample=5"));
+   assert(lines==96 && !reads);contains("sample=4");assert(!strstr(output,"sample=5"));
    /* Service quotas must not consume the critical-exit quota. */
-   picasso_report_critical_fault(&proc,0);assert(lines==65);contains("PICASSO_CRITICAL sample=1");goto pass;
+   picasso_report_critical_fault(&proc,0);assert(lines==97);contains("PICASSO_CRITICAL sample=1");goto pass;
   }
-  if(scenario==63) {memset(host_exit_description,'A',sizeof(host_exit_description));host_exit_description[199]=0;picasso_report_service_exit(&proc,0);assert(lines==3 && !reads);char *s=strstr(output,"description=")+12;assert(strchr(s,'\n')-s==160);contains("description_bytes=199 capped=0");contains("offset=160 text=");goto pass;}
+  if(scenario==63) {memset(host_exit_description,'A',sizeof(host_exit_description));host_exit_description[199]=0;picasso_report_service_exit(&proc,0);assert(lines==4 && !reads);char *s=strstr(output,"offset=0 text=")+14;assert(strchr(s,'\n')-s==128);contains("description_bytes=199 capped=0");contains("offset=128 text=");goto pass;}
   if(scenario==64) {
    memset(host_exit_description,'A',sizeof(host_exit_description));
    memcpy(host_exit_description+180,"VITAL_TASK_AFTER_PREFIX",23);host_exit_description[220]=0;
-   picasso_report_service_exit(&proc,9);contains("VITAL_TASK_AFTER_PREFIX");assert(lines==3 && !reads);goto pass;
+   picasso_report_service_exit(&proc,9);contains("VITAL_TASK_AFTER_PREFIX");assert(lines==4 && !reads);goto pass;
   }
   if(scenario==65) {
    memset(host_exit_description,'A',sizeof(host_exit_description));
-   picasso_report_service_exit(&proc,9);contains("description_bytes=960 capped=1");contains("offset=800 text=");
-   assert(!strstr(output,"offset=960") && lines==7 && !reads);goto pass;
+   picasso_report_service_exit(&proc,9);contains("description_bytes=960 capped=1");contains("offset=896 text=");
+   assert(!strstr(output,"offset=1024") && lines==10 && !reads);goto pass;
   }
   if(scenario==66 || scenario==67) {
    size_t length=scenario==66?7:0, total=sizeof(struct host_item)*2+length;
@@ -256,15 +257,15 @@ int main(int argc,char **argv) {
    ((struct host_item *)buffer)->type=KCDATA_BUFFER_BEGIN_OS_REASON;
    struct host_item *desc=(struct host_item *)(buffer+sizeof(struct host_item));desc->type=EXIT_REASON_USER_DESC;desc->size=(uint32_t)length;
    memset(buffer+sizeof(struct host_item)*2,'Z',length);reason.osr_kcd_buf=(char *)buffer;reason.osr_bufsize=(uint32_t)total;
-   picasso_report_service_exit(&proc,9);assert(lines==2 && !reads);
-   contains(scenario==66?"description=ZZZZZZZ\n":"description=\n");free(buffer);goto pass;
+   picasso_report_service_exit(&proc,9);assert(lines==3 && !reads);
+   contains(scenario==66?"offset=0 text=ZZZZZZZ\n":"offset=0 text=\n");free(buffer);goto pass;
   }
   if(scenario>=68 && scenario<=71) {
    if(scenario==68)host_reason_data.begin.type=99;
    if(scenario==69)host_reason_data.desc.size=UINT32_MAX;
    if(scenario==70)host_reason_data.desc.type=99;
    if(scenario==71)reason.osr_bufsize=sizeof(struct host_item)-1;
-   picasso_report_service_exit(&proc,9);contains("description_bytes=0 capped=0 description=\n");assert(lines==2 && !reads);goto pass;
+   picasso_report_service_exit(&proc,9);contains("description_bytes=0 capped=0\n");contains("offset=0 text=\n");assert(lines==3 && !reads);goto pass;
   }
  }
  if(scenario==7) picasso_fault_lock=1;

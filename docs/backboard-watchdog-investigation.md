@@ -57,8 +57,10 @@ The existing final XNU diagnostics patch now reports selected service exits
 before ordinary corpse handling, which previously printed only the process
 name when corpse resources were exhausted. There are four reports per exact
 process name, shared across restarts: backboardd, SpringBoard, mediaserverd,
-audiomxd, CommCenter, powerd and mobiletimerd. Each report includes exit status,
-signal, reason namespace/code and at most 160 sanitized description bytes.
+audiomxd, CommCenter, powerd, mobiletimerd and liveactivitiesd. Each report
+includes exit status, signal, reason namespace/code and at most 960 sanitized
+description bytes, in separate 128-byte chunks. See the later
+[build81 investigation](build81-startup-investigation.md).
 
 A SIGTRAP exit may use the existing saved breakpoint registers, main header,
 cache slide and bounded frame reads only when process lifetime, task and
@@ -67,8 +69,8 @@ SIGKILL from watchdogd is not treated as a breakpoint. The critical-process
 report budget remains separate. The original breakpoint capture hook is
 unchanged; this does not capture blocked threads or every exception type.
 
-backboardd and SpringBoard also receive 12 begin/end pairs per operation and
-exact name, shared across restarts:
+backboardd, SpringBoard, mediaserverd and audiomxd receive 12 operation reports
+per exact name and type, shared across restarts:
 
 | `PICASSO_IOKIT op` | Observation |
 | --- | --- |
@@ -77,10 +79,11 @@ exact name, shared across restarts:
 | 2 | Notification registration; `object=1` does not prove matching delivery |
 | 3 | Service open, including distinct RPC and UserClient result codes |
 
-The begin line copies only bounded matching keys/class names already in
+The begin/match/detail lines copy only bounded matching keys/class names already in
 kernel memory. Non-string matching values are labeled; no dictionary is
 serialized, iterator consumed or result changed. The output is capped at
-192 IOKit lines plus 196 service-exit lines. No timeout, checkin, critical-exit
+768 IOKit lines plus 480 service-exit/snapshot lines. New description and IOKit
+lines fit within 255 formatted bytes. No timeout, checkin, critical-exit
 policy or Sandbox permission changes accompany these diagnostics.
 
 ## Verification and next device checkpoint

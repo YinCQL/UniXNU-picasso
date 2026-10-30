@@ -8,6 +8,7 @@
 #include <libkern/c++/OSSymbol.h>
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
+#include <sys/proc.h>
 extern "C" {
 extern kmod_info_t g_kernel_kmod_info;
 void native_keyevents_static_init(void) __asm__("__GLOBAL__sub_I_NativeKeyStoreEvents.cpp");
@@ -17,20 +18,30 @@ static bool enabled;
 static IOService *stateService;
 extern "C" bool picasso_aks_state_enabled(void) {return enabled;}
 
-extern "C" void picasso_aks_observed(unsigned selector,IOReturn result) {
-    // Two reports per known selector and result category, across all clients.
+extern "C" void picasso_aks_observed(unsigned selector,IOReturn result,bool hasContext,uint64_t context) {
+    // Keep SpringBoard observations separate from the earlier system daemons.
+    // State-query context is an integer ABI argument, never key/bag contents.
     // Unknown selector values share a single bucket. Never log key material.
-    static unsigned counts[258][2], total;
-    unsigned *counter=&counts[selector<=256?selector:257][result==kIOReturnSuccess?0:1];
+    static unsigned counts[4][258][2], totals[4];
+    char name[32]={0};int pid=proc_selfpid();proc_name(pid,name,sizeof(name));
+    for(unsigned i=0;i<sizeof(name) && name[i];++i)
+        if((unsigned char)name[i]<32 || (unsigned char)name[i]>126)name[i]='?';
+    unsigned group=!strcmp(name,"SpringBoard")?0:!strcmp(name,"keybagd")?1:!strcmp(name,"securityd")?2:3;
+    unsigned *counter=&counts[group][selector<=256?selector:257][result==kIOReturnSuccess?0:1];
     unsigned count=__atomic_load_n(counter,__ATOMIC_RELAXED);
     while(count<2) {
         if(__atomic_compare_exchange_n(counter,&count,count+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {
-            unsigned used=__atomic_load_n(&total,__ATOMIC_RELAXED);
+            unsigned *total=&totals[group];
+            unsigned used=__atomic_load_n(total,__ATOMIC_RELAXED);
             for(;;) {
-                if(used>=48)return;
-                if(__atomic_compare_exchange_n(&total,&used,used+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED))break;
+                if(used>=24)return;
+                if(__atomic_compare_exchange_n(total,&used,used+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED))break;
             }
-            IOLog("PICASSO_AKS selector=%u sample=%u result=%x\n",selector,count+1,result);break;
+            char stateContext[24]="<absent>";
+            if(hasContext && (selector==7 || selector==17 || selector==35))
+                snprintf(stateContext,sizeof(stateContext),"0x%llx",(unsigned long long)context);
+            IOLog("PICASSO_AKS pid=%d name=%s selector=%u sample=%u result=%x state_context=%s\n",
+                pid,name,selector,count+1,result,stateContext);break;
         }
     }
 }

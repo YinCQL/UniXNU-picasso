@@ -7,11 +7,18 @@
 #include <map>
 #include <string>
 #include <cstdio>
+#include <cstdarg>
 #include <intrin.h>
 #define __ATOMIC_ACQUIRE 0
 #define __ATOMIC_RELEASE 0
+#define __ATOMIC_RELAXED 0
 #define __atomic_load_n(p,o) ((unsigned)_InterlockedCompareExchange((volatile long *)(p),0,0))
 #define __atomic_store_n(p,v,o) ((void)_InterlockedExchange((volatile long *)(p),(long)(v)))
+static bool host_compare(unsigned *p,unsigned *expected,unsigned desired) {
+    unsigned actual=(unsigned)_InterlockedCompareExchange((volatile long *)p,(long)desired,(long)*expected);
+    if(actual==*expected)return true;*expected=actual;return false;
+}
+#define __atomic_compare_exchange_n(p,e,d,w,s,f) host_compare(p,e,d)
 using UInt32=uint32_t;
 using task_t=void *;
 using IOReturn=int;
@@ -69,7 +76,15 @@ public:
 #define OSDefineMetaClassAndStructors(n,b)
 static bool enabled;
 extern "C" bool picasso_aks_state_enabled(){return enabled;}
-extern "C" void picasso_aks_observed(unsigned,IOReturn){}
+static const char *processName="SpringBoard";
+static int proc_selfpid(){return 27;}
+static void proc_name(int,char *name,int size){snprintf(name,size,"%s",processName);}
+static std::string diagnosticOutput;
+static void IOLog(const char *fmt,...) {
+    char line[256];va_list args;va_start(args,fmt);int n=vsnprintf(line,sizeof(line),fmt,args);va_end(args);
+    assert(n>0 && n<(int)sizeof(line));diagnosticOutput+=line;
+}
+#include "observed.inc"
 #include "NativeKeyStoreEvents.cpp"
 
 static std::map<std::string,unsigned> decode(const uint8_t *p,size_t n) {
@@ -141,6 +156,9 @@ int main() {
     memory.length=256;memory.shortWrite=true;
     assert(call(client,17,a)==kIOReturnUnderrun && a.structureOutputDescriptorSize==256);
     a.structureOutputDescriptor=nullptr;
+    processName="keybagd";
+    for(unsigned i=0;i<10;++i)picasso_aks_observed(14,kIOReturnUnsupported,true,0xdeadbeef);
+    processName="SpringBoard";
     // All bag, unlock, crypto, assertion, notification and unknown operations fail.
     for(unsigned selector=1;selector<300;++selector) {
         if(selector==7 || selector==17 || selector==35)continue;
@@ -155,5 +173,13 @@ int main() {
     enabled=false;assert(call(client,7,a)==kIOReturnNotReady);enabled=true;
     assert(client->clientClose()==0 && call(client,7,a)==kIOReturnNotReady);
     client->release();
+    assert(diagnosticOutput.find("name=SpringBoard selector=7 sample=1 result=0 state_context=0x0")!=std::string::npos);
+    assert(diagnosticOutput.find("state_context=0x1")!=std::string::npos);
+    assert(diagnosticOutput.find("name=keybagd selector=14 sample=2")!=std::string::npos);
+    assert(diagnosticOutput.find("name=keybagd selector=14 sample=3")==std::string::npos);
+    assert(diagnosticOutput.find("deadbeef")==std::string::npos);
+    assert(diagnosticOutput.find("sample=3")==std::string::npos);
+    processName="securityd";picasso_aks_observed(0,kIOReturnSuccess,false,0);
+    assert(diagnosticOutput.find("name=securityd selector=0 sample=1 result=0")!=std::string::npos);
     puts("PASS state ABI, no key operations, lifecycle failures, input/output bounds and short writes");
 }
