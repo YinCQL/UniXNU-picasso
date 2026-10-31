@@ -14,7 +14,7 @@ import shutil
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
-CASES = 4
+CASES = 6
 
 
 def load(path):

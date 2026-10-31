@@ -34,6 +34,7 @@ struct Descriptor { uint64_t bytes; uint64_t getLength() const { return bytes; }
 struct IOExternalMethodArguments {
     Descriptor *structureInputDescriptor;
     uint32_t structureInputSize, scalarInputCount, structureOutputSize, scalarOutputCount;
+    const void *structureInput;
 };
 static thread_local const char *processName = "backboardd";
 static thread_local uint64_t threadId = 42;
@@ -57,11 +58,15 @@ static int host_log(const char *format, ...) {
 int main(int argc, char **argv) {
     assert(argc == 2); int scenario = atoi(argv[1]);
     IOUserClient display{true}, other{false};
-    IOExternalMethodArguments args{nullptr, 1132, 0, 0, 0};
+    uint8_t input[1132] = {};
+    input[0] = input[17] = input[1023] = input[1024] = input[1131] = 0xa5;
+    IOExternalMethodArguments args{nullptr, 1132, 0, 0, 0, input};
     if (scenario == 0) {
         auto t = picasso_fb_method_begin(&display, 5, &args);
         assert(t.ticket == 1); picasso_fb_method_end(t, &args, 0xe00002c2U);
-        assert(lines == 2 && args.structureInputSize == 1132);
+        assert(lines == 3 && args.structureInputSize == 1132);
+        assert(output.find("blocks16_lo=8000000000000003 blocks16_hi=0000000000000041") != std::string::npos);
+        assert(output.find("a5") == std::string::npos);
         assert(output.find("sel=5 sample=1") != std::string::npos);
         assert(output.find("in_bytes=1132") != std::string::npos);
         assert(output.find("result=e00002c2") != std::string::npos);
@@ -93,7 +98,7 @@ int main(int argc, char **argv) {
             }
         });
         for (auto &worker : workers) worker.join();
-        assert(lines == 36);
+        assert(lines == 42);
         for (uint32_t selector : {4u, 5u, 72u}) for (unsigned sample : {1u, 2u, 3u}) {
             std::string begin = "begin sel=" + std::to_string(selector) + " sample=" + std::to_string(sample);
             std::string end = "end sel=" + std::to_string(selector) + " sample=" + std::to_string(sample);
@@ -102,6 +107,33 @@ int main(int argc, char **argv) {
             assert(output.find(begin, a + 1) != std::string::npos);
             assert(output.find(end, b + 1) != std::string::npos);
         }
+    } else if (scenario == 4) {
+        args.structureInputSize = 1131;
+        auto a = picasso_fb_method_begin(&display, 5, &args);
+        picasso_fb_method_end(a, &args, 0);
+        args.structureInputSize = 1132; args.structureInput = nullptr;
+        auto b = picasso_fb_method_begin(&display, 5, &args);
+        picasso_fb_method_end(b, &args, 0);
+        Descriptor descriptor{1132}; args.structureInputDescriptor = &descriptor;
+        args.structureInput = input;
+        auto c = picasso_fb_method_begin(&display, 5, &args);
+        picasso_fb_method_end(c, &args, 0);
+        assert(lines == 6 && output.find("PICASSO_FB shape") == std::string::npos);
+    } else if (scenario == 5) {
+        memset(input, 0, sizeof(input));
+        auto a = picasso_fb_method_begin(&display, 5, &args);
+        picasso_fb_method_end(a, &args, 0);
+        assert(output.find("blocks16_lo=0000000000000000 blocks16_hi=0000000000000000") != std::string::npos);
+        input[5] = 1; input[1100] = 2;
+        auto b = picasso_fb_method_begin(&display, 5, &args);
+        picasso_fb_method_end(b, &args, 0);
+        input[5] = 19; input[1100] = 47;
+        auto c = picasso_fb_method_begin(&display, 5, &args);
+        picasso_fb_method_end(c, &args, 0);
+        const std::string mask = "blocks16_lo=0000000000000001 blocks16_hi=0000000000000010";
+        auto first = output.find(mask);
+        assert(lines == 9 && first != std::string::npos && output.find(mask, first + 1) != std::string::npos);
+        assert(input[5] == 19 && input[1100] == 47);
     } else { assert(false); }
     std::printf("PASS scenario=%d\n", scenario);
 }

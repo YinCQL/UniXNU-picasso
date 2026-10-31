@@ -1913,7 +1913,7 @@ diff --git a/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch b/patches/xnu/z
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
-@@ -0,0 +1,1981 @@
+@@ -0,0 +1,1996 @@
 +diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 +--- a/bsd/vfs/vfs_syscalls.c
 ++++ b/bsd/vfs/vfs_syscalls.c
@@ -3694,7 +3694,7 @@ new file mode 100644
 + 	return err;
 + }
 + 
-+@@ -6459,10 +6657,74 @@ is_io_device_tree_entry_exists_with_name(
++@@ -6459,10 +6657,89 @@ is_io_device_tree_entry_exists_with_name(
 + }
 + } /* extern "C" */
 +-
@@ -3743,6 +3743,21 @@ new file mode 100644
 ++	    selector, trace.ticket, pid, (unsigned long long)trace.tid,
 ++	    (unsigned long long)bytes, args->scalarInputCount,
 ++	    args->structureOutputSize, args->scalarOutputCount);
+++	// Record only which 16-byte regions contain data, never input values.
+++	// The MIG in-band input is kernel-owned; descriptor-backed calls are not read.
+++	if (selector == 5 && !args->structureInputDescriptor &&
+++	    args->structureInput && args->structureInputSize == 1132) {
+++		const uint8_t *input = static_cast<const uint8_t *>(args->structureInput);
+++		uint64_t low = 0, high = 0;
+++		for (unsigned i = 0; i < 1132; ++i) {
+++			if (!input[i]) continue;
+++			unsigned block = i / 16;
+++			if (block < 64) low |= 1ULL << block;
+++			else high |= 1ULL << (block - 64);
+++		}
+++		printf("PICASSO_FB shape sel=5 sample=%u pid=%d blocks16_lo=%016llx blocks16_hi=%016llx\n",
+++		    trace.ticket, pid, (unsigned long long)low, (unsigned long long)high);
+++	}
 ++	return trace;
 ++}
 ++
@@ -3771,7 +3786,7 @@ new file mode 100644
 ++
 + 	ipcEnter(defaultLocking ? (defaultLockingSingleThreadExternalMethod ? kIPCLockWrite : kIPCLockRead) : kIPCLockNone);
 + 	if (uc2022) {
-+@@ -6471,6 +6733,11 @@ IOUserClient::callExternalMethod(uint32_t selector, IOExternalMethodArguments *
++@@ -6471,6 +6748,11 @@ IOUserClient::callExternalMethod(uint32_t selector, IOExternalMethodArguments *
 + 		ret = externalMethod(selector, args);
 + 	}
 + 	ipcExit(defaultLocking ? (defaultLockingSingleThreadExternalMethod ? kIPCLockWrite : kIPCLockRead) : kIPCLockNone);
