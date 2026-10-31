@@ -150,6 +150,12 @@ jobs:
           python3 scripts/check-picasso-data-artifacts.py --tree out/picasso/tree --work out/picasso \
             --output out/picasso/logs/data-artifacts.json
 
+      - name: Check iOS 16 registered-port contracts
+        run: |
+          python3 scripts/check-picasso-mach-ports.py --xnu out/picasso/tree/.cache/xnu-work \
+            --output out/picasso/host-checks/mach-ports
+          cp out/picasso/host-checks/mach-ports/results.json out/picasso/logs/mach-ports-host-check.json
+
       - name: Check native counter microtime conversion
         run: |
           python3 scripts/check-picasso-microtime.py --xnu out/picasso/tree/.cache/xnu-work \

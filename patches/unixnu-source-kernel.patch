@@ -3915,3 +3915,135 @@ diff --git a/scripts/unixnu/payload.py b/scripts/unixnu/payload.py
      if data and adt.get('persistent_data'):
          command.append('--persistent-data')
      # Fixups of signed text (patches/xnu/native-text-fixup.patch) travel in /chosen/text-fixups, outside the 1000-byte command line.
+diff --git a/patches/xnu/picasso-ios16-mach-ports.patch b/patches/xnu/picasso-ios16-mach-ports.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/picasso-ios16-mach-ports.patch
+@@ -0,0 +1,127 @@
++diff --git a/osfmk/mach/task.defs b/osfmk/mach/task.defs
++--- a/osfmk/mach/task.defs
+++++ b/osfmk/mach/task.defs
++@@ -132,34 +132,19 @@
++  *	Stash a handful of ports for the target task; child
++  *	tasks inherit this stash at task_create time.
++  */
++-#if LIBSYSCALL_INTERFACE
+++/* Picasso's iOS 16 userland uses the OOL array ABI at IDs 3403/3404. */
++ routine	mach_ports_register(
++ 		target_task	: task_t;
++ 		init_port_set	: mach_port_array_t =
++ 					^array[] of mach_port_t);
++-#else
++-routine	_kernelrpc_mach_ports_register3(
++-		target_task	: task_t;
++-		port1           : mach_port_t;
++-		port2           : mach_port_t;
++-		port3           : mach_port_t);
++-#endif
++-
+++
++ /*
++  *	Retrieve the stashed ports for the target task.
++  */
++-#if LIBSYSCALL_INTERFACE
++ routine	mach_ports_lookup(
++ 		target_task	: task_t;
++ 	out	init_port_set	: mach_port_array_t =
++ 					^array[] of mach_port_t);
++-#else
++-routine	_kernelrpc_mach_ports_lookup3(
++-		target_task	: task_t;
++-	out	port1		: mach_port_t;
++-	out	port2		: mach_port_t;
++-	out	port3		: mach_port_t);
++-#endif
++-
+++
++ /*
++  *      Returns information about the target task.
++diff --git a/osfmk/kern/task.h b/osfmk/kern/task.h
++--- a/osfmk/kern/task.h
+++++ b/osfmk/kern/task.h
++@@ -1316,6 +1316,13 @@
++ 	mach_port_t             port2,
++ 	mach_port_t             port3);
++-
+++
+++/* Retained in-kernel helper; the Picasso MIG interface uses OOL arrays. */
+++extern kern_return_t _kernelrpc_mach_ports_lookup3(
+++	task_t                  task,
+++	ipc_port_t              *port1,
+++	ipc_port_t              *port2,
+++	ipc_port_t              *port3);
+++
++ /* Kernel side prototypes for MIG routines */
++ extern kern_return_t task_get_exception_ports(
++ 	task_t                          task,
++diff --git a/osfmk/kern/ipc_tt.c b/osfmk/kern/ipc_tt.c
++--- a/osfmk/kern/ipc_tt.c
+++++ b/osfmk/kern/ipc_tt.c
++@@ -2392,8 +2392,61 @@
++ 	*port3 = ipc_port_copy_send_any(task->itk_registered[2]);
++-
+++
++ 	itk_unlock(task);
++-
+++
+++	return KERN_SUCCESS;
+++}
+++
+++/*
+++ * Picasso runs iOS 16 libsystem_kernel, whose registered-port RPCs carry
+++ * OOL arrays. Keep the current helpers (including the immovable-send check)
+++ * and adapt only the array ownership and null padding at the MIG boundary.
+++ * On failure MIG still owns the incoming array and all of its send rights.
+++ */
+++kern_return_t
+++mach_ports_register(
+++	task_t                  task,
+++	mach_port_array_t       memory,
+++	mach_msg_type_number_t  portsCnt)
+++{
+++	ipc_port_t ports[TASK_PORT_REGISTER_MAX] = { IP_NULL };
+++	kern_return_t kr;
+++
+++	if (task == TASK_NULL || portsCnt > TASK_PORT_REGISTER_MAX ||
+++	    (portsCnt != 0 && memory == NULL)) {
+++		return KERN_INVALID_ARGUMENT;
+++	}
+++	for (mach_msg_type_number_t i = 0; i < portsCnt; i++) {
+++		ports[i] = memory[i];
+++	}
+++	kr = _kernelrpc_mach_ports_register3(task, ports[0], ports[1], ports[2]);
+++	if (kr == KERN_SUCCESS && portsCnt != 0) {
+++		kfree_type(mach_port_t, portsCnt, memory);
+++	}
+++	return kr;
+++}
+++
+++kern_return_t
+++mach_ports_lookup(
+++	task_t                  task,
+++	mach_port_array_t       *portsp,
+++	mach_msg_type_number_t  *portsCnt)
+++{
+++	ipc_port_t *ports;
+++	kern_return_t kr;
+++
+++	if (task == TASK_NULL) {
+++		return KERN_INVALID_ARGUMENT;
+++	}
+++	ports = kalloc_type(ipc_port_t, TASK_PORT_REGISTER_MAX,
+++	    Z_WAITOK | Z_ZERO | Z_NOFAIL);
+++	kr = _kernelrpc_mach_ports_lookup3(task, &ports[0], &ports[1], &ports[2]);
+++	if (kr != KERN_SUCCESS) {
+++		kfree_type(ipc_port_t, TASK_PORT_REGISTER_MAX, ports);
+++		return kr;
+++	}
+++	*portsp = ports;
+++	*portsCnt = TASK_PORT_REGISTER_MAX;
++ 	return KERN_SUCCESS;
++ }
++-
+++
++ static kern_return_t
