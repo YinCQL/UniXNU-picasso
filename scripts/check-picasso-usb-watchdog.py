@@ -59,6 +59,7 @@ enum Action { NoAction, EnterPanic, RequestReboot, RequestHang, RequestPanic, Re
 static Action action;
 static unsigned poll_calls, pet_calls, reboot_calls, hang_calls, panic_calls;
 static unsigned wait_calls, yield_calls, stop_after;
+static unsigned simulated_control;
 static uint64_t fake_now_ns, yield_step;
 static volatile uint64_t armcpu_timer_interrupts;
 static bool in_poll, replay_console, in_printf, panic_on_yield;
@@ -90,13 +91,19 @@ static void ud_poll(void) {
 }
 static void usb_wr(uintptr_t base, unsigned off, unsigned value) {
     assert(!in_poll && ud.poll_lock == 0 && !ud.panic_mode && !irq_enabled);
-    assert(base == ud.wdt && off == 4u && value == 1);
+    assert(base == ud.wdt);
+    if (off == 8u) {
+        simulated_control = value;
+        return;
+    }
+    if (off == 0x10u || off == 0x14u) return;
+    assert(off == 4u && value == 1);
     ++pet_calls;
     sequence.emplace_back("pet");
 }
 static unsigned usb_rd(uintptr_t base, unsigned off) {
     assert(base == ud.wdt && !irq_enabled);
-    if (off == 8u) return 1u;
+    if (off == 8u) return simulated_control;
     assert(off == 0x10u || off == 0x14u);
     return 983039u;
 }
@@ -160,6 +167,7 @@ static void reset(void) {
     action = NoAction;
     poll_calls = pet_calls = reboot_calls = hang_calls = panic_calls = 0;
     wait_calls = yield_calls = 0;
+    simulated_control = 1;
     stop_after = 1;
     fake_now_ns = 5000000000ULL;
     yield_step = 1000000;

@@ -192,6 +192,15 @@ int main(void) {
  assert(picasso_usb_watchdog_pet() && writes.size()==6);
  passed("boot arm retains the five-write 30-second sequence and checks real register values");
 
+ reset();ud.watchdog_armed=true;regs[APSS_WDT_EN/4]=1;
+ regs[APSS_WDT_BARK/4]=regs[APSS_WDT_BITE/4]=0xdffff;writes.clear();
+ picasso_usb_watchdog_arm();
+ assert(ud.watchdog_armed && writes.size()==3);
+ assert(writes[0].off==APSS_WDT_BARK && writes[0].value==983039);
+ assert(writes[1].off==APSS_WDT_BITE && writes[1].value==983039);
+ assert(writes[2].off==APSS_WDT_RST && writes[2].value==1);
+ passed("running firmware watchdog accepts the 30-second hot update and an immediate pet");
+
  for(unsigned mode=0;mode<3;++mode) {
   reset();ud.watchdog_armed=false;
   if(mode==0)ud.wdt=0;if(mode==1)ud.watchdog=false;if(mode==2)atomic_store_host(&picasso_wdt_lock,1);
@@ -199,10 +208,12 @@ int main(void) {
  }
  passed("unmapped disabled-option or busy boot arm changes no hardware");
 
- for(unsigned off:{APSS_WDT_EN,APSS_WDT_BARK,APSS_WDT_BITE}) {
+ for(unsigned off:{APSS_WDT_EN,APSS_WDT_BITE}) {
   reset();regs[off/4]^=2;
   assert(!picasso_watchdog_backend_claim(&owner_a) && !picasso_wdt_owner && writes.empty());
  }
+ reset();regs[APSS_WDT_BARK/4]^=2;
+ assert(picasso_watchdog_backend_claim(&owner_a) && picasso_wdt_owner==&owner_a);
  reset();ud.watchdog_armed=false;assert(!picasso_watchdog_backend_claim(&owner_a) && writes.empty());
  reset();ud.wdt=0;assert(!picasso_watchdog_backend_claim(&owner_a) && writes.empty());
  passed("claim rejects unarmed unmapped and every persistent-register mismatch without installing owner");

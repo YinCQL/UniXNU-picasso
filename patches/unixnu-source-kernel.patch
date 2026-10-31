@@ -4443,12 +4443,10 @@ diff --git a/patches/xnu/zzzzzzzzzzzz-picasso-watchdog-policy.patch b/patches/xn
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzzzzzzzzz-picasso-watchdog-policy.patch
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,127 @@
 +--- a/bsd/kern/kern_exec.c
 ++++ b/bsd/kern/kern_exec.c
-+@@ -7381,10 +7381,115 @@
-+ #endif
-+ 	"/sbin/launchd",
++@@ -8031,6 +8031,111 @@
 + };
 + 
 + /*
@@ -4560,15 +4558,10 @@ new file mode 100644
 +  * load_init_program
 +  *
 +  * Description:	Load the "init" program; in most cases, this will be "launchd"
-+  *
-+  * Parameters:	p			Process to call execve() to create
-+@@ -7432,11 +7537,16 @@
-+ #if defined(XNU_OWNER_DATA_MOUNT) && XNU_OWNER_DATA_MOUNT
-+ 	boot_progress_stage("Data mount enter");
++@@ -8082,6 +8187,12 @@
 + 	int data_error = native_owner_data_prepare(p, (user_addr_t)scratch_addr);
 + 	boot_progress_stage("Data mount returned");
 + 	if (data_error) panic("offline scratch Data mount failed: %d", data_error);
-+-
 ++	{
 ++		int policy_error = picasso_boot_watchdog_policy(p, scratch_addr);
 ++		if (policy_error) {
@@ -4578,5 +4571,125 @@ new file mode 100644
 + #if defined(XNU_BOOT_PROGRESS) && XNU_BOOT_PROGRESS
 + 	extern int sheng_boot_watchdog_policy(void *, uint64_t);
 + 	boot_progress_stage("temporary watchdog launch policy enter");
-+ 	int policy_error=sheng_boot_watchdog_policy(p, (uint64_t)scratch_addr);
-+ 	if (policy_error) panic("sheng watchdog launch policy failed: %d", policy_error);
+
+diff --git a/patches/xnu/zzzzzzzzzzzzzz-picasso-live-wait-stack.patch b/patches/xnu/zzzzzzzzzzzzzz-picasso-live-wait-stack.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/zzzzzzzzzzzzzz-picasso-live-wait-stack.patch
+@@ -0,0 +1,116 @@
++--- a/osfmk/kern/task.c
+++++ b/osfmk/kern/task.c
++@@ -421,6 +421,7 @@
++ 
++ extern kern_return_t exception_deliver(thread_t, exception_type_t, mach_exception_data_t, mach_msg_type_number_t, struct exception_action *, lck_mtx_t *);
++ extern void bsd_copythreadname(void *dst_uth, void *src_uth);
+++extern kern_return_t thread_suspend(thread_t thread);
++ extern kern_return_t thread_resume(thread_t thread);
++ 
++ extern int exit_with_port_space_exception(void *proc, mach_exception_code_t code, mach_exception_subcode_t subcode);
++@@ -10292,18 +10293,71 @@
++ }
++ /* Bounded live-task observation for the host-triggered CDC diagnostic.
++  * Thread state and wait-event scalars are copied under their locks, then
++- * printed after both locks are released. No user stack or task memory is read. */
+++ * printed after both locks are released. A small number of waiting threads
+++ * are suspended one at a time for bounded user-stack sampling. */
++ void picasso_live_task_snapshot(task_t, int, unsigned);
+++
+++#if __arm64__ && (DEVELOPMENT || DEBUG)
+++static void
+++picasso_live_thread_stack(thread_t thread, int pid, unsigned sample,
+++    uint64_t tid)
+++{
+++	if (thread == current_thread()) {
+++		printf("PICASSO_WAIT stack pid=%d sample=%u thread=%llu unavailable=current-thread\n",
+++		    pid, sample, (unsigned long long)tid);
+++		return;
+++	}
+++	kern_return_t suspend_result = thread_suspend(thread);
+++	printf("PICASSO_WAIT stack pid=%d sample=%u thread=%llu suspend=%d scope=live-suspended-thread\n",
+++	    pid, sample, (unsigned long long)tid, suspend_result);
+++	if (suspend_result != KERN_SUCCESS) {
+++		return;
+++	}
+++	arm_saved_state_t *state = get_user_regs(thread);
+++	if (!state || !is_saved_state64(state) ||
+++	    !PSR64_IS_USER64(get_saved_state_cpsr(state))) {
+++		printf("PICASSO_WAIT stack pid=%d sample=%u thread=%llu unavailable=user-state\n",
+++		    pid, sample, (unsigned long long)tid);
+++		(void)thread_resume(thread);
+++		return;
+++	}
+++	printf("PICASSO_WAIT regs pid=%d sample=%u thread=%llu pc=%llx lr=%llx sp=%llx fp=%llx\n",
+++	    pid, sample, (unsigned long long)tid,
+++	    (unsigned long long)get_saved_state_pc(state),
+++	    (unsigned long long)get_saved_state_lr(state),
+++	    (unsigned long long)get_saved_state_sp(state),
+++	    (unsigned long long)get_saved_state_fp(state));
+++	uintptr_t frames[12] = {};
+++	struct backtrace_control ctl = BTCTL_INIT;
+++	struct backtrace_user_info info = BTUINFO_INIT;
+++	ctl.btc_user_thread = thread;
+++	unsigned depth = backtrace_user(frames, 12, &ctl, &info);
+++	printf("PICASSO_WAIT stack pid=%d sample=%u thread=%llu frames=%u error=%d flags=%x scope=live-suspended-thread\n",
+++	    pid, sample, (unsigned long long)tid, depth, info.btui_error,
+++	    (unsigned)info.btui_info);
+++	for (unsigned i = 0; i < depth; i += 4) {
+++		printf("PICASSO_WAIT frames pid=%d sample=%u thread=%llu offset=%u %llx %llx %llx %llx\n",
+++		    pid, sample, (unsigned long long)tid, i,
+++		    (unsigned long long)frames[i],
+++		    (unsigned long long)(i + 1 < depth ? frames[i + 1] : 0),
+++		    (unsigned long long)(i + 2 < depth ? frames[i + 2] : 0),
+++		    (unsigned long long)(i + 3 < depth ? frames[i + 3] : 0));
+++	}
+++	(void)thread_resume(thread);
+++}
+++#endif
++ 
++ void
++ picasso_live_task_snapshot(task_t task, int pid, unsigned sample)
++ {
++ 	struct {
+++		thread_t thread;
++ 		uint64_t tid, pc, lr, sp, fp;
++ 		event64_t wait_event;
++ 		uint32_t valid, user64, state, hint;
++ 	} rows[32] = {};
++ 	unsigned count = 0, total = 0, locked = 0;
+++	unsigned trace_count = 0;
++ 	uint64_t main_header = 0;
++ 	uint32_t slide = 0;
++ 
++@@ -10322,7 +10376,9 @@
++ 			if (count == 32) {
++ 				break;
++ 			}
+++			rows[count].thread = thread;
++ 			rows[count].tid = thread_tid(thread);
+++			thread_reference(thread);
++ 			spl_t level = splsched();
++ 			if (simple_lock_try(&thread->sched_lock, &thread_lck_grp)) {
++ 				rows[count].valid = 1;
++@@ -10360,6 +10416,22 @@
++ 		    (unsigned long long)rows[i].pc, (unsigned long long)rows[i].lr,
++ 		    (unsigned long long)rows[i].sp, (unsigned long long)rows[i].fp);
++ 	}
+++	for (unsigned i = 0; i < count; i++) {
+++#if __arm64__ && (DEVELOPMENT || DEBUG)
+++		if (rows[i].valid && rows[i].user64 &&
+++		    (rows[i].state & TH_WAIT)) {
+++			if (trace_count < 4) {
+++				picasso_live_thread_stack(rows[i].thread, pid,
+++				    sample, rows[i].tid);
+++				++trace_count;
+++			} else {
+++				printf("PICASSO_WAIT stack pid=%d sample=%u thread=%llu skipped=limit\n",
+++				    pid, sample, (unsigned long long)rows[i].tid);
+++			}
+++		}
+++#endif
+++		thread_deallocate(rows[i].thread);
+++	}
++ }
++ 
++ 

@@ -237,7 +237,7 @@ kernel_args = [
   # is alive, then force a Fastboot reset after 60 s of silence.
   "picasso_usb_watchdog=1",
   "picasso_usb_watchdog_ms=30000",
-  "picasso_usb_early_watchdog=0",
+  "picasso_usb_early_watchdog=1",
   "picasso_usb_host_timeout_ms=60000",
   "picasso_usb_host_boot_grace_ms=120000",
   # The XNU CDC panic/reset path uses PSHOLD as its final fallback and arms the
