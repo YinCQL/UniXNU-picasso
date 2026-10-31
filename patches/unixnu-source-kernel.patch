@@ -3919,7 +3919,7 @@ diff --git a/patches/xnu/picasso-ios16-mach-ports.patch b/patches/xnu/picasso-io
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/picasso-ios16-mach-ports.patch
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,131 @@
 +diff --git a/osfmk/mach/task.defs b/osfmk/mach/task.defs
 +--- a/osfmk/mach/task.defs
 ++++ b/osfmk/mach/task.defs
@@ -3982,7 +3982,7 @@ new file mode 100644
 +diff --git a/osfmk/kern/ipc_tt.c b/osfmk/kern/ipc_tt.c
 +--- a/osfmk/kern/ipc_tt.c
 ++++ b/osfmk/kern/ipc_tt.c
-+@@ -2392,8 +2392,61 @@
++@@ -2392,8 +2392,65 @@
 + 	*port3 = ipc_port_copy_send_any(task->itk_registered[2]);
 +-
 ++
@@ -4012,11 +4012,11 @@ new file mode 100644
 ++		return KERN_INVALID_ARGUMENT;
 ++	}
 ++	for (mach_msg_type_number_t i = 0; i < portsCnt; i++) {
-++		ports[i] = memory[i];
+++		ports[i] = memory[i].port;
 ++	}
 ++	kr = _kernelrpc_mach_ports_register3(task, ports[0], ports[1], ports[2]);
 ++	if (kr == KERN_SUCCESS && portsCnt != 0) {
-++		kfree_type(mach_port_t, portsCnt, memory);
+++		mach_port_array_free(memory, portsCnt);
 ++	}
 ++	return kr;
 ++}
@@ -4027,18 +4027,22 @@ new file mode 100644
 ++	mach_port_array_t       *portsp,
 ++	mach_msg_type_number_t  *portsCnt)
 ++{
-++	ipc_port_t *ports;
+++	mach_port_array_t ports;
+++	ipc_port_t values[TASK_PORT_REGISTER_MAX];
 ++	kern_return_t kr;
 ++
 ++	if (task == TASK_NULL) {
 ++		return KERN_INVALID_ARGUMENT;
 ++	}
-++	ports = kalloc_type(ipc_port_t, TASK_PORT_REGISTER_MAX,
+++	ports = mach_port_array_alloc(TASK_PORT_REGISTER_MAX,
 ++	    Z_WAITOK | Z_ZERO | Z_NOFAIL);
-++	kr = _kernelrpc_mach_ports_lookup3(task, &ports[0], &ports[1], &ports[2]);
+++	kr = _kernelrpc_mach_ports_lookup3(task, &values[0], &values[1], &values[2]);
 ++	if (kr != KERN_SUCCESS) {
-++		kfree_type(ipc_port_t, TASK_PORT_REGISTER_MAX, ports);
+++		mach_port_array_free(ports, TASK_PORT_REGISTER_MAX);
 ++		return kr;
+++	}
+++	for (mach_msg_type_number_t i = 0; i < TASK_PORT_REGISTER_MAX; i++) {
+++		ports[i].port = values[i];
 ++	}
 ++	*portsp = ports;
 ++	*portsCnt = TASK_PORT_REGISTER_MAX;

@@ -28,6 +28,21 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     source = (args.xnu / 'osfmk/kern/ipc_tt.c').read_text(encoding='utf-8')
     defs = (args.xnu / 'osfmk/mach/task.defs').read_text(encoding='utf-8')
+    port_header = (args.xnu / 'osfmk/mach/port.h').read_text(encoding='utf-8')
+    message_header = (args.xnu / 'osfmk/mach/message.h').read_text(encoding='utf-8')
+    array_type = re.findall(
+        r'typedef struct \{\s*mach_port_t __mach_port_array_auth port;\s*\}'
+        r'\s*mach_port_ool_t;\s*typedef mach_port_ool_t\s*\*mach_port_array_t;',
+        port_header)
+    array_allocators = re.findall(
+        r'#define mach_port_array_alloc\(count, flags\)\s*\\\s*'
+        r'kalloc_type\(mach_port_ool_t, count, flags\)\s*'
+        r'#define mach_port_array_free\(ptr, count\)\s*\\\s*'
+        r'kfree_type\(mach_port_ool_t, count, ptr\)', message_header)
+    if len(array_type) != 1 or len(array_allocators) != 1:
+        raise ValueError('Unexpected XNU private Mach port array declarations')
+    (out / 'xnu-port-array.h').write_text(array_type[0] + '\n' + array_allocators[0] + '\n',
+                                           encoding='utf-8', newline='\n')
     names = ('_kernelrpc_mach_ports_register3', '_kernelrpc_mach_ports_lookup3',
              'mach_ports_register', 'mach_ports_lookup')
     blocks = []
@@ -55,7 +70,10 @@ def main():
     if not vcvars and not cc:
         raise RuntimeError('No installed C compiler')
     report = dict(scope=__doc__, source_sha256=hashlib.sha256(source.encode()).hexdigest(),
-                  helper_sha256=hashlib.sha256(helper.encode()).hexdigest(), runs=[], pass_result=False)
+                  helper_sha256=hashlib.sha256(helper.encode()).hexdigest(),
+                  port_header_sha256=hashlib.sha256(port_header.encode()).hexdigest(),
+                  message_header_sha256=hashlib.sha256(message_header.encode()).hexdigest(),
+                  runs=[], pass_result=False)
     try:
         for name, asan in (('mach-ports', False), ('mach-ports-asan', True)):
             compiled, exe = host.compile_case(out, name, 'mach-ports.c', asan, cc, vcvars)
