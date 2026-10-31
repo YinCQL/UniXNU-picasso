@@ -5,7 +5,6 @@
 > XNU 10063 / Darwin 23 and its qualified native kexts are retained. iOS 16
 > userspace compatibility is not yet established. Input, root-policy and native
 > ABI checks gate the build; runtime validation is reported separately.
-> See [the migration status](docs/iphone-x-migration.md).
 > Device results below describe the previous iPadOS branch.
 
 > **Status: original early userspace runs; service startup is still incomplete.**

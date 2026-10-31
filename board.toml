@@ -10,7 +10,6 @@ kit = "picasso"
 
 # iPhone X userland target. Retain XNU 10063 / Darwin 23 and the qualified
 # 21H461 native kext backend. Cross-version userspace qualification is pending.
-# See docs/iphone-x-migration.md before building a kernel or payload.
 [ipsw]
 url = "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
 product = "iPhone10,3"
