@@ -113,19 +113,35 @@ static bool matchWord(IORegistryEntry *entry, const char *key, uint32_t value, b
     return ok;
 }
 
+// Honor the ADT's iPhone scale while keeping the existing 2x default when no
+// scale is supplied. Reject malformed or unsupported properties unchanged.
+static bool matchDisplayScale(IORegistryEntry *entry, uint32_t &scale, bool &added) {
+    OSObject *old = entry->getProperty("display-scale");
+    if (!old) {
+        scale = 2;
+        return matchWord(entry, "display-scale", scale, added);
+    }
+    OSData *data = OSDynamicCast(OSData, old);
+    if (!data || data->getLength() != sizeof(scale)) return false;
+    memcpy(&scale, data->getBytesNoCopy(), sizeof(scale));
+    return scale == 2 || scale == 3;
+}
+
 extern "C" bool native_legacy_gop_mapping_observed(IOService *, IOMemoryMap *map, uint32_t width, uint32_t height) {
     PE_Video video = {};
     if (PE_current_console(&video) || map->getPhysicalAddress() != video.v_baseAddr ||
         width != video.v_width || height != video.v_height) return false;
     if (displayChosen) return false;
     displayChosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
-    // Two scanout pixels per UI point. This is UI policy, not physical DPI.
-    bool ok = displayChosen && matchWord(displayChosen, "display-scale", 2, scaleAdded) &&
-        matchWord(displayChosen, "display-rotation", 0, rotationAdded);
+    // Scale is UI policy, not physical DPI; the actual scanout geometry is unchanged.
+    uint32_t scale = 0;
+    bool scaleOK = displayChosen && matchDisplayScale(displayChosen, scale, scaleAdded);
+    bool rotationOK = scaleOK && matchWord(displayChosen, "display-rotation", 0, rotationAdded);
+    bool ok = scaleOK && rotationOK;
     if (!ok) finishDisplayPolicy(false);
-    IOLog("PICASSO_DISPLAY mapped ok=%u base=%llx bytes=%llx width=%u height=%u stride=%lu depth=%lu console=%lu scale=2\n",
-        ok, map->getPhysicalAddress(), map->getLength(), width, height,
-        video.v_rowBytes, video.v_depth, video.v_display);
+    IOLog("PICASSO_DISPLAY mapped ok=%u base=%llx bytes=%llx width=%u height=%u stride=%lu depth=%lu console=%lu scale=%u scale_ok=%u rotation_ok=%u\n",
+        (unsigned)ok, map->getPhysicalAddress(), map->getLength(), width, height,
+        video.v_rowBytes, video.v_depth, video.v_display, scale, (unsigned)scaleOK, (unsigned)rotationOK);
     return ok;
 }
 

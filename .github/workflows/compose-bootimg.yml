@@ -47,6 +47,13 @@ jobs:
       - name: Check generated picasso ADT timer binding
         run: python3 scripts/check-picasso-adt.py --output out/picasso/logs/adt-host-check
 
+      - name: Check display policy against the generated ADT
+        run: |
+          python3 scripts/check-picasso-display-policy.py \
+            --adt out/picasso/logs/adt-host-check/board-with-data.adt \
+            --output out/picasso/host-checks/display-policy
+          cp out/picasso/host-checks/display-policy/results.json out/picasso/logs/display-policy-host.json
+
       - name: Check root input verifier failure paths
         run: |
           python3 scripts/check-picasso-root-inputs-host.py --output out/picasso/host-checks/root-inputs
@@ -149,6 +156,13 @@ jobs:
         run: |
           python3 scripts/check-picasso-data-artifacts.py --tree out/picasso/tree --work out/picasso \
             --output out/picasso/logs/data-artifacts.json
+
+      - name: Check display policy against the payload ADT
+        run: |
+          python3 scripts/check-picasso-display-policy.py \
+            --adt out/picasso/logs/data-artifacts.files/EFI/UniXNU/Payloads/kernel.macho.adt \
+            --output out/picasso/host-checks/display-policy-payload
+          cp out/picasso/host-checks/display-policy-payload/results.json out/picasso/logs/display-policy-payload.json
 
       - name: Check iOS 16 registered-port contracts
         run: |
