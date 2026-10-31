@@ -3,7 +3,8 @@
 // descriptor reads, a monotonic deadline and bounded pacing. No resubmission.
 enum class UfsTransferEnd { Completed, Fatal, Timeout };
 struct UfsTransferPoll {
-  uint32_t polls = 0, doorbellSeen = 0, interruptSeen = 0, ocs = 15;
+  uint32_t polls = 0, doorbellSeen = 0, interruptSeen = 0;
+  uint32_t lastDoorbell = 0, lastInterrupt = 0, ocs = 15;
 };
 static constexpr uint32_t kUfsFatalStatus = 0x71880U;
 
@@ -14,8 +15,11 @@ static UfsTransferEnd pollUfsTransfer(Port &port, UfsTransferPoll &state)
     ++state.polls;
     port.beginPoll(state.polls);
     uint32_t doorbell = port.doorbell();
+    uint32_t interrupt = port.interrupt();
+    state.lastDoorbell = doorbell;
+    state.lastInterrupt = interrupt;
     state.doorbellSeen |= doorbell;
-    state.interruptSeen |= port.interrupt();
+    state.interruptSeen |= interrupt;
     if (state.interruptSeen & kUfsFatalStatus) return UfsTransferEnd::Fatal;
     if (!(doorbell & 1)) {
       state.ocs = port.completedOcs();

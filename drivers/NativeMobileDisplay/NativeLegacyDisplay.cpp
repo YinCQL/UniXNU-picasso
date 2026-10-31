@@ -47,6 +47,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
     uint32_t scanBudget=4;
+    uint64_t frameCount=0;
     bool primary=false;
     bool logicalPM=false;
     bool transferred=false;
@@ -267,9 +268,11 @@ public:
             source->getLength(),sourceStride,width,height)) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
         }
-        // Inspect at most four frames to distinguish black from rendered pixels.
-        if(scanBudget) {
-            --scanBudget;
+        // Inspect the first four frames and a sparse periodic sample after
+        // that. Full-frame scans are deliberately not done on every copy.
+        ++frameCount;
+        if(scanBudget || (frameCount%600)==0) {
+            if(scanBudget)--scanBudget;
             uint64_t scan[5];
             if(native_legacy_frame_scan(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,scan))
                 native_legacy_frame_observed(0,scan[0],scan[1],scan[2],scan[3],scan[4]);

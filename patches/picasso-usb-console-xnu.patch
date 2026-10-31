@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..2237fb2
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,3059 @@
+@@ -0,0 +1,3071 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -71,7 +71,7 @@ index 0000000..2237fb2
 +#define APSS_WDT_BARK       0x10u
 +#define APSS_WDT_BITE       0x14u
 +#define APSS_WDT_RATE_HZ    32768u
-+#define APSS_WDT_TIMEOUT_MS 15000u
++#define APSS_WDT_TIMEOUT_MS 30000u
 +#define APSS_WDT_FORCED_BITE 4u
 +#define PICASSO_USB_FLUSH_POLLS 64u
 +#define PICASSO_USB_FINAL_FLUSH_POLLS 8u
@@ -403,6 +403,7 @@ index 0000000..2237fb2
 +	int         publish_pending;
 +	bool        watchdog;
 +	bool        watchdog_armed;
++	bool        early_watchdog;
 +	unsigned    reset_mode;
 +	vm_offset_t pshold;
 +	vm_offset_t wdt;
@@ -2923,6 +2924,7 @@ index 0000000..2237fb2
 +	int panic_test = 0;
 +	int panic_reset = 1;
 +	int watchdog = 1;
++	int early_watchdog = 1;
 +	int trace_polling = 0;
 +	char reset_mode[16] = "psci";
 +
@@ -2936,6 +2938,8 @@ index 0000000..2237fb2
 +	    sizeof(panic_reset));
 +	PE_parse_boot_argn("picasso_usb_watchdog", &watchdog,
 +	    sizeof(watchdog));
++	PE_parse_boot_argn("picasso_usb_early_watchdog", &early_watchdog,
++	    sizeof(early_watchdog));
 +	PE_parse_boot_argn("picasso_usb_reset", reset_mode,
 +	    sizeof(reset_mode));
 +	ud.mps = 64;
@@ -2944,6 +2948,7 @@ index 0000000..2237fb2
 +	ud.panic_test = panic_test != 0;
 +	ud.panic_reset = panic_reset != 0;
 +	ud.watchdog = watchdog != 0;
++	ud.early_watchdog = early_watchdog != 0;
 +	if (strcmp(reset_mode, "watchdog") == 0) {
 +		ud.reset_mode = PICASSO_USB_RESET_WATCHDOG;
 +	} else if (strcmp(reset_mode, "pshold") == 0) {
@@ -2957,6 +2962,13 @@ index 0000000..2237fb2
 +	ud.pshold = ml_io_map(PSHOLD_PA, PAGE_SIZE);
 +	ud.wdt = ml_io_map(APSS_WDT_PA, PAGE_SIZE);
 +	ud.imem = ml_io_map(IMEM_PA, PAGE_SIZE);
++	if (ud.watchdog && ud.early_watchdog) {
++		picasso_usb_watchdog_arm();
++		if (ud.watchdog_armed) {
++			printf("PICASSO USB: early APSS watchdog armed timeout=%u ms\n",
++			    APSS_WDT_TIMEOUT_MS);
++		}
++	}
 +	printf("PICASSO USB: PSHOLD mapped=%u panic-reset=%u watchdog=%u "
 +	    "mapped=%u IMEM mapped=%u reset=%u(%s)\n",
 +	    ud.pshold != 0 ? 1u : 0u, ud.panic_reset ? 1u : 0u,

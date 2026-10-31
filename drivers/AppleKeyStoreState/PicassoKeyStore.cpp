@@ -10,6 +10,8 @@
 #include <pexpert/pexpert.h>
 extern "C" {
 extern kmod_info_t g_kernel_kmod_info;
+int proc_selfpid(void);
+void proc_name(int pid, char *name, int size);
 void native_keyevents_static_init(void) __asm__("__GLOBAL__sub_I_NativeKeyStoreEvents.cpp");
 IOService *native_keyevents_allocate(void);
 }
@@ -18,20 +20,32 @@ static IOService *stateService;
 extern "C" bool picasso_aks_state_enabled(void) {return enabled;}
 extern "C" bool picasso_aks_ready(void) {return enabled && stateService != nullptr;}
 
-extern "C" void picasso_aks_observed(unsigned selector,IOReturn result) {
-    // Two reports per known selector and result category, across all clients.
+extern "C" void picasso_aks_observed(unsigned selector,IOReturn result,
+    unsigned scalar_input_count,unsigned scalar_output_count,
+    unsigned structure_input_size,unsigned structure_output_size,
+    uint64_t context) {
+    // Four reports per known selector and result category, across all clients.
     // Unknown selector values share a single bucket. Never log key material.
-    static unsigned counts[258][2], total;
+    static unsigned counts[258][4], total;
     unsigned *counter=&counts[selector<=256?selector:257][result==kIOReturnSuccess?0:1];
     unsigned count=__atomic_load_n(counter,__ATOMIC_RELAXED);
-    while(count<2) {
+    while(count<4) {
         if(__atomic_compare_exchange_n(counter,&count,count+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {
             unsigned used=__atomic_load_n(&total,__ATOMIC_RELAXED);
             for(;;) {
-                if(used>=48)return;
+                if(used>=96)return;
                 if(__atomic_compare_exchange_n(&total,&used,used+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED))break;
             }
-            printf("PICASSO_AKS selector=%u sample=%u result=%x\n",selector,count+1,result);break;
+            int pid=proc_selfpid();
+            char name[32]={};
+            proc_name(pid,name,sizeof(name));
+            printf("PICASSO_AKS pid=%d name=%s selector=%u sample=%u result=%x "
+                "in=%u out=%u sin=%u sout=%u ctx=%llx\n",
+                pid,name[0]?name:"?",selector,count+1,result,
+                scalar_input_count,scalar_output_count,
+                structure_input_size,structure_output_size,
+                (unsigned long long)context);
+            break;
         }
     }
 }

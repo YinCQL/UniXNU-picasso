@@ -137,6 +137,11 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
   gRootDiagnostic.isSeen = state.interruptSeen;
   *ocs = state.ocs;
   if (end != UfsTransferEnd::Completed) {
+    IOLog ("NATIVE_UFS_TRANSFER_STALL result=%u polls=%u ocs=%x db=%x is=%x "
+           "hcs=%x hce=%x utrldb=%x command=%u\n",
+           static_cast<unsigned> (end), state.polls, state.ocs, state.lastDoorbell,
+           state.lastInterrupt, read32 (gHost.hc, 0x30), read32 (gHost.hc, 0x34),
+           read32 (gHost.hc, 0x58), gRootDiagnostic.command);
     // No cancel/reset/retry: the controller may still own the buffer, even
     // with DB=0. Keep it allocated and prohibit all subsequent CPU writes.
     gHost.poisoned = true;
@@ -345,7 +350,10 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   uint8_t cdb[10] = { 0x28, 0, uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
   uint32_t scsi = 0;
-  IOReturn status = hostScsi (lun, cdb, 10, true, blocks * 4096U, 1000000, &scsi);
+  // Background UFS garbage collection can exceed the old one-second bound.
+  // Keep the controller and DMA untouched while allowing a transient stall
+  // to finish; a real hang still quarantines the host below.
+  IOReturn status = hostScsi (lun, cdb, 10, true, blocks * 4096U, 10000000, &scsi);
   if (status == kIOReturnSuccess) {
     memcpy (dst, gHost.virt + kDataOffset, blocks * 4096U);
   }

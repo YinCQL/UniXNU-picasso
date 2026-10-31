@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -22,7 +23,14 @@ static std::vector<std::string> events;
 static int failure, schedules, pets, checks, frees, timerReleases, loopReleases, ucResult, clientLogs;
 static void *claimed;
 static bool policyTraps;
+static uint32_t watchdogdBootArg;
 [[noreturn]] static void panic(const char *message) { throw std::runtime_error(message); }
+static bool PE_parse_boot_argn(const char *name, void *value, size_t size) {
+  if (std::strcmp(name, "sheng-disable-watchdogd")) return false;
+  assert(size==sizeof(uint32_t));
+  *static_cast<uint32_t*>(value)=watchdogdBootArg;
+  return true;
+}
 static void IOLog(const char *format,...) {
   if (std::string(format).find("newUserClient")!=std::string::npos) ++clientLogs;
 }
@@ -182,5 +190,12 @@ int main(int argc,char **argv) {
   try { fire(timer); } catch(const std::runtime_error&) { trapped=true; }
   assert(trapped && checks==2 && pets==1 && schedules==3);
   std::puts("PASS: original policy panic cannot pet hardware or schedule another check");
+  PicassoWatchdogDriver disabledPolicy;
+  watchdogdBootArg=1; failure=0; claimed=nullptr;
+  schedules=0; pets=0; checks=0; trapped=false;
+  assert(disabledPolicy.start(&provider));
+  fire(IOTimerEventSource::last);
+  assert(checks==0 && pets==1 && schedules==2);
+  std::puts("PASS: diagnostic watchdogd disable skips only policy while hardware stays petted");
   return 0;
 }

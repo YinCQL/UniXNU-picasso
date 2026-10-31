@@ -27,12 +27,14 @@ int main()
   FakePort noAcceptance{{{0, 15, 0}, {0, 15, 0}, {0, 15, 0}}};
   UfsTransferPoll a;
   assert(pollUfsTransfer(noAcceptance, a) == UfsTransferEnd::Timeout);
-  assert(a.polls == 3 && a.ocs == 15 && a.doorbellSeen == 0);
+  assert(a.polls == 3 && a.ocs == 15 && a.doorbellSeen == 0 &&
+         a.lastDoorbell == 0 && a.lastInterrupt == 0);
 
   FakePort delayed{{{0, 15, 0}, {1, 15, 0}, {0, 15, 0}, {0, 0, 1}}};
   UfsTransferPoll b;
   assert(pollUfsTransfer(delayed, b) == UfsTransferEnd::Completed);
-  assert(b.polls == 4 && b.ocs == 0 && b.doorbellSeen == 1 && delayed.reads == 3);
+  assert(b.polls == 4 && b.ocs == 0 && b.doorbellSeen == 1 && delayed.reads == 3 &&
+         b.lastDoorbell == 0 && b.lastInterrupt == 1);
 
   FakePort immediate{{{0, 0, 0}}};
   UfsTransferPoll c;
@@ -45,7 +47,8 @@ int main()
 
   FakePort stuck{{{1, 15, 0}, {1, 15, 0}}};
   UfsTransferPoll e;
-  assert(pollUfsTransfer(stuck, e) == UfsTransferEnd::Timeout && stuck.reads == 0);
+  assert(pollUfsTransfer(stuck, e) == UfsTransferEnd::Timeout && stuck.reads == 0 &&
+         e.lastDoorbell == 1);
 
   for (unsigned bit = 0; bit < 32; ++bit) {
     uint32_t mask = uint32_t(1) << bit;

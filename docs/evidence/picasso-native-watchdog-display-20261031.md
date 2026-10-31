@@ -129,3 +129,91 @@ the exact 8 GiB seed and kernel with `sheng-log-reserve=1025` caused repeated
 NativeRamBlock/APFS page-in `EINVAL`, followed by SpringBoard, logd and timed
 crashes. The qualified layout remains the default 1024 MiB reserve; changing it
 is not a safe way to simulate a fresh persistent store.
+
+## First userspace frame over the CPU/GOP path
+
+The clean microtime and framebuffer-trace rebuild exposed a separate UFS
+timeout after command 128605: the one-second READ(10) deadline expired with
+`OCS=0xf`, permanently quarantined the host, and caused every later APFS read
+to fail with `EINVAL`/`NotReady`. The qualified follow-up keeps the controller
+untouched but extends only the block-read deadline to ten seconds and reports
+the final DB/IS/HCS/HCE state if a transfer really stalls.
+
+The same run used `sheng-data-reset=1` once to discard the checksum-invalid
+persistent overlay. The fresh Data volume mounted without checksum errors or
+ENOSPC.
+
+| Item | SHA-256 |
+| --- | --- |
+| UFS ten-second kernel | `779a729343f338805a10e5c60dcf7e2bc172a23ed799effda1c1d822e503be43` |
+| exact payload (`watchdog-v4-ufs10-clean`) | `6e61b8c84d0667c0d61f267a2896cafd67763845ce36eca117a8b84b031d7c80` |
+| boot image (`watchdog-v4-ufs10-clean-reset.img`) | `2937a3591a0d8776d8f5042c69cc5e9dc5667c8af9e7a9d4e6b6f7053512489c` |
+
+The complete capture is:
+
+`picasso-diagnostics/20261031-stage7-watchdog-integration/hardware-cdc-watchdog-v4-ufs10-clean.log`
+
+The final userspace display path is now proven end to end:
+
+```text
+PICASSO_FB begin sel=4 ... pid=58 ... result=0
+PICASSO_FB begin sel=5 ... in_bytes=1288 ...
+PICASSO_DISPLAY event=6 ... failure=0
+PICASSO_DISPLAY frame kind=0 nonblack=41011
+PICASSO_DISPLAY event=8 sample=1 a=1 ...
+PICASSO_DISPLAY event=10 sample=1 a=4590b8 b=9e3400 c=0 failure=0
+PICASSO_DISPLAY event=7 sample=1 a=0 b=9e3400 c=0 failure=0
+PICASSO_DISPLAY event=9 sample=1 a=1 ...
+```
+
+This is the Apple logo visible on the physical panel, not a bootloader-side
+splash. A replacement `backboardd` subsequently submitted three more complete
+frames. `SpringBoard` started and remained alive; it queried the power and
+platform services, but no later frame has been observed.
+
+The first `backboardd` instance was killed by the original userspace watchdog
+before it checked in. Its replacement checked in and remained stable. The next
+boundary is therefore the post-logo SpringBoard/backboardd wait, not raw
+framebuffer output. `SpringBoard` also reports no `AGXAccelerator`; that remains
+a high-value dependency to investigate, but it is not yet proof that the logo
+or all remaining UI work requires AGX.
+
+## Long-run watchdog and Fastboot recovery
+
+The v14 policy build isolates the original userspace watchdog policy while
+keeping the native hardware pet active. It was captured for more than 16
+minutes after early boot with `sheng-disable-watchdogd=1`; the former
+`no checkins from watchdogd` panic did not recur. The boot log shows both
+expected markers:
+
+```text
+picasso-watchdog: first policy step and hardware pet complete (watchdogd-policy-disabled=1)
+PICASSO_WATCHDOG_POLICY: watchdogd disabled for this boot
+```
+
+More than 100 user processes started. `SpringBoard` (PID 27) and `backboardd`
+(PID 57) remained alive. The display path reported three accepted, transferred
+and retired nonblack frames (`copy_bytes=31104000`), followed by a fourth
+event sequence from `backboardd`. No UFS timeout appeared in this run.
+`SpringBoard` and `backboardd` both failed an `AGXAccelerator` lookup with
+`e00002f0`; the sampled SpringBoard main thread was waiting in
+`_mach_msg_trap`, which is a normal IPC wait state but does not yet identify its
+peer or synchronous caller.
+
+The CDC reset path was also exercised on this build. `reboot-fastboot` armed
+IMEM with `0x77665500`, disconnected CDC, and the same device serial reappeared
+in Fastboot automatically. The intended recovery design remains:
+
+- the invalid boot-partition header forces normal boots into Fastboot;
+- the host-gated APSS watchdog returns a hung boot to Fastboot after 60 seconds
+  without host activity;
+- CDC `reboot-fastboot` provides the controlled software-reset path.
+
+Only `fastboot boot` should be used for the macOS image. The boot partition was
+not restored or rewritten.
+
+| Item | SHA-256 |
+| --- | --- |
+| v14 policy kernel | `ecf9a6004e43ef230f458c00b9eef616b01bb33bcd17c775dd7a6d3c7cbeba24` |
+| v14 policy payload | `c8b882c3e05f7db4665331e2fe16c711298f7d15d9405eaa2564c78ee052f7f6` |
+| v14 policy boot image | `0e9a08ded08095c420a98eda643546e04dda5dcace1f0067f12ae145840fcee1` |

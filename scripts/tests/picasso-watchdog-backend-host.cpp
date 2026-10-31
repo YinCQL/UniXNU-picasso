@@ -46,6 +46,7 @@ static bool atomic_compare_host(uint32_t *p,uint32_t old_value,uint32_t value) {
 #define os_atomic_store(p,v,o) atomic_store_host(p,v)
 #define os_atomic_cmpxchg(p,a,b,o) atomic_compare_host(p,a,b)
 typedef bool boolean_t;
+typedef int kern_return_t;
 static thread_local bool irq_enabled=true;
 static boolean_t ml_set_interrupts_enabled(bool enabled) {
  bool prior=irq_enabled;irq_enabled=enabled;return prior;
@@ -53,6 +54,8 @@ static boolean_t ml_set_interrupts_enabled(bool enabled) {
 struct {
  bool watchdog,watchdog_armed,panic_mode,panic_pending,reset_pending,reboot_pending,hang_pending;
  bool cmd_pending,configured,host_open,live,hold;
+ bool start_kext_pending,register_pending;
+ int publish_pending;
  uint32_t poll_lock,reset_mode;
  uintptr_t wdt;
  unsigned long long commands,events,chars,rx_bytes;
@@ -77,6 +80,10 @@ static void absolutetime_to_nanoseconds(uint64_t,uint64_t *);
 #define printf backend_log
 #include "backend-production.inc"
 #undef printf
+
+int native_start_kext_and_report(const char *,const char *) { return -1; }
+int native_register_display_and_report(void) { return -1; }
+int native_publish_display_and_report(int) { return -1; }
 
 struct Write { unsigned off;uint32_t value; };
 static uint32_t regs[6];
@@ -180,10 +187,10 @@ int main(void) {
  reset();ud.watchdog_armed=false;regs[APSS_WDT_EN/4]=0;picasso_usb_watchdog_arm();
  assert(ud.watchdog_armed && writes.size()==5 && irq_enabled);
  assert(writes[0].off==APSS_WDT_EN && writes[0].value==0);
- assert(writes[1].off==APSS_WDT_RST && writes[2].off==APSS_WDT_BARK && writes[2].value==491519);
- assert(writes[3].off==APSS_WDT_BITE && writes[3].value==491519 && writes[4].value==1);
+ assert(writes[1].off==APSS_WDT_RST && writes[2].off==APSS_WDT_BARK && writes[2].value==983039);
+ assert(writes[3].off==APSS_WDT_BITE && writes[3].value==983039 && writes[4].value==1);
  assert(picasso_usb_watchdog_pet() && writes.size()==6);
- passed("boot arm retains the five-write 15-second sequence and checks real register values");
+ passed("boot arm retains the five-write 30-second sequence and checks real register values");
 
  for(unsigned mode=0;mode<3;++mode) {
   reset();ud.watchdog_armed=false;
@@ -225,7 +232,7 @@ int main(void) {
  assert(!picasso_watchdog_backend_claim(&owner_a) && !picasso_watchdog_backend_pet(&owner_a));
  assert(!picasso_usb_watchdog_pet() && writes.empty());
  assert(picasso_watchdog_backend_enable(&owner_a) && writes.size()==5 && ud.watchdog_armed);
- assert(regs[APSS_WDT_BARK/4]==491519 && regs[APSS_WDT_BITE/4]==491519);
+ assert(regs[APSS_WDT_BARK/4]==983039 && regs[APSS_WDT_BITE/4]==983039);
  writes.clear();assert(picasso_watchdog_backend_enable(&owner_a) && writes.size()==1 && writes[0].off==APSS_WDT_RST);
  passed("disable retains identity without boot fallback and enable restores the identical hardware interval");
 

@@ -9,13 +9,13 @@ extern "C" {
 #endif
 
 /* owner must be non-NULL and remain alive for the rest of this boot.
- * A successful claim pets the already armed 15-second hardware watchdog and
+ * A successful claim pets the already armed 30-second hardware watchdog and
  * permanently retires USB boot pets. A failed first claim never retains owner.
  * There is deliberately no release API.
  * Calls never wait: false includes lock contention and hardware mismatch.
  * A successful pet means RST was written with the expected control/timeout
  * readbacks; the write-only reset pulse itself has no acknowledgement.
- * Disable retains ownership. Enable restores the same 15-second hardware
+ * Disable retains ownership. Enable restores the same 30-second hardware
  * configuration. Panic/reset permanently rejects ordinary operations. */
 bool picasso_watchdog_backend_claim(const void *owner);
 bool picasso_watchdog_backend_enable(const void *owner);

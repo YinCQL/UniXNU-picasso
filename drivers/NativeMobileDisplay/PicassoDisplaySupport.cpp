@@ -9,6 +9,7 @@
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSKext.h>
 #include <libkern/OSKextLibPrivate.h>
+#include <kern/clock.h>
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
 #include "PicassoGop.h"
@@ -34,6 +35,16 @@ static bool initialized, screenReleased;
 static unsigned reportCounts[12][2];
 static IORegistryEntry *displayChosen;
 static bool scaleAdded, rotationAdded;
+static struct {
+    uint64_t submissions, accepted, rejected, rejectReasons[8];
+    uint64_t scans, blankFrames, nonblackFrames;
+    uint64_t transfers, transferFailures, retireSuccesses, retireFailures;
+    uint64_t copies, copyBytes, lastCopyTicks, lastCopyBytes;
+    uint64_t lastSubmitTick, lastFrameTick, lastTransferTick, lastRetireTick;
+    uint64_t lastPixels, lastMinX, lastMinY, lastMaxX, lastMaxY;
+    uint64_t vsyncTicks;
+    uint32_t lastTransferStatus;
+} displayStats;
 
 extern "C" bool native_legacy_display_probe_ready(void);
 extern "C" bool native_legacy_surface_ready(void);
@@ -229,6 +240,64 @@ static void report(unsigned event, uint64_t a, uint64_t b, uint64_t c, bool fail
         event, sample, a, b, c, failed);
 }
 
+static uint64_t absoluteNanoseconds(uint64_t ticks) {
+    uint64_t value = 0;
+    absolutetime_to_nanoseconds(ticks, &value);
+    return value;
+}
+
+static void reportDisplayState(const char *trigger) {
+    const uint64_t now = mach_absolute_time();
+    const uint64_t lastSubmit = __atomic_load_n(&displayStats.lastSubmitTick, __ATOMIC_RELAXED);
+    const uint64_t lastFrame = __atomic_load_n(&displayStats.lastFrameTick, __ATOMIC_RELAXED);
+    const uint64_t lastTransfer = __atomic_load_n(&displayStats.lastTransferTick, __ATOMIC_RELAXED);
+    const uint64_t lastRetire = __atomic_load_n(&displayStats.lastRetireTick, __ATOMIC_RELAXED);
+    printf("PICASSO_DISPLAY_STATE trigger=%s now_ns=%llu submit=%llu accept=%llu reject=%llu "
+        "reasons=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu scans=%llu blank=%llu nonblack=%llu "
+        "transfer=%llu transfer_fail=%llu retire=%llu retire_fail=%llu copies=%llu copy_bytes=%llu "
+        "last_submit_ns=%llu last_frame_ns=%llu last_transfer_ns=%llu last_retire_ns=%llu "
+        "last_copy_ticks=%llu last_copy_bytes=%llu last_pixels=%llu bbox=%llu,%llu-%llu,%llu "
+        "last_status=%x vsync_ticks=%llu\n",
+        trigger, (unsigned long long)absoluteNanoseconds(now),
+        (unsigned long long)__atomic_load_n(&displayStats.submissions, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.accepted, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.rejected, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.rejectReasons[0], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.rejectReasons[1], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.rejectReasons[2], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.rejectReasons[3], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.rejectReasons[4], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.rejectReasons[5], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.rejectReasons[6], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.rejectReasons[7], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.scans, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.blankFrames, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.nonblackFrames, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.transfers, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.transferFailures, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.retireSuccesses, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.retireFailures, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.copies, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.copyBytes, __ATOMIC_RELAXED),
+        (unsigned long long)absoluteNanoseconds(lastSubmit),
+        (unsigned long long)absoluteNanoseconds(lastFrame),
+        (unsigned long long)absoluteNanoseconds(lastTransfer),
+        (unsigned long long)absoluteNanoseconds(lastRetire),
+        (unsigned long long)__atomic_load_n(&displayStats.lastCopyTicks, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.lastCopyBytes, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.lastPixels, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.lastMinX, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.lastMinY, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.lastMaxX, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.lastMaxY, __ATOMIC_RELAXED),
+        __atomic_load_n(&displayStats.lastTransferStatus, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&displayStats.vsyncTicks, __ATOMIC_RELAXED));
+}
+
+extern "C" void native_legacy_display_state_report(void) {
+    reportDisplayState("wait");
+}
+
 extern "C" bool native_legacy_prepare_scanout(void) {
     if (!screenReleased) {
         // Release the real XNU text console before the first system frame.
@@ -254,7 +323,13 @@ extern "C" void native_legacy_pm_observed(unsigned stage, IOReturn status, unsig
     report(5, stage, status, state, status != kIOReturnSuccess);
 }
 extern "C" void native_legacy_swap_validation_observed(bool ok, unsigned reason, const void *, const void *) {
+    const uint64_t total = __atomic_add_fetch(&displayStats.submissions, 1, __ATOMIC_RELAXED);
+    if (ok) __atomic_add_fetch(&displayStats.accepted, 1, __ATOMIC_RELAXED);
+    else __atomic_add_fetch(&displayStats.rejected, 1, __ATOMIC_RELAXED);
+    if (reason < 8) __atomic_add_fetch(&displayStats.rejectReasons[reason], 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&displayStats.lastSubmitTick, mach_absolute_time(), __ATOMIC_RELAXED);
     report(6, ok, reason, 0, !ok);
+    if ((total % 600) == 0) reportDisplayState("submissions");
 }
 extern "C" void native_legacy_surface_rejected(uint64_t width, uint64_t height, uint32_t format,
     uint32_t planes, uint64_t stride, uint64_t allocation, uint64_t length) {
@@ -262,12 +337,50 @@ extern "C" void native_legacy_surface_rejected(uint64_t width, uint64_t height, 
     if (takeReport(&count)) printf("PICASSO_DISPLAY surface rejected width=%llu height=%llu format=%x planes=%u stride=%llu allocation=%llu length=%llu\n",
         width, height, format, planes, stride, allocation, length);
 }
-extern "C" void native_legacy_transfer_observed(IOReturn status, const void *, uint64_t bytes) { report(7, status, bytes, 0, status != kIOReturnSuccess); }
-extern "C" void native_legacy_retirement_failed(IOService *) { report(9, 0, 0, 0, true); }
-extern "C" void native_legacy_retirement_observed(IOService *) { report(9, 1, 0, 0); }
-extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t bytes) { report(10, ticks, bytes, 0); }
-extern "C" void native_legacy_vsync_observed(unsigned event, unsigned hz) { report(11, event, hz, 0); }
-extern "C" void native_legacy_frame_observed(unsigned kind, uint64_t pixels, uint64_t, uint64_t, uint64_t, uint64_t) {
+extern "C" void native_legacy_transfer_observed(IOReturn status, const void *, uint64_t bytes) {
+    __atomic_add_fetch(&displayStats.transfers, 1, __ATOMIC_RELAXED);
+    if (status != kIOReturnSuccess) __atomic_add_fetch(&displayStats.transferFailures, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&displayStats.lastTransferStatus, static_cast<uint32_t>(status), __ATOMIC_RELAXED);
+    __atomic_store_n(&displayStats.lastTransferTick, mach_absolute_time(), __ATOMIC_RELAXED);
+    report(7, status, bytes, 0, status != kIOReturnSuccess);
+}
+extern "C" void native_legacy_retirement_failed(IOService *) {
+    __atomic_add_fetch(&displayStats.retireFailures, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&displayStats.lastRetireTick, mach_absolute_time(), __ATOMIC_RELAXED);
+    report(9, 0, 0, 0, true);
+}
+extern "C" void native_legacy_retirement_observed(IOService *) {
+    __atomic_add_fetch(&displayStats.retireSuccesses, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&displayStats.lastRetireTick, mach_absolute_time(), __ATOMIC_RELAXED);
+    report(9, 1, 0, 0);
+}
+extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t bytes) {
+    __atomic_add_fetch(&displayStats.copies, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&displayStats.copyBytes, bytes, __ATOMIC_RELAXED);
+    __atomic_store_n(&displayStats.lastCopyTicks, ticks, __ATOMIC_RELAXED);
+    __atomic_store_n(&displayStats.lastCopyBytes, bytes, __ATOMIC_RELAXED);
+    report(10, ticks, bytes, 0);
+}
+extern "C" void native_legacy_vsync_observed(unsigned event, unsigned hz) {
+    if (event == 1) {
+        const uint64_t total = __atomic_add_fetch(&displayStats.vsyncTicks, 1, __ATOMIC_RELAXED);
+        if ((total % 600) == 0) reportDisplayState("vsync");
+    }
+    report(11, event, hz, 0);
+}
+extern "C" void native_legacy_frame_observed(unsigned kind, uint64_t pixels,
+    uint64_t minx, uint64_t miny, uint64_t maxx, uint64_t maxy) {
+    if (kind == 0) {
+        __atomic_add_fetch(&displayStats.scans, 1, __ATOMIC_RELAXED);
+        if (pixels) __atomic_add_fetch(&displayStats.nonblackFrames, 1, __ATOMIC_RELAXED);
+        else __atomic_add_fetch(&displayStats.blankFrames, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&displayStats.lastFrameTick, mach_absolute_time(), __ATOMIC_RELAXED);
+        __atomic_store_n(&displayStats.lastPixels, pixels, __ATOMIC_RELAXED);
+        __atomic_store_n(&displayStats.lastMinX, minx, __ATOMIC_RELAXED);
+        __atomic_store_n(&displayStats.lastMinY, miny, __ATOMIC_RELAXED);
+        __atomic_store_n(&displayStats.lastMaxX, maxx, __ATOMIC_RELAXED);
+        __atomic_store_n(&displayStats.lastMaxY, maxy, __ATOMIC_RELAXED);
+    }
     static unsigned count;
     if (takeReport(&count)) printf("PICASSO_DISPLAY frame kind=%u nonblack=%llu\n", kind, pixels);
 }

@@ -6,6 +6,7 @@ import fcntl
 import glob
 import os
 from pathlib import Path
+import re
 import select
 import struct
 import subprocess
@@ -14,9 +15,9 @@ import termios
 import time
 
 
-COMMANDS = ('help', 'status', 'panic-test', 'reset-test', 'start-graphics',
-            'register-display', 'publish-display', 'publish-display-start',
-            'hang-test', 'reboot-fastboot')
+COMMANDS = ('help', 'status', 'uistate', 'panic-test', 'reset-test',
+            'start-graphics', 'register-display', 'publish-display',
+            'publish-display-start', 'hang-test', 'reboot-fastboot')
 
 
 def serial_ports():
@@ -128,7 +129,8 @@ def write_all(fd, data, timeout):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', help='serial device, e.g. /dev/cu.usbmodem1101')
-    parser.add_argument('--command', required=True, choices=COMMANDS)
+    parser.add_argument('--command', required=True,
+                        help='one of the built-in commands, or "wait <pid>"')
     parser.add_argument('--output', type=Path,
                         help='log file (defaults to out/picasso/logs)')
     parser.add_argument('--wait', type=float, default=15,
@@ -157,6 +159,9 @@ def main():
         parser.error('--repeat must be greater than zero')
     if args.repeat_interval <= 0:
         parser.error('--repeat-interval must be greater than zero')
+    if args.command not in COMMANDS and not re.fullmatch(
+            r'wait [1-9][0-9]{0,4}', args.command):
+        parser.error(f'unknown command: {args.command}')
     if args.write_timeout <= 0:
         parser.error('--write-timeout must be greater than zero')
     if args.fastboot_timeout is not None and args.fastboot_timeout <= 0:
