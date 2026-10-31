@@ -170,6 +170,12 @@ jobs:
             --output out/picasso/host-checks/mach-ports
           cp out/picasso/host-checks/mach-ports/results.json out/picasso/logs/mach-ports-host-check.json
 
+      - name: Check bounded framebuffer method diagnostics
+        run: |
+          python3 scripts/check-picasso-fb-method-trace.py --xnu out/picasso/tree/.cache/xnu-work \
+            --output out/picasso/host-checks/fb-method-trace
+          cp out/picasso/host-checks/fb-method-trace/results.json out/picasso/logs/fb-method-trace.json
+
       - name: Check native counter microtime conversion
         run: |
           python3 scripts/check-picasso-microtime.py --xnu out/picasso/tree/.cache/xnu-work \
