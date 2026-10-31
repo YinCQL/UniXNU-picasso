@@ -34,6 +34,7 @@ extern const uint8_t verified_root_key[];
 #include <kern/debug.h>
 #include "GccUfs.h"
 #include "RootDiagnostics.h"
+#include "RootReadDiagnostics.h"
 #include "TransferPoll.h"
 #include "SmmuTakeover.h"
 
@@ -1384,6 +1385,7 @@ class NativeUfsBlock : public IOBlockStorageDevice {
   uint8_t *bounce = nullptr;
   IOLock *windowLock = nullptr;
   bool online = false;
+  uint32_t readFailureReports = 0;
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
   struct vr_view verified = {};
   uint32_t verifiedRecordBytes = 0;
@@ -1449,6 +1451,15 @@ static void rootDiagnosticFailure (const char *reason)
 {
   // Kept even when the panic diagnostic is off, so the boot page can say why nothing was published.
   native_ufs_root_failure = reason;
+  static uint32_t reports = 0;
+  if (ufsClaimFailureReport (&reports)) {
+    // Cached fields may describe adjacent updates; exact read failures below
+    // use request-local facts instead. Reporting never changes the panic mode.
+    UfsRootDiagnostics sample = gRootDiagnostic;
+    IOLog ("NATIVE_UFS_FAILURE cached reason=%.48s stage=%.32s result=%08x verify=%08x lba=%llx published=%u\n",
+           reason, sample.stage, sample.result, sample.verify,
+           static_cast<unsigned long long> (sample.lba), native_ufs_blocks_published);
+  }
   if (!gRootDiagnosticEnabled) return;
   gRootDiagnostic.published = native_ufs_blocks_published;
   gRootDiagnostic.reads = native_ufs_block_reads;
@@ -1499,22 +1510,28 @@ static bool equalDigest (const uint8_t *a, const uint8_t *b, size_t length)
 }
 
 static bool verifyEmbeddedRecord (const vr_view *view, uint32_t recordBytes,
-                                  uint64_t index, const void *data, size_t length)
+                                  uint64_t index, const void *data, size_t length,
+                                  UfsRecordFailure *failure = nullptr)
 {
   if (!view || !view->hashes || !data || !recordBytes || !vr_xnu_crypto.sha256 ||
       index >= view->block_count) {
-    return false;
+    return ufsRejectRecord (failure, "invalid_input", index, length, 0);
   }
   uint64_t offset = index * recordBytes;
   if (offset >= view->image_bytes) {
-    return false;
+    return ufsRejectRecord (failure, "record_bounds", index, length, 0);
   }
   uint64_t remaining = view->image_bytes - offset;
   size_t expected = remaining < recordBytes ? static_cast<size_t> (remaining) : recordBytes;
   uint8_t digest[32];
-  return length == expected &&
-         vr_xnu_crypto.sha256 (data, length, digest) &&
-         equalDigest (digest, view->hashes + index * 32, sizeof (digest));
+  const uint8_t *wanted = view->hashes + index * 32;
+  if (length != expected)
+    return ufsRejectRecord (failure, "record_length", index, length, expected, wanted);
+  if (!vr_xnu_crypto.sha256 (data, length, digest))
+    return ufsRejectRecord (failure, "sha256_failed", index, length, expected, wanted);
+  if (!equalDigest (digest, wanted, sizeof (digest)))
+    return ufsRejectRecord (failure, "hash_mismatch", index, length, expected, wanted, digest);
+  return true;
 }
 
 static bool verifyPolicyHeader (const uint8_t *manifest, uint64_t manifestBytes,
@@ -2006,9 +2023,16 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     uint32_t recordBytes;
     UfsVerifiedReadStats *stats;
 #endif
+    uint64_t lastLba = 0;
+    uint32_t lastBlocks = 0;
+    const char *phase = "request";
+    UfsRecordFailure failure = {};
     void lock () { IOLockLock (mutex); }
     void unlock () { IOLockUnlock (mutex); }
     IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
+      phase = "transport";
+      lastLba = lba;
+      lastBlocks = blocks;
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
       uint64_t t0 = timerTicks ();
       IOReturn r = hostRead4k (0, lba, blocks, out);
@@ -2021,10 +2045,11 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
       return r;
     }
     IOReturn verify (uint64_t index, const void *data, size_t length) {
+      phase = "verification";
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
       uint64_t t0 = timerTicks ();
       bool verifiedRecord = verifyEmbeddedRecord (
-        view, recordBytes, index, data, length
+        view, recordBytes, index, data, length, &failure
       );
       uint64_t elapsed = timerTicks () - t0;
       stats->verifyTicks += elapsed;
@@ -2043,6 +2068,7 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
       return kIOReturnSuccess;
     }
     uint64_t copy (uint64_t offset, const void *data, uint64_t length) {
+      phase = "copy";
       uint64_t copied = buffer->writeBytes (offset, data, length);
       if (copied == length) __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
       return copied;
@@ -2070,6 +2096,20 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
   uint64_t done = outcome.done;
   if (result != kIOReturnSuccess) {
     __atomic_fetch_add (&native_ufs_block_failures, 1, __ATOMIC_RELAXED);
+    if (ufsClaimFailureReport (&readFailureReports)) {
+      IOLog ("NATIVE_UFS_READ_FAILURE window=%.31s phase=%s block=%llu count=%llu done=%llu result=%08x lba=%llx blocks=%u\n",
+             label, operations.phase, block, count, done, static_cast<unsigned> (result),
+             static_cast<unsigned long long> (operations.lastLba), operations.lastBlocks);
+      if (operations.failure.reason) {
+        char line[256];
+        formatUfsRecordFailure (line, sizeof (line), label, operations.failure);
+        IOLog ("%s", line);
+        formatUfsRecordDigest (line, sizeof (line), label, operations.failure, true);
+        IOLog ("%s", line);
+        formatUfsRecordDigest (line, sizeof (line), label, operations.failure, false);
+        IOLog ("%s", line);
+      }
+    }
     gRootDiagnostic.result = static_cast<uint32_t> (result);
     rootDiagnosticFailure ("root window read failed");
   }
@@ -2141,6 +2181,7 @@ static bool mediaWithUuidExists (const char *uuid, NativeUfsBlock *window)
 static void captureMissingMedia (const char *uuid)
 {
   int used = snprintf (gRootMediaText, sizeof (gRootMediaText), "Waiting for signed UUID %s\n", uuid);
+  IOLog ("NATIVE_UFS_MEDIA missing_uuid=%.36s\n", uuid);
   OSDictionary *matching = IOService::serviceMatching ("IOMedia");
   OSIterator *iterator = matching ? IOService::getMatchingServices (matching) : nullptr;
   unsigned count = 0;
@@ -2150,6 +2191,10 @@ static void captureMissingMedia (const char *uuid)
     OSString *id = OSDynamicCast (OSString, media->getProperty ("UUID"));
     OSString *bsd = OSDynamicCast (OSString, media->getProperty (kIOBSDNameKey));
     OSNumber *size = OSDynamicCast (OSNumber, media->getProperty ("Size"));
+    OSString *content = OSDynamicCast (OSString, media->getProperty ("Content"));
+    IOLog ("NATIVE_UFS_MEDIA bsd=%.24s bytes=%llx uuid=%.36s content=%.40s\n",
+           bsd ? bsd->getCStringNoCopy () : "-", size ? size->unsigned64BitValue () : 0ULL,
+           id ? id->getCStringNoCopy () : "-", content ? content->getCStringNoCopy () : "-");
     used += snprintf (gRootMediaText + used, sizeof (gRootMediaText) - used,
                       "media %.24s bytes=%llx uuid=%.36s\n",
                       bsd ? bsd->getCStringNoCopy () : "-", size ? size->unsigned64BitValue () : 0ULL,
