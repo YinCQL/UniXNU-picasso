@@ -1598,11 +1598,21 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
   #include <mach/exclaves.h>
   
 -@@ -7013,8 +7013,256 @@
-+@@ -7013,8 +7013,278 @@
++@@ -7013,8 +7013,281 @@
    *		word width of the kernel. Once the self-exec completes, the
    *		initproc might be different.
    */
-@@ -95,15 +95,19 @@
+@@ -19,6 +19,9 @@
+ +#endif
+ +extern int native_verified_block_volume_device(const char *, dev_t *, char *, size_t);
+ +#if defined(XNU_OWNER_BOOT_MANIFEST) && XNU_OWNER_BOOT_MANIFEST
+++#ifndef XNU_OWNER_ROOT_VOLUME_UUID
+++#error Supply the signed OS volume UUID for owner boot metadata
+++#endif
+ +extern int native_owner_publish_boot_manifest(dev_t, const char *, dev_t, const char *);
+ +#endif
+ +#if defined(XNU_OWNER_CACHE_STARTUP) && XNU_OWNER_CACHE_STARTUP
+@@ -95,15 +98,19 @@
  +	request.flags |= MNT_UNION;
  +#endif
  +	if (device_vnode) vnode_put(device_vnode);
@@ -1622,7 +1632,7 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
  +	/* Exact user-mount payload already qualified against this original APFS. */
  +	memcpy(mount_data, &spec, sizeof(spec));
  +	memcpy(mount_data + 8, &mount_flags, sizeof(mount_flags));
-@@ -115,10 +119,13 @@
+@@ -115,10 +122,13 @@
  +	    (error = copyout(device_path, spec, strlen(device_path) + 1)) != 0 ||
  +	    (error = copyout(mount_data, request.data, sizeof(mount_data))) != 0) goto done;
  +	native_owner_cache_stage = 3;
@@ -1636,7 +1646,7 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
  +	error = vnode_lookup(mountpoint, 0, &mounted_root, vfs_context_current());
  +	if (error) goto done;
  +	mount_t cache_mount = vnode_mount(mounted_root);
-@@ -140,6 +147,7 @@
+@@ -140,6 +150,7 @@
  +#endif
  +	if (!cache_authorized) { error = EAUTH; goto done; }
  +	native_owner_cache_stage = 5;
@@ -1644,7 +1654,7 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
  +#if !defined(XNU_OWNER_UNION_SYSTEMOS) || !XNU_OWNER_UNION_SYSTEMOS
  +	if ((error = copyout(environment, environment_vector[0], strlen(environment) + 1)) != 0 ||
  +	    (error = copyout(environment_vector, scratch + 0x500, sizeof(environment_vector))) != 0) goto done;
-@@ -151,6 +159,7 @@
+@@ -151,6 +162,7 @@
  +	*envp = USER_ADDR_NULL;
  +#endif
  +	native_owner_cache_stage = 6;
@@ -1652,7 +1662,16 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
  +done:
  +	if (mounted_root) vnode_put(mounted_root);
  +	int root_recheck = root_authorized && native_verified_block_root_authorized(root_device);
-@@ -172,6 +181,8 @@
+@@ -158,7 +170,7 @@
+ +	if (!root_recheck) error = EAUTH;
+ +#if defined(XNU_OWNER_BOOT_MANIFEST) && XNU_OWNER_BOOT_MANIFEST
+ +	if (!error && cache_authorized && root_recheck &&
+-+	    !native_owner_publish_boot_manifest(root_device, "04769D26-2CA0-4825-B443-E2E5F88300F2",
+++	    !native_owner_publish_boot_manifest(root_device, XNU_OWNER_ROOT_VOLUME_UUID,
+ +	        selected, volume)) error = EAUTH;
+ +#endif
+ +#if defined(XNU_OWNER_CACHE_STARTUP) && XNU_OWNER_CACHE_STARTUP
+@@ -172,6 +184,8 @@
  +#endif
  +	native_owner_cache_authorized = cache_authorized;
  +	native_owner_cache_status = error;
@@ -1661,7 +1680,7 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
  +	native_owner_cache_checkpoint(error, cache_authorized);
  +	return error;
  +}
-@@ -205,7 +216,9 @@
+@@ -205,7 +219,9 @@
  +	int error = EINVAL;
  +	vnode_t data_root = NULLVP;
  +	char device_path[64] = "/dev/md0";
@@ -1671,7 +1690,7 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
  +	/* The typed provider supplies logical seed identity for both dense and
  +	 * sparse media. A sparse disk has no contiguous logical-byte address. */
  +	if (!native_ram_block_volume_seed(XNU_OWNER_DATA_VOLUME_UUID, &device, device_path,
-@@ -213,6 +226,7 @@
+@@ -213,6 +229,7 @@
  +	/* The typed provider's disk may be far larger than 2 GiB (a persistent Data disk keeps only its seed's nonzero pages). */
  +	if (!size || size > UINT64_C(0x10000000000) || (size & 4095)) goto done;
  +#else
@@ -1679,7 +1698,7 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
  +	device = mdevlookup(0);
  +	if (device == NODEV || mdevgetrange(0, &base, &size) || base < VM_MIN_KERNEL_ADDRESS ||
  +	    !size || size > UINT64_C(0x80000000) || (base & 4095) || (size & 4095)) goto done;
-@@ -225,6 +239,8 @@
+@@ -225,6 +242,8 @@
  +	native_owner_data_seed_size = size;
  +	native_owner_data_stage = 1;
  +	strlcpy(native_owner_data_device_path, device_path, sizeof(native_owner_data_device_path));
@@ -1688,7 +1707,7 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
  +	uint8_t payload[0x150] = {0};
  +	user64_addr_t spec = scratch + 0x160;
  +	uint16_t mode = 1;
-@@ -241,10 +257,14 @@
+@@ -241,10 +260,14 @@
  +	    (error = copyout(device_path, spec, strlen(device_path) + 1)) ||
  +	    (error = copyout(payload, request.data, sizeof(payload)))) goto done;
  +	native_owner_data_stage = 2;
@@ -1703,7 +1722,7 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
  +	if (error) goto done;
  +	mount_t data_mount = vnode_mount(data_root);
  +	vnode_t device_node = vfs_devvp(data_mount);
-@@ -258,6 +278,8 @@
+@@ -258,6 +281,8 @@
  +done:
  +	if (data_root) vnode_put(data_root);
  +	native_owner_data_status = error;
@@ -1712,7 +1731,7 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
  +	return error;
  +}
  +#endif
-@@ -267,7 +289,7 @@
+@@ -267,7 +292,7 @@
   {
   	int retval[2];
   	int error;
@@ -1721,7 +1740,7 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
   	 */
   	init_exec_args.fname = argv0;
   	init_exec_args.argp = scratch_addr;
-@@ -276,7 +298,7 @@
+@@ -276,7 +301,7 @@
   
   	/*
   	 * So that init task is set with uid,gid 0 token
@@ -1730,7 +1749,7 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
   	mach_vm_size_t map_page_size = vm_map_page_size(map);
   
   	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size, VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_NONE);
-@@ -292,7 +314,7 @@
+@@ -292,7 +317,7 @@
   #if CONFIG_MEMORYSTATUS
   	(void) memorystatus_init_at_boot_snapshot();
   #endif /* CONFIG_MEMORYSTATUS */
@@ -1739,7 +1758,7 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
   
   		if (is_release_suffix) {
   			printf("load_init_program: attempting to load /sbin/launchd\n");
-@@ -301,7 +323,7 @@
+@@ -301,7 +326,7 @@
   			if (!error) {
   				return;
   			}
@@ -1748,7 +1767,7 @@ diff --git a/patches/xnu/offline-owner-systemos-mount.patch b/patches/xnu/offlin
   			strlcat(launchd_path, launchd_suffix, sizeof(launchd_path));
   
   			printf("load_init_program: attempting to load %s\n", launchd_path);
-@@ -310,7 +332,7 @@
+@@ -310,7 +335,7 @@
   			if (!error) {
   				return;
   			} else if (error != ENOENT) {
@@ -1832,6 +1851,15 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
    exit 1
  fi
  ADRENO_FIRMWARE_PROBE=${XNU_ADRENO_FIRMWARE_PROBE:-0}
+@@ -392,7 +402,7 @@
+   exit 1
+ fi
+ OWNER_DATA_HEADER=$ROOT/build/xnu/owner-data-volume.h
+-python3 - "$OWNER_DATA_HEADER" "$OWNER_DATA_MOUNT" "$NATIVE_RAM_BLOCK" "${XNU_OWNER_DATA_VOLUME_UUID:-}" "${XNU_OWNER_CACHE_VOLUME_UUID:-}" <<'PY_DATA_UUID'
++python3 - "$OWNER_DATA_HEADER" "$OWNER_DATA_MOUNT" "$NATIVE_RAM_BLOCK" "${XNU_OWNER_DATA_VOLUME_UUID:-}" "${XNU_OWNER_CACHE_VOLUME_UUID:-}" "$OWNER_BOOT_MANIFEST" "${XNU_OWNER_ROOT_VOLUME_UUID:-}" <<'PY_DATA_UUID'
+ from pathlib import Path
+ import sys
+ import uuid
 @@ -400,7 +410,10 @@
  text = '/* Scratch Data IOKit selection disabled. */\n'
  if sys.argv[2:4] == ['1', '1']:
@@ -1844,14 +1872,28 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
      except ValueError:
          raise SystemExit('Set XNU_OWNER_DATA_VOLUME_UUID to the actual observed scratch APFS volume UUID')
      text = '#define XNU_OWNER_DATA_VOLUME_UUID "' + value + '"\n'
-@@ -417,9 +430,19 @@
+@@ -412,14 +425,33 @@
+     except ValueError:
+         raise SystemExit('Set XNU_OWNER_CACHE_VOLUME_UUID to the SystemOS volume UUID of the signed policy')
+ text += '#define XNU_OWNER_CACHE_VOLUME_UUID "' + cache + '"\n'
++# Boot metadata must name the signed OS selected by this device, not a donor.
++if sys.argv[6] == '1':
++    try:
++        root = uuid.UUID(sys.argv[7])
++        if root.int == 0 or root == uuid.UUID(cache):
++            raise ValueError('OS and SystemOS must have distinct nonzero identities')
++    except ValueError:
++        raise SystemExit('Set XNU_OWNER_ROOT_VOLUME_UUID to the OS volume UUID of the signed policy')
++    text += '#define XNU_OWNER_ROOT_VOLUME_UUID "' + str(root).upper() + '"\n'
+ path.parent.mkdir(parents=True, exist_ok=True)
+ if not path.exists() or path.read_text() != text:
      path.write_text(text)
  PY_DATA_UUID
  OWNER_DATA_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-data-mount-mode
 -if [ "$(cat "$OWNER_DATA_STAMP" 2>/dev/null || echo 0)" != "$OWNER_DATA_MOUNT:$NATIVE_RAM_BLOCK:${XNU_OWNER_CACHE_VOLUME_UUID:-}" ]; then
 -  rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o"
 -  printf '%s\n' "$OWNER_DATA_MOUNT:$NATIVE_RAM_BLOCK:${XNU_OWNER_CACHE_VOLUME_UUID:-}" > "$OWNER_DATA_STAMP"
-+OWNER_DATA_MODE="$OWNER_DATA_MOUNT:$NATIVE_RAM_BLOCK:${XNU_OWNER_DATA_VOLUME_UUID:-}:${XNU_OWNER_CACHE_VOLUME_UUID:-}"
++OWNER_DATA_MODE="$OWNER_DATA_MOUNT:$NATIVE_RAM_BLOCK:${XNU_OWNER_DATA_VOLUME_UUID:-}:${XNU_OWNER_CACHE_VOLUME_UUID:-}:$OWNER_BOOT_MANIFEST:${XNU_OWNER_ROOT_VOLUME_UUID:-}"
 +if [ "$(cat "$OWNER_DATA_STAMP" 2>/dev/null || echo 0)" != "$OWNER_DATA_MODE" ]; then
 +  python3 - "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o" "$ROOT/build/xnu/stale-owner-data" <<'PY_DATA_STALE'
 +from pathlib import Path

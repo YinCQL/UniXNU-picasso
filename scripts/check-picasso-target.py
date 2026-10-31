@@ -46,6 +46,10 @@ def check_board(root=ROOT):
                                       {'name': 'SystemOS', 'component': 'Cryptex1,SystemOS'}]:
         raise ValueError('The iPhone firmware still requires both original volumes')
     config = (root / 'configs/picasso_defconfig').read_text()
+    root_uuid_lines = [line.strip() for line in config.splitlines()
+                       if line.strip().startswith('CONFIG_XNU_OWNER_ROOT_VOLUME_UUID=')]
+    if root_uuid_lines != [f'CONFIG_XNU_OWNER_ROOT_VOLUME_UUID="{target.OS_UUID}"']:
+        raise ValueError('Configured owner boot-manifest OS UUID differs from the target volume')
     if config.count(f'CONFIG_XNU_OWNER_CACHE_VOLUME_UUID="{target.SYSTEMOS_UUID}"') != 1:
         raise ValueError('Configured SystemOS UUID differs from the target volume')
     check_policy(root / 'policy/verified-root-picasso')
