@@ -31,6 +31,17 @@ MAX_PACKED = 4 * 1024**2
 MAX_LOGICAL = 2 * 1024**3  # Larger disks select the persistent-store driver path.
 DATA_UUID_KEY = 'CONFIG_XNU_OWNER_DATA_VOLUME_UUID'
 OFFLINE_POLICY_DIR = 'db/com.apple.xpc.launchd'
+# Jobs the offline policy may never disable: what the path to SpringBoard waits on or what many
+# other daemons look up. watchdogd is NOT here: it traps in its own code during bring-up and, being
+# a critical process, panics the whole system, so it is disabled like HackiOS does.
+PROTECTED_JOBS = frozenset((
+    'com.apple.notifyd', 'com.apple.SpringBoard',
+    'com.apple.backboardd', 'com.apple.runningboardd', 'com.apple.logd',
+    'com.apple.configd', 'com.apple.cfprefsd.xpc.daemon', 'com.apple.containermanagerd',
+    'com.apple.mobile.usermanagerd', 'com.apple.lsd', 'com.apple.powerd',
+    'com.apple.fseventsd', 'com.apple.mediaserverd', 'com.apple.apsd',
+    'com.apple.nsurlsessiond', 'com.apple.mobileactivationd',
+))
 DIRECTORIES = (
     'db/dslocal/nodes/Default/users', 'db/dslocal/nodes/Default/groups',
     'db/dslocal/nodes/Default/config', 'containers/Bundle',
@@ -193,10 +204,17 @@ def add_directories(target):
 
 
 def offline_jobs(payload):
-    """Only the unavailable telephony job may be excluded on volatile Data."""
+    """Stock jobs excluded on volatile Data: each named once, none the boot depends on."""
     jobs = payload.get('offline_disabled_jobs', [])
-    if not isinstance(jobs, list) or jobs not in ([], ['com.apple.CommCenter']):
-        raise ValueError('Offline policy permits only com.apple.CommCenter once')
+    if not isinstance(jobs, list) or not all(isinstance(job, str) for job in jobs):
+        raise ValueError('Offline policy must be a list of job labels')
+    if len(set(jobs)) != len(jobs):
+        raise ValueError('Offline policy names a job more than once')
+    for job in jobs:
+        if not job.startswith('com.apple.'):
+            raise ValueError(f'Offline policy names a non-stock job: {job}')
+        if job in PROTECTED_JOBS:
+            raise ValueError(f'Offline policy may not disable {job}')
     adt = payload.get('adt', {})
     if jobs and (adt.get('packed_data_ramdisk') is not True or adt.get('persistent_data')):
         raise ValueError('Offline launch policy requires packed volatile Data')
@@ -204,8 +222,8 @@ def offline_jobs(payload):
 
 
 def offline_policy_contents(jobs):
-    if jobs not in ([], ['com.apple.CommCenter']):
-        raise ValueError('Unexpected offline job list')
+    offline_jobs({'offline_disabled_jobs': jobs,
+                  'adt': {'packed_data_ramdisk': True}})
     if not jobs:
         return {}
     return {

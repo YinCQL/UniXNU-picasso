@@ -4748,3 +4748,88 @@ new file mode 100644
 ++	}
 ++}
 ++#endif
+diff --git a/patches/xnu/zzzzzz-picasso-springboard-inject.patch b/patches/xnu/zzzzzz-picasso-springboard-inject.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/zzzzzz-picasso-springboard-inject.patch
+@@ -0,0 +1,80 @@
++diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
++index 8bba078..49d986d 100644
++--- a/bsd/kern/kern_exec.c
+++++ b/bsd/kern/kern_exec.c
++@@ -5823,10 +5823,52 @@ bad:
++  * Note:	The argument and environment vectors are user space pointers
++  *		to arrays of user space pointers.
++  */
+++#if DEVELOPMENT || DEBUG
+++/*
+++ * Picasso bring-up: boot-arg picasso_inject_sb=PATH starts SpringBoard with
+++ * DYLD_INSERT_LIBRARIES=PATH so dyld loads our library into it. launchd refuses
+++ * DYLD_ variables from a job, so the kernel adds this one (after HackiOS's
+++ * kern.exec_inject). The library itself is supplied separately.
+++ */
+++static bool
+++picasso_springboard_inject_env(struct image_params *imgp, char *env, size_t size)
+++{
+++	static const char program[] = "SpringBoard";
+++	char path[200];
+++	if (imgp->ip_ndp == NULL || imgp->ip_ndp->ni_cnd.cn_namelen != sizeof(program) - 1 ||
+++	    strncmp(imgp->ip_ndp->ni_cnd.cn_nameptr, program, sizeof(program) - 1) != 0) {
+++		return false;
+++	}
+++	if (!PE_parse_boot_argn("picasso_inject_sb", path, sizeof(path)) || path[0] != '/') {
+++		return false;
+++	}
+++	snprintf(env, size, "DYLD_INSERT_LIBRARIES=%s", path);
+++	printf("PICASSO_INJECT SpringBoard started with %s\n", env);
+++	return true;
+++}
+++
+++/* Read-only sysctl the inject library reads on load. A sysctl read is allowed by SpringBoard's
+++ * sandbox (a /dev/console write may not be), so this is the reliable proof the library ran. */
+++static int
+++picasso_inject_ack_sysctl SYSCTL_HANDLER_ARGS
+++{
+++	int value = 1;
+++	char name[32] = "?";
+++	proc_name(proc_selfpid(), name, sizeof(name));
+++	printf("PICASSO_SBINJECT library ran: ack read by pid=%d name=%s\n", proc_selfpid(), name);
+++	return SYSCTL_OUT(req, &value, sizeof(value));
+++}
+++SYSCTL_PROC(_kern, OID_AUTO, picasso_inject_ack, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+++    0, 0, picasso_inject_ack_sysctl, "I", "picasso: prints the reader's pid to confirm injection");
+++#endif
+++
++ __attribute__((noinline))
++ static int
++ exec_extract_strings(struct image_params *imgp)
++ {
+++#if DEVELOPMENT || DEBUG
+++	char picasso_inject[256];
+++#endif
++ 	int error = 0;
++ 	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
++ 	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
++@@ -5996,6 +6038,22 @@ exec_extract_strings(struct image_params *imgp)
++ 		imgp->ip_envc++;
++ 	}
++
+++#if DEVELOPMENT || DEBUG
+++	/* One more variable for SpringBoard (see picasso_springboard_inject_env). */
+++	if (picasso_springboard_inject_env(imgp, picasso_inject, sizeof(picasso_inject))) {
+++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(picasso_inject), UIO_SYSSPACE, TRUE);
+++		if (error) {
+++			goto bad;
+++		}
+++		if (imgp->ip_argspace < new_ptr_size) {
+++			error = E2BIG;
+++			goto bad;
+++		}
+++		imgp->ip_argspace -= new_ptr_size;
+++		imgp->ip_envc++;
+++	}
+++#endif
+++
++ 	/* Save space for envv[] NULL terminator */
++ 	if (imgp->ip_argspace < new_ptr_size) {
++ 		error = E2BIG;

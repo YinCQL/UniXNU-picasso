@@ -94,6 +94,12 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
 
+      - name: Build the SpringBoard inject library
+        run: |
+          mkdir -p out/picasso
+          python3 scripts/build-picasso-sb-inject.py \
+            package/picasso-springboard/picasso-sb-probe.m out/picasso/libpicasso-sb.dylib
+
       - name: Download the target IPSW
         run: |
           mkdir -p out/ipsw
@@ -150,7 +156,7 @@ jobs:
         run: |
           python3 ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
           mkdir -p out/picasso/logs
-          python3 ./unixnu build kernel payload -j 3 --trust-cache out/picasso/original-static-system.bundle --data-ramdisk out/picasso/ram-data/data.dbrdisk 2>&1 | tee out/picasso/logs/actions-build.log
+          python3 ./unixnu build kernel payload -j 3 --skip-setup --trust-cache out/picasso/original-static-system.bundle --data-ramdisk out/picasso/ram-data/data.dbrdisk 2>&1 | tee out/picasso/logs/actions-build.log
 
       - name: Verify Data seed, compiled UUID and payload handoff
         run: |

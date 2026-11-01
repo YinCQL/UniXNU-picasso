@@ -170,9 +170,55 @@ BUILDID_STRING = "picasso-research"
 # Payload: a FAT volume with UniXNU config + kernel + ADT. Loader (DarwinBoot) is in the firmware.
 [payload]
 volume = "PICASSOESP"
-# No native telephony backend is selected. A fresh volatile Data seed skips
-# both stock CommCenter variants by their shared label; watchdogd stays enabled.
-offline_disabled_jobs = ["com.apple.CommCenter"]
+# With one CPU, the ~530 stock jobs leave notifyd's background workqueue thread too
+# little time to answer SpringBoard. A fresh volatile Data seed disables the jobs for
+# hardware this board has not got (telephony, radios, camera, NFC, biometrics, USB
+# accessories), for a paired Watch or car, and for accounts, Siri, analytics, updates
+# and restore, after HackiOS's DENY list. It also disables watchdogd, which traps in its own code
+# during bring-up and panics the system as a critical process (HackiOS denies it too). notifyd and
+# what SpringBoard waits on stay enabled (PROTECTED_JOBS in scripts/prepare-picasso-ram-data.py).
+offline_disabled_jobs = [
+  "com.apple.watchdogd",
+  "com.apple.BTServer.avrcp", "com.apple.BTServer.le", "com.apple.BTServer.map",
+  "com.apple.BTServer.pbap", "com.apple.ClarityBoard", "com.apple.CommCenter",
+  "com.apple.CommCenterMobileHelper", "com.apple.CommCenterRootHelper", "com.apple.DumpPanic",
+  "com.apple.MobileInternetSharing", "com.apple.OTACrashCopier", "com.apple.ReportCrash",
+  "com.apple.RestoreRemoteServices.restoreserviced", "com.apple.WirelessRadioManager",
+  "com.apple.abm-helper", "com.apple.accessibility.axremoted", "com.apple.accessoryd",
+  "com.apple.accessoryupdaterd", "com.apple.applecamerad", "com.apple.appstored",
+  "com.apple.assistantd", "com.apple.avconferenced", "com.apple.awdd", "com.apple.backupd",
+  "com.apple.biometrickitd.pearl", "com.apple.bird", "com.apple.bluetoothd",
+  "com.apple.bluetoothuserd", "com.apple.brook.brookcompaniond", "com.apple.carkitd",
+  "com.apple.checkerboard", "com.apple.checkerboardd", "com.apple.cloudpaird",
+  "com.apple.companioncamerad", "com.apple.corespeechd", "com.apple.dhcp6d",
+  "com.apple.dietapplecamerad", "com.apple.dietappleh13camerad", "com.apple.dmd",
+  "com.apple.dt.AutomationModeUI", "com.apple.duetexpertd", "com.apple.exchangesyncd",
+  "com.apple.factory.NFQRCoded", "com.apple.fairplayd.H2", "com.apple.fairplaydeviceidentityd",
+  "com.apple.gpsd", "com.apple.healthd", "com.apple.homed", "com.apple.icloud.findmydeviced",
+  "com.apple.identityservicesd", "com.apple.imagent", "com.apple.iomfb_bics_daemon",
+  "com.apple.itunesstored", "com.apple.locationd", "com.apple.magicswitchd.companion",
+  "com.apple.mediastream.mstreamd", "com.apple.mobile.keybagd", "com.apple.mobile.lockdown",
+  "com.apple.mobile.obliteration", "com.apple.mobile.softwareupdated",
+  "com.apple.mobile.storage_mounter", "com.apple.mobile.storage_mounter_proxy",
+  "com.apple.mobileassetd", "com.apple.mobilerepaird", "com.apple.mobilestoredemod",
+  "com.apple.mobilestoredemodhelper", "com.apple.nanobackupd",
+  "com.apple.nanomediaremotelinkagent", "com.apple.nanophone", "com.apple.nanoprefsyncd.2",
+  "com.apple.nanoregistryd", "com.apple.navd", "com.apple.nearbyd", "com.apple.nfcd",
+  "com.apple.nfrestore", "com.apple.nptocompaniond", "com.apple.osanalytics.osanalyticshelper",
+  "com.apple.pairedsyncd", "com.apple.peakpowermanagerd", "com.apple.photoanalysisd",
+  "com.apple.ptpcamerad", "com.apple.ptpd", "com.apple.purplebuddy.budd", "com.apple.rapportd",
+  "com.apple.remindd", "com.apple.remoted", "com.apple.routined", "com.apple.safetyalertsd",
+  "com.apple.sharingd", "com.apple.softwareupdateservicesd", "com.apple.sosd",
+  "com.apple.syncdefaultsd", "com.apple.terminusd", "com.apple.thermalmonitord",
+  "com.apple.timesync.audioclocksyncd", "com.apple.triald", "com.apple.tvremoted",
+  "com.apple.usb.networking.addNetworkInterface", "com.apple.usbsmartcardreaderd",
+  "com.apple.wifi.hostapd", "com.apple.wifi.wapic", "com.apple.wifiFirmwareLoader",
+  "com.apple.wifianalyticsd", "com.apple.wifip2pd", "com.apple.wifivelocityd"
+]
+# --skip-setup: Setup and per-boot data migration are skipped, and the display does
+# not dim or sleep (the board has no input yet). The wrapper names the iOS userland.
+skip_setup_tool = "scripts/picasso-seed-skip-setup.py"
+skip_setup_args = ["--no-auto-dim", "--inject-lib", "out/picasso/libpicasso-sb.dylib"]
 # Room for the kernel, original trust caches and packed APFS Data seed.
 # The payload builder retains its 95% content limit; CI checks the actual seed.
 size_mib = 60
@@ -187,18 +233,40 @@ dram_size = "0x80000000"
 # nothing and left the boot without a console. debug=0x14e keeps DB_KPRT (0x8),
 # so kprintf is still enabled; the flags are 0x2 and 0x4 (NMI) plus 0x40 (ARP)
 # and 0x100 (obsolete), none of which halt early.
-# Also pin the platform explicitly: cpus=1 avoids spinning up seven secondary
-# cores before the platform expert has an interrupt controller.
+# All eight cores: ArmCpu maps the GIC on the boot core, then starts each
+# secondary core with PSCI CPU_ON (sheng-smp=1) once the boot core is registered.
+# armcpu-self-ipi=1 makes every core take one IPI from initCPU, which XNU needs
+# before it will signal that core. ICC_SGI1R_EL1 SGIs reach no core here (0 taken
+# on every secondary), so armcpu-spi-ipi=1 sends IPIs as software-pended SPIs
+# routed to the target core. With one core, background daemons starved notifyd
+# and MobileGestaltHelper for minutes.
 kernel_args = [
   "-v",
   "debug=0x14e",
-  # Keep backboardd presenting on the firmware-backed panel.
-  "picasso-fb-reject-off=1",
   "cpus=8",
   "sheng-smp=1",
   "armcpu-self-ipi=1",
   "armcpu-spi-ipi=1",
+  # Every frequency domain at the top of its lookup table (ArmCpu raiseCpuFrequency):
+  # firmware leaves the cores slow. No thermal governor runs yet; the SoC's own limits
+  # management hardware still applies.
   "armcpu-cpufreq=1",
+  # SpringBoard library injection for bring-up (bsd/kern/kern_exec.c): the kernel starts
+  # SpringBoard with DYLD_INSERT_LIBRARIES set to this path. The library is ad-hoc signed and
+  # not in the trust cache, so AMFI is told to accept any signature and code-signing enforcement
+  # is relaxed. These loosen code signing for the whole system and are a research/bring-up setting.
+  "picasso_inject_sb=/private/var/picasso/libpicasso-sb.dylib",
+  # amfi_allow_any_signature=1 lets AMFI accept the ad-hoc, non-trust-cached inject library into
+  # SpringBoard. cs_enforcement_disable is deliberately NOT set: with both, early boot hung before
+  # the console came up, and amfi_allow_any_signature alone is the targeted lever (developer mode is
+  # already on here because protected data is unavailable).
+  "amfi_allow_any_signature=1",
+  # The lock screen renders but the display then drops; refuse the framebuffer power-off
+  # transition so backboardd keeps presenting it (selector 12, IOUserClient.cpp).
+  "picasso-fb-reject-off=1",
+  # No picasso_session_s timer: after a long run the bootloader ignores the armed
+  # IMEM Fastboot reason and boots normally, and the first boot on volatile Data
+  # rebuilds the LaunchServices database for longer than a short session lasts.
   # Production root path. native-ufs-root=1 starts the root from the
   # root-device personality without the diagnostic media-report panic that
   # native-ufs-probe=12 ends with. Upstream's payload guard (check_native_root)
