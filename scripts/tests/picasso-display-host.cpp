@@ -116,6 +116,8 @@ static void bootLogo() {
     assert(!p.holdBlank(999));
     p.observe(1000,1080,2400,logo);assert(p.holdBlank(2000));
     p.observe(2000,1080,2400,logo);assert(p.deadline==301000);
+    logo[0]=29441;p.observe(3000,1080,2400,logo);assert(p.holdBlank(3001));
+    logo[0]=29457;
     assert(p.holdBlank(300999) && !p.holdBlank(301000));
     p.observe(301001,1080,2400,logo);assert(!p.holdBlank(301002));
     p={};p.enabled=true;p.observe(1000,1080,2400,logo);

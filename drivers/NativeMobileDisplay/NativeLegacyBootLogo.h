@@ -15,7 +15,9 @@ struct NativeLegacyBootLogo {
     }
     void observe(uint64_t now, uint32_t width, uint32_t height, const uint64_t scan[5]) {
         if (!needsScan(now)) return;
-        bool logo = width == 1080 && height == 2400 && scan[0] == 29457 &&
+        // The boot logo fades slightly before the first UI frame (29441 in build115).
+        bool countMatches = observed ? scan[0] >= 29201 && scan[0] <= 29713 : scan[0] == 29457;
+        bool logo = width == 1080 && height == 2400 && countMatches &&
             scan[1] >= width / 4 && scan[2] >= height / 4 &&
             scan[3] < width * 3 / 4 && scan[4] < height * 3 / 4;
         if (!observed) {
