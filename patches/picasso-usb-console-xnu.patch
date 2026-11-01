@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..2237fb2
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,3079 @@
+@@ -0,0 +1,3084 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -1786,6 +1786,9 @@ index 0000000..2237fb2
 +				    type, status, received);
 +			}
 +			if (received != 0) {
++				/* A host that can submit a bulk command has attached even if
++				 * its tty layer did not deliver SET_CONTROL_LINE_STATE. */
++				ud.host_open = true;
 +				ud_sync(UD_RX, received);
 +				ud_rx_consume((const uint8_t *)(ud.dma + UD_RX), received);
 +				ud.rx_bytes += received;
@@ -2888,6 +2891,7 @@ index 0000000..2237fb2
 +		while ((!ud.configured || !ud.host_open) && handoff_ms < 10000) {
 +			picasso_usb_busy_wait(1000);
 +			ud_poll_serialized();
++			picasso_usb_watchdog_pet();
 +			handoff_ms++;
 +			if (ud.configured &&
 +			    (handoff_ms <= 5 || handoff_ms % 1000 == 0)) {
@@ -2902,6 +2906,7 @@ index 0000000..2237fb2
 +		for (unsigned settle_ms = 0; settle_ms < 500; settle_ms++) {
 +			picasso_usb_busy_wait(1000);
 +			ud_poll_serialized();
++			picasso_usb_watchdog_pet();
 +			if (settle_ms % 100 == 99) {
 +				ud_dump_ep_state("settle", EP_RX);
 +			}

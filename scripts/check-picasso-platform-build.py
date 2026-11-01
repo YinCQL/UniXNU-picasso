@@ -63,8 +63,18 @@ def main():
                         str(source), '-o', str(obj)], check=True, capture_output=True)
 
     try:
+        assert builder.SOURCES == ('PicassoPmgr', 'PicassoWatchdog', 'PicassoBootState',
+                                   'PicassoPowerSource')
+        pmgr = (ROOT / 'package/PicassoPmgr.cpp').read_text(encoding='utf-8')
+        source_start = pmgr.index('extern "C" void sheng_pmgr_run(void)')
+        power_call = pmgr.index('picasso_power_source_run();', source_start)
+        mode_gate = pmgr.index('PE_parse_boot_argn("sheng-pmgr"', source_start)
+        assert power_call < mode_gate
+        passed('static power source is built and published before the PMGR mode gate')
+
         expected = [Path('PicassoPmgr.o'), Path('PicassoWatchdog.late.o'),
-                    Path('PicassoBootState.late.o'), Path('watchdog-bindings.o')]
+                    Path('PicassoBootState.late.o'), Path('PicassoPowerSource.late.o'),
+                    Path('watchdog-bindings.o')]
         names = [p.name for p in expected]
         for index in ('__.SYMDEF', '__.SYMDEF SORTED', '__.SYMDEF_64', '__.SYMDEF_64 SORTED'):
             checked = builder.check_archive_members([index] + names, expected)
@@ -223,6 +233,9 @@ def main():
         boot_schema = '.text\n__GLOBAL__sub_I_PicassoBootState.cpp:\nret\n'
         boot_schema += '.section __DATA,__mod_init_func,mod_init_funcs\n.p2align 3\n.quad __GLOBAL__sub_I_PicassoBootState.cpp\n'
         (tree / 'kits/picasso/PicassoBootState.cpp').write_text(boot_schema)
+        power_schema = '.text\n__GLOBAL__sub_I_PicassoPowerSource.cpp:\nret\n'
+        power_schema += '.section __DATA,__mod_init_func,mod_init_funcs\n.p2align 3\n.quad __GLOBAL__sub_I_PicassoPowerSource.cpp\n'
+        (tree / 'kits/picasso/PicassoPowerSource.cpp').write_text(power_schema)
         record_path = tree / builder.RECORD; record_path.parent.mkdir(parents=True)
         synthetic = {'file': 'record-source.cpp', 'directory': str(tree),
                      'arguments': [clang, '-target', 'arm64-apple-ios17.0', '-x', 'assembler', '-c',
@@ -249,11 +262,12 @@ def main():
             builder.main()
             built = json.loads((archive.parent / 'build-report.json').read_text())
             assert built['complete'] and built['members'] == ['PicassoPmgr.o', 'PicassoWatchdog.late.o',
-                                                            'PicassoBootState.late.o', 'watchdog-bindings.o']
+                                                            'PicassoBootState.late.o', 'PicassoPowerSource.late.o',
+                                                            'watchdog-bindings.o']
             assert Path(built['previous_archive']).read_bytes() == b'previous archive retained'
             assert built['symbol_table_members'] == ['__.SYMDEF SORTED']
             builder.write_json(out / 'schema-build-success.json', built)
-            passed('complete archive build has exactly four qualified objects and preserves previous archive')
+            passed('complete archive build has exactly five qualified objects and preserves previous archive')
             prior = archive.read_bytes()
             with patch.dict(os.environ, {'UNIXNU_KERNELCACHE': str(corrupted)}):
                 reject('full builder fails closed on wrong image', builder.main)

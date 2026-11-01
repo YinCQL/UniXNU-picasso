@@ -1778,23 +1778,61 @@ diff --git a/patches/xnu/offline-owner-cache-carrier.patch b/patches/xnu/offline
  +}
  +#endif
 diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
+index 5815dd9..aa46d0b 100644
 --- a/scripts/build-xnu-4k-baseline.sh
 +++ b/scripts/build-xnu-4k-baseline.sh
-@@ -35,7 +35,12 @@
- # Remove them first so earlier independent patches retain their idempotent checks.
- # The same holds for the boot-time GPU addon mount and the staged system apps copy (zzy), which edit the owner Data mount function
- # inside the systemos patch. Reverse newest first; the loop below re-applies them in name order.
+@@ -31,22 +31,37 @@ if [ ! -x .cache/fakeroot/usr/local/libexec/availability.pl ]; then
+     OBJROOT="$ROOT/build/availability" SYMROOT="$ROOT/build/availability" \
+     DSTROOT="$ROOT/.cache/fakeroot" CMAKE="$(command -v cmake)" NINJA="$(command -v ninja)"
+ fi
+-# The optional observation hooks overlap existing root/exec patch context.
+-# Remove them first so earlier independent patches retain their idempotent checks.
+-# The same holds for the boot-time GPU addon mount and the staged system apps copy (zzy), which edit the owner Data mount function
+-# inside the systemos patch. Reverse newest first; the loop below re-applies them in name order.
 -for LATE_PATCH in "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \
-+for LATE_PATCH in "$ROOT/patches/xnu/zzzzzz-picasso-live-wait-sample.patch" \
-+    "$ROOT/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch" \
-+    "$ROOT/patches/xnu/zzzz-picasso-systemos-union.patch" \
-+    "$ROOT/patches/xnu/zzz-picasso-usb-console.patch" \
-+    "$ROOT/patches/xnu/zzz-picasso-console-ring.patch" \
-+    "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \
-     "$ROOT/patches/xnu/zzy-native-gpu-addon-mount.patch"; do
-   if git -C .cache/xnu-work apply --reverse --check "$LATE_PATCH" >/dev/null 2>&1; then
-     git -C .cache/xnu-work apply --reverse "$LATE_PATCH"
-@@ -180,8 +184,12 @@
+-    "$ROOT/patches/xnu/zzy-native-gpu-addon-mount.patch"; do
+-  if git -C .cache/xnu-work apply --reverse --check "$LATE_PATCH" >/dev/null 2>&1; then
+-    git -C .cache/xnu-work apply --reverse "$LATE_PATCH"
++# Patch order matters, and later patches overlap earlier contexts. A reverse
++# check cannot tell "already applied" from "applied and then extended", so
++# persist the exact patch-chain identity and replay only onto a clean cache.
++PATCH_FILES=("$ROOT"/patches/xnu/*.patch "$ROOT"/kits/NativePrelink/patches/*.patch)
++PATCH_FINGERPRINT=$(
++  {
++    for PATCH in "${PATCH_FILES[@]}"; do
++      printf '%s\n' "${PATCH#"$ROOT"/}"
++      shasum -a 256 "$PATCH" | awk '{print $1}'
++    done
++    printf '%s\n' scripts/prepare-xnu-source.py
++    shasum -a 256 scripts/prepare-xnu-source.py | awk '{print $1}'
++  } | shasum -a 256 | awk '{print $1}'
++)
++PATCH_STAMP=.cache/xnu-work/.picasso-patch-fingerprint
++if [ ! -f "$PATCH_STAMP" ] || [ "$(cat "$PATCH_STAMP")" != "$PATCH_FINGERPRINT" ]; then
++  if [ -f "$PATCH_STAMP" ] || ! git -C .cache/xnu-work diff --quiet --exit-code; then
++    OLD_STAMP=$(cat "$PATCH_STAMP" 2>/dev/null || printf 'unstamped')
++    ARCHIVE=.cache/xnu-work-before-${OLD_STAMP:0:12}
++    if [ -e "$ARCHIVE" ]; then
++      ARCHIVE="$ARCHIVE-$(date +%s)"
++    fi
++    mv .cache/xnu-work "$ARCHIVE"
++    git clone --shared refer/xnu .cache/xnu-work
+   fi
+-done
+-for PATCH in "$ROOT"/patches/xnu/*.patch "$ROOT"/kits/NativePrelink/patches/*.patch; do
+-  if ! git -C .cache/xnu-work apply --reverse --check "$PATCH" >/dev/null 2>&1; then
++  for PATCH in "${PATCH_FILES[@]}"; do
+     git -C .cache/xnu-work apply --check "$PATCH"
+     git -C .cache/xnu-work apply "$PATCH"
+-  fi
+-done
++  done
++  printf '%s\n' "$PATCH_FINGERPRINT" > "$PATCH_STAMP"
++fi
+ export XNU_AVAILABILITY_PL=$ROOT/.cache/fakeroot/usr/local/libexec/availability.pl
+ python3 scripts/prepare-xnu-source.py
+ # The first pass of a new tree (XNU_BOOTSTRAP=1, set by the unixnu driver) only has to leave the compile records and
+@@ -180,8 +195,12 @@ if [ "$NATIVE_RAM_BLOCK" != 0 ] && [ "$NATIVE_RAM_BLOCK" != 1 ]; then
    exit 1
  fi
  if [ "$NATIVE_RAM_BLOCK" = 1 ]; then
@@ -1809,7 +1847,7 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
      exit 1
    fi
    PERSONALITY_CFLAGS="$PERSONALITY_CFLAGS -DXNU_NATIVE_RAM_BLOCK=1"
-@@ -254,8 +262,9 @@
+@@ -254,8 +273,9 @@ if [ "$OWNER_ROOT_AUDIT" != 0 ] && [ "$OWNER_ROOT_AUDIT" != 1 ]; then
    echo 'XNU_OWNER_ROOT_AUDIT must be 0 or 1' >&2
    exit 1
  fi
@@ -1821,7 +1859,7 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
    exit 1
  fi
  OWNER_ROOT_TRUST=${XNU_OWNER_ROOT_TRUST:-0}
-@@ -263,8 +272,9 @@
+@@ -263,8 +283,9 @@ if [ "$OWNER_ROOT_TRUST" != 0 ] && [ "$OWNER_ROOT_TRUST" != 1 ]; then
    echo 'XNU_OWNER_ROOT_TRUST must be 0 or 1' >&2
    exit 1
  fi
@@ -1833,7 +1871,7 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
    exit 1
  fi
  ADRENO_FIRMWARE_PROBE=${XNU_ADRENO_FIRMWARE_PROBE:-0}
-@@ -400,7 +410,10 @@
+@@ -400,7 +421,10 @@ path = Path(sys.argv[1])
  text = '/* Scratch Data IOKit selection disabled. */\n'
  if sys.argv[2:4] == ['1', '1']:
      try:
@@ -1845,7 +1883,7 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
      except ValueError:
          raise SystemExit('Set XNU_OWNER_DATA_VOLUME_UUID to the actual observed scratch APFS volume UUID')
      text = '#define XNU_OWNER_DATA_VOLUME_UUID "' + value + '"\n'
-@@ -417,9 +430,19 @@
+@@ -417,9 +441,19 @@ if not path.exists() or path.read_text() != text:
      path.write_text(text)
  PY_DATA_UUID
  OWNER_DATA_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-data-mount-mode
@@ -3748,9 +3786,10 @@ new file mode 100644
 + }
 diff --git a/patches/xnu/zzzzzz-picasso-live-wait-sample.patch b/patches/xnu/zzzzzz-picasso-live-wait-sample.patch
 new file mode 100644
+index 0000000..5da7480
 --- /dev/null
 +++ b/patches/xnu/zzzzzz-picasso-live-wait-sample.patch
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,147 @@
 +diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
 +--- a/osfmk/kern/task.c
 ++++ b/osfmk/kern/task.c
@@ -3811,7 +3850,7 @@ new file mode 100644
 +diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 +--- a/bsd/kern/kern_exit.c
 ++++ b/bsd/kern/kern_exit.c
-+@@ -117,2 +117,24 @@
++@@ -117,2 +117,26 @@
 ++extern void picasso_live_task_snapshot(task_t, int, unsigned);
 ++
 ++void
@@ -3872,7 +3911,7 @@ new file mode 100644
 ++}
 ++
 + /* PICASSO_WATCHDOG_BACKEND_BEGIN: all APSS WDT writes share this lock. */
-+ #define PICASSO_WDT_TICKS ((APSS_WDT_TIMEOUT_MS * APSS_WDT_RATE_HZ / 1000u) - 1u)
++ #define PICASSO_WDT_TICKS ((uint32_t)(((uint64_t)APSS_WDT_TIMEOUT_MS * APSS_WDT_RATE_HZ / 1000u) - 1u))
 +@@ -2257,11 +2286,13 @@ ud_finish_hang(void)
 +-
 ++extern void picasso_live_thread_state(int, unsigned);
