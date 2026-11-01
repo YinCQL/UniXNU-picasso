@@ -9,12 +9,13 @@ name: Compose Boot Image (FD + kernel + payload)
 # Produces boot.img ready for "fastboot boot" (or "fastboot flash boot" when the
 # payload is sized to fit the boot partition).
 # iPhone userland is experimental; successful composition is not runtime qualification.
+# Pure host regressions run separately in host-checks.yml.
 
 on:
   workflow_dispatch:
     inputs:
       fast:
-        description: Skip verification-only steps (device iteration; run the full set before merging)
+        description: Skip optional artifact checks for device iteration
         type: boolean
         default: false
 
@@ -34,7 +35,7 @@ jobs:
         shell: bash
         working-directory: device
     steps:
-      - name: Check out the picasso device repo (test branch, carries uefi/)
+      - name: Check out the picasso device repo
         uses: actions/checkout@v4
         with:
           path: device
@@ -49,32 +50,7 @@ jobs:
           python3 scripts/check-picasso-target.py --require-build-inputs \
             --output out/picasso/logs/target-readiness.json --github-env "$GITHUB_ENV"
 
-      - name: Check generated picasso ADT timer binding
-        if: ${{ !inputs.fast }}
-        run: python3 scripts/check-picasso-adt.py --output out/picasso/logs/adt-host-check
-
-      - name: Check display policy against the generated ADT
-        if: ${{ !inputs.fast }}
-        run: |
-          python3 scripts/check-picasso-display-policy.py \
-            --adt out/picasso/logs/adt-host-check/board-with-data.adt \
-            --output out/picasso/host-checks/display-policy
-          cp out/picasso/host-checks/display-policy/results.json out/picasso/logs/display-policy-host.json
-
-      - name: Check root input verifier failure paths
-        if: ${{ !inputs.fast }}
-        run: |
-          python3 scripts/check-picasso-root-inputs-host.py --output out/picasso/host-checks/root-inputs
-          cp out/picasso/host-checks/root-inputs/results.json out/picasso/logs/root-inputs-host.json
-
-      - name: Check bounded virtual input gestures
-        if: ${{ !inputs.fast }}
-        run: |
-          python3 scripts/check-picasso-hid-plan.py --output out/picasso/host-checks/hid-plan
-          cp out/picasso/host-checks/hid-plan/results.json out/picasso/logs/hid-plan-host.json
-
       - name: Verify firmware volume and DTB are present
-        if: ${{ !inputs.fast }}
         run: |
           test -s uefi/SILICIUM_UEFI.fd || { echo "uefi/SILICIUM_UEFI.fd missing"; exit 1; }
           test -s uefi/mu-silicium/Resources/DTBs/picasso.dtb || { echo "picasso.dtb missing"; exit 1; }
@@ -86,23 +62,6 @@ jobs:
         run: |
           TREE=$(python3 ./unixnu --prepare)
           echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
-
-      - name: Check packed Data format and seed validation
-        if: ${{ !inputs.fast }}
-        run: |
-          # Fixtures contain intentional symlinks. Upload only the result JSON.
-          python3 scripts/check-picasso-ram-data.py --output out/picasso/host-checks/data \
-            --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py"
-          python3 scripts/check-picasso-data-artifacts-host.py --output out/picasso/host-checks/payload-seed
-          mkdir -p out/picasso/logs
-          cp out/picasso/host-checks/data/results.json out/picasso/logs/data-host-check.json
-          cp out/picasso/host-checks/payload-seed/results.json out/picasso/logs/payload-seed-host.json
-
-      - name: Check ephemeral keystore state boundaries
-        if: ${{ !inputs.fast }}
-        run: |
-          python3 scripts/check-picasso-keystore.py --output out/picasso/host-checks/keystore
-          cp out/picasso/host-checks/keystore/results.json out/picasso/logs/keystore-host-check.json
 
       - name: Restore the kernel compiler cache
         uses: actions/cache@v4
@@ -158,9 +117,8 @@ jobs:
       - name: Bundle the original trust caches
         run: |
           mkdir -p out/picasso/logs
-          TREE=$(python3 ./unixnu --prepare)
           python3 ./unixnu ipsw fetch OS Cryptex1,SystemOS StaticTrustCache Cryptex1,SystemTrustCache 2>&1 | tee out/picasso/logs/actions-ipsw.log
-          python3 scripts/prepare-original-trust.py --tree "$TREE" --inputs "out/ipsw/$PICASSO_IPSW_BUILD" --output out/picasso/original-static-system.bundle 2>&1 | tee out/picasso/logs/actions-trust.log
+          python3 scripts/prepare-original-trust.py --tree "$UNIXNU_TREE" --inputs "out/ipsw/$PICASSO_IPSW_BUILD" --output out/picasso/original-static-system.bundle 2>&1 | tee out/picasso/logs/actions-trust.log
 
       - name: Verify native macOS root disks against the signed policy
         if: ${{ !inputs.fast }}
@@ -284,32 +242,6 @@ jobs:
                   raise SystemExit(f'Missing executable module entry: {component}')
               print(f'Prelink includes {component}, start={start:#x}')
           PY
-
-      - name: Report kernel/payload sizes
-        if: ${{ !inputs.fast }}
-        run: |
-          ls -l out/picasso/kernel/kernel.macho out/picasso/payload/payload.img
-          python3 - <<'EOF'
-          import struct
-          from pathlib import Path
-          k = Path('out/picasso/kernel/kernel.macho')
-          if k.is_file():
-              d = k.read_bytes()
-              print('kernel.macho', len(d), 'bytes')
-              # Count segments and report the file size of each one.
-              ncmds = struct.unpack_from('<I', d, 16)[0]
-              off = 32
-              for _ in range(ncmds):
-                  cmd, size = struct.unpack_from('<II', d, off)
-                  if cmd == 0x19:
-                      name = d[off+8:off+24].rstrip(b'\0').decode('latin1', 'replace')
-                      vmaddr, vmsize, fileoff, filesize = struct.unpack_from('<QQQQ', d, off+24)
-                      print(f'  seg {name:20s} filesize={filesize}')
-                  off += size
-          p = Path('out/picasso/payload/payload.img')
-          if p.is_file():
-              print('payload.img', p.stat().st_size, 'bytes')
-          EOF
 
       - name: Compose boot image (BootShim + repo FD + payload as ramdisk)
         run: |

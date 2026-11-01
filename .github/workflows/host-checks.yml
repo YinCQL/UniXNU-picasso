@@ -1,0 +1,94 @@
+name: Picasso host regressions
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/ios16]
+    paths:
+      - '.github/workflows/host-checks.yml'
+      - 'scripts/**'
+      - 'drivers/**'
+      - 'package/**'
+      - 'board.toml'
+      - 'configs/**'
+      - 'patches/**'
+      - 'policy/**'
+      - 'upstream.rev'
+      - 'unixnu'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: picasso-host-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: device
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Prepare the isolated upstream source
+        run: |
+          TREE=$(python3 ./unixnu --prepare)
+          echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
+          mkdir -p out/picasso/logs
+
+      - name: Check generated picasso ADT timer binding
+        run: python3 scripts/check-picasso-adt.py --output out/picasso/logs/adt-host-check
+
+      - name: Check display policy against the generated ADT
+        run: |
+          python3 scripts/check-picasso-display-policy.py \
+            --adt out/picasso/logs/adt-host-check/board-with-data.adt \
+            --output out/picasso/host-checks/display-policy
+          cp out/picasso/host-checks/display-policy/results.json out/picasso/logs/display-policy-host.json
+
+      - name: Check root input verifier failure paths
+        run: |
+          python3 scripts/check-picasso-root-inputs-host.py --output out/picasso/host-checks/root-inputs
+          cp out/picasso/host-checks/root-inputs/results.json out/picasso/logs/root-inputs-host.json
+
+      - name: Check bounded virtual input gestures
+        run: |
+          python3 scripts/check-picasso-hid-plan.py --output out/picasso/host-checks/hid-plan
+          cp out/picasso/host-checks/hid-plan/results.json out/picasso/logs/hid-plan-host.json
+
+      - name: Check packed Data format and seed validation
+        run: |
+          # Fixtures contain intentional symlinks. Upload only the result JSON.
+          python3 scripts/check-picasso-ram-data.py --output out/picasso/host-checks/data \
+            --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py"
+          python3 scripts/check-picasso-data-artifacts-host.py --output out/picasso/host-checks/payload-seed
+          mkdir -p out/picasso/logs
+          cp out/picasso/host-checks/data/results.json out/picasso/logs/data-host-check.json
+          cp out/picasso/host-checks/payload-seed/results.json out/picasso/logs/payload-seed-host.json
+
+      - name: Check ephemeral keystore state boundaries
+        run: |
+          python3 scripts/check-picasso-keystore.py --output out/picasso/host-checks/keystore
+          cp out/picasso/host-checks/keystore/results.json out/picasso/logs/keystore-host-check.json
+
+      - name: Upload regression reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: picasso-host-${{ github.run_id }}
+          path: |
+            device/out/picasso/logs/**
+            device/out/picasso/host-checks/**/*.log
+          if-no-files-found: warn
+          retention-days: 7
