@@ -1,6 +1,9 @@
 /* Real extracted backend, with simulated MMIO/IRQ and OS helpers. */
 #define _CRT_SECURE_NO_WARNINGS
 #include <cassert>
+#ifdef _MSC_VER
+#define __attribute__(value) /* Apple linkage attributes have no host equivalent. */
+#endif
 #include <cstdint>
 #include <cstdarg>
 #include <cstdio>

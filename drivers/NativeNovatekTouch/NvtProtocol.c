@@ -26,7 +26,7 @@ static const struct nvt_map map_nt36675 = {
 };
 
 // Trim table entry from sm7150-mainline commit e1795b0. Bytes 1 and 2 are masked out; the six id bytes are at
-// chip_info + 1 .. + 6. hw_crc = 2 is annotated "3Bytes" in that driver (TODO: confirm the exact CRC bank width).
+// chip_info .. + 5 after the SPI lead-in. hw_crc = 2 is annotated "3Bytes" in that driver.
 struct nvt_trim_id {
     uint8_t id[6], mask[6];
     const struct nvt_map *map;
@@ -299,7 +299,7 @@ static int fw_crc_enable(struct nvt_chip *c) {
     if (r) return r;
     return nvt_write_byte(c, c->map->event_buf + NVT_EVENT_HOST_CMD, NVT_HOST_CMD_ENABLE_FW_CRC);
 }
-// NT36xxx checks byte 1 of the reset-complete event (the NT36532E reference checked byte 0).
+// The reset-complete state is the first data byte after the SPI lead-in.
 static int check_reset_state(struct nvt_chip *c) {
     const unsigned max = c->reset_retries ? c->reset_retries : 10;
     for (unsigned retry = 0; retry <= max; ++retry) {

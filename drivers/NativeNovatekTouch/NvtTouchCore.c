@@ -56,8 +56,8 @@ static int free_tracking_id(const struct nvt_touch_core *core) {
 
 // Smoothing factor (1/65536) of a first-order low-pass filter with this cutoff, sampled once a frame:
 // w / (1 + w), w = 2 pi fc / rate.
-static long filter_alpha(long cutoff_mhz) {
-    const long w = cutoff_mhz * 411775 / (1000L * NVT_FRAME_HZ);   // 2 pi * 65536 = 411775
+static int64_t filter_alpha(int64_t cutoff_mhz) {
+    const int64_t w = cutoff_mhz * 411775 / (1000L * NVT_FRAME_HZ);   // 2 pi * 65536 = 411775
     return w * 65536 / (65536 + w);
 }
 
@@ -66,15 +66,15 @@ static long filter_alpha(long cutoff_mhz) {
 // moves nothing: its centroid is the least reliable.
 static void follow(struct nvt_slot *slot, int x, int y, int weak) {
     if (weak) return;
-    const long sx = ((long)x * 16 - slot->fx) * NVT_FRAME_HZ / 16,
-               sy = ((long)y * 16 - slot->fy) * NVT_FRAME_HZ / 16;
-    const long speed_alpha = filter_alpha(NVT_SPEED_CUTOFF_MHZ);
+    const int64_t sx = ((int64_t)x * 16 - slot->fx) * NVT_FRAME_HZ / 16,
+               sy = ((int64_t)y * 16 - slot->fy) * NVT_FRAME_HZ / 16;
+    const int64_t speed_alpha = filter_alpha(NVT_SPEED_CUTOFF_MHZ);
     slot->vx += (sx - slot->vx) * speed_alpha / 65536;
     slot->vy += (sy - slot->vy) * speed_alpha / 65536;
-    const long speed = (slot->vx < 0 ? -slot->vx : slot->vx) + (slot->vy < 0 ? -slot->vy : slot->vy);
-    const long alpha = filter_alpha(NVT_MIN_CUTOFF_MHZ + speed * NVT_CUTOFF_PER_SPEED / 2);
-    slot->fx += ((long)x * 16 - slot->fx) * alpha / 65536;
-    slot->fy += ((long)y * 16 - slot->fy) * alpha / 65536;
+    const int64_t speed = (slot->vx < 0 ? -slot->vx : slot->vx) + (slot->vy < 0 ? -slot->vy : slot->vy);
+    const int64_t alpha = filter_alpha(NVT_MIN_CUTOFF_MHZ + speed * NVT_CUTOFF_PER_SPEED / 2);
+    slot->fx += ((int64_t)x * 16 - slot->fx) * alpha / 65536;
+    slot->fy += ((int64_t)y * 16 - slot->fy) * alpha / 65536;
     slot->rx = (int)((slot->fx + 8) / 16);
     slot->ry = (int)((slot->fy + 8) / 16);
 }
@@ -82,31 +82,31 @@ static void follow(struct nvt_slot *slot, int x, int y, int weak) {
 // The reason a tracked finger at (x, y) matched none of this frame's blobs, judged by the nearest blob of any kind.
 static int miss_reason(const struct nvt_slot *slot, const struct nvt_contact *found, const int *used, int nfound,
                        const int (*palms)[2], int npalms) {
-    long best = -1;
+    int64_t best = -1;
     int reason = NVT_MISS_NONE;
     for (int c = 0; c < nfound; ++c) {
-        const long dx = found[c].x - slot->x, dy = found[c].y - slot->y, d = dx * dx + dy * dy;
+        const int64_t dx = found[c].x - slot->x, dy = found[c].y - slot->y, d = dx * dx + dy * dy;
         if (best >= 0 && d >= best) continue;
         best = d;
         reason = used[c] ? NVT_MISS_TAKEN : found[c].peak < NVT_UP_THRESHOLD ? NVT_MISS_WEAK : NVT_MISS_FAR;
     }
     for (int p = 0; p < npalms; ++p) {
-        const long dx = palms[p][0] - slot->x, dy = palms[p][1] - slot->y, d = dx * dx + dy * dy;
+        const int64_t dx = palms[p][0] - slot->x, dy = palms[p][1] - slot->y, d = dx * dx + dy * dy;
         if (best < 0 || d < best) { best = d; reason = NVT_MISS_PALM; }
     }
-    if (best > (long)TRACK_RADIUS * TRACK_RADIUS && reason != NVT_MISS_NONE) reason = NVT_MISS_FAR;
+    if (best > (int64_t)TRACK_RADIUS * TRACK_RADIUS && reason != NVT_MISS_NONE) reason = NVT_MISS_FAR;
     return reason;
 }
 
 // The cost of giving a finger blob j (j >= nfound: no blob): the squared distance from where the finger is heading,
 // the radius squared for no blob, more than that for a blob out of reach or too weak to keep a finger.
-static long track_cost(const struct nvt_slot *slot, const struct nvt_contact *found, int nfound, int j) {
-    const long r2 = (long)TRACK_RADIUS * TRACK_RADIUS;
+static int64_t track_cost(const struct nvt_slot *slot, const struct nvt_contact *found, int nfound, int j) {
+    const int64_t r2 = (int64_t)TRACK_RADIUS * TRACK_RADIUS;
     if (j >= nfound) return r2;
     if (found[j].peak < NVT_UP_THRESHOLD) return 4 * r2;
-    const long px = slot->x + (long)slot->dx * (slot->missed + 1),
-               py = slot->y + (long)slot->dy * (slot->missed + 1);
-    const long dx = found[j].x - px, dy = found[j].y - py, d = dx * dx + dy * dy;
+    const int64_t px = slot->x + (int64_t)slot->dx * (slot->missed + 1),
+               py = slot->y + (int64_t)slot->dy * (slot->missed + 1);
+    const int64_t dx = found[j].x - px, dy = found[j].y - py, d = dx * dx + dy * dy;
     return d <= r2 ? d : 4 * r2;
 }
 
@@ -119,21 +119,21 @@ static void assign_tracks(const struct nvt_touch_core *core, const struct nvt_co
     for (int s = 0; s < NVT_SLOTS; ++s) { match[s] = -1; if (core->slots[s].active) rows[++n] = s; }
     if (!n) return;
     const int m = nfound + n;
-    long u[NVT_SLOTS + 1] = {0}, v[COLUMNS + 1] = {0}, minv[COLUMNS + 1];
+    int64_t u[NVT_SLOTS + 1] = {0}, v[COLUMNS + 1] = {0}, minv[COLUMNS + 1];
     int p[COLUMNS + 1] = {0}, way[COLUMNS + 1] = {0};
     char used[COLUMNS + 1];
     for (int i = 1; i <= n; ++i) {
         p[0] = i;
         int j0 = 0;
-        for (int j = 0; j <= m; ++j) { minv[j] = __LONG_MAX__; used[j] = 0; }
+        for (int j = 0; j <= m; ++j) { minv[j] = INT64_MAX; used[j] = 0; }
         do {
             used[j0] = 1;
             const int i0 = p[j0];
-            long delta = __LONG_MAX__;
+            int64_t delta = INT64_MAX;
             int j1 = 0;
             for (int j = 1; j <= m; ++j) {
                 if (used[j]) continue;
-                const long cur = track_cost(&core->slots[rows[i0]], found, nfound, j - 1) - u[i0] - v[j];
+                const int64_t cur = track_cost(&core->slots[rows[i0]], found, nfound, j - 1) - u[i0] - v[j];
                 if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
                 if (minv[j] < delta) { delta = minv[j]; j1 = j; }
             }
@@ -145,7 +145,7 @@ static void assign_tracks(const struct nvt_touch_core *core, const struct nvt_co
         } while (p[j0]);
         do { const int j1 = way[j0]; p[j0] = p[j1]; j0 = j1; } while (j0);
     }
-    const long r2 = (long)TRACK_RADIUS * TRACK_RADIUS;
+    const int64_t r2 = (int64_t)TRACK_RADIUS * TRACK_RADIUS;
     for (int j = 1; j <= nfound; ++j) {
         if (!p[j]) continue;
         const int s = rows[p[j]];
@@ -175,7 +175,7 @@ static void form_reference(struct nvt_touch_core *core) {
 }
 
 struct peak { int index, value; };
-struct blob { long sum_w, sum_row, sum_col; int peak, area, label; };
+struct blob { int64_t sum_w, sum_row, sum_col; int peak, area, label; };
 
 static int delta_at(const int16_t *m, const int16_t *ref, int index) { return (int)m[index] - (int)ref[index]; }
 
@@ -302,8 +302,8 @@ int nvt_touch_process(struct nvt_touch_core *core, const int16_t *matrix, unsign
         int w = delta[i] - floor;
         if (w < 0) w = 0;
         b->sum_w += w;
-        b->sum_row += (long)w * kRowMap[i / NVT_COLUMNS] * NVT_SUPER_RESOLUTION;
-        b->sum_col += (long)w * kColumnMap[i % NVT_COLUMNS] * NVT_SUPER_RESOLUTION;
+        b->sum_row += (int64_t)w * kRowMap[i / NVT_COLUMNS] * NVT_SUPER_RESOLUTION;
+        b->sum_col += (int64_t)w * kColumnMap[i % NVT_COLUMNS] * NVT_SUPER_RESOLUTION;
         ++b->area;
     }
     struct nvt_contact found[MAX_PEAKS];
@@ -390,8 +390,8 @@ int nvt_touch_process(struct nvt_touch_core *core, const int16_t *matrix, unsign
             core->slots[s].y = found[c].y;
             core->slots[s].rx = found[c].x;
             core->slots[s].ry = found[c].y;
-            core->slots[s].fx = (long)found[c].x * 16;
-            core->slots[s].fy = (long)found[c].y * 16;
+            core->slots[s].fx = (int64_t)found[c].x * 16;
+            core->slots[s].fy = (int64_t)found[c].y * 16;
             core->slots[s].vx = core->slots[s].vy = 0;
             core->slots[s].dx = core->slots[s].dy = 0;
             found[c].slot = s;

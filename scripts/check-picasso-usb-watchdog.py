@@ -18,6 +18,9 @@ import subprocess
 import sys
 
 HOST_TEST = r"""#include <cassert>
+#ifdef _MSC_VER
+#define __attribute__(value) /* Apple linkage attributes have no host equivalent. */
+#endif
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>

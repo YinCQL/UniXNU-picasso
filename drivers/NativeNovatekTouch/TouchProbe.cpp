@@ -3,9 +3,9 @@
 //   1  read-only snapshot of the GCC branches, the SE7 DFS levels and the touch pins
 //   2  vote the QUP clocks, wait for them, configure the pins, read the GENI engine identity
 //   3  initialize GENI SPI, choose the serial clock, reset the touch bootloader, read the chip id
-//   4  download the caller-supplied firmware, start scanning, decode THP frames and publish contacts
+//   4  download the caller-supplied firmware, decode 65-byte contact reports and publish contacts
 // Every stage reports through native_novatek_touch_* globals and a PICASSO_NVT line; the first failure stops the
-// sequence. Board constants and their sources are in TouchBoard.h. No hardware run has validated this sequence yet.
+// sequence. Board constants and their sources are in TouchBoard.h.
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -30,6 +30,7 @@ extern "C" {
 // drivers/NativeHidInput/NativeHidInput.cpp.
 volatile uint32_t native_touch_seq;
 volatile uint32_t native_touch_count;
+extern volatile uint32_t native_touch_writer_lock;
 volatile int native_touch_xs[NVT_SLOTS], native_touch_ys[NVT_SLOTS], native_touch_ids[NVT_SLOTS];
 
 // Entry points declared before their definitions (XNU builds with -Wmissing-prototypes).
@@ -511,6 +512,7 @@ void publish(const struct nvt_contact *out, int n) {
     pub.slots = NVT_SLOTS;
     pub.sink = &notifyThunk;
     pub.sink_context = nullptr;
+    pub.writer_lock = &native_touch_writer_lock;
     nvt_touch_publish(&pub, xs, ys, ids, static_cast<unsigned>(n));
 }
 
