@@ -44,6 +44,10 @@ extern "C" void native_touch_set_sink(void (*sink)(void *), void *context) {
     touchSink = sink; touchContext = context;
 }
 
+// No physical button producer is linked on this board. Resolve its optional
+// HID hook under -no_weak_imports; a future button driver can override it.
+extern "C" __attribute__((weak)) void native_buttons_set_sink(void (*)(void *, uint32_t), void *) {}
+
 extern "C" void native_hid_input_observed(unsigned event, int result) {
     if (event >= 8) return;
     __atomic_store_n(&results[event], result, __ATOMIC_RELEASE);

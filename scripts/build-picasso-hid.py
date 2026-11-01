@@ -108,8 +108,10 @@ def build(root, platform, native, record, out, board):
             platform.make_late(obj, late, native, objcopy, '__GLOBAL__sub_I_NativeHidInput.cpp')
             objects.append(late)
         else:
-            _, sections, _ = platform.inspect_object(obj, native)
+            _, sections, symbols = platform.inspect_object(obj, native)
             platform.require(not any(s['name'] == '__mod_init_func' for s in sections), 'Input probe must have no automatic initializer')
+            platform.require(any(s['name'] == '_native_buttons_set_sink' and s['kind'] == 15 for s in symbols),
+                             'Input probe must define the optional board-button hook')
             objects.append(obj)
     assembly = out / 'hid-original-bindings.S'
     assembly.write_text(''.join(f'.globl {name}\n.set {name}, {va:#x}\n' for name, va in sorted(audit['bindings'].items())), encoding='utf-8')
@@ -147,6 +149,7 @@ def verify(platform, native, reference, directory, kernel, plan):
     require(struct.unpack_from('<Q', kernel, superclass)[0] == audit['bindings']['__ZN11IOHIDDevice10gMetaClassE'],
             'Wrong linked HID superclass')
     for name in ('_picasso_hid_start_later', '_picasso_hid_frame_presented',
-                 '_native_hid_input_requested', '_native_touch_set_sink', '_native_hid_input_allocate', initializer):
+                 '_native_hid_input_requested', '_native_touch_set_sink', '_native_buttons_set_sink',
+                 '_native_hid_input_allocate', initializer):
         require(name in names, 'Missing HID lifecycle ' + name)
     return audit
