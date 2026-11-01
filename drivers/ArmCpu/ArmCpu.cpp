@@ -305,8 +305,10 @@ bool ArmCpu::wakeRedistributor (bool local)
       redist = frames + offset;
       break;
     }
-    if ((typer & 16) != 0) { break; }
-    offset += gRedistStride != 0 ? gRedistStride : ((typer & 2) != 0 ? 0x40000 : 0x20000);
+    // Scan every 128 KiB RD_base slot instead of trusting the DT stride or the
+    // VLPI/Last bits: on picasso the old walk stepped 0x40000 and never found
+    // the frames of cores 1/3/5/7 (initCPU fail 2), while 2/4/6 started.
+    offset += 0x20000;
   }
   if (redist == 0) { return false; }
   write32 (redist, 0x14, read32 (redist, 0x14) & ~2U);
@@ -668,8 +670,10 @@ extern "C" void armcpu_gic_diag (uint64_t aff, uint32_t *out)
       armcpu_gic_diag_stage = 9;
       return;
     }
-    if ((typer & 16) != 0) { break; }
-    offset += gRedistStride != 0 ? gRedistStride : ((typer & 2) != 0 ? 0x40000 : 0x20000);
+    // Scan every 128 KiB RD_base slot instead of trusting the DT stride or the
+    // VLPI/Last bits: on picasso the old walk stepped 0x40000 and never found
+    // the frames of cores 1/3/5/7 (initCPU fail 2), while 2/4/6 started.
+    offset += 0x20000;
   }
   armcpu_gic_diag_stage = 0xe;
 }
