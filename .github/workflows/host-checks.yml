@@ -87,8 +87,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: picasso-host-${{ github.run_id }}
+          # Anchor log searches outside Data fixtures containing directory symlinks.
           path: |
             device/out/picasso/logs/**
-            device/out/picasso/host-checks/**/*.log
+            device/out/picasso/host-checks/display-policy/*.log
+            device/out/picasso/host-checks/hid-plan/*.log
+            device/out/picasso/host-checks/keystore/*.log
           if-no-files-found: warn
           retention-days: 7
