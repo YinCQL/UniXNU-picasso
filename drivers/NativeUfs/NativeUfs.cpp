@@ -1392,6 +1392,7 @@ class NativeUfsBlock : public IOBlockStorageDevice {
   vm_offset_t verifiedStorage = 0;
   vm_size_t verifiedStorageBytes = 0;
   UfsVerifiedRecordCache verifiedCache = {};
+  uint8_t *verifiedCacheStorage = nullptr;
   bool configureVerification ();
 #endif
 public:
@@ -1685,6 +1686,16 @@ bool NativeUfsBlock::configureVerification ()
   memcpy (verified.volume_uuid, manifest + 40, sizeof (verified.volume_uuid));
   memcpy (verified.image_sha256, manifest + 56, sizeof (verified.image_sha256));
   verifiedRecordBytes = kEmbeddedAuthRecordBytes;
+  constexpr size_t cacheBytes = (kUfsVerifiedCacheRecords - 1) * kDataMax;
+  verifiedCacheStorage = static_cast<uint8_t *> (IOMalloc (cacheBytes));
+  if (verifiedCacheStorage) {
+    verifiedCache.extraBuffer = verifiedCacheStorage;
+    verifiedCache.extraBytes = cacheBytes;
+  }
+  // Allocation pressure falls back to the original authenticated single slot.
+  IOLog ("NATIVE_UFS_CACHE configured window=%s slots=%u extra_bytes=%llu\n", label,
+         verifiedCacheStorage ? kUfsVerifiedCacheRecords : 1,
+         static_cast<unsigned long long> (verifiedCache.extraBytes));
   IOLog ("NATIVE_UFS_VERIFY embedded window=%s records=%llu record_bytes=%u table=%llu table_sha256=%02x%02x%02x%02x\n",
          label, blockCount, verifiedRecordBytes, blockCount * 32,
          tableDigest[0], tableDigest[1], tableDigest[2], tableDigest[3]);
@@ -2121,6 +2132,10 @@ void NativeUfsBlock::free ()
 {
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
   verifiedCache = {};
+  if (verifiedCacheStorage) {
+    IOFree (verifiedCacheStorage, (kUfsVerifiedCacheRecords - 1) * kDataMax);
+    verifiedCacheStorage = nullptr;
+  }
   if (verifiedStorage) {
     kmem_free (kernel_map, verifiedStorage, verifiedStorageBytes);
     verifiedStorage = 0;

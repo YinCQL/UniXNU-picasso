@@ -67,6 +67,11 @@ jobs:
           python3 scripts/check-picasso-hid-plan.py --output out/picasso/host-checks/hid-plan
           cp out/picasso/host-checks/hid-plan/results.json out/picasso/logs/hid-plan-host.json
 
+      - name: Check authenticated UFS record cache
+        run: |
+          python3 scripts/check-picasso-ufs-cache.py --output out/picasso/host-checks/ufs-cache
+          cp out/picasso/host-checks/ufs-cache/results.json out/picasso/logs/ufs-cache-host.json
+
       - name: Check packed Data format and seed validation
         run: |
           # Fixtures contain intentional symlinks. Upload only the result JSON.
@@ -93,5 +98,6 @@ jobs:
             device/out/picasso/host-checks/display-policy/*.log
             device/out/picasso/host-checks/hid-plan/*.log
             device/out/picasso/host-checks/keystore/*.log
+            device/out/picasso/host-checks/ufs-cache/*.log
           if-no-files-found: warn
           retention-days: 7

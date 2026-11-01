@@ -19,11 +19,18 @@ struct Shared {
   unsigned attempts=0;
   bool concurrent=false;
   std::vector<uint8_t> bounce;
+  std::vector<uint8_t> extra;
   UfsVerifiedRecordCache cache;
   std::vector<uint8_t> original, disk;
-  Shared() : bounce(kDataMax), original(4*kDataMax) {
+  Shared(unsigned records=4, unsigned slots=1) : bounce(kDataMax),
+      extra(slots > 1 ? (slots-1)*kDataMax+32 : 0, 0xa7), original(records*kDataMax) {
     for(size_t i=0;i<original.size();++i) original[i]=uint8_t(i*17+i/512);
     disk=original;
+    if(slots>1) { cache.extraBuffer=extra.data()+16; cache.extraBytes=extra.size()-32; }
+  }
+  void canaries() const {
+    if(extra.empty())return;
+    for(unsigned i=0;i<16;++i)assert(extra[i]==0xa7 && extra[extra.size()-1-i]==0xa7);
   }
 };
 struct Ops {
@@ -34,7 +41,7 @@ struct Ops {
   unsigned reads=0, checks=0, copies=0, badRead=0, badVerify=0;
   uint64_t shortCopy=UINT64_MAX;
   bool held=false, parked=false;
-  explicit Ops(Shared &v) : s(v), output(4*kDataMax,0xa5) {}
+  explicit Ops(Shared &v) : s(v), output(v.original.size(),0xa5) { bytes=v.original.size(); }
   void lock() {
     { std::lock_guard<std::mutex> g(s.control); ++s.attempts; s.changed.notify_all(); }
     s.window.lock(); held=true;
@@ -101,30 +108,30 @@ int main() {
     s.disk[0]^=0xff; // Read-only authenticated snapshot remains trustworthy.
     o.good(0,8);assert(o.reads==1);
     o.good(256,8);auto r=o.run(0,8);
-    assert(r.status==3 && !r.done && !s.cache.valid && o.reads==3);
+    assert(r.status==3 && !r.done && !s.cache.entries[0].valid && o.reads==3);
     s.disk=s.original;o.good(0,8);assert(o.reads==4);
     puts("PASS cached snapshot survives backing mutation; eviction reauthenticates and rejects tampering");
   }
   {
     Shared s; Ops o(s);o.good(0,8);o.badRead=2;
-    auto r=o.run(256,8);assert(r.status==2 && !r.done && !s.cache.valid);
+    auto r=o.run(256,8);assert(r.status==2 && !r.done && !s.cache.entries[0].valid);
     o.good(0,8);assert(o.reads==3 && o.checks==2);
     puts("PASS partial failed read invalidates previous cache before buffer overwrite");
   }
   {
     Shared s; Ops o(s);o.good(0,8);o.badVerify=2;
-    auto r=o.run(256,8);assert(r.status==3 && !r.done && !s.cache.valid);
+    auto r=o.run(256,8);assert(r.status==3 && !r.done && !s.cache.entries[0].valid);
     o.good(0,8);assert(o.reads==3 && o.checks==3);
     puts("PASS failed verification cannot publish or resurrect an old cache entry");
   }
   {
     Shared s; Ops o(s);o.badVerify=2;auto r=o.run(0,257);
-    assert(r.status==3 && r.done==kDataMax && o.copies==1 && o.output[r.done]==0xa5 && !s.cache.valid);
+    assert(r.status==3 && r.done==kDataMax && o.copies==1 && o.output[r.done]==0xa5 && !s.cache.entries[0].valid);
     puts("PASS partial completion stops exactly before unauthenticated record");
   }
   {
     Shared s; Ops o(s);o.shortCopy=17;auto r=o.run(0,8);
-    assert(r.status==2 && r.done==17 && s.cache.valid && o.output[17]==0xa5);
+    assert(r.status==2 && r.done==17 && s.cache.entries[0].valid && o.output[17]==0xa5);
     o.shortCopy=UINT64_MAX;o.good(0,8);assert(o.reads==1);
     puts("PASS copy failure preserves only the previously authenticated snapshot");
   }
@@ -166,6 +173,65 @@ int main() {
     assert(s.window.try_lock());s.window.unlock();
     puts(same?"PASS concurrent same-record hit keeps authenticated snapshot":"PASS concurrent eviction keeps each reader's snapshot and releases completion lock");
   }
-  puts("PASS ALL 14 authenticated-cache scenarios");
+  {
+    Shared s(12,8); Ops o(s);
+    for(unsigned page=0;page<32;++page)
+      for(unsigned record=0;record<8;++record)o.good(record*256+page*8,8);
+    assert(o.reads==8 && o.checks==8 && s.cache.stats.hits==248);
+    assert(s.cache.stats.requestedBytes==8*kDataMax && s.cache.stats.readBytes==8*kDataMax);
+    s.canaries();
+    puts("PASS 8 interleaved records: 256 page reads use 8 reads/verifications instead of 256");
+  }
+  {
+    Shared s(12,8); Ops o(s);
+    for(unsigned record=0;record<8;++record)o.good(record*256,8);
+    o.good(0,8); // Refresh zero; one is now the LRU victim.
+    s.disk[kDataMax]^=0xff;
+    o.good(8*256,8);o.good(0,8);assert(o.reads==9);
+    auto r=o.run(256,8);assert(r.status==3 && !r.done && o.reads==10);
+    o.good(8*256,8);assert(o.reads==10); // Failed replacement does not poison other slots.
+    s.disk=s.original;o.good(256,8);assert(o.reads==11);s.canaries();
+    puts("PASS LRU hit refresh, eviction reauthentication and tamper rejection preserve other slots");
+  }
+  for(bool verifyFailure:{false,true}) {
+    Shared s(12,8);Ops o(s);o.good(0,8);
+    if(verifyFailure)o.badVerify=2;else o.badRead=2;
+    auto r=o.run(256,8);assert(r.status==(verifyFailure?3u:2u) && !r.done);
+    o.good(0,8);assert(o.reads==2);
+    o.good(256,8);assert(o.reads==3);s.canaries();
+    puts(verifyFailure?"PASS failed multi-slot verification never publishes bytes":"PASS partial DMA failure leaves unrelated authenticated slots reusable");
+  }
+  {
+    Shared s(12,8);Ops o(s);o.absolute=4096;o.bytes=2*kDataMax+512;
+    o.good(512,1);o.good(0,8);o.good(512,1);assert(o.reads==2);
+    // All slots, including the tail record, must be discarded on geometry/storage changes.
+    o.bytes-=512;o.good(0,8);assert(o.reads==3);
+    o.recordBytes=4096;o.good(0,8);assert(o.reads==4);
+    s.cache.extraBytes=4095;o.good(0,8);o.good(8,8);o.good(0,8);assert(o.reads==7);
+    s.cache.extraBuffer=nullptr;s.cache.extraBytes=SIZE_MAX;o.good(0,8);assert(o.reads==8);
+    s.canaries();
+    puts("PASS multi-slot short tail, geometry invalidation and insufficient/null storage fallback");
+  }
+  {
+    Shared s(12,10);Ops o(s);
+    for(unsigned record=0;record<9;++record)o.good(record*256,8);
+    unsigned valid=0;for(auto &entry:s.cache.entries){valid+=entry.valid;assert(entry.age<8);}
+    assert(valid==8);auto r=o.run(0,8);assert(!r.status && o.reads==10);
+    for(size_t i=7*kDataMax+16;i<s.extra.size();++i)assert(s.extra[i]==0xa7);
+    s.canaries();
+    puts("PASS oversized storage is capped at 8 slots with bounded ages and untouched excess bytes");
+  }
+  {
+    Shared s(12,8);s.concurrent=true;Ops first(s),second(s);UfsWindowResult a{},b{};
+    std::thread one([&]{a=first.run(0,8);});
+    {std::unique_lock<std::mutex> g(s.control);s.changed.wait(g,[&]{return s.attempts==1;});}
+    std::thread two([&]{b=second.run(256,8);});one.join();two.join();
+    assert(!a.status && !b.status && !memcmp(first.output.data(),s.original.data(),4096));
+    assert(!memcmp(second.output.data(),s.original.data()+kDataMax,4096));
+    first.good(256,8);second.good(0,8);assert(first.reads+second.reads==2);
+    assert(s.window.try_lock());s.window.unlock();s.canaries();
+    puts("PASS concurrent multi-slot misses/hits retain each authenticated snapshot and release the lock");
+  }
+  puts("PASS ALL 21 authenticated-cache scenarios");
   return 0;
 }

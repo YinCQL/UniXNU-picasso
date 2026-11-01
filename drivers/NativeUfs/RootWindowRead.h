@@ -58,15 +58,25 @@ struct UfsVerifiedReadStats {
   uint64_t readTicks = 0, verifyTicks = 0;
 };
 
-// One authenticated snapshot in the existing per-window bounce buffer. The
-// window lock must cover lookup, replacement, verification AND copying. The
-// owner policy and read-only window are immutable for this cache's lifetime;
-// discard it before changing either or writing to the bounce buffer elsewhere.
-struct UfsVerifiedRecordCache {
+// Bounded LRU of authenticated snapshots. Slot zero uses the existing bounce
+// buffer; optional storage supplies up to seven more records. The window lock
+// covers lookup, replacement, verification and copying. The owner policy is
+// immutable for this lifetime; reset before changing it or these buffers.
+static constexpr unsigned kUfsVerifiedCacheRecords = 8;
+struct UfsVerifiedRecordEntry {
   bool valid = false;
-  uint64_t absolute = 0, bytes = 0, record = 0;
+  uint64_t record = 0;
+  unsigned age = 0;
+};
+struct UfsVerifiedRecordCache {
+  UfsVerifiedRecordEntry entries[kUfsVerifiedCacheRecords] = {};
+  uint8_t *extraBuffer = nullptr;
+  size_t extraBytes = 0;
+  uint64_t absolute = 0, bytes = 0;
   uint32_t recordBytes = 0;
   const uint8_t *buffer = nullptr;
+  const uint8_t *boundExtraBuffer = nullptr;
+  size_t boundExtraBytes = 0;
   UfsVerifiedReadStats stats = {};
 };
 
@@ -86,6 +96,22 @@ static UfsWindowResult ufsReadVerifiedRecords (Ops &ops, uint64_t absolute, uint
       block >= bytes / 512 || count > bytes / 512 - block)
     return { kIOReturnBadArgument, 0 };
   UfsWindowGuard<Ops> guard (ops);
+  // Invalidate every slot when geometry or storage changes, including when
+  // an optional allocation becomes unavailable. No stale snapshot can match.
+  if (cache.absolute != absolute || cache.bytes != bytes || cache.recordBytes != recordBytes ||
+      cache.buffer != bounce || cache.boundExtraBuffer != cache.extraBuffer ||
+      cache.boundExtraBytes != cache.extraBytes) {
+    for (auto &entry : cache.entries) entry = {};
+    cache.absolute = absolute;
+    cache.bytes = bytes;
+    cache.recordBytes = recordBytes;
+    cache.buffer = bounce;
+    cache.boundExtraBuffer = cache.extraBuffer;
+    cache.boundExtraBytes = cache.extraBytes;
+  }
+  size_t extraRecords = cache.extraBuffer ? cache.extraBytes / recordBytes : 0;
+  unsigned slots = extraRecords >= kUfsVerifiedCacheRecords - 1 ? kUfsVerifiedCacheRecords :
+                   1 + static_cast<unsigned> (extraRecords);
   ++cache.stats.requests;
   cache.stats.requestedBytes += count * 512;
   uint64_t start = block * 512, remaining = count * 512;
@@ -97,30 +123,47 @@ static UfsWindowResult ufsReadVerifiedRecords (Ops &ops, uint64_t absolute, uint
     uint64_t recordLength = bytes - record * recordBytes;
     if (recordLength > recordBytes) recordLength = recordBytes;
     uint64_t blocks = (recordLength + 4095) / 4096;
-    if (cache.valid && cache.absolute == absolute && cache.bytes == bytes &&
-        cache.recordBytes == recordBytes && cache.record == record && cache.buffer == bounce) {
+    unsigned selected = slots;
+    for (unsigned i = 0; i < slots; ++i) {
+      if (cache.entries[i].valid && cache.entries[i].record == record) { selected = i; break; }
+    }
+    bool hit = selected != slots;
+    if (!hit) {
+      selected = 0;
+      for (unsigned i = 0; i < slots; ++i) {
+        if (!cache.entries[i].valid) { selected = i; break; }
+        if (cache.entries[i].age > cache.entries[selected].age) selected = i;
+      }
+    }
+    auto &entry = cache.entries[selected];
+    uint8_t *snapshot = selected ? cache.extraBuffer + (selected - 1) * size_t (recordBytes) : bounce;
+    if (hit) {
       ++cache.stats.hits;
     } else {
       // A failed/partial DMA read or failed authentication must not leave a
       // cache hit pointing at bytes that replaced the previous good record.
-      cache.valid = false;
+      entry.valid = false;
       ++cache.stats.misses;
       cache.stats.readBytes += blocks * 4096; // attempted transport bytes
       result.status = ops.read (absolute / 4096 + record * (recordBytes / 4096),
-                                static_cast<uint32_t> (blocks), bounce);
+                                static_cast<uint32_t> (blocks), snapshot);
       if (result.status != kIOReturnSuccess) break;
-      result.status = ops.verify (record, bounce, static_cast<size_t> (recordLength));
+      result.status = ops.verify (record, snapshot, static_cast<size_t> (recordLength));
       if (result.status != kIOReturnSuccess) break;
-      cache.absolute = absolute;
-      cache.bytes = bytes;
-      cache.recordBytes = recordBytes;
-      cache.record = record;
-      cache.buffer = bounce;
-      cache.valid = true;
+      entry.record = record;
+      entry.valid = true;
     }
+    // Ages remain bounded by the slot count; no timestamp can wrap on a long
+    // boot. Hits refresh recency as well as successful authenticated misses.
+    unsigned previousAge = hit ? entry.age : kUfsVerifiedCacheRecords;
+    for (unsigned i = 0; i < slots; ++i) {
+      if (i != selected && cache.entries[i].valid && cache.entries[i].age < previousAge)
+        ++cache.entries[i].age;
+    }
+    entry.age = 0;
     uint64_t usable = recordLength - recordOffset;
     if (usable > remaining) usable = remaining;
-    uint64_t copied = ops.copy (result.done, bounce + recordOffset, usable);
+    uint64_t copied = ops.copy (result.done, snapshot + recordOffset, usable);
     if (copied > usable) { result.status = kIOReturnIOError; break; }
     result.done += copied;
     if (copied != usable) { result.status = kIOReturnIOError; break; }
