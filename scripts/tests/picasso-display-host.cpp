@@ -107,7 +107,28 @@ static void queue() {
     assert(valid.addValidated(reinterpret_cast<const OriginalLegacySwapRequest *>(&objects[8])));
 }
 
+#include "NativeLegacyBootLogo.h"
+static void bootLogo() {
+    uint64_t logo[5]={29457,430,1000,650,1300}, ui[5]={900000,0,0,1079,2399};
+    NativeLegacyBootLogo p;
+    p.observe(1000,1080,2400,logo);assert(!p.holdBlank(2000));
+    p={};p.enabled=true;
+    assert(!p.holdBlank(999));
+    p.observe(1000,1080,2400,logo);assert(p.holdBlank(2000));
+    p.observe(2000,1080,2400,logo);assert(p.deadline==301000);
+    assert(p.holdBlank(300999) && !p.holdBlank(301000));
+    p.observe(301001,1080,2400,logo);assert(!p.holdBlank(301002));
+    p={};p.enabled=true;p.observe(1000,1080,2400,logo);
+    p.observe(2000,1080,2400,ui);assert(!p.holdBlank(2001) && p.ended);
+    p.observe(3000,1080,2400,logo);assert(!p.holdBlank(3001));
+    p={};p.enabled=true;p.observe(1000,1080,2400,ui);assert(!p.holdBlank(1001));
+    p={};p.enabled=true;p.observe(1000,1125,2436,logo);assert(!p.holdBlank(1001));
+    logo[1]=0;p={};p.enabled=true;p.observe(1000,1080,2400,logo);assert(!p.holdBlank(1001));
+    logo[1]=430;logo[0]=29456;p={};p.enabled=true;p.observe(1000,1080,2400,logo);assert(!p.holdBlank(1001));
+    puts("PASS: initial-logo qualification, bounded blank hold, UI release and no rearming");
+}
+
 int main() {
-    video(); pixels(); queue();
+    video(); pixels(); queue(); bootLogo();
     puts("PASS: GOP handoff, linear format, bounded pixel copies, blank frames and original queue ownership");
 }

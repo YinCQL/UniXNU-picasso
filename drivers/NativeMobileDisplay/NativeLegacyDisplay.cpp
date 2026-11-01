@@ -3,6 +3,7 @@
 // Original family lifecycle and client methods are bound by the build audit.
 #include "OriginalLegacyFramebufferABI.h"
 #include "NativeLegacyRequest.h"
+#include "NativeLegacyBootLogo.h"
 #include "PicassoGop.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -48,6 +49,8 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
     uint32_t scanBudget=4;
+    NativeLegacyBootLogo bootLogo;
+    bool logoConfigured=false;
     bool primary=false;
     bool logicalPM=false;
     bool transferred=false;
@@ -214,6 +217,12 @@ public:
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
         if(!request || !isValidated(request))return;
+        if(!logoConfigured) {
+            unsigned hold=0;PE_parse_boot_argn("picasso-boot-logo-hold",&hold,sizeof(hold));
+            bootLogo.enabled=hold==1;logoConfigured=true;
+        }
+        uint64_t nowNs=0;absolutetime_to_nanoseconds(mach_absolute_time(),&nowNs);
+        uint64_t nowMs=nowNs/1000000;
         // This bounded first-frame transfer preserves the original queue's
         // resource ownership. Separately gated retirement follows the copy;
         // neither path signals a hardware fence, announces a vblank or
@@ -233,6 +242,15 @@ public:
                 native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
             }
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+            if(bootLogo.holdBlank(nowMs)) {
+                // Consume this validated blank without erasing the existing
+                // boot logo. Retire normally so the compositor keeps moving.
+                transferred=true;
+                native_legacy_frame_observed(2,UINT64_MAX,0,0,0,0);
+                native_legacy_transfer_observed(kIOReturnSuccess,request,0);
+                finishTransfer(request);
+                return;
+            }
             if(!native_legacy_fill_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                 bootMapping->getLength(),blank.v_rowBytes,bw,bh,0xff000000U)) {
                 native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
@@ -268,12 +286,15 @@ public:
             source->getLength(),sourceStride,width,height)) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
         }
-        // Inspect at most four frames to distinguish black from rendered pixels.
-        if(scanBudget) {
-            --scanBudget;
-            uint64_t scan[5];
-            if(native_legacy_frame_scan(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,scan))
-                native_legacy_frame_observed(0,scan[0],scan[1],scan[2],scan[3],scan[4]);
+        // Continue scanning only through the bounded logo phase. Every copied
+        // frame is counted below, even when its pixels are no longer scanned.
+        uint64_t scan[5]={UINT64_MAX,0,0,0,0};
+        bool scanned=false;
+        if(scanBudget || bootLogo.needsScan(nowMs)) {
+            if(scanBudget)--scanBudget;
+            if(native_legacy_frame_scan(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,scan)) {
+                scanned=true;
+            }
         }
         if(!native_legacy_prepare_scanout()) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
@@ -287,6 +308,13 @@ public:
         __asm__ volatile("dsb sy" ::: "memory");
         {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,length);}
         OSSafeReleaseNULL(source);transferred=true;
+        if(scanned) {
+            bool held=bootLogo.holding;
+            bootLogo.observe(nowMs,width,height,scan);
+            if(held!=bootLogo.holding)
+                IOLog("PICASSO_DISPLAY boot_logo holding=%u time_ms=%llu\n",bootLogo.holding,nowMs);
+        }
+        native_legacy_frame_observed(0,scan[0],scan[1],scan[2],scan[3],scan[4]);
         native_legacy_transfer_observed(kIOReturnSuccess,request,length);
         finishTransfer(request);
     }

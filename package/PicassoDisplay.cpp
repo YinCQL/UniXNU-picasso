@@ -124,15 +124,20 @@ extern "C" void native_legacy_swap_geometry_observed(const uint32_t *a, const ui
 }
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t bytes) { report(10, ticks, bytes, 0); }
 extern "C" void native_legacy_vsync_observed(unsigned event, unsigned hz) { report(11, event, hz, 0); }
-extern "C" void native_legacy_frame_observed(unsigned kind, uint64_t pixels, uint64_t, uint64_t, uint64_t, uint64_t) {
-    picasso_hid_frame_presented();
+extern "C" void native_legacy_frame_observed(unsigned kind, uint64_t pixels, uint64_t minx, uint64_t miny, uint64_t maxx, uint64_t maxy) {
+    if(kind!=2)picasso_hid_frame_presented();
     static unsigned count, frames;
-    // Every one of the first 200 frames, then every 64th: the pictures between the boot logo and the
-    // display-off request show whether SpringBoard drew a lock screen before backboardd turned it off.
+    // Count every completed copy/blank/held request; unscanned pixels are unknown.
     unsigned frame = __atomic_add_fetch(&frames, 1, __ATOMIC_RELAXED);
     (void)count;
-    if (frame <= 200 || frame % 64 == 0)
-        IOLog("PICASSO_DISPLAY frame %u kind=%u nonblack=%llu\n", frame, kind, pixels);
+    if (frame <= 200 || frame % 64 == 0) {
+        uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+        if(pixels==UINT64_MAX)
+            IOLog("PICASSO_DISPLAY frame %u kind=%u nonblack=unknown held=%u time_ms=%llu\n",frame,kind,kind==2,ns/1000000);
+        else
+            IOLog("PICASSO_DISPLAY frame %u kind=%u nonblack=%llu bounds=%llu,%llu,%llu,%llu time_ms=%llu\n",
+                frame,kind,pixels,minx,miny,maxx,maxy,ns/1000000);
+    }
 }
 
 static void finishDisplayPolicy(bool keep) {

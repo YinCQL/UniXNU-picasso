@@ -93,7 +93,7 @@ def main():
     if result.returncode:
         raise RuntimeError(result.stderr)
     report['arm64_copy_compile'] = command
-    inputs = [source_dir / name for name in ('NativeLegacyDisplay.cpp', 'NativeLegacyRequest.h', 'PicassoGop.h', 'OriginalLegacyFramebufferBase.h.in')]
+    inputs = [source_dir / name for name in ('NativeLegacyDisplay.cpp', 'NativeLegacyRequest.h', 'NativeLegacyBootLogo.h', 'PicassoGop.h', 'OriginalLegacyFramebufferBase.h.in')]
     inputs += [fixture, ROOT / 'scripts/build-picasso-display.py', ROOT / 'package/PicassoDisplay.cpp']
     report['source_sha256'] = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}
     report['pass'] = True

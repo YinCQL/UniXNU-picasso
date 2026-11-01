@@ -278,7 +278,7 @@ def main():
     archive = out / pending.name
     platform.save_old_archive(archive)
     pending.rename(archive)
-    sources += [source_dir / n for n in ('PicassoGop.h', 'NativeLegacyRequest.h', 'OriginalLegacyFramebufferBase.h.in')]
+    sources += [source_dir / n for n in ('PicassoGop.h', 'NativeLegacyRequest.h', 'NativeLegacyBootLogo.h', 'OriginalLegacyFramebufferBase.h.in')]
     sources += [ROOT / 'scripts/build-picasso-display.py', ROOT / 'scripts/build-picasso-pmgr.py',
                 ROOT / 'scripts/picasso_target.py']
     platform.write_json(out / 'build-report.json', dict(complete=True, archive_sha256=sha(archive.read_bytes()),
