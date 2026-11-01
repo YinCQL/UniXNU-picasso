@@ -12,10 +12,10 @@ index 19b4065..b22147f 100644
  
 diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
 new file mode 100644
-index 0000000..4cddf14
+index 0000000..2237fb2
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,3121 @@
+@@ -0,0 +1,3119 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -1921,11 +1921,20 @@ index 0000000..4cddf14
 +picasso_watchdog_enter(boolean_t *interrupts)
 +{
 +	*interrupts = ml_set_interrupts_enabled(false);
-+	if (!os_atomic_cmpxchg(&picasso_wdt_lock, 0, 1, acquire)) {
-+		ml_set_interrupts_enabled(*interrupts);
-+		return false;
++	/* The USB background poll takes this lock on every iteration. A pet that
++	 * lands while another CPU holds it for a few register reads must not be a
++	 * fatal event; spin briefly (the holder never sleeps) and fail only when
++	 * the lock stays held, which is the real stuck-writer case. */
++	for (unsigned spin = 0; spin < 10000; ++spin) {
++		if (os_atomic_cmpxchg(&picasso_wdt_lock, 0, 1, acquire)) {
++			return true;
++		}
++#if defined(__arm64__) || defined(__aarch64__)
++		__asm__ volatile("yield" ::: "memory");
++#endif
 +	}
-+	return true;
++	ml_set_interrupts_enabled(*interrupts);
++	return false;
 +}
 +
 +static void
@@ -2903,12 +2912,13 @@ index 0000000..4cddf14
 +		printf("PICASSO USB: live handoff configured=%u host_open=%u after %u ms\n",
 +		    ud.configured ? 1u : 0u, ud.host_open ? 1u : 0u, handoff_ms);
 +		ud_poll_serialized();
-+		/*
-+		 * Keep the early, synchronous control window open long enough for
-+		 * the host to attach and issue commands. This path runs before the
-+		 * timer-dependent background poller and UFS probe, so commands and
-+		 * watchdog petting remain reliable even when those later paths hang.
-+		 */
++		/* Arm after the bounded enumeration handoff, before servicing the
++		 * control window. The window continues polling and petting. */
++		picasso_usb_watchdog_arm();
++		if (ud.watchdog_armed) {
++			printf("PICASSO USB: APSS watchdog armed timeout=%u ms\n",
++			    APSS_WDT_TIMEOUT_MS);
++		}
 +		if (ud.control_ms != 0) {
 +			printf("PICASSO USB: control window open for %u ms\n",
 +			    ud.control_ms);
@@ -2917,8 +2927,7 @@ index 0000000..4cddf14
 +				picasso_usb_busy_wait(1000);
 +				ud_poll_serialized();
 +				picasso_usb_watchdog_pet();
-+				if (ud.configured &&
-+				    ((control_ms + 1) % 10000 == 0)) {
++				if (ud.configured && ((control_ms + 1) % 10000 == 0)) {
 +					printf("PICASSO USB: control window t=%ums events=%llu rx=%llu\n",
 +					    control_ms + 1, ud.events, ud.rx_bytes);
 +				}
@@ -2937,18 +2946,14 @@ index 0000000..4cddf14
 +				}
 +			}
 +		}
-+		if (ud.watchdog_armed) {
-+			printf("PICASSO USB: APSS watchdog retained timeout=%u ms\n",
-+			    APSS_WDT_TIMEOUT_MS);
-+		}
 +		kern_return_t result = kernel_thread_start(ud_thread, NULL, &thread);
 +		if (result == KERN_SUCCESS) {
 +			thread_deallocate(thread);
 +			printf("PICASSO USB: background poller started\n");
 +			ud_poll_serialized();
 +		} else {
-+			printf("PICASSO USB: background poller failed (%d); watchdog will reset\n",
-+			    result);
++			printf("PICASSO USB: background poller failed (%d)\n", result);
++			picasso_usb_watchdog_disable();
 +		}
 +	}
 +}
@@ -3004,14 +3009,6 @@ index 0000000..4cddf14
 +	ud.pshold = ml_io_map(PSHOLD_PA, PAGE_SIZE);
 +	ud.wdt = ml_io_map(APSS_WDT_PA, PAGE_SIZE);
 +	ud.imem = ml_io_map(IMEM_PA, PAGE_SIZE);
-+	/*
-+	 * Arm before any USB, SMMU or storage work.  If enumeration never
-+	 * succeeds, the absent poller still returns the device to Fastboot.
-+	 */
-+	picasso_usb_watchdog_arm();
-+	if (!ud.watchdog_armed) {
-+		printf("PICASSO USB: watchdog unavailable; autonomous reset disabled\n");
-+	}
 +	printf("PICASSO USB: PSHOLD mapped=%u panic-reset=%u watchdog=%u "
 +	    "mapped=%u IMEM mapped=%u reset=%u(%s)\n",
 +	    ud.pshold != 0 ? 1u : 0u, ud.panic_reset ? 1u : 0u,
@@ -3033,7 +3030,8 @@ index 0000000..4cddf14
 +	    gdscr, master, cfg, aggre);
 +	printf("PICASSO USB: GCC sleep=%08x mock_utmi=%08x clkref=%08x\n",
 +	    sleep, mock, clkref);
-+	if (ud.watchdog && ud.early_watchdog) {
++	/* Early arming is reserved for the explicit USB-only hold mode. */
++	if (ud.hold && ud.watchdog && ud.early_watchdog) {
 +		picasso_usb_watchdog_arm();
 +		if (ud.watchdog_armed) {
 +			printf("PICASSO USB: early APSS watchdog armed timeout=%u ms\n",

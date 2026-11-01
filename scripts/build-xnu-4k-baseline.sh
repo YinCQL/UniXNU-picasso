@@ -98,6 +98,20 @@ if [ "$SHENG_HIDINPUT" = 1 ] && [ "$BOOTSTRAP" != 1 ]; then
   fi
   python3 scripts/build-sheng-hid-input.py
 fi
+NOVATEK_TOUCH=${XNU_NOVATEK_TOUCH:-0}
+if [ "$NOVATEK_TOUCH" != 0 ] && [ "$NOVATEK_TOUCH" != 1 ]; then
+  echo 'XNU_NOVATEK_TOUCH must be 0 or 1' >&2
+  exit 1
+fi
+if [ "$NOVATEK_TOUCH" = 1 ] && [ "$BOOTSTRAP" != 1 ]; then
+  if [ "$BOOT_PROGRESS" != 1 ]; then
+    echo 'NativeNovatekTouch needs the boot-progress build: its probe call site lives in BootProgress.c' >&2
+    exit 1
+  fi
+  # NOVATEK_TOUCH_FW points at a bare Novatek image (or one of the 0x22000 arrays
+  # carved from the stock kernel; the probe skips that trailer itself).
+  python3 scripts/build-native-novatek-touch.py ${NOVATEK_TOUCH_FW:+--firmware "$NOVATEK_TOUCH_FW"}
+fi
 python3 - "$BOOT_PROGRESS" <<'PY'
 from pathlib import Path
 import hashlib, sys
@@ -780,6 +794,10 @@ PY_BINDINGS
   if [ "$SHENG_HIDINPUT" = 1 ]; then
     KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$ROOT/build/sheng-hid-input/libShengHidInput.a"
     KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $ROOT/build/sheng-hid-input/libShengHidInput.a"
+  fi
+  if [ "$NOVATEK_TOUCH" = 1 ]; then
+    KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$ROOT/build/novatek-touch/libNativeNovatekTouch.a"
+    KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $ROOT/build/novatek-touch/libNativeNovatekTouch.a"
   fi
   KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES ${XNU_EXTRA_LD_ARCHIVES:-}"
   EXTRA_MAKE_ARGS+=("LD_KERNEL_ARCHIVES=$KERNEL_EXTRA_ARCHIVES")

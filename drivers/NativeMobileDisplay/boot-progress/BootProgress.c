@@ -158,6 +158,12 @@ extern void native_hid_input_probe(void) __attribute__((weak_import));
 // Served once per monitor pass: the probe arms a swipe plan and this emits one gesture when it is due,
 // so the lock-screen swipe never blocks the monitor for longer than a single gesture.
 extern void native_hid_swipe_tick(unsigned) __attribute__((weak_import));
+// Staged Novatek NT36672C probe (sheng-touch=<1..4>); inert without the argument.
+// sheng-touch-start=<seconds> delays the start on the monitor clock, so a faulting
+// probe cannot take the display and the CDC console down with it.
+extern void native_novatek_touch_probe(void) __attribute__((weak_import));
+// Prints (once, early) the IMEM step marker the probe left when it died on the previous boot.
+extern void native_novatek_touch_boot_report(unsigned) __attribute__((weak_import));
 extern volatile uint32_t native_hid_stage,native_hid_resource_found __attribute__((weak_import));
 extern volatile int native_hid_load_status,native_hid_input_meta_status __attribute__((weak_import));
 extern volatile uint64_t native_hid_input_object __attribute__((weak_import));
@@ -1178,6 +1184,9 @@ static void monitor(void *arg, wait_result_t result) {
     boot_progress_poll();
     unsigned now=seconds();
     if(nprocs>0 && !named){thread_set_thread_name(current_thread(),"boot_progress");named=1;}
+    // Report the warm-reset marker the touch probe left in IMEM on the previous boot. Self-gated to once, and
+    // to a time before userland starts flooding the CDC console.
+    if(native_novatek_touch_boot_report)native_novatek_touch_boot_report(now);
     if(boot_process_snapshot)boot_process_snapshot();
     if(boot_log_tick)boot_log_tick(now);
     if(sheng_cpufreq_poll)sheng_cpufreq_poll();
@@ -1205,6 +1214,29 @@ static void monitor(void *arg, wait_result_t result) {
             native_hid_input_meta_status,(unsigned long long)native_hid_input_object);
       }
       if(native_hid_swipe_tick)native_hid_swipe_tick(now);
+      {
+        // sheng-touch-start=<seconds>: start the staged touch probe on the monitor clock.
+        // Default 0 runs it at the first pass, which is also the earliest boot state.
+        static unsigned touch_start_at,touch_start_set;
+        if(!touch_start_set) {
+          touch_start_set=1;touch_start_at=0;
+          PE_parse_boot_argn("sheng-touch-start",&touch_start_at,sizeof(touch_start_at));
+        }
+        if(native_novatek_touch_probe && now>=touch_start_at)native_novatek_touch_probe();
+      }
+    }
+    // Secondary-CPU progress over CDC: the panel row only exists on the screen, and
+    // a core that fails to arrive is otherwise invisible from the host.
+    if(&armcpu_smp_requested && armcpu_smp_requested) {
+      static unsigned smp_printed;
+      if(smp_printed<2 && now>=(smp_printed?300:30)) {
+        char b[220];unsigned n=(unsigned)snprintf(b,sizeof(b),"PICASSO_SMP req=%u run=%u cond=%u",
+          armcpu_smp_requested,armcpu_smp_running,armcpu_smp_conduit);
+        for(unsigned c=1;c<8&&n<sizeof(b)-24;++c)
+          n+=(unsigned)snprintf(b+n,sizeof(b)-n," c%u=s%u%s%u/rc%d",c,armcpu_smp_step[c],
+            armcpu_smp_fail[c]?"!f":"",armcpu_smp_fail[c],(int)armcpu_smp_psci_rc[c]);
+        printf("%s\n",b);++smp_printed;
+      }
     }
     if(&boot_process_attempts && &boot_process_busy) {
       unsigned attempt=__atomic_load_n(&boot_process_attempts,__ATOMIC_RELAXED);

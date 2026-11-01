@@ -259,7 +259,7 @@ kernel_args = [
   # Bound the attended synchronous window while still leaving time to issue
   # status/start-graphics/register-display/publish-display-start commands.
   "picasso_usb_control_ms=15000",
-  # watchdog=1 and early_watchdog=1 are already the console defaults.
+  # watchdog=1 is the console default; normal console boots arm at handoff.
   # APSS_WDT_TIMEOUT_MS fixes the interval at 30000 ms; the console does not
   # parse watchdog_ms, host_timeout_ms or host_boot_grace_ms arguments.
   # Omit those redundant/unused options to fit the payload's 1000-byte limit.
@@ -285,8 +285,6 @@ kernel_args = [
   # inaccessible until CX/GX power and clocks are established.
   "sheng-gpu-probe=1",
   # Opt-in write limited to GPUCC_CX_GDSCR.SW_COLLAPSE; no GPU core access.
-  "sheng-gpu-cx-power=1",
-  "sheng-gpu-gcc-probe=1",
   # Official UniXNU boot-page UI trace. boot-progress=2 keeps the OS running.
   # boot-diag-resume is deliberately absent: taking the panel back after 30 s
   # without a system scanout made the lock screen flip to the log page and back,
@@ -306,9 +304,11 @@ kernel_args = [
   # for this path.
   "offline-hid-input=1",
   "offline-hid-home=1",
-  "offline-hid-auto-home=120",
-  "offline-hid-auto-home-count=8",
-  "offline-hid-auto-home-interval=60",
+  # The synthetic bottom-edge swipe that unlocks this iPad identity; auto-home did
+  # not leave the lock screen. One gesture every 20 s from t=540 s covers the window
+  # in which SpringBoard takes the panel.
+  "offline-hid-start=540",
+  "offline-hid-swipe=16",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
