@@ -69,7 +69,8 @@ for name in ('NativeHidInput.late.o', 'hid-original-bindings.o'):
         raise SystemExit(f'missing qualified object: {HID_OUT / name}')
 
 probe = OUT / 'HidInputProbe.o'
-compile_cpp(ROOT / RECORD, ROOT / 'package/HidInputProbe.cpp', probe)
+# The assembler links the device package at kits/picasso; package/ is upstream.
+compile_cpp(ROOT / RECORD, ROOT / 'kits/picasso/HidInputProbe.cpp', probe)
 
 archive = OUT / 'libShengHidInput.a'
 archive.unlink(missing_ok=True)
