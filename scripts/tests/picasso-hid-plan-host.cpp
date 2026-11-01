@@ -53,5 +53,10 @@ int main() {
     assert(p.poll(999999, 0, true, true) == Plan::Contact);
     assert(p.poll(999999, 1, true, true) == Plan::Idle); // No catch-up burst.
     assert(p.poll(1000015, 1, true, true) == Plan::Contact); ++cases;
+    p={};p.arm(1000,1,8000);
+    assert(p.poll(8999,0,true,true)==Plan::Idle);
+    assert(p.poll(9000,0,true,true)==Plan::Contact);++cases;
+    p={};p.arm(1000,1,0);
+    assert(p.poll(1000,0,true,true)==Plan::Contact);++cases;
     printf("PASS %u HID pacing, completion, timeout, release and attempt-budget cases\n", cases);
 }

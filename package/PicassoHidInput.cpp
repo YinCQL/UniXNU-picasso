@@ -161,9 +161,15 @@ static void inputTick(thread_call_param_t, thread_call_param_t) {
         homeLimit = count > 8 ? 8 : count;
         unsigned swipes = 0;
         PE_parse_boot_argn("offline-hid-swipe", &swipes, sizeof(swipes));
-        gesture.arm(now, swipes); homeDue = now + 120000;
+        unsigned homeDelay = 120, swipeDelay = 125;
+        PE_parse_boot_argn("offline-hid-auto-home", &homeDelay, sizeof(homeDelay));
+        PE_parse_boot_argn("offline-hid-swipe-delay", &swipeDelay, sizeof(swipeDelay));
+        if (homeDelay > 300) homeDelay = 300;
+        if (swipeDelay > 300) swipeDelay = 300;
+        gesture.arm(now, swipes, swipeDelay * 1000); homeDue = now + homeDelay * 1000;
         __atomic_store_n(&planArmed, true, __ATOMIC_RELEASE);
-        IOLog("PICASSO_HID plan armed time_ms=%llu home=%u swipe=%u\n", now, homeLimit, gesture.limit);
+        IOLog("PICASSO_HID plan armed time_ms=%llu home=%u swipe=%u home_delay_s=%u swipe_delay_s=%u\n",
+            now, homeLimit, gesture.limit, homeDelay, swipeDelay);
     }
     bool wasActive = gesture.active;
     auto action = gesture.poll(now, native_touch_hid_reports,

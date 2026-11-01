@@ -245,10 +245,12 @@ kernel_args = [
   "picasso-aks-state=1",
   # Software refresh notifications only; panel timing remains firmware-owned.
   "sheng-vsync=60",
-  # Virtual input: after HID and two frames are ready, wake at 120 s and swipe at 125 s.
+  # Virtual input: after HID and two frames are ready, wake at 5 s and swipe at 8 s.
   # Repeat at 60 s intervals, up to eight attempts; failure releases the contact.
   "offline-hid-input=1",
   "sheng-touch-hid=1",
+  "offline-hid-auto-home=5",
+  "offline-hid-swipe-delay=8",
   "offline-hid-auto-home-count=8",
   "offline-hid-swipe=8",
 ]

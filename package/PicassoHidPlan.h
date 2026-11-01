@@ -9,9 +9,9 @@ struct PicassoHidPlan {
     unsigned limit = 0, sent = 0, frame = 0, expected = 0;
     bool active = false, waiting = false, releasing = false;
 
-    void arm(uint64_t now, unsigned count) {
+    void arm(uint64_t now, unsigned count, uint32_t delayMs = 125000) {
         limit = count > 8 ? 8 : count;
-        due = now + 125000;
+        due = now + delayMs;
     }
     Action poll(uint64_t now, unsigned reports, bool ok, bool ready) {
         if (waiting) {
