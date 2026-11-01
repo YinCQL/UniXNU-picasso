@@ -4880,3 +4880,220 @@ index 0000000..13b4281
 + 		    (unsigned long long)rows[i].pc, (unsigned long long)rows[i].lr,
 + 		    (unsigned long long)rows[i].sp, (unsigned long long)rows[i].fp);
 + 	}
+diff --git a/patches/xnu/zzzzzzzzzzzzzzzz-picasso-bringup-diagnostics.patch b/patches/xnu/zzzzzzzzzzzzzzzz-picasso-bringup-diagnostics.patch
+new file mode 100644
+index 0000000..809fe44
+--- /dev/null
++++ b/patches/xnu/zzzzzzzzzzzzzzzz-picasso-bringup-diagnostics.patch
+@@ -0,0 +1,211 @@
++diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
++--- a/iokit/Kernel/IOUserClient.cpp
+++++ b/iokit/Kernel/IOUserClient.cpp
++@@ -2700,7 +2700,7 @@
++ /* PICASSO_SERVICE_TRACE_BEGIN */
++ #if DEVELOPMENT || DEBUG
++ /* No iterator consumption or serialized user-data logging. Counters are per
++- * process name and operation, shared across restarts, with at most 12 pairs. */
+++ * process name and operation, shared across restarts, with at most 64 pairs. */
++ struct picasso_service_trace {
++ 	unsigned ticket, operation;
++ 	int pid;
++@@ -2726,17 +2726,19 @@
++ picasso_service_begin(unsigned operation, OSDictionary *dict, const char *detail, unsigned type)
++ {
++ 	picasso_service_trace trace = {};
++-	static const char * const names[] = {"backboardd", "SpringBoard"};
++-	static unsigned counters[2][4];
+++	static const char * const names[] = {
+++		"backboardd", "SpringBoard", "profiled", "securityd"
+++	};
+++	static unsigned counters[4][4];
++ 	char name[32] = {0};
++ 	int pid = proc_selfpid();
++ 	proc_name(pid, name, sizeof(name));
++ 	if (operation >= 4) return trace;
++-	for (unsigned index = 0; index < 2; ++index) {
+++	for (unsigned index = 0; index < sizeof(names) / sizeof(names[0]); ++index) {
++ 		if (strcmp(name, names[index])) continue;
++ 		unsigned *counter = &counters[index][operation];
++ 		unsigned value = __atomic_load_n(counter, __ATOMIC_RELAXED);
++-		while (value < 12) {
+++		while (value < 64) {
++ 			if (__atomic_compare_exchange_n(counter, &value, value + 1, false,
++ 			    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++ 				trace.ticket = value + 1;
++diff --git a/osfmk/ipc/ipc_port.c b/osfmk/ipc/ipc_port.c
++--- a/osfmk/ipc/ipc_port.c
+++++ b/osfmk/ipc/ipc_port.c
++@@ -1826,7 +1826,8 @@
++ 	static const char * const names[] = {
++ 		"SpringBoard", "backboardd", "chronod", "liveactivitiesd",
++ 		"coreduetd", "duetexpertd", "routined", "assistantd",
++-		"studentd", "mediaremoted", "contextstored",
+++		"studentd", "mediaremoted", "contextstored", "profiled",
+++		"securityd", "keybagd",
++ 	};
++
++ 	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++@@ -1853,15 +1854,21 @@
++ 	}
++ 	unsigned ticket =
++ 	    os_atomic_inc_orig(&picasso_sync_ipc_trace_count, relaxed);
++-	if (ticket >= 512) {
+++	if (ticket >= 4096) {
++ 		return;
++ 	}
++ 	int client_pid = task_pid(client_task);
++ 	pid_t dest_pid = ipc_port_get_receiver_task(dest_port, NULL);
+++	char dest_name[32] = {};
+++	if (dest_pid > 0) {
+++		extern void proc_name(int, char *, int);
+++		proc_name(dest_pid, dest_name, sizeof(dest_name));
+++	}
++ 	printf("PICASSO_SYNC link sample=%u client=%d name=%.32s srp=%p "
++-	    "dest=%d state=%u sent=%u lost=%u bootstrap=%u\n",
+++	    "dest=%d dest_name=%.32s state=%u sent=%u lost=%u bootstrap=%u\n",
++ 	    ticket + 1, client_pid, client_name, special_reply_port,
++-	    dest_pid, link_state, msg_sent, lost_link, bootstrap_checkin);
+++	    dest_pid, dest_name, link_state, msg_sent, lost_link,
+++	    bootstrap_checkin);
++ }
++ #endif
++
++diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
++--- a/bsd/kern/kern_exit.c
+++++ b/bsd/kern/kern_exit.c
++@@ -174,6 +174,49 @@
++ 	proc_rele(p);
++ }
++
+++struct picasso_process_find {
+++	const char *name;
+++	int pid;
+++};
+++
+++static int
+++picasso_process_find_filter(proc_t p, void *arg)
+++{
+++	struct picasso_process_find *find = arg;
+++	return p && find && strcmp(p->p_name, find->name) == 0;
+++}
+++
+++static int
+++picasso_process_find_callout(proc_t p, void *arg)
+++{
+++	struct picasso_process_find *find = arg;
+++	if (p && find) {
+++		find->pid = proc_getpid(p);
+++	}
+++	return PROC_RETURNED_DONE;
+++}
+++
+++void
+++picasso_live_named_state(const char *name, unsigned sample)
+++{
+++	struct picasso_process_find find = { .name = name };
+++	if (!name || !name[0]) {
+++		printf("PICASSO_WAIT task name=<empty> sample=%u unavailable=bad-name\n",
+++		    sample);
+++		return;
+++	}
+++	proc_iterate(PROC_ALLPROCLIST, picasso_process_find_callout, &find,
+++	    picasso_process_find_filter, &find);
+++	if (!find.pid) {
+++		printf("PICASSO_WAIT task name=%.32s sample=%u unavailable=no-proc\n",
+++		    name, sample);
+++		return;
+++	}
+++	printf("PICASSO_WAIT resolved name=%.32s pid=%d sample=%u\n",
+++	    name, find.pid, sample);
+++	picasso_live_thread_state(find.pid, sample);
+++}
+++
++ #include <mach/mach_types.h>
++ #include <mach/task.h>
++ #include <mach/thread_act.h>
++diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
++--- a/bsd/dev/picasso_usb.c
+++++ b/bsd/dev/picasso_usb.c
++@@ -1891,17 +1891,33 @@
++ }
++
++ static bool
++-ud_parse_wait_command(const char *command, int *pid)
+++ud_parse_wait_command(const char *command, int *pid, char *name,
+++    size_t name_size)
++ {
++ 	const char prefix[] = "wait ";
++ 	if (strncmp(command, prefix, sizeof(prefix) - 1) != 0) {
++ 		return false;
++ 	}
++ 	const char *at = command + sizeof(prefix) - 1;
++-	unsigned value = 0;
++ 	if (*at == '\0') {
++ 		return false;
++ 	}
+++	bool numeric = true;
+++	for (const char *scan = at; *scan != '\0'; scan++) {
+++		if (*scan < '0' || *scan > '9') {
+++			numeric = false;
+++			break;
+++		}
+++	}
+++	if (!numeric) {
+++		const size_t length = strlen(at);
+++		if (length == 0 || length >= name_size) {
+++			return false;
+++		}
+++		memcpy(name, at, length + 1);
+++		return true;
+++	}
+++	unsigned value = 0;
++ 	while (*at != '\0') {
++ 		if (*at < '0' || *at > '9') {
++ 			return false;
++@@ -2295,18 +2311,20 @@
++ 	}
++ }
++ extern void picasso_live_thread_state(int, unsigned);
+++extern void picasso_live_named_state(const char *, unsigned);
++ extern void picasso_live_process_list(unsigned);
++ extern void native_legacy_display_state_report(void);
++ static void
++ ud_process_command(void)
++ {
++ 	int waitPid = 0;
+++	char waitName[32] = {};
++ 	static unsigned processSamples;
++ 	ud.cmd_pending = false;
++ 	ud.commands++;
++ 	printf("PICASSO CDC: command '%s'\n", ud.cmd);
++ 	if (ud_command_is(ud.cmd, "help")) {
++-		printf("PICASSO CDC: commands: help | status | ps | wait <pid> | panic-test | reset-test | start-graphics | register-display | publish-display | publish-display-start | hang-test | reboot-fastboot\n");
+++		printf("PICASSO CDC: commands: help | status | ps | wait <pid|name> | panic-test | reset-test | start-graphics | register-display | publish-display | publish-display-start | hang-test | reboot-fastboot\n");
++ 	} else if (ud_command_is(ud.cmd, "status")) {
++ 		printf("PICASSO CDC: configured=%u host_open=%u live=%u panic=%u "
++ 		    "watchdog=%u armed=%u reset=%u events=%llu tx=%llu "
++@@ -2354,11 +2372,18 @@
++ 		    ud.reset_mode);
++ 		picasso_usb_watchdog_terminal();
++ 		ud.reboot_pending = true;
++-	} else if (ud_parse_wait_command(ud.cmd, &waitPid)) {
+++	} else if (ud_parse_wait_command(ud.cmd, &waitPid, waitName,
+++	    sizeof(waitName))) {
++ 		static unsigned waitSamples;
++-		printf("PICASSO CDC: wait snapshot pid=%d sample=%u\n",
++-		    waitPid, ++waitSamples);
++-		picasso_live_thread_state(waitPid, waitSamples);
+++		if (waitName[0] != '\0') {
+++			printf("PICASSO CDC: wait snapshot name=%s sample=%u\n",
+++			    waitName, ++waitSamples);
+++			picasso_live_named_state(waitName, waitSamples);
+++		} else {
+++			printf("PICASSO CDC: wait snapshot pid=%d sample=%u\n",
+++			    waitPid, ++waitSamples);
+++			picasso_live_thread_state(waitPid, waitSamples);
+++		}
++ 		native_legacy_display_state_report();
++ 	} else if (ud.cmd[0] != '\0') {
++ 		printf("PICASSO CDC: unknown command '%s'; type help\n", ud.cmd);
