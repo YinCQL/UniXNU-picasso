@@ -57,6 +57,11 @@ CONFIG_XNU_OWNER_CACHE_VOLUME_UUID="8846FE78-2910-4297-AF97-D59BB6F8FC16"
 CONFIG_XNU_OWNER_DATA_MOUNT=y
 CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
 CONFIG_XNU_BOOT_PROGRESS=y
+# Owned offline HID source (ShengHidInput): virtual keyboard/digitizer attached
+# through the original IOHIDDevice ABI. The device is built only when the probe
+# is started (offline-hid-input=1), and the Home reports come from
+# offline-hid-auto-home; without those arguments nothing is published.
+CONFIG_XNU_SHENG_HIDINPUT=y
 
 # prepare-picasso-ram-data.py writes the formatted APFS volume's actual UUID
 # into out/picasso/.config before compilation. An unprepared build must fail.

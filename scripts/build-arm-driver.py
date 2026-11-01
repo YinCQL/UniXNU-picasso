@@ -274,7 +274,8 @@ def build_adreno(record: dict):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('component', choices=['ArmDTPlatform', 'ArmCpu', 'NativeRamBlock', 'NativeUfs', 'NativeAdreno'])
+    parser.add_argument('component', choices=['ArmDTPlatform', 'ArmCpu', 'NativeRamBlock', 'NativeUfs', 'NativeAdreno',
+                                              'NativeHidInput'])
     args = parser.parse_args()
 
     recipe = ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'
@@ -285,6 +286,12 @@ def main():
         return
 
     out_map = {
+        'NativeHidInput': ('native-hid-input', 'NativeHidInput', 'NativeHidInput.cpp', [
+            # The original IOHIDDevice ABI header is generated next to the objects by
+            # build-native-hid-input.py before this compile.
+            '-I', str(ROOT / 'build/native-hid-input'),
+            '-I', str(ROOT / 'drivers/NativeHidInput'),
+        ]),
         'ArmCpu': ('armcpu', 'ArmCpu', 'ArmCpu.cpp', []),
         'ArmDTPlatform': ('armdt-platform', 'ArmDTPlatform', 'ArmDTPlatform.cpp', []),
         'NativeRamBlock': ('native-ram-block', 'NativeRamBlock', 'NativeRamBlock.cpp', [

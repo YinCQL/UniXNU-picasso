@@ -151,6 +151,16 @@ extern char native_touch_rows[4][120] __attribute__((weak_import));
 extern char native_cpufreq_row[120] __attribute__((weak_import));
 extern volatile uint32_t native_hid_input_events[8] __attribute__((weak_import));
 extern volatile int native_hid_input_results[8] __attribute__((weak_import));
+// Owned offline HID source (ShengHidInput): the probe attaches the virtual
+// keyboard once userland owns the panel; offline-hid-auto-home then posts the
+// Home reports that unlock the lock screen. Absent when the archive is not linked.
+extern void native_hid_input_probe(void) __attribute__((weak_import));
+// Served once per monitor pass: the probe arms a swipe plan and this emits one gesture when it is due,
+// so the lock-screen swipe never blocks the monitor for longer than a single gesture.
+extern void native_hid_swipe_tick(unsigned) __attribute__((weak_import));
+extern volatile uint32_t native_hid_stage,native_hid_resource_found __attribute__((weak_import));
+extern volatile int native_hid_load_status,native_hid_input_meta_status __attribute__((weak_import));
+extern volatile uint64_t native_hid_input_object __attribute__((weak_import));
 extern volatile uint32_t native_touch_loop_step __attribute__((weak_import));
 extern volatile uint32_t native_touch_seq,native_touch_count __attribute__((weak_import));
 extern volatile int native_touch_xs[12],native_touch_ys[12],native_touch_ids[12] __attribute__((weak_import));
@@ -1172,6 +1182,30 @@ static void monitor(void *arg, wait_result_t result) {
     if(boot_log_tick)boot_log_tick(now);
     if(sheng_cpufreq_poll)sheng_cpufreq_poll();
     if(boot_ui_trace_snapshot)boot_ui_trace_snapshot(now);
+    // Start the owned offline HID source after userland owns the panel. The probe
+    // itself gates on offline-hid-input, and offline-hid-auto-home then emits the
+    // Home reports; this only decides when the kext attach is attempted.
+    {
+      static unsigned hid_probed,hid_start_at,hid_configured;
+      if(!hid_configured) {
+        // offline-hid-start=<seconds>: when to attach the owned HID source. The
+        // default (60 s) is early userland; a late value attaches it only after
+        // the lock screen is already rendered, so SpringBoard's HID setup is not
+        // disturbed by a device appearing mid-initialisation.
+        hid_configured=1;hid_start_at=60;
+        PE_parse_boot_argn("offline-hid-start",&hid_start_at,sizeof(hid_start_at));
+        if(hid_start_at<5)hid_start_at=5;
+      }
+      if(!hid_probed && native_hid_input_probe && now>=hid_start_at) {
+        hid_probed=1;
+        printf("PICASSO_HID probe at %us\n",now);
+        native_hid_input_probe();
+        printf("PICASSO_HID stage=%u resource=%u load=%d meta=%d object=%llx\n",
+            native_hid_stage,native_hid_resource_found,native_hid_load_status,
+            native_hid_input_meta_status,(unsigned long long)native_hid_input_object);
+      }
+      if(native_hid_swipe_tick)native_hid_swipe_tick(now);
+    }
     if(&boot_process_attempts && &boot_process_busy) {
       unsigned attempt=__atomic_load_n(&boot_process_attempts,__ATOMIC_RELAXED);
       unsigned capturing=__atomic_load_n(&boot_process_busy,__ATOMIC_ACQUIRE);
