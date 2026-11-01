@@ -51,7 +51,7 @@ public:
     return text + '};\nstatic_assert(sizeof(IOHIDDevice)==0xd0,"Original device instance size");\n'
 
 
-def audit_object(platform, native, obj, reference):
+def audit_object(platform, native, obj, reference, *, slot_names=None):
     require = platform.require
     methods = qualify_hid(reference)
     raw, sections, symbols = platform.inspect_object(obj, native)
@@ -83,6 +83,8 @@ def audit_object(platform, native, obj, reference):
     require(owned == OWNED, 'Only qualified HID methods overridden')
     undefined = {s['name'] for s in symbols if s['kind'] == 1 and '11IOHIDDevice' in s['name']}
     require(undefined == set(bindings), 'All and only actual HID imports bound')
+    if slot_names is not None:
+        slot_names.extend(compiled)
     return dict(original_sha256=hashlib.sha256(reference.data).hexdigest(), bindings=bindings,
                 original_slide=-0x1000000, original_slots=207, instance_bytes=208,
                 owned_slots=owned, runtime_qualified=False)
@@ -124,11 +126,12 @@ def build(root, platform, native, record, out, board):
     return objects, sources
 
 
-def verify(platform, native, reference, directory, kernel, plan):
+def verify(platform, aes, native, reference, directory, kernel, plan):
     import json
     require = platform.require
     require((directory / 'OriginalHidDeviceABI.h').read_text(encoding='utf-8') == header(), 'Changed generated HID header')
-    audit = audit_object(platform, native, directory / 'NativeHidInput.o', reference)
+    slot_names = []
+    audit = audit_object(platform, native, directory / 'NativeHidInput.o', reference, slot_names=slot_names)
     require(audit == json.loads((directory / 'hid-object-audit.json').read_text()), 'Stale HID object audit')
     initializer = '__GLOBAL__sub_I_NativeHidInput.cpp'
     require(platform.initializer_state(directory / 'NativeHidInput.o', native, initializer, True) ==
@@ -138,10 +141,15 @@ def verify(platform, native, reference, directory, kernel, plan):
     vt = names['__ZTV14NativeHidInput'] + 16
     offset = native.backed_offset(image['segments'], vt, 207 * 8, len(kernel))
     compiled = struct.unpack_from('<207Q', kernel, offset)
-    original = qualify_hid(reference)
-    local = {va for n, va in names.items() if n.startswith(('__ZN14NativeHidInput', '__ZNK14NativeHidInput'))}
-    require([i for i, va in enumerate(compiled) if va in local] == OWNED, 'Wrong linked HID overrides')
-    require(all(compiled[i] == original[i] for i in range(207) if i not in OWNED), 'Wrong linked original HID dispatch')
+    # Inline overrides may be local N_SECT definitions after linking. Reuse
+    # the AES/display resolver, which checks unique executable definitions.
+    wanted = {slot_names[i] for i in OWNED}
+    methods, local = aes.linked_native_methods(native, kernel, image, wanted)
+    # OSObject/IOService methods come from the source kernel; retained
+    # IOHIDDevice methods keep their original aliases, checked below.
+    for i, name in enumerate(slot_names):
+        target = methods.get(name) if i in OWNED else names.get(name)
+        require(target is not None and compiled[i] == target, f'Wrong linked HID dispatch slot {i}')
     for name, va in audit['bindings'].items():
         require(names.get(name) == va, 'Wrong linked HID alias ' + name)
         require(any(e['module'] == 'com.apple.iokit.IOHIDFamily' and e['va'] <= va < e['va'] + e['size'] for e in plan['extents']), 'HID alias outside retained original family')
@@ -152,4 +160,4 @@ def verify(platform, native, reference, directory, kernel, plan):
                  '_native_hid_input_requested', '_native_touch_set_sink', '_native_buttons_set_sink',
                  '_native_hid_input_allocate', initializer):
         require(name in names, 'Missing HID lifecycle ' + name)
-    return audit
+    return dict(audit, linked_local_methods=sorted(local))

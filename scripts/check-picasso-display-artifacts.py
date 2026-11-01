@@ -65,7 +65,7 @@ def check(tree, work, kernelcache, output):
     report = builder.verify_kernel(aes, native, original, kernel.read_bytes(), plan, audit)
     hid = load(tree / 'scripts/build-picasso-hid.py')
     from picasso_original_abi import OriginalReference
-    report['hid'] = hid.verify(platform, native, OriginalReference(kernelcache, board),
+    report['hid'] = hid.verify(platform, aes, native, OriginalReference(kernelcache, board),
                                directory, kernel.read_bytes(), plan)
     config = (work / '.config').read_text()
     builder.require(config.splitlines().count('CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y') == 1, 'Display disabled in actual config')
