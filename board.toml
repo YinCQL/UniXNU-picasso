@@ -184,12 +184,20 @@ dram_size = "0x80000000"
 # nothing and left the boot without a console. debug=0x14e keeps DB_KPRT (0x8),
 # so kprintf is still enabled; the flags are 0x2 and 0x4 (NMI) plus 0x40 (ARP)
 # and 0x100 (obsolete), none of which halt early.
-# SMP isolation test: compare two CPUs against the established single-CPU
-# baseline without changing any other boot argument.
+# All eight SM7250 cores. The ADT already declares cpu0..cpu7 and /psci; without
+# sheng-smp the ArmCpu driver refuses every secondary, so these arguments are
+# what make the other seven start. They take the boot from about 500 s to the lock screen
+# down to about 310 s; the pre-launchd UFS phase stays single-threaded.
 kernel_args = [
   "-v",
   "debug=0x14e",
-  "cpus=2",
+  "cpus=8",
+  # PSCI CPU_ON per secondary (conduit comes from the ADT /psci node). The SGI
+  # form of an IPI produces nothing on this board, so cross-core signals are
+  # software-pended SPIs; the self-IPI makes XNU clear SIGPdisabled on a new core.
+  "sheng-smp=1",
+  "armcpu-spi-ipi=1",
+  "armcpu-self-ipi=1",
   # Production root path. native-ufs-root=1 starts the root from the
   # root-device personality without the diagnostic media-report panic that
   # native-ufs-probe=12 ends with. Upstream's payload guard (check_native_root)
@@ -258,7 +266,6 @@ kernel_args = [
   "picasso_usb_watchdog_ms=30000",
   "picasso_usb_early_watchdog=1",
   "picasso_usb_host_timeout_ms=60000",
-  "picasso_usb_host_boot_grace_ms=120000",
   # The XNU CDC panic/reset path uses PSHOLD as its final fallback and arms the
   # IMEM Fastboot reason before either panic or command reset. The hardware
   # watchdog path is the proven automatic Fastboot recovery route.
@@ -281,14 +288,12 @@ kernel_args = [
   # inaccessible until CX/GX power and clocks are established.
   "sheng-gpu-probe=1",
   # Opt-in write limited to GPUCC_CX_GDSCR.SW_COLLAPSE; no GPU core access.
-  "sheng-gpu-cx-power=1",
-  "sheng-gpu-gcc-probe=1",
-  # Official UniXNU boot-page UI trace. Keep the OS running, then take the
-  # panel back after 30 seconds without a system scanout so the sampled stacks
-  # and wait chain remain photographable even when SpringBoard is stuck.
+  # Official UniXNU boot-page UI trace. boot-progress=2 keeps the OS running.
+  # boot-diag-resume is deliberately absent: taking the panel back after 30 s
+  # without a system scanout made the lock screen flip to the log page and back,
+  # which also disturbed the CDC log the host reads.
   "boot-progress=2",
-  "boot-diag-resume=30",
-  "sheng-build-tag=picasso-ui-trace",
+  "sheng-build-tag=picasso-smp",
   "boot-ui-focus=chronod",
   "boot-ui-focus2=SpringBoard",
   "boot-ui-focus3=backboardd",
@@ -302,9 +307,11 @@ kernel_args = [
   # for this path.
   "offline-hid-input=1",
   "offline-hid-home=1",
-  "offline-hid-auto-home=120",
-  "offline-hid-auto-home-count=8",
-  "offline-hid-auto-home-interval=60",
+  # The synthetic bottom-edge swipe that unlocks this iPad identity; auto-home did
+  # not leave the lock screen. One gesture every 20 s from t=540 s covers the window
+  # in which SpringBoard takes the panel.
+  "offline-hid-start=540",
+  "offline-hid-swipe=16",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
