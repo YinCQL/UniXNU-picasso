@@ -42,10 +42,8 @@
 
 ## Credits
 
-Thanks to [silenzio111](https://github.com/silenzio111) for build/driver tooling,
-[#1](https://github.com/YinCQL/UniXNU-picasso/pull/1) USB CDC console,
-[#2](https://github.com/YinCQL/UniXNU-picasso/pull/2) verified UFS/APFS root, and
-[#3](https://github.com/YinCQL/UniXNU-picasso/pull/3) CDC fixes, command tools and hardware tests.
+- [silenzio111](https://github.com/silenzio111) 
+- [huydre](https://github.com/huydre) 
 
 ## Reference
 
