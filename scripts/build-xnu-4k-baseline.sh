@@ -89,7 +89,9 @@ if [ "$SHENG_HIDINPUT" != 0 ] && [ "$SHENG_HIDINPUT" != 1 ]; then
   echo 'XNU_SHENG_HIDINPUT must be 0 or 1' >&2
   exit 1
 fi
-if [ "$SHENG_HIDINPUT" = 1 ]; then
+# Like the other device archives, HID needs the compile records produced by
+# the bootstrap pass. That pass disables boot progress and links no archives.
+if [ "$SHENG_HIDINPUT" = 1 ] && [ "$BOOTSTRAP" != 1 ]; then
   if [ "$BOOT_PROGRESS" != 1 ]; then
     echo 'ShengHidInput needs the boot-progress build: its probe call site lives in BootProgress.c' >&2
     exit 1
@@ -101,7 +103,7 @@ if [ "$NOVATEK_TOUCH" != 0 ] && [ "$NOVATEK_TOUCH" != 1 ]; then
   echo 'XNU_NOVATEK_TOUCH must be 0 or 1' >&2
   exit 1
 fi
-if [ "$NOVATEK_TOUCH" = 1 ]; then
+if [ "$NOVATEK_TOUCH" = 1 ] && [ "$BOOTSTRAP" != 1 ]; then
   if [ "$BOOT_PROGRESS" != 1 ]; then
     echo 'NativeNovatekTouch needs the boot-progress build: its probe call site lives in BootProgress.c' >&2
     exit 1
@@ -115,7 +117,7 @@ if [ "$PICASSO_CPUFREQ" != 0 ] && [ "$PICASSO_CPUFREQ" != 1 ]; then
   echo 'XNU_PICASSO_CPUFREQ must be 0 or 1' >&2
   exit 1
 fi
-if [ "$PICASSO_CPUFREQ" = 1 ]; then
+if [ "$PICASSO_CPUFREQ" = 1 ] && [ "$BOOTSTRAP" != 1 ]; then
   if [ "$BOOT_PROGRESS" != 1 ]; then
     echo 'PicassoCpuFreq needs the boot-progress build: its probe call site lives in BootProgress.c' >&2
     exit 1

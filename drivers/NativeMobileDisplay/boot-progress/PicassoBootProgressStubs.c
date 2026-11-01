@@ -50,6 +50,7 @@ WEAK void native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context)
 WEAK void (*sheng_ioconnect_hook)(void *, uint32_t, uint64_t, uint64_t, uint64_t);
 WEAK volatile uint32_t native_touch_loop_step;
 WEAK volatile uint32_t native_touch_seq;
+volatile uint32_t native_touch_writer_lock;
 WEAK volatile uint32_t native_touch_count;
 // Referenced by the owned HID source (ShengHidInput) for its touch timeline.
 WEAK volatile uint32_t native_touch_hid_reports;

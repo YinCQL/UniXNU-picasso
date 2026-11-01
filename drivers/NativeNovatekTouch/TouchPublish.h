@@ -14,14 +14,21 @@ struct nvt_touch_publication {
     unsigned slots;
     void (*sink)(void *);
     void *sink_context;
+    volatile uint32_t *writer_lock;
 };
 
 // Publish n contacts. Source arrays are the raw HID convention (xs 0..30480, ys 0..20320). Returns the number of
 // contacts actually written (n clamped to slots).
 static inline unsigned nvt_touch_publish(struct nvt_touch_publication *p, const int *xs, const int *ys,
                                          const int *ids, unsigned n) {
-    if (!p || !p->seq || !p->count) return 0;
+    if (!p || !p->seq || !p->count || !p->writer_lock) return 0;
     if (n > p->slots) n = p->slots;
+    if (n && (!xs || !ys || !ids || !p->xs || !p->ys || !p->ids)) return 0;
+    // The physical and virtual producers share one writer lock. Drop a busy
+    // frame rather than spin on a producer that may run on another CPU.
+    uint32_t expected = 0;
+    if (!__atomic_compare_exchange_n(p->writer_lock, &expected, 1, 0,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
     const uint32_t seq = *p->seq;
     *p->seq = seq + 1;                      // odd: the snapshot is being written
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -33,6 +40,7 @@ static inline unsigned nvt_touch_publish(struct nvt_touch_publication *p, const 
     }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     *p->seq = seq + 2;                      // even: the snapshot is complete
+    __atomic_store_n(p->writer_lock, 0, __ATOMIC_RELEASE);
     if (p->sink) p->sink(p->sink_context);
     return n;
 }

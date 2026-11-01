@@ -1,96 +1,31 @@
 # NativeNovatekTouch (picasso, NT36672C)
 
-Touch driver for the Redmi K30 5G ("picasso", Qualcomm SM7250) Novatek NT36672C controller on GENI SPI SE7. This is a
-new driver; nothing here has run on the device yet. The pure layers are host-tested, the board/probe layer has only
-been syntax-checked against the XNU headers.
+Touch driver for the Redmi K30 5G (SM7250), using GENI SPI SE7 and the panel's 65-byte reports with ten 6-byte contact records. The 18x36 matrix helpers are retained for diagnostics; the running contact path does not use them. See `NOTICE` for source provenance and licenses.
 
-## Files
+## Build and firmware
 
-| File | Contents |
-| --- | --- |
-| `TouchBoard.h` | Every picasso address, clock, pin and panel constant with its source; pure clock-divider helpers; core-to-HID coordinate mapping; the 18x36 compile-time check. |
-| `NvtProtocol.c/.h` | NT36xxx SPI framing, trim-id identification, firmware partition parser, bootloader download, THP frame access. |
-| `NvtTouchCore.c/.h` | 18x36 baseline, delta, peak labelling, blob merge, palm rejection, centroid, edge compensation and tracking. No allocation; scratch lives in the caller's `struct nvt_touch_core`. |
-| `TouchPublish.h` | The seqlock publication helper used by the probe and the host test. |
-| `TouchProbe.cpp` | Staged `sheng-touch=<n>` probe and frame loop. Provides `native_novatek_touch_probe()` and the HID publication globals/sink. |
-| `GeniSpi.c/.h` | Vendored from UniXNU/NativeGeniSpi (BSD-2-Clause-Patent, SPDX headers unchanged). |
-| `Test/` | Host tests and `make test`. |
-
-`NvtProtocol` and `NvtTouchCore` are Apache-2.0 (adapted from ShengNovatekTouch); the new files are
-BSD-2-Clause-Patent. See `NOTICE`.
-
-## Host tests
-
-```
-$ cd drivers/NativeNovatekTouch/Test && make test
-cc -I.. -std=c11 -O2 -Wall -Wextra -Werror -o nvt_tests main.c ../NvtProtocol.c ../NvtTouchCore.c -lm
-./nvt_tests
-PASS: NT36672C board/clock/HID helpers, publication seqlock, SPI framing, trim-id, firmware parse and model download, frame header/matrix decode, two-blob tracking, thresholds, palm and edge rules; synthetic data, no hardware
-```
-
-The fake bus models the NT36xxx page-select framing (0x`ff`, page bytes, offset with bit 7 for writes, no dummy byte
-on reads) and enough of the register file to check identification, the firmware parser, the full download handshake,
-frame-header validation and matrix decode. The core tests feed synthetic 18x36 frames with two Gaussian blobs,
-threshold and palm cases, sub-pixel movement and tracking continuity.
+`CONFIG_XNU_NOVATEK_TOUCH=y` builds the driver after bootstrap compile records exist. Supply the panel firmware with `NOVATEK_TOUCH_FW` or `scripts/build-native-novatek-touch.py --firmware PATH`. No firmware is stored in this repository. Without a supplied image, the archive supports diagnostic stages 1-3; stage 4 reports missing firmware and stops. An explicitly supplied invalid path fails the build before compilation.
 
 ## Probe
 
-`sheng-touch=<n>` selects the last stage:
+The probe is inert unless `sheng-touch=<1..4>` is supplied. `sheng-touch-start=<seconds>` delays it on the boot monitor clock.
 
 | Stage | Work |
 | --- | --- |
-| 1 | Map GCC/TLMM, read the QUP branch states, GPLL0 mode and SE7 DFS levels; read the GENI identity if the clocks already run. |
-| 2 | Vote GPLL0 and the wrapper/SE branches, wait for them, configure SPI pins 6..9 plus reset GPIO4 and IRQ GPIO5, read the GENI identity. |
-| 3 | Reset pulse, GENI SPI init, DFS clock choice, chip identification (SPI mode sweep; `sheng-touch-mode` forces one). |
-| 4 | Parse and download the firmware, read FWINFO, then peek/read frames and publish contacts. |
+| 1 | Read GCC branches, SE7 DFS levels, pins and the GENI identity if clocks are running. |
+| 2 | Vote clocks and configure reset GPIO4, IRQ GPIO5 and SPI GPIO6-9. |
+| 3 | Reset, initialize SPI, choose the clock and identify the controller. |
+| 4 | Download supplied firmware, validate FWINFO and publish contact reports. |
 
-Options: `sheng-touch-poll=1` (frame-counter polling instead of the GPIO IRQ), `sheng-touch-hz` (default and maximum
-5 MHz, the DT value), `sheng-touch-legacy-start=1` (send the NT36532E idle/doze commands, unconfirmed on this chip).
-Stage 1/2/3 exit after their report; stage 4 loops.
+`sheng-touch-hz` is capped at 5 MHz. `sheng-touch-mode` forces an SPI mode; `sheng-touch-poll=1` uses polling. GPIO IRQ SPI240 has a 20 ms fallback. Stage 4 publishes into the existing 12-slot HID snapshot and calls the shared sink after closing the sequence and releasing the writer lock. Physical and virtual producers share that lock; a busy writer drops the competing frame.
 
-The probe publishes through the existing globals (`native_touch_seq/count/xs/ys/ids`, 12 slots) and calls the sink
-after every published frame, including an empty frame for a lift. `xs` is the 1080-pixel short axis mapped to
-0..30480, `ys` the 2400-pixel long axis mapped to 0..20320, which is what `NativeHidInput.cpp` already normalises.
-`TB_HID_MIRROR_X/Y` are the orientation switches to try if the panel is mounted rotated.
+SPI reads send the low address byte plus a leading dummy byte, then return data starting at receive offset 2. Writes set address bit 7. GPIO4/5 use the EAST tile, GPIO6-9 the WEST tile. The board helpers map the 1080x2400 panel to HID ranges 0..30480 and 0..20320.
 
-## What is confident, and what is a TODO
+## Verification
 
-Confident (public NT36xxx driver and this board's DT):
+`Test/main.c` covers board clocks, HID mapping, publication including busy writers and lift frames, SPI framing, trim IDs, firmware parsing and simulated download, plus diagnostic matrix processing and tracking. `make test` runs these host models. They do not validate hardware register timing.
 
-- SPI framing: page select `0xff, addr[22:15], addr[14:7]`, then the low 7 address bits (bit 7 set for writes) and
-  data; reads have no dummy byte.
-- Trim id read at `0x1F64E` (six id bytes at +1), NT36672C entry `{0x0c, x, x, 0x72, 0x66, 0x03}` with mask
-  `{1,0,0,1,1,1}`, selecting the NT36675 map, `hw_crc = 2`.
-- Map: event buffer `0x22D00`, boot-ready `0x3F10D`, software reset `0x3F0FE`, fast-read `0x3F310`, ILM/DLM
-  descriptor/length/checksum and BLD-CRC registers.
-- Download: `0x69` reset, ~35 ms, clear fast-read, write all non-empty partitions (`size + 1` bytes), program
-  descriptors/lengths/checksums, set BLD CRC enable bit 7, clear the reset event, host command `0xae`, boot-ready 1,
-  10 ms, poll byte 1 of the reset event for `0xa0..0xaf`.
-- Firmware header: image end at +0, ILM/DLM descriptors at 0/12, golden checksums at 0x18/0x1C (the `hw_crc=2` case),
-  info sections at 0x30, overlays after the DLM, `NVT`/`MOD` 4 KiB marker, `FW_VER + FW_VER_BAR == 0xff`. The
-  stock-kernel objects carry a 0x2000-byte trailer after the image; `nvt_fw_parse_stock()` handles that and a
-  marker-anchored carve that starts 0x2000 early.
-- Board addresses: SE `0x984000`, wrapper `0x9c0000`, SMMU SID `0x23`, GCC `0x100000`, clocks se7 `0x4b`/`0x57`/
-  `0x58`, pins GPIO4 reset / GPIO5 IRQ / GPIO6-9 QUP, panel 1080x2400, 18x36.
-- SM7250 GCC register offsets for the branch/vote/DFS registers (proposal-stage `gcc-sm7250` driver), GPLL0 600 MHz
-  main / 300 MHz even.
-
-TODO / unverified (all marked in source):
-
-- The classic THP 32-byte header field offsets (counter +2, integrity +4/+12/+8/+16, type +24) and the matrix
-  row/column order. The vendor THP test protocol is not public; the layout is the NT36532E 32-byte sub-header plus
-  an 18x36 little-endian matrix. This must be checked against a captured frame. The DT's four key channels are not
-  consumed either; if the classic frame appends key data or a checksum, the frame length will need extending.
-- The numeric TLMM function selector for `qup11` is not in the DTS; 1 is assumed.
-- Reset pulse and IRQ edge timing/polarity.
-- Signal thresholds, startup frame count, palm node count and the 120 Hz filter rate (NT36532E values, partly
-  rescaled for 648 nodes).
-- GPLL0 mode register offset (0x0 assumed), and the `hw_crc = 2` "3 bytes" meaning.
-- Legacy start commands (0x19 / doze delay 0x113718 / 0x01) are only sent on request.
-- No DMA/SMMU path: GENI FIFO mode only. If the SE reports its FIFO interface disabled, the probe stops with
-  `GENI_ERR_NOTSUP`; the integrator needs the SE DMA path with the apps-SMMU bypass stream 0x23 (constants are in
-  `TouchBoard.h`).
-- Nothing has been run on hardware. No hardware success is claimed.
+The PR author reported a successful firmware download, IRQ-driven contacts and HID event-driver attachment on picasso. Changes made during integration still need a new complete kernel build and device run. The default board does not enable `sheng-touch=4`.
 
 ## Firmware
 
@@ -180,30 +115,6 @@ candidate6 53e7970109428a0a3efd0208125885ff11d208915e091ff1c479511e2af2657e  pay
 candidate7 8299566dea99f4fd3a62f68263a5cebbe2f302b0a218ab6fbe69df6cf0e58be7  payload7 07c3f7318b2ecbc6e5313b482895d7b7a04f68144f8e8bc1ae1b1fcb6b17f3e9
 ```
 
-## What the main session must wire up
+## Integration
 
-1. Build entry: compile `GeniSpi.c`, `NvtProtocol.c`, `NvtTouchCore.c` (C, `gnu11`) and `TouchProbe.cpp` (C++, the
-   XNU kext flags) for arm64 into the kernel link, with `drivers/NativeNovatekTouch` on the include path. No existing
-   file was modified.
-2. Boot monitor: call `native_novatek_touch_probe()` from the existing boot-monitor sequence (the same place
-   `native_hid_input_probe()` is called, or later once userland owns the panel). It is inert without
-   `sheng-touch=<n>`.
-3. Firmware: link the chosen blob (the bare 0x20000 image is cleanest; the true 0x22000 object or the shifted carve
-   also parse) as the two weak symbols above or call the setter before the probe. No blob is checked into this
-   repository.
-4. Symbols: `TouchProbe.cpp` defines the HID publication globals, a strong `native_touch_set_sink` and
-   `native_novatek_touch_probe`. `package/HidInputProbe.cpp` currently also defines `native_touch_set_sink`
-   strongly; exactly one strong definition may remain. The weak stubs in `PicassoBootProgressStubs.c` are overridden
-   as intended.
-5. IRQ: the probe registers a frame handler on TLMM GPIO5 and calls the weak `armcpu_spi_attach(TB_TLMM_SUMMARY_INTID,
-   false, ...)` (INTID 240). If that helper is not linked, use `sheng-touch-poll=1`; the GIC SPI for the SE itself
-   (354) is in `TouchBoard.h` but unused by the GPIO-driven loop.
-6. Diagnostics: read `native_novatek_touch_stage/step/error`, `native_novatek_touch_frames/valid/contacts`,
-   `native_novatek_touch_dfshz[8]`, `native_novatek_touch_id[6]` and `native_novatek_touch_irq_stats[3]` from the
-   boot report. The probe prints `PICASSO_NVT ...` lines.
-
-## Verification status
-
-- Host tests: built and passed on macOS with the system `cc` (command and output above).
-- `TouchProbe.cpp`: `clang -fsyntax-only` with the tree's recorded XNU arm64 kernel arguments, no errors.
-- Kernel build, link, boot and hardware: not run. The driver is off by default.
+The baseline build links the archive and the boot monitor calls the staged probe. `TouchProbe.cpp` supplies the contact globals; `PicassoBootProgressStubs.c` owns the writer lock and shared sink, including when the virtual HID producer is disabled. The HID archive registers its notification callback there. Inspect `PICASSO_NVT` logs and `native_novatek_touch_stage/step/error`, frame/contact counters and IRQ statistics during qualification.

@@ -2,7 +2,8 @@
 """Check the actual compiled RAM Data provider and FAT handoff; keep audit files.
 
 Run on the macOS build host after kernel + payload. This does not establish that
-the device has booted or that its later Data writes fit in physical memory.
+the device has booted, that the optional UFS overlay attached successfully, or
+that later Data writes fit in physical memory.
 """
 import argparse
 import hashlib
@@ -27,15 +28,27 @@ def require(value, message):
         raise ValueError(message)
 
 
+def ufs_store_mode(arguments):
+    """Match the pinned NativeUfs provider's optional overlay modes."""
+    values = []
+    for argument in arguments:
+        name, separator, value = argument.partition('=')
+        require(name != 'sheng-log', 'Persistent UFS log must remain disabled')
+        if name == 'sheng-data-persist':
+            require(separator and value in ('0', '1', '2'),
+                    'UFS Data store mode must be exactly 0, 1 or 2')
+            values.append(int(value))
+    require(len(values) <= 1, 'Duplicate UFS Data store mode')
+    return values[0] if values else 0
+
+
 def check(work, tree, output):
     board = tomllib.loads((ROOT / 'board.toml').read_text(encoding='utf-8'))
     spec = board['payload']
     require(spec['size_mib'] == 60, 'Picasso payload must be 60 MiB')
     require(spec['adt'].get('packed_data_ramdisk') is True, 'Packed Data ADT mode required')
-    require(not spec['adt'].get('persistent_data'), 'Data must remain volatile')
-    for argument in spec['kernel_args']:
-        require(argument.split('=')[0] not in ('sheng-data-persist', 'sheng-log'),
-                'Persistent UFS store must remain disabled')
+    require(not spec['adt'].get('persistent_data'), 'Persistent Data ADT mode must remain disabled')
+    store_mode = ufs_store_mode(spec['kernel_args'])
 
     seed_dir = work / 'ram-data'
     seed = json.loads((seed_dir / 'seed.json').read_text())
@@ -47,6 +60,7 @@ def check(work, tree, output):
         require(seed[key] == packed[key], f'Data report mismatch: {key}')
     require(packed['logical_bytes'] == 256 * 1024**2, 'Expected 256 MiB sparse logical disk')
     require(packed['packed_bytes'] <= 4 * 1024**2, 'Packed seed exceeds its memory/payload budget')
+    # This is provenance of the base seed, not of the driver's optional UFS overlay.
     require(seed['persistent'] is False and seed['ownership_preserved'] is True
             and seed['os_inputs_modified'] is False, 'Unsafe seed provenance')
     require(seed['source_launchd_sha256'] ==
@@ -82,6 +96,15 @@ def check(work, tree, output):
             symbols[fields[2]] = int(fields[0], 16)
     require('_native_ram_block_volume_seed' in symbols, 'Kernel lacks the RAM volume provider')
     require('_native_ufs_store_open' in symbols, 'Kernel lacks its UFS provider')
+    store_symbols = {}
+    if store_mode:
+        # The pinned RAM driver requires all six callbacks, even in read-only mode.
+        for suffix in ('mode', 'open', 'read', 'write', 'sync', 'gpt_check'):
+            name = '_native_ufs_store_' + suffix
+            require(name in symbols, f'Kernel lacks the UFS Data store callback: {name}')
+            store_symbols[name] = hex(symbols[name])
+        require('_native_data_persist_state' in symbols,
+                'Kernel lacks the RAM Data overlay integration')
     ram = tree / 'build/native-ram-block'
     ufs = tree / 'build/native-ufs'
     imports = json.loads((ram / 'storage-imports.json').read_text())
@@ -132,7 +155,10 @@ def check(work, tree, output):
                   volume_uuid=identity, packed=packed, payload_bytes=payload.stat().st_size,
                   content_bytes=content, content_budget_bytes=payload.stat().st_size * 95 // 100,
                   kernel_sha256=digest(kernel), storage_imports=imports['imports'],
-                  persistent=False, hardware_tested=False)
+                  seed_persistent=False, ufs_store_mode=store_mode,
+                  ufs_store_symbols=store_symbols, persistent_requested=bool(store_mode),
+                  persistent=False if not store_mode else None,
+                  persistent_runtime_verified=False, hardware_tested=False)
     output.write_text(json.dumps(report, indent=2) + '\n')
     return report
 

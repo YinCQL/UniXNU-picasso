@@ -166,17 +166,17 @@ void native_hid_input_observed(unsigned event,int result) {
     }
 }
 __attribute__((noinline)) void native_hid_checkpoint(void) { __asm__ volatile("" ::: "memory"); }
-// The digitizer registers its notify callback here at start(). Picasso has no
-// board touch producer yet, so this probe owns the sink: the weak definition in
-// PicassoBootProgressStubs.c would be a no-op and the driver has no timer left
-// to poll the seqlock.
 // The sink storage lives in PicassoBootProgressStubs.c (always linked); this probe
 // only notifies after publishing a frame.
 extern "C" void native_touch_notify(void);
 extern "C" int native_touch_sink_ready(void);
+extern "C" volatile uint32_t native_touch_writer_lock;
 // One finger-set frame for the virtual digitizer. The reader (NativeHidInput::touchSend) treats an odd
 // sequence as torn and retries, so the sequence brackets the snapshot.
-static void swipePublish(unsigned count,int id,int x,int y) {
+static bool swipePublish(unsigned count,int id,int x,int y) {
+    uint32_t expected=0;
+    if(!__atomic_compare_exchange_n(&native_touch_writer_lock,&expected,1,false,
+                                   __ATOMIC_ACQUIRE,__ATOMIC_RELAXED))return false;
     const uint32_t seq=native_touch_seq;
     native_touch_seq=seq+1;
     __asm__ volatile("dmb ish":::"memory");
@@ -184,13 +184,15 @@ static void swipePublish(unsigned count,int id,int x,int y) {
     if(count){native_touch_ids[0]=id;native_touch_xs[0]=x;native_touch_ys[0]=y;}
     __asm__ volatile("dmb ish":::"memory");
     native_touch_seq=seq+2;
+    __atomic_store_n(&native_touch_writer_lock,0,__ATOMIC_RELEASE);
     native_touch_notify();
+    return true;
 }
 // Publish a frame and wait (bounded) for the event driver to take it; returns false when no report
 // moved in 200 ms, which means the digitizer is not attached and further frames are pointless.
 static bool swipeFrame(unsigned count,int x,int y) {
     const uint32_t want=native_touch_hid_reports+1;
-    swipePublish(count,1,x,y);
+    if(!swipePublish(count,1,x,y))return false;
     for(unsigned i=0;i<100;++i) {
         if(native_touch_hid_reports>=want)return true;
         IOSleep(2);

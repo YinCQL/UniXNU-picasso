@@ -8,7 +8,7 @@ addressing to the NT36xxx format. It is distributed under the same license.
 
 GeniSpi.c and GeniSpi.h are vendored from UniXNU/NativeGeniSpi (BSD-2-Clause-Patent); their SPDX headers are unchanged.
 
-The NT36xxx bus facts (page/offset framing, no dummy byte, register bank, chip-info address, trim table and download
+The NT36xxx bus facts (page/offset framing, two-byte read lead-in, register bank, chip-info address, trim table and download
 sequence) were read from the public sm7150-mainline NT36xxx driver (GPL-2.0-or-later, Novatek/community) and the
 sm7250-mainline GCC clock driver proposal. The `hw_crc` firmware-checksum interpretation (golden ILM/DLM values at
 0x18/0x1C, `size + 1` partition writes) was confirmed against Google's `kernel/google-modules/touch/novatek_touch`
