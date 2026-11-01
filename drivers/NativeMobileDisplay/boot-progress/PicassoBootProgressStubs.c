@@ -21,13 +21,31 @@ WEAK volatile int native_hid_input_results[8];
 // valid when CONFIG_XNU_SHENG_HIDINPUT is off.
 WEAK void native_hid_input_probe(void) {}
 WEAK void native_hid_swipe_tick(unsigned now) { (void)now; }
+WEAK void native_novatek_touch_probe(void) {}
+WEAK void native_novatek_touch_boot_report(unsigned now) { (void)now; }
 WEAK volatile uint32_t native_hid_stage, native_hid_resource_found;
 WEAK volatile int native_hid_load_status, native_hid_input_meta_status;
 WEAK volatile uint64_t native_hid_input_object;
 // Optional producers the sheng HID source binds weakly. The kernel links with
 // -no_weak_imports, so the absent ones need real weak definitions here; the
 // touch and button drivers replace them when they are ported.
-WEAK void native_touch_set_sink(void (*sink)(void *), void *context) { (void)sink; (void)context; }
+// Shared HID digitizer sink. This file is linked in every configuration, so the
+// storage has exactly one owner: the owned HID archive registers its notify
+// callback here, and every producer (the synthetic swipe and the Novatek touch
+// probe) calls native_touch_notify() after publishing a frame.
+static void (*native_touch_sink_fn)(void *);
+static void *native_touch_sink_context;
+void native_touch_set_sink(void (*sink)(void *), void *context) {
+    __atomic_store_n(&native_touch_sink_context, context, __ATOMIC_RELEASE);
+    __atomic_store_n(&native_touch_sink_fn, sink, __ATOMIC_RELEASE);
+}
+void native_touch_notify(void) {
+    void (*sink)(void *) = __atomic_load_n(&native_touch_sink_fn, __ATOMIC_ACQUIRE);
+    if (sink) sink(__atomic_load_n(&native_touch_sink_context, __ATOMIC_ACQUIRE));
+}
+int native_touch_sink_ready(void) {
+    return __atomic_load_n(&native_touch_sink_fn, __ATOMIC_ACQUIRE) != 0;
+}
 WEAK void native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context) { (void)sink; (void)context; }
 WEAK void (*sheng_ioconnect_hook)(void *, uint32_t, uint64_t, uint64_t, uint64_t);
 WEAK volatile uint32_t native_touch_loop_step;

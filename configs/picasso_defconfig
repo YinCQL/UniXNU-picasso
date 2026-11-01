@@ -62,6 +62,8 @@ CONFIG_XNU_BOOT_PROGRESS=y
 # is started (offline-hid-input=1), and the Home reports come from
 # offline-hid-auto-home; without those arguments nothing is published.
 CONFIG_XNU_SHENG_HIDINPUT=y
+# Novatek NT36672C touch: the GENI SPI probe and its embedded firmware.
+CONFIG_XNU_NOVATEK_TOUCH=y
 
 # prepare-picasso-ram-data.py writes the formatted APFS volume's actual UUID
 # into out/picasso/.config before compilation. An unprepared build must fail.

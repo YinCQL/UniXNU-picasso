@@ -170,11 +170,10 @@ __attribute__((noinline)) void native_hid_checkpoint(void) { __asm__ volatile(""
 // board touch producer yet, so this probe owns the sink: the weak definition in
 // PicassoBootProgressStubs.c would be a no-op and the driver has no timer left
 // to poll the seqlock.
-static void (*nativeTouchSink)(void *);
-static void *nativeTouchSinkContext;
-extern "C" void native_touch_set_sink(void (*sink)(void *),void *context) {
-    nativeTouchSink=sink;nativeTouchSinkContext=context;
-}
+// The sink storage lives in PicassoBootProgressStubs.c (always linked); this probe
+// only notifies after publishing a frame.
+extern "C" void native_touch_notify(void);
+extern "C" int native_touch_sink_ready(void);
 // One finger-set frame for the virtual digitizer. The reader (NativeHidInput::touchSend) treats an odd
 // sequence as torn and retries, so the sequence brackets the snapshot.
 static void swipePublish(unsigned count,int id,int x,int y) {
@@ -185,7 +184,7 @@ static void swipePublish(unsigned count,int id,int x,int y) {
     if(count){native_touch_ids[0]=id;native_touch_xs[0]=x;native_touch_ys[0]=y;}
     __asm__ volatile("dmb ish":::"memory");
     native_touch_seq=seq+2;
-    if(nativeTouchSink)nativeTouchSink(nativeTouchSinkContext);
+    native_touch_notify();
 }
 // Publish a frame and wait (bounded) for the event driver to take it; returns false when no report
 // moved in 200 ms, which means the digitizer is not attached and further frames are pointless.
@@ -278,7 +277,7 @@ void native_hid_input_probe(void) {
                         touchReady=true;
                     }
                     if(touchReady && swipeWanted) {
-                        printf("PICASSO_HID swipe armed sink=%u count=%u\n",nativeTouchSink?1:0,swipes);
+                        printf("PICASSO_HID swipe armed sink=%d count=%u\n",native_touch_sink_ready(),swipes);
                         swipeTotal=swipes;swipeSent=0;swipeDue=1;   // first gesture on the next monitor pass
                     }
                     // The offline devices live for this bounded boot. Its
