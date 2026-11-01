@@ -94,6 +94,12 @@ roots = [
   "com.apple.driver.ApplePMGR",
   "com.apple.filesystems.apfs",
   "com.apple.iokit.IOHIDFamily",
+  # The IOHIDFamily plug-in that turns device reports into IOHIDEvents. Without
+  # it prelinked, OSKext load requests are refused ("requests to user space are
+  # disabled") and an owned virtual HID device falls through to the DriverKit
+  # event driver, which waits forever for its user-space server and stalls the
+  # HID stack (the boot never reaches SpringBoard).
+  "com.apple.iokit.IOHIDEventDriver",
   # Original IOBSD-matched IOSurfaceRoot, required by graphics/media clients.
   "com.apple.iokit.IOSurface",
   # IOAcceleratorES parent for the discovery-only accelerator service. This
@@ -296,6 +302,17 @@ kernel_args = [
   "boot-ui-focus3=backboardd",
   "boot-ui-focus4=liveactivitiesd",
   "boot-ui-follow=1",
+  # Owned offline HID source (ShengHidInput). offline-hid-input=1 lets the probe
+  # attach a virtual keyboard through the ORIGINAL IOHIDDevice ABI;
+  # offline-hid-home=1 is the device-creation gate, and the auto-home series
+  # posts Home reports from 120 s after the probe, every 60 s, eight times, so
+  # the lock screen is unlocked whenever it appears. No touch driver is needed
+  # for this path.
+  "offline-hid-input=1",
+  "offline-hid-home=1",
+  "offline-hid-auto-home=120",
+  "offline-hid-auto-home-count=8",
+  "offline-hid-auto-home-interval=60",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
