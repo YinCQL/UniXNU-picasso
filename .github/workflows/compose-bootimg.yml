@@ -87,8 +87,10 @@ jobs:
           # Fixtures contain intentional symlinks. Upload only the result JSON.
           python3 scripts/check-picasso-ram-data.py --output out/picasso/host-checks/data \
             --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py"
+          python3 scripts/check-picasso-data-artifacts-host.py --output out/picasso/host-checks/payload-seed
           mkdir -p out/picasso/logs
           cp out/picasso/host-checks/data/results.json out/picasso/logs/data-host-check.json
+          cp out/picasso/host-checks/payload-seed/results.json out/picasso/logs/payload-seed-host.json
 
       - name: Check ephemeral keystore state boundaries
         if: ${{ !inputs.fast }}

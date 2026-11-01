@@ -8,7 +8,9 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import plistlib
 import runpy
+import stat
 import struct
 import subprocess
 import tomllib
@@ -26,6 +28,96 @@ def digest(path):
 def require(value, message):
     if not value:
         raise ValueError(message)
+
+
+def payload_seed(work, spec, report, base, inspect):
+    """Bind the builder's optional Setup copy to the validated original seed."""
+    require(type(report.get('skip_setup')) is bool, 'Invalid payload Setup mode')
+    if not report['skip_setup']:
+        require(report['data_ramdisk_sha256'] == base['packed_sha256'], 'Wrong payload seed')
+        return work / 'ram-data/data.dbrdisk', base, None
+    require(spec.get('skip_setup_tool') == 'scripts/picasso-seed-skip-setup.py',
+            'Unexpected payload Setup tool')
+    arguments = [str(arg) for arg in spec.get('skip_setup_args', [])]
+    # Match the cache name used by the pinned unixnu.payload.skip_setup_seed.
+    key = base['packed_sha256'][:12]
+    if arguments:
+        key += '-' + hashlib.sha256(' '.join(arguments).encode()).hexdigest()[:8]
+    path = work / 'payload' / f'data-skip-setup-{key}.dbr'
+    require(path.is_file() and path.with_suffix('.json').is_file(),
+            'Missing payload Setup seed or transformation report')
+    transform = json.loads(path.with_suffix('.json').read_text())
+    require(transform['base_sha256'] == base['raw_sha256'], 'Setup seed has the wrong base')
+    require(transform['build'] == firmware.BUILD, 'Setup seed has the wrong iOS build')
+    require(transform['no_auto_dim'] is ('--no-auto-dim' in arguments),
+            'Setup seed dim policy differs from board')
+    packed = inspect(path)
+    output = transform['output']
+    require(output['packed'] is True, 'Setup seed must remain packed')
+    for name, field in (('logical_bytes', 'bytes'), ('raw_sha256', 'sha256'),
+                        ('packed_bytes', 'encoded_bytes'), ('packed_sha256', 'encoded_sha256')):
+        require(packed[name] == output[field], f'Setup seed report mismatch: {name}')
+    require(packed['logical_bytes'] == base['logical_bytes'], 'Setup seed changed Data capacity')
+    require(report['data_ramdisk_sha256'] == packed['packed_sha256'], 'Wrong payload Setup seed')
+    return path, packed, transform
+
+
+def verify_setup_preferences(target, spec):
+    expected = {
+        'com.apple.migration': {'LastSystemVersion': firmware.BUILD,
+                               'DMUserDataDisposition': {'SyntheticDidUpgrade': False,
+                                                        'buildVersion': firmware.BUILD}},
+        'com.apple.purplebuddy': {'SetupDone': True, 'SetupFinishedAllSteps': True,
+                                 'SetupVersion': 11, 'daemonizeNeedsToRun': False},
+        'com.apple.springboard': {'BSUIVibrancyEffectViewDisabled': True},
+    }
+    arguments = spec.get('skip_setup_args', [])
+    if '--no-auto-dim' in arguments:
+        expected['com.apple.springboard'].update(SBDisableAutoDim=True,
+                                                SBDontDimOrLockOnAC=True, SBDisableIdleSleep=True)
+    for name, values in expected.items():
+        path = target / 'mobile/Library/Preferences' / (name + '.plist')
+        require(stat.S_ISREG(path.lstat().st_mode), f'Setup preference is not a file: {name}')
+        actual = plistlib.loads(path.read_bytes())
+        require(all(actual.get(key) == value for key, value in values.items()),
+                f'Payload Setup preferences differ: {name}')
+    injected = None
+    if '--inject-lib' in arguments:
+        require(arguments.count('--inject-lib') == 1, 'Duplicate Setup inject library')
+        index = arguments.index('--inject-lib') + 1
+        require(index < len(arguments), 'Missing Setup inject library path')
+        source = Path(arguments[index])
+        if not source.is_absolute():
+            source = ROOT / source
+        path = target / 'picasso/libpicasso-sb.dylib'
+        require(stat.S_ISREG(path.lstat().st_mode) and stat.S_IMODE(path.lstat().st_mode) == 0o644,
+                'Invalid payload SpringBoard library metadata')
+        require(digest(path) == digest(source), 'Payload SpringBoard library differs from build output')
+        injected = dict(path='picasso/libpicasso-sb.dylib', sha256=digest(path))
+    return dict(preferences=list(expected), injected_library=injected)
+
+
+def verify_payload_policy(path, packed, preparation, identity, spec, jobs, policy, output):
+    """Expand only validated extents, then audit the actual boot copy read-only."""
+    raw = output.with_suffix('.payload-data.cdr')
+    blob = path.read_bytes()
+    count = packed['extent_count']
+    cursor = 32 + count * 16
+    with raw.open('xb') as stream:
+        stream.truncate(packed['logical_bytes'])
+        for index in range(count):
+            offset, length = struct.unpack_from('<QQ', blob, 32 + index * 16)
+            stream.seek(offset)
+            require(stream.write(blob[cursor:cursor + length]) == length, 'Short payload Data expansion')
+            cursor += length
+    require(preparation['inspect_packed'](path, raw=raw) == packed, 'Payload Data expansion mismatch')
+    mountpoint = output.with_suffix('.payload-policy-mount')
+    with preparation['mounted'](raw, mountpoint, readonly=True) as info:
+        require(str(uuid.UUID(info['VolumeUUID'])).upper() == identity, 'Payload Data UUID mismatch')
+        actual = preparation['verify_offline_policy'](mountpoint, jobs)
+        require(actual == policy, 'Payload Data offline policy differs from base seed')
+        settings = verify_setup_preferences(mountpoint, spec)
+    return actual, settings
 
 
 def check(work, tree, output):
@@ -108,14 +200,18 @@ def check(work, tree, output):
     require(payload.stat().st_size == 60 * 1024**2, 'Incorrect FAT payload size')
     payload_report = json.loads(payload.with_suffix('.json').read_text())
     require(payload_report['payload_sha256'] == digest(payload), 'Stale payload report')
-    require(payload_report['data_ramdisk_sha256'] == packed['packed_sha256'], 'Wrong payload seed')
+    data_path, payload_packed, transformation = payload_seed(work, spec, payload_report, packed, inspect)
+    payload_policy, setup_settings = policy, None
+    if transformation is not None:
+        payload_policy, setup_settings = verify_payload_policy(
+            data_path, payload_packed, preparation, identity, spec, jobs, policy, output)
     require(payload_report['kernel_args'] == ' '.join(spec['kernel_args']), 'Unexpected boot arguments')
     extracted = output.with_suffix('.files')
     extracted.mkdir(parents=True, exist_ok=False)
     subprocess.run(['mcopy', '-i', str(payload), '-s', '::/EFI', str(extracted)], check=True)
     directory = extracted / 'EFI/UniXNU'
     files = directory / 'Payloads'
-    require(digest(files / 'scratch-data.img') == packed['packed_sha256'], 'FAT Data bytes mismatch')
+    require(digest(files / 'scratch-data.img') == payload_packed['packed_sha256'], 'FAT Data bytes mismatch')
     require(digest(files / 'kernel.macho') == digest(kernel), 'FAT kernel bytes mismatch')
     require(digest(files / 'kernel.macho.trustcache') == payload_report['trust_cache_sha256'],
             'FAT trust cache bytes mismatch')
@@ -139,6 +235,8 @@ def check(work, tree, output):
                   kernel_sha256=digest(kernel), storage_imports=imports['imports'],
                   owned_memory_request_bytes=owned,
                   offline_launch_policy=policy,
+                  payload_packed=payload_packed, payload_seed_transformation=transformation,
+                  payload_offline_launch_policy=payload_policy, payload_setup_settings=setup_settings,
                   persistent=False, hardware_tested=False)
     output.write_text(json.dumps(report, indent=2) + '\n')
     return report
