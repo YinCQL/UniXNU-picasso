@@ -44,6 +44,7 @@ struct {
     bool watchdog_armed, hold, trace_polling, rx_busy;
     uintptr_t wdt;
     uint64_t events;
+    uint64_t session_deadline;
 } ud;
 static bool pur_live;
 enum Action { NoAction, EnterPanic, RequestReboot, RequestHang, RequestPanic, RequestReset };
@@ -350,7 +351,7 @@ def extract_production(patch, out):
         raise ValueError(f'Incorrect new-file hunk count: {count} != {len(lines) - 1}')
     source = '\n'.join(line[1:] for line in lines[1:]) + '\n'
     (out / 'picasso_usb.c').write_text(source, encoding='utf-8', newline='\n')
-    backend_names = ['picasso_watchdog_enter', 'picasso_watchdog_leave',
+    backend_names = ['picasso_watchdog_enter', 'picasso_watchdog_leave', 'picasso_usb_watchdog_terminal',
                      'picasso_watchdog_live_locked', 'picasso_watchdog_config_locked',
                      'picasso_watchdog_pet_locked']
     names = ['picasso_usb_watchdog_pet', 'ud_poll_serialized', 'picasso_usb_console_drive_poll',

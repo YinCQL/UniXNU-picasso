@@ -27,6 +27,7 @@ bool picasso_power_source_publish(void);
 void picasso_keystore_probe(void);
 void picasso_hid_start_later(void);
 void picasso_hid_frame_presented(void);
+void picasso_hid_content_presented(void);
 IOService *native_legacy_display_allocate(void);
 kern_return_t OSKextLoadKextWithIdentifier(const char *);
 }
@@ -126,6 +127,9 @@ extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t byte
 extern "C" void native_legacy_vsync_observed(unsigned event, unsigned hz) { report(11, event, hz, 0); }
 extern "C" void native_legacy_frame_observed(unsigned kind, uint64_t pixels, uint64_t minx, uint64_t miny, uint64_t maxx, uint64_t maxy) {
     if(kind!=2)picasso_hid_frame_presented();
+    // A substantial rendered UI, not the centered logo or a blank, ends boot input.
+    if(kind==0 && pixels!=UINT64_MAX && pixels>=1080ULL*2400/8)
+        picasso_hid_content_presented();
     static unsigned count, frames;
     // Count every completed copy/blank/held request; unscanned pixels are unknown.
     unsigned frame = __atomic_add_fetch(&frames, 1, __ATOMIC_RELAXED);

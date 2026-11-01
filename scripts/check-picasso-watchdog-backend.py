@@ -49,8 +49,10 @@ def extract(device, out):
         body = function(source, name)
         assert re.search(r'\{\s*picasso_usb_watchdog_terminal\(\);', body), name
     for field in ('panic_pending', 'reset_pending', 'hang_pending', 'reboot_pending'):
-        assert source.count(f'ud.{field} = true;') == 1
-        assert f'picasso_usb_watchdog_terminal();\n\t\tud.{field} = true;' in source
+        assignments = list(re.finditer(r'ud\.' + field + r' = true;', source))
+        assert len(assignments) == (2 if field == 'reboot_pending' else 1)
+        for assignment in assignments:
+            assert source[:assignment.start()].rstrip().endswith('picasso_usb_watchdog_terminal();')
     header = (device / 'package/PicassoWatchdogBackend.h').read_text(encoding='utf-8')
     for name in ('claim', 'enable', 'disable', 'pet'):
         declaration = f'bool picasso_watchdog_backend_{name}(const void *owner);'

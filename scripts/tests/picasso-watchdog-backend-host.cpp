@@ -56,6 +56,7 @@ struct {
  uint32_t poll_lock,reset_mode;
  uintptr_t wdt;
  unsigned long long commands,events,chars,rx_bytes;
+ uint64_t session_deadline;
  char cmd[80];
 } ud;
 static bool pur_live=true,pu_panic_active;

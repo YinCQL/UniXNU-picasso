@@ -1910,6 +1910,19 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
  fi
  OWNER_CRYPTEX_FILES=${XNU_OWNER_CRYPTEX_FILES:-0}
  if [ "$OWNER_CRYPTEX_FILES" != 0 ] && [ "$OWNER_CRYPTEX_FILES" != 1 ]; then
+@@ -629,6 +629,12 @@
+     KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$UFS_ARCHIVE"
+     KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $UFS_ARCHIVE"
+   fi
++  if [ "${XNU_NOVATEK_TOUCH:-0}" = 1 ]; then
++    NOVATEK_ARCHIVE=$ROOT/build/novatek-touch/libNativeNovatekTouch.a
++    test -f "$NOVATEK_ARCHIVE"
++    KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$NOVATEK_ARCHIVE"
++    KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $NOVATEK_ARCHIVE"
++  fi
+   if [ "${XNU_NATIVE_ADRENO:-0}" = 1 ]; then
+     # NativeAdreno plus its kits (scripts/build-native-adreno-kits.py). No personality is installed: the
+     # board probe calls NativeAdrenoGmuContextBringup directly once it has powered the GPU CX domain.
 diff --git a/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
 new file mode 100644
 --- /dev/null

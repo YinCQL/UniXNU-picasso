@@ -7,7 +7,9 @@ struct PicassoHidPlan {
     enum Action { Idle, Contact, Release };
     uint64_t due = 0, deadline = 0;
     unsigned limit = 0, sent = 0, frame = 0, expected = 0;
-    bool active = false, waiting = false, releasing = false;
+    bool active = false, waiting = false, releasing = false, stopped = false;
+
+    void stop() { stopped = true; limit = sent; }
 
     void arm(uint64_t now, unsigned count, uint32_t delayMs = 125000) {
         limit = count > 8 ? 8 : count;
@@ -23,6 +25,11 @@ struct PicassoHidPlan {
                 releasing = true; expected = reports + 1; deadline = now + 200;
                 return Release;
             } else return Idle;
+        }
+        if (stopped) {
+            if (!active) return Idle;
+            releasing = true; waiting = true; expected = reports + 1; deadline = now + 200;
+            return Release;
         }
         if (!active) {
             if (!ready || !limit || sent >= limit || now < due) return Idle;

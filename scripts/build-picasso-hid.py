@@ -131,7 +131,8 @@ def build(root, platform, native, record, out, board):
     objects = []
     for source in sources:
         obj = out / (source.stem + '.o')
-        command = platform.compile_command(record, source, obj, root) + ['-I', str(out), '-I', str(source.parent), '-mgeneral-regs-only']
+        command = platform.compile_command(record, source, obj, root) + ['-I', str(out), '-I', str(source.parent),
+            '-I', str(root / 'drivers/NativeNovatekTouch'), '-mgeneral-regs-only']
         platform.run(command, obj.with_suffix('.compile.log'), record['directory'])
         platform.inspect_object(obj, native)
         if source.stem == 'NativeHidInput':

@@ -93,6 +93,11 @@ jobs:
           python3 scripts/build-picasso-sb-inject.py \
             package/picasso-springboard/picasso-sb-probe.m out/picasso/libpicasso-sb.dylib
 
+      - name: Prepare authenticated stock touch firmware
+        run: |
+          python3 scripts/fetch-picasso-touch-firmware.py --output out/picasso/novatek/firmware.bin
+          echo "NOVATEK_TOUCH_FW=$PWD/out/picasso/novatek/firmware.bin" >> "$GITHUB_ENV"
+
       - name: Download the target IPSW
         run: |
           mkdir -p out/ipsw
@@ -278,6 +283,10 @@ jobs:
             device/out/picasso/tree/build/native-legacy-display/*.o
             device/out/picasso/tree/build/native-legacy-display/*.a
             device/out/picasso/tree/build/native-legacy-display/*.h
+            device/out/picasso/tree/build/novatek-touch/*.json
+            device/out/picasso/tree/build/novatek-touch/*.o
+            device/out/picasso/tree/build/novatek-touch/*.a
+            device/out/picasso/novatek/*.json
             device/out/picasso/tree/build/xnu/**/kern_exec.cpo.json
             device/out/picasso/tree/build/xnu/**/vfs_syscalls.cpo.json
             device/out/picasso/ram-data/*.json

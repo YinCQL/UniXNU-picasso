@@ -272,6 +272,7 @@ def main():
     hid_objects, hid_sources = hid.build(ROOT, platform, native, record, out, board)
     objects += hid_objects
     sources += hid_sources
+    sources += [ROOT / 'drivers/NativeNovatekTouch/TouchPublish.h']
     pending = Path(tempfile.mkdtemp(prefix='qualified-display-', dir=out)) / 'libNativeLegacyDisplay.late.a'
     platform.run(['xcrun', 'ar', 'rcs', pending, *objects], out / 'archive.log')
     members = platform.check_archive_members(platform.run(['xcrun', 'ar', 't', pending], out / 'members.log').splitlines(), objects)

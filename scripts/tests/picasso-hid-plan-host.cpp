@@ -58,5 +58,15 @@ int main() {
     assert(p.poll(9000,0,true,true)==Plan::Contact);++cases;
     p={};p.arm(1000,1,0);
     assert(p.poll(1000,0,true,true)==Plan::Contact);++cases;
+    p={};p.arm(0,8,0);p.stop();
+    assert(p.poll(999999,0,true,true)==Plan::Idle && p.sent==0);++cases;
+    p={};p.arm(0,8,0);assert(p.poll(0,0,true,true)==Plan::Contact);p.stop();
+    assert(p.poll(1,0,true,true)==Plan::Idle);
+    assert(p.poll(2,1,true,true)==Plan::Release);
+    assert(p.poll(3,2,true,true)==Plan::Idle && !p.active);
+    assert(p.poll(999999,2,true,true)==Plan::Idle && p.sent==1);++cases;
+    p={};p.arm(0,8,0);assert(p.poll(0,0,true,true)==Plan::Contact);p.stop();
+    assert(p.poll(200,0,true,true)==Plan::Release);
+    assert(p.poll(400,0,false,false)==Plan::Idle && !p.active);++cases;
     printf("PASS %u HID pacing, completion, timeout, release and attempt-budget cases\n", cases);
 }

@@ -12,6 +12,7 @@
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
 #include "PicassoHidPlan.h"
+#include "TouchPublish.h"
 
 extern "C" {
 extern kmod_info_t g_kernel_kmod_info;
@@ -21,6 +22,8 @@ kern_return_t OSKextLoadKextWithIdentifier(const char *);
 volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
 volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
 volatile uint32_t native_hid_input_command;
+volatile uint32_t native_touch_writer_lock;
+void native_novatek_touch_probe(void);
 }
 
 static IOService *inputDevice;
@@ -33,6 +36,16 @@ static void (*touchSink)(void *);
 static void *touchContext;
 static unsigned reports[8];
 static int results[8];
+static unsigned autoStop;
+
+extern "C" void picasso_hid_content_presented(void) {
+    unsigned expected = 0;
+    __atomic_compare_exchange_n(&autoStop, &expected, 1, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+
+extern "C" void picasso_hid_physical_contact(void) {
+    __atomic_store_n(&autoStop, 2, __ATOMIC_RELEASE);
+}
 
 static uint64_t milliseconds() {
     uint64_t ns = 0;
@@ -42,6 +55,10 @@ static uint64_t milliseconds() {
 
 extern "C" void native_touch_set_sink(void (*sink)(void *), void *context) {
     touchSink = sink; touchContext = context;
+}
+
+extern "C" void native_touch_notify(void) {
+    if (touchSink) touchSink(touchContext);
 }
 
 // No physical button producer is linked on this board. Resolve its optional
@@ -97,7 +114,8 @@ extern "C" void native_hid_live_checkpoint(IOService *device) {
 
 extern "C" bool native_hid_input_requested(void) {
     if (__atomic_exchange_n(&native_hid_input_command, 0, __ATOMIC_ACQ_REL) == 1) return true;
-    if (!__atomic_load_n(&planArmed, __ATOMIC_ACQUIRE) || homeSent >= homeLimit || milliseconds() < homeDue) return false;
+    if (__atomic_load_n(&autoStop, __ATOMIC_ACQUIRE) ||
+        !__atomic_load_n(&planArmed, __ATOMIC_ACQUIRE) || homeSent >= homeLimit || milliseconds() < homeDue) return false;
     ++homeSent; homeDue = milliseconds() + 60000;
     return true;
 }
@@ -106,15 +124,13 @@ extern "C" void picasso_hid_frame_presented(void) {
     __atomic_add_fetch(&presented, 1, __ATOMIC_RELAXED);
 }
 
+static void notifyPublished(void *) { native_touch_notify(); }
+
 static void publishContact(unsigned count, int y) {
-    const uint32_t seq = native_touch_seq;
-    native_touch_seq = seq + 1;
-    __asm__ volatile("dmb ish" ::: "memory");
-    native_touch_count = count;
-    if (count) { native_touch_ids[0] = 1; native_touch_xs[0] = 15240; native_touch_ys[0] = y; }
-    __asm__ volatile("dmb ish" ::: "memory");
-    native_touch_seq = seq + 2;
-    if (touchSink) touchSink(touchContext);
+    const int x = 15240, id = 1;
+    nvt_touch_publication publication = {&native_touch_seq, &native_touch_count,
+        native_touch_xs, native_touch_ys, native_touch_ids, 12, notifyPublished, nullptr, &native_touch_writer_lock};
+    nvt_touch_publish_if(&publication, &x, &y, &id, count, &autoStop);
 }
 
 static void attachInput() {
@@ -155,7 +171,20 @@ static void inputTick(thread_call_param_t, thread_call_param_t) {
     const uint64_t now = milliseconds();
     const bool ready = touchSink && __atomic_load_n(&reports[3], __ATOMIC_ACQUIRE) &&
         __atomic_load_n(&results[3], __ATOMIC_ACQUIRE) == 1;
-    if (!planArmed && ready && __atomic_load_n(&presented, __ATOMIC_RELAXED) >= 2) {
+    static bool touchStarted, stopPrinted;
+    if (ready && !touchStarted) { touchStarted = true; native_novatek_touch_probe(); }
+    unsigned stopped = __atomic_load_n(&autoStop, __ATOMIC_ACQUIRE);
+    if (stopped && !stopPrinted) {
+        stopPrinted = true;
+        IOLog("PICASSO_HID automatic input stopped reason=%s time_ms=%llu\n",
+            stopped == 2 ? "physical-contact" : "visible-content", now);
+    }
+    if (stopped == 2) {
+        // The physical report replaces virtual fingers; do not lift the user's contact.
+        gesture = {}; return;
+    }
+    if (stopped) gesture.stop();
+    if (!stopped && !planArmed && ready && __atomic_load_n(&presented, __ATOMIC_RELAXED) >= 2) {
         unsigned count = 0;
         PE_parse_boot_argn("offline-hid-auto-home-count", &count, sizeof(count));
         homeLimit = count > 8 ? 8 : count;
@@ -179,7 +208,7 @@ static void inputTick(thread_call_param_t, thread_call_param_t) {
     if (wasActive && !gesture.active)
         IOLog("PICASSO_HID swipe=%u reports=%u result=%x\n", gesture.sent, native_touch_hid_reports,
             __atomic_load_n(&results[6], __ATOMIC_ACQUIRE));
-    if (planArmed && !gesture.active && gesture.sent >= gesture.limit) return;
+    if ((stopped || planArmed) && !gesture.active && gesture.sent >= gesture.limit) return;
     uint64_t deadline = 0;
     clock_interval_to_deadline(gesture.active ? 16 : 1000, kMillisecondScale, &deadline);
     thread_call_enter_delayed(inputCall, deadline);
