@@ -1914,7 +1914,7 @@ diff --git a/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch b/patches/xnu/z
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
-@@ -0,0 +1,2063 @@
+@@ -0,0 +1,2068 @@
 +diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 +--- a/bsd/vfs/vfs_syscalls.c
 ++++ b/bsd/vfs/vfs_syscalls.c
@@ -2361,7 +2361,7 @@ new file mode 100644
 +
 + #if SYSV_SHM
 + #include <sys/shm_internal.h>   /* shmexit */
-+@@ -1359,6 +1364,327 @@
++@@ -1359,6 +1364,332 @@
 +
 + #define OS_REASON_TOTAL_USER_FAULTS_PER_PROC  5
 +
@@ -2617,9 +2617,8 @@ new file mode 100644
 ++	}
 ++}
 ++
-++/* Diagnostic: SpringBoard waits in notify_register_check for notifyd. Every two
-++ * minutes after the framebuffer client opens, fifteen times, print the receive queues,
-++ * workqueue and threads of both, and the runnable threads, without ending anyone. */
+++/* Every two minutes after the framebuffer client opens, take bounded snapshots
+++ * of UI services and their initialization dependencies without ending anyone. */
 ++#include <kern/clock.h>
 ++#define PICASSO_SNAPSHOT_COUNT 15
 ++#define PICASSO_SNAPSHOT_PERIOD_S 120ull
@@ -2657,13 +2656,19 @@ new file mode 100644
 ++	static unsigned taken;
 ++	thread_call_t call = param1;
 ++	(void)param0;
-++	printf("PICASSO_WAIT snapshot %u of %u\n", taken + 1, PICASSO_SNAPSHOT_COUNT);
+++	uint64_t uptime_ns = 0;
+++	absolutetime_to_nanoseconds(mach_absolute_time(), &uptime_ns);
+++	printf("PICASSO_WAIT snapshot %u of %u uptime_ms=%llu\n", taken + 1, PICASSO_SNAPSHOT_COUNT, uptime_ns / 1000000);
 ++	proc_t client = picasso_dump_named_proc("SpringBoard");
 ++	if (client != PROC_NULL) proc_rele(client);
 ++	proc_t p = picasso_dump_named_proc("notifyd");
 ++	if (p != PROC_NULL) proc_rele(p);
 ++	proc_t seeder = picasso_dump_named_proc("lsd");
 ++	if (seeder != PROC_NULL) proc_rele(seeder);
+++	proc_t compositor = picasso_dump_named_proc("backboardd");
+++	if (compositor != PROC_NULL) proc_rele(compositor);
+++	proc_t widgets = picasso_dump_named_proc("chronod");
+++	if (widgets != PROC_NULL) proc_rele(widgets);
 ++	picasso_dump_runnable();
 ++	if (++taken < PICASSO_SNAPSHOT_COUNT) {
 ++		uint64_t interval = 0;
