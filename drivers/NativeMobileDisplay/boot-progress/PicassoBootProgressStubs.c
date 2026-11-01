@@ -16,9 +16,25 @@ WEAK char native_touch_rows[4][120];
 WEAK char native_cpufreq_row[120];
 WEAK volatile uint32_t native_hid_input_events[8];
 WEAK volatile int native_hid_input_results[8];
+// Owned offline HID source (ShengHidInput). The real definitions live in
+// libShengHidInput.a and override these; the weak set keeps the kernel link
+// valid when CONFIG_XNU_SHENG_HIDINPUT is off.
+WEAK void native_hid_input_probe(void) {}
+WEAK void native_hid_swipe_tick(unsigned now) { (void)now; }
+WEAK volatile uint32_t native_hid_stage, native_hid_resource_found;
+WEAK volatile int native_hid_load_status, native_hid_input_meta_status;
+WEAK volatile uint64_t native_hid_input_object;
+// Optional producers the sheng HID source binds weakly. The kernel links with
+// -no_weak_imports, so the absent ones need real weak definitions here; the
+// touch and button drivers replace them when they are ported.
+WEAK void native_touch_set_sink(void (*sink)(void *), void *context) { (void)sink; (void)context; }
+WEAK void native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context) { (void)sink; (void)context; }
+WEAK void (*sheng_ioconnect_hook)(void *, uint32_t, uint64_t, uint64_t, uint64_t);
 WEAK volatile uint32_t native_touch_loop_step;
 WEAK volatile uint32_t native_touch_seq;
 WEAK volatile uint32_t native_touch_count;
+// Referenced by the owned HID source (ShengHidInput) for its touch timeline.
+WEAK volatile uint32_t native_touch_hid_reports;
 WEAK volatile int native_touch_xs[12];
 WEAK volatile int native_touch_ys[12];
 WEAK volatile int native_touch_ids[12];

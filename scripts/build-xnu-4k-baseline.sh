@@ -84,6 +84,18 @@ if [ "$BOOT_PROGRESS" = 1 ]; then
   fi
   python3 scripts/build-boot-progress.py
 fi
+SHENG_HIDINPUT=${XNU_SHENG_HIDINPUT:-0}
+if [ "$SHENG_HIDINPUT" != 0 ] && [ "$SHENG_HIDINPUT" != 1 ]; then
+  echo 'XNU_SHENG_HIDINPUT must be 0 or 1' >&2
+  exit 1
+fi
+if [ "$SHENG_HIDINPUT" = 1 ]; then
+  if [ "$BOOT_PROGRESS" != 1 ]; then
+    echo 'ShengHidInput needs the boot-progress build: its probe call site lives in BootProgress.c' >&2
+    exit 1
+  fi
+  python3 scripts/build-sheng-hid-input.py
+fi
 python3 - "$BOOT_PROGRESS" <<'PY'
 from pathlib import Path
 import hashlib, sys
@@ -762,6 +774,10 @@ PY_BINDINGS
   if [ "$BOOT_PROGRESS" = 1 ]; then
     KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$ROOT/build/boot-progress/libBootProgress.a"
     KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $ROOT/build/boot-progress/libBootProgress.a"
+  fi
+  if [ "$SHENG_HIDINPUT" = 1 ]; then
+    KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$ROOT/build/sheng-hid-input/libShengHidInput.a"
+    KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $ROOT/build/sheng-hid-input/libShengHidInput.a"
   fi
   KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES ${XNU_EXTRA_LD_ARCHIVES:-}"
   EXTRA_MAKE_ARGS+=("LD_KERNEL_ARCHIVES=$KERNEL_EXTRA_ARCHIVES")
