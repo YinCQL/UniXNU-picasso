@@ -194,7 +194,8 @@ def verify_kernel(aes, native, original, kernel, plan, audit):
         require(symbols.get(name) == target, 'Wrong linked display alias ' + name)
         require(any(e['module'] in (FAMILY, 'com.apple.iokit.IOSurface') and e['va'] <= target < e['va'] + e['size']
                     for e in plan['extents']), 'Display alias outside retained original component ' + name)
-    for name in ('_native_legacy_display_probe', '_native_legacy_display_late_probe'):
+    for name in ('_native_legacy_display_probe', '_native_legacy_display_late_probe',
+                 '_picasso_accelerator_allocate', '__GLOBAL__sub_I_PicassoAccelerator.cpp'):
         require(name in symbols, 'Missing display lifecycle ' + name)
     for name in ('_picasso_keystore_probe', '_picasso_aks_state_enabled', '_picasso_aks_observed',
                  '_native_keyevents_allocate', '__GLOBAL__sub_I_NativeKeyStoreEvents.cpp',
@@ -241,7 +242,8 @@ def main():
     record = json.loads((ROOT / platform.RECORD).read_text().strip().rstrip(','))
     objects = []
     sources = [source_dir / 'NativeLegacyDisplay.cpp', ROOT / 'kits/picasso/PicassoDisplay.cpp',
-               ROOT / 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp', ROOT / 'kits/picasso/PicassoKeyStore.cpp']
+               ROOT / 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp', ROOT / 'kits/picasso/PicassoKeyStore.cpp',
+               ROOT / 'kits/picasso/PicassoAccelerator.cpp']
     audit = None
     for source in sources:
         obj = out / (source.stem + '.o')
@@ -250,7 +252,7 @@ def main():
         if source.stem == 'NativeLegacyDisplay':
             audit = audit_object(platform, native, obj, slots, aliases, names)
             platform.write_json(out / 'object-audit.json', audit)
-        if source.stem in ('NativeLegacyDisplay', 'NativeKeyStoreEvents'):
+        if source.stem in ('NativeLegacyDisplay', 'NativeKeyStoreEvents', 'PicassoAccelerator'):
             late = out / (source.stem + '.late.o')
             objcopy = shutil.which('llvm-objcopy')
             require(objcopy, 'llvm-objcopy required')

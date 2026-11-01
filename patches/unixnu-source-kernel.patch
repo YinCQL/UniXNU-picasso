@@ -87,13 +87,13 @@ index 0000000..8449d72
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
 +@@ -107,6 +107,7 @@ bsd/dev/random/randomdev.c		standard
-+ 
++
 + bsd/dev/memdev.c			standard
 + bsd/dev/mem.c				standard
 ++bsd/dev/picasso_usb.c			standard
 + bsd/dev/munge.c 			optional config_requires_u32_munging
 + bsd/dev/unix_startup.c			standard
-+ 
++
 +diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
 +new file mode 100644
 +index 0000000..bfe7ccc
@@ -1515,13 +1515,13 @@ index 0000000..8449d72
 ++++ b/bsd/kern/bsd_init.c
 +@@ -506,6 +506,10 @@ bsd_init(void)
 + 	throttle_init();
-+ 
++
 + 	printf(copyright);
 ++	{
 ++		extern void picasso_usb_console_start(void);
 ++		picasso_usb_console_start();
 ++	}
-+ 
++
 + #if CONFIG_DEV_KMEM
 + 	bsd_init_kprintf("calling dev_kmem_init\n");
 +diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
@@ -1538,7 +1538,7 @@ index 0000000..8449d72
 ++		 * recursive '\r' also lands here and is stored exactly once. */
 ++		picasso_usb_log_char(c);
 ++	}
-+ 
++
 + 	cons_ops[idx].putc(c, poll);
 + }
 diff --git a/patches/xnu/zzzz-picasso-panic-null-guard.patch b/patches/xnu/zzzz-picasso-panic-null-guard.patch
@@ -1551,7 +1551,7 @@ index 0000000..095e8da
 +--- a/pexpert/arm/pe_init.c
 ++++ b/pexpert/arm/pe_init.c
 +@@ -165,6 +165,15 @@ check_for_panic_log(void)
-+ 
++
 + #endif
 + 	panic_info = (struct embedded_panic_header *)gPanicBase;
 ++	/* picasso: while startup_phase < STARTUP_SUB_KMEM, io_map() hands back
@@ -1563,7 +1563,7 @@ index 0000000..095e8da
 ++	if (gPanicBase == 0) {
 ++		return;
 ++	}
-+ 
++
 + 	/* Check if a shared memory console is running in the panic buffer */
 + 	if (panic_info->eph_magic == 'SHMC') {
 diff --git a/scripts/unixnu/kernel.py b/scripts/unixnu/kernel.py
@@ -1799,12 +1799,13 @@ diff --git a/patches/xnu/offline-owner-cache-carrier.patch b/patches/xnu/offline
 diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
 --- a/scripts/build-xnu-4k-baseline.sh
 +++ b/scripts/build-xnu-4k-baseline.sh
-@@ -35,7 +35,11 @@
+@@ -35,7 +35,12 @@
  # Remove them first so earlier independent patches retain their idempotent checks.
  # The same holds for the boot-time GPU addon mount and the staged system apps copy (zzy), which edit the owner Data mount function
  # inside the systemos patch. Reverse newest first; the loop below re-applies them in name order.
 -for LATE_PATCH in "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \
-+for LATE_PATCH in "$ROOT/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch" \
++for LATE_PATCH in "$ROOT/patches/xnu/zzzzzz-picasso-ios16-framebuffer-swap.patch" \
++    "$ROOT/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch" \
 +    "$ROOT/patches/xnu/zzzz-picasso-systemos-union.patch" \
 +    "$ROOT/patches/xnu/zzz-picasso-usb-console.patch" \
 +    "$ROOT/patches/xnu/zzz-picasso-console-ring.patch" \
@@ -1913,7 +1914,7 @@ diff --git a/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch b/patches/xnu/z
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch
-@@ -0,0 +1,1996 @@
+@@ -0,0 +1,2063 @@
 +diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 +--- a/bsd/vfs/vfs_syscalls.c
 ++++ b/bsd/vfs/vfs_syscalls.c
@@ -1922,7 +1923,7 @@ new file mode 100644
 + #include <kern/kalloc.h>
 + #include <kern/task.h>
 ++#include <kern/thread.h>
-+ 
++
 + #include <vm/vm_pageout.h>
 + #include <vm/vm_protos.h>
 +@@ -4578,6 +4579,21 @@
@@ -1950,7 +1951,7 @@ new file mode 100644
 +@@ -4592,6 +4608,26 @@
 + 	struct vfs_context context;
 + 	vnode_t authvp = NULLVP;
-+ 
++
 ++#if DEVELOPMENT || DEBUG
 ++	static unsigned pid1_open_count;
 ++	unsigned pid1_open_ticket = proc_getpid(p) == 1 ?
@@ -1972,7 +1973,7 @@ new file mode 100644
 ++#endif
 ++
 + 	oflags = uflags;
-+ 
++
 + 	amode = oflags & O_ACCMODE;
 +@@ -4601,7 +4637,7 @@
 + 	 * with FREAD/FWRITE.
@@ -1981,11 +1982,11 @@ new file mode 100644
 +-		return EINVAL;
 ++		PICASSO_PID1_OPEN_RETURN(EINVAL);
 + 	}
-+ 
++
 + 	flags = FFLAGS(uflags);
 +@@ -4612,7 +4648,7 @@
 + 	AUDIT_ARG(mode, vap->va_mode);
-+ 
++
 + 	if ((error = falloc_withinit(p, p_cred, ctx, &fp, &indx, fp_init, initarg)) != 0) {
 +-		return error;
 ++		PICASSO_PID1_OPEN_RETURN(error);
@@ -2000,7 +2001,7 @@ new file mode 100644
 ++			PICASSO_PID1_OPEN_RETURN(error);
 + 		}
 + 	}
-+ 
++
 +@@ -4647,14 +4683,14 @@
 + 		if ((error == ENODEV || error == ENXIO) && (uu->uu_dupfd >= 0)) {
 + 			if ((error = dupfdopen(p, indx, uu->uu_dupfd, flags, error)) == 0) {
@@ -2016,12 +2017,12 @@ new file mode 100644
 +-		return error;
 ++		PICASSO_PID1_OPEN_RETURN(error);
 + 	}
-+ 
++
 + 	if (authvp != NULLVP) {
 +@@ -4858,7 +4894,7 @@
-+ 
++
 + 	*retval = indx;
-+ 
++
 +-	return 0;
 ++	PICASSO_PID1_OPEN_RETURN(0);
 + bad:
@@ -2030,13 +2031,13 @@ new file mode 100644
 +@@ -4878,8 +4914,9 @@
 + 	vnode_put(vp);
 + 	fp_free(p, indx, fp);
-+ 
++
 +-	return error;
 +-}
 ++	PICASSO_PID1_OPEN_RETURN(error);
 ++}
 ++#undef PICASSO_PID1_OPEN_RETURN
-+ 
++
 + /*
 +  * While most of the *at syscall handlers can call nameiat() which
 +diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
@@ -2095,9 +2096,9 @@ new file mode 100644
 ++	}
 ++}
 ++#endif
-+ 
++
 + #include <sys/paths.h>
-+ 
++
 +@@ -287,6 +336,11 @@
 + 		goto error_out;
 + 	}
@@ -2109,7 +2110,7 @@ new file mode 100644
 ++#endif
 + 	ndp->ni_pathlen = (u_int)bytes_copied;
 + 	bytes_copied = 0;
-+ 
++
 +diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
 +--- a/bsd/vm/vm_unix.c
 ++++ b/bsd/vm/vm_unix.c
@@ -2161,12 +2162,12 @@ new file mode 100644
 ++#else
 ++#define PICASSO_PID1_SETUP_STAGE(value) do { (void)0; } while (0)
 ++#endif
-+ 
++
 + 	SHARED_REGION_TRACE_DEBUG(
 + 		("shared_region: %p [%d(%s)] -> map\n",
 +@@ -2349,6 +2386,7 @@
 + 	}
-+ 
++
 + 	/* get the process's shared region (setup in vm_map_exec()) */
 ++	PICASSO_PID1_SETUP_STAGE("shared_region");
 + 	shared_region = vm_shared_region_trim_and_get(current_task());
@@ -2193,7 +2194,7 @@ new file mode 100644
 + 			continue;
 +@@ -2427,6 +2470,7 @@
 + 		}
-+ 
++
 + 		/* get file structure from file descriptor */
 ++		PICASSO_PID1_SETUP_STAGE("file_descriptor");
 + 		error = fp_get_ftype(p, srfmp->fd, DTYPE_VNODE, EINVAL, &srfmp->fp);
@@ -2201,7 +2202,7 @@ new file mode 100644
 + 			SHARED_REGION_TRACE_ERROR(
 +@@ -2438,6 +2482,7 @@
 + 		}
-+ 
++
 + 		/* we need at least read permission on the file */
 ++		PICASSO_PID1_SETUP_STAGE("read_permission");
 + 		if (!(srfmp->fp->fp_glob->fg_flag & FREAD)) {
@@ -2209,7 +2210,7 @@ new file mode 100644
 + 				("shared_region: %p [%d(%s)] map: "
 +@@ -2449,6 +2494,7 @@
 + 		}
-+ 
++
 + 		/* get vnode from file structure */
 ++		PICASSO_PID1_SETUP_STAGE("file_vnode");
 + 		error = vnode_getwithref((vnode_t)fp_get_data(srfmp->fp));
@@ -2226,7 +2227,7 @@ new file mode 100644
 +@@ -2544,6 +2591,7 @@
 + root_check:
 + #endif /* XNU_TARGET_OS_OSX && defined(__arm64__) */
-+ 
++
 ++		PICASSO_PID1_SETUP_STAGE("root_ownership");
 + 		/* The shared cache file must be owned by root */
 + 		VATTR_INIT(&va);
@@ -2234,7 +2235,7 @@ new file mode 100644
 +@@ -2576,6 +2624,7 @@
 + after_root_check:
 + #endif /* XNU_TARGET_OS_OSX && defined(__arm64__) */
-+ 
++
 ++		PICASSO_PID1_SETUP_STAGE("mount_authorization");
 + #if CONFIG_CSR
 + 		if (csr_check(CSR_ALLOW_UNRESTRICTED_FS) != 0) {
@@ -2242,14 +2243,14 @@ new file mode 100644
 +@@ -2655,6 +2704,7 @@
 + 		}
 + #endif /* CONFIG_CSR */
-+ 
++
 ++		PICASSO_PID1_SETUP_STAGE("cache_directory");
 + 		if (scdir_enforce
 + #if defined(XNU_OWNER_CACHE_CARRIER) && XNU_OWNER_CACHE_CARRIER && !CONFIG_CSR
 + 		    && !owner_carrier
 +@@ -2701,6 +2751,7 @@
 + scdir_ok:
-+ 
++
 + 		/* get vnode size */
 ++		PICASSO_PID1_SETUP_STAGE("file_size");
 + 		error = vnode_size(srfmp->vp, &fs, vfs_context_current());
@@ -2257,7 +2258,7 @@ new file mode 100644
 + 			SHARED_REGION_TRACE_ERROR(
 +@@ -2716,6 +2767,7 @@
 + 		srfmp->file_size = fs;
-+ 
++
 + 		/* get the file's memory object handle */
 ++		PICASSO_PID1_SETUP_STAGE("memory_object");
 + 		srfmp->file_control = ubc_getobject(srfmp->vp, UBC_HOLDOBJECT);
@@ -2266,7 +2267,7 @@ new file mode 100644
 +@@ -2729,6 +2781,7 @@
 + 			goto done;
 + 		}
-+ 
++
 ++		PICASSO_PID1_SETUP_STAGE("code_signature");
 + 		/* check that the mappings are properly covered by code signatures */
 + 		if (!cs_system_enforcement()) {
@@ -2282,7 +2283,7 @@ new file mode 100644
 + 	return error;
 + }
 ++#undef PICASSO_PID1_SETUP_STAGE
-+ 
++
 + /*
 +  * shared_region_map_np()
 +@@ -2795,6 +2853,12 @@
@@ -2295,12 +2296,12 @@ new file mode 100644
 ++	    picasso_pid1_trace_ticket(&pid1_vm_map_count, 16) : 0;
 ++	uint64_t pid1_vm_map_thread = pid1_vm_map_ticket ? thread_tid(current_thread()) : 0;
 ++#endif
-+ 
++
 + 	/*
 + 	 * Get a reference to the current proc's root dir.
 +@@ -2821,7 +2885,15 @@
 + 	}
-+ 
++
 + 	/* map the file(s) into that shared region's submap */
 ++#if DEVELOPMENT || DEBUG
 ++	if (pid1_vm_map_ticket) printf("PICASSO_PID1 vm_map begin sample=%u thread=%llu files=%u mappings=%u\n",
@@ -2315,7 +2316,7 @@ new file mode 100644
 + 		SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] map(): "
 + 		    "vm_shared_region_map_file() failed kr=0x%x\n",
 +@@ -2974,6 +3046,14 @@
-+ 
++
 + 	files_count = uap->files_count;
 + 	mappings_count = uap->mappings_count;
 ++#if DEVELOPMENT || DEBUG
@@ -2326,7 +2327,7 @@ new file mode 100644
 ++	if (pid1_map_ticket) printf("PICASSO_PID1 map begin sample=%u thread=%llu files=%u mappings=%u\n",
 ++	    pid1_map_ticket, (unsigned long long)pid1_map_thread, files_count, mappings_count);
 ++#endif
-+ 
++
 + 	if (files_count == 0) {
 + 		SHARED_REGION_TRACE_INFO(
 +@@ -3081,6 +3161,10 @@
@@ -2339,31 +2340,31 @@ new file mode 100644
 ++#endif
 + 	return kr;
 + }
-+ 
++
 +diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 +--- a/bsd/kern/kern_exit.c
 ++++ b/bsd/kern/kern_exit.c
 +@@ -135,11 +135,16 @@
-+ 
++
 + #include <vm/vm_protos.h>
 + #include <os/log.h>
 ++#include <os/atomic_private.h>
 + #include <os/system_event_log.h>
-+ 
++
 + #include <pexpert/pexpert.h>
-+ 
++
 + #include <kdp/kdp_dyld.h>
 ++#if __arm64__ && (DEVELOPMENT || DEBUG)
 ++#include <arm/thread.h>
 ++#include <arm64/proc_reg.h>
 ++#endif
-+ 
++
 + #if SYSV_SHM
 + #include <sys/shm_internal.h>   /* shmexit */
-+@@ -1359,6 +1364,260 @@
-+ 
++@@ -1359,6 +1364,327 @@
++
 + #define OS_REASON_TOTAL_USER_FAULTS_PER_PROC  5
-+ 
++
 ++
 ++#if DEVELOPMENT || DEBUG
 ++/* Saturating tickets bound output even when PID 1 has concurrent threads. */
@@ -2578,7 +2579,7 @@ new file mode 100644
 ++{
 ++	static const char * const names[] = {
 ++		"backboardd", "SpringBoard", "mediaserverd", "audiomxd",
-++		"CommCenter", "powerd", "mobiletimerd", "liveactivitiesd"
+++		"notifyd", "powerd", "mobiletimerd", "liveactivitiesd"
 ++	};
 ++	static unsigned counts[8];
 ++	for (unsigned index = 0; index < 8; ++index) {
@@ -2601,7 +2602,7 @@ new file mode 100644
 ++picasso_report_service_wait(proc_t p, int rv)
 ++{
 ++	static const char * const names[] = {
-++		"backboardd", "SpringBoard", "mediaserverd", "audiomxd"
+++		"backboardd", "SpringBoard", "mediaserverd", "notifyd"
 ++	};
 ++	static unsigned counts[4];
 ++	if (p != current_proc() || proc_task(p) != current_task() ||
@@ -2614,6 +2615,73 @@ new file mode 100644
 ++		if (ticket) picasso_service_wait_snapshot(proc_task(p), proc_getpid(p), proc_uniqueid(p), ticket);
 ++		return;
 ++	}
+++}
+++
+++/* Diagnostic: SpringBoard waits in notify_register_check for notifyd. Every two
+++ * minutes after the framebuffer client opens, fifteen times, print the receive queues,
+++ * workqueue and threads of both, and the runnable threads, without ending anyone. */
+++#include <kern/clock.h>
+++#define PICASSO_SNAPSHOT_COUNT 15
+++#define PICASSO_SNAPSHOT_PERIOD_S 120ull
+++extern void picasso_dump_receive_rights(task_t task, const char *who);
+++extern void picasso_workq_report(proc_t p, const char *who);
+++extern void picasso_dump_threads(task_t task, const char *who);
+++extern void picasso_dump_runnable(void);
+++struct picasso_named_proc { const char *name; int pid; };
+++static int
+++picasso_named_proc_find(proc_t p, void *arg)
+++{
+++	struct picasso_named_proc *want = arg;
+++	if (strncmp(p->p_name, want->name, sizeof(p->p_name))) return PROC_RETURNED;
+++	want->pid = proc_getpid(p);
+++	return PROC_RETURNED_DONE;
+++}
+++/* Print the receive queues of one named process; returns it with a reference. */
+++static proc_t
+++picasso_dump_named_proc(const char *name)
+++{
+++	struct picasso_named_proc want = { name, 0 };
+++	proc_iterate(PROC_ALLPROCLIST, picasso_named_proc_find, &want, NULL, NULL);
+++	proc_t p = want.pid ? proc_find(want.pid) : PROC_NULL;
+++	printf("PICASSO_IPC %s pid=%d%s\n", name, want.pid, p == PROC_NULL ? " not running" : "");
+++	if (p != PROC_NULL && proc_task(p) != TASK_NULL) {
+++		picasso_dump_receive_rights(proc_task(p), name);
+++		picasso_workq_report(p, name);
+++		picasso_dump_threads(proc_task(p), name);
+++	}
+++	return p;
+++}
+++static void
+++picasso_notifyd_snapshot_fire(thread_call_param_t param0, thread_call_param_t param1)
+++{
+++	static unsigned taken;
+++	thread_call_t call = param1;
+++	(void)param0;
+++	printf("PICASSO_WAIT snapshot %u of %u\n", taken + 1, PICASSO_SNAPSHOT_COUNT);
+++	proc_t client = picasso_dump_named_proc("SpringBoard");
+++	if (client != PROC_NULL) proc_rele(client);
+++	proc_t p = picasso_dump_named_proc("notifyd");
+++	if (p != PROC_NULL) proc_rele(p);
+++	proc_t seeder = picasso_dump_named_proc("lsd");
+++	if (seeder != PROC_NULL) proc_rele(seeder);
+++	picasso_dump_runnable();
+++	if (++taken < PICASSO_SNAPSHOT_COUNT) {
+++		uint64_t interval = 0;
+++		nanoseconds_to_absolutetime(PICASSO_SNAPSHOT_PERIOD_S * NSEC_PER_SEC, &interval);
+++		thread_call_enter1_delayed(call, call, mach_absolute_time() + interval);
+++	}
+++}
+++void picasso_notifyd_snapshot_later(void);
+++void
+++picasso_notifyd_snapshot_later(void)
+++{
+++	static int armed;
+++	if (__atomic_exchange_n(&armed, 1, __ATOMIC_ACQ_REL)) return;
+++	thread_call_t call = thread_call_allocate(picasso_notifyd_snapshot_fire, NULL);
+++	if (call == NULL) return;
+++	uint64_t interval = 0;
+++	nanoseconds_to_absolutetime(PICASSO_SNAPSHOT_PERIOD_S * NSEC_PER_SEC, &interval);
+++	thread_call_enter1_delayed(call, call, mach_absolute_time() + interval);
 ++}
 ++#endif
 ++/* PICASSO_SERVICE_WAIT_BSD_END */
@@ -2641,18 +2709,18 @@ new file mode 100644
 ++#else
 ++#define PICASSO_PID1_ABORT_RETURN(value) return (value)
 ++#endif
-+ 
++
 + 	if (internal_flags & OS_REASON_IFLAG_USER_FAULT) {
 + 		uint32_t old_value = atomic_load_explicit(&p->p_user_faults,
 +@@ -1375,13 +1650,13 @@
-+ 
++
 + #if DEVELOPMENT || DEBUG
 + 		if (bootarg_disable_user_faults) {
 +-			return EQFULL;
 ++			PICASSO_PID1_ABORT_RETURN(EQFULL);
 + 		}
 + #endif /* DEVELOPMENT || DEBUG */
-+ 
++
 + 		for (;;) {
 + 			if (old_value >= OS_REASON_TOTAL_USER_FAULTS_PER_PROC) {
 +-				return EQFULL;
@@ -2661,7 +2729,7 @@ new file mode 100644
 + 			// this reloads the value in old_value
 + 			if (atomic_compare_exchange_strong_explicit(&p->p_user_faults,
 +@@ -1422,16 +1697,17 @@
-+ 
++
 + 	switch (kr) {
 + 	case KERN_SUCCESS:
 +-		return 0;
@@ -2681,7 +2749,7 @@ new file mode 100644
 ++	}
 ++}
 ++#undef PICASSO_PID1_ABORT_RETURN
-+ 
++
 + int
 + abort_with_payload(struct proc *cur_proc, struct abort_with_payload_args *args,
 +@@ -1820,6 +2096,15 @@
@@ -2703,12 +2771,12 @@ new file mode 100644
 +@@ -1834,6 +2119,9 @@
 + 	}
 + #endif /* DEVELOPMENT */
-+ 
++
 ++#if __arm64__ && (DEVELOPMENT || DEBUG)
 ++	picasso_report_critical_fault(p, rv);
 ++#endif
 + 	char *exit_reason_desc = exit_reason_get_string_desc(p->p_exit_reason);
-+ 
++
 + 	if (p->p_exit_reason == OS_REASON_NULL) {
 +@@ -1901,6 +2189,13 @@
 + 	boot_progress_exit(proc_getpid(p),p->p_name,rv,
@@ -2721,14 +2789,14 @@ new file mode 100644
 ++	picasso_report_service_wait(p, rv);
 ++#endif
 ++/* PICASSO_SERVICE_TRACE_END */
-+ 
++
 + 	if (p->p_crash_behavior != 0 || p == initproc) {
 + 		proc_handle_critical_exit(p, rv);
 +diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
 +--- a/bsd/kern/sys_generic.c
 ++++ b/bsd/kern/sys_generic.c
 +@@ -74,6 +74,7 @@
-+ 
++
 + #include <sys/param.h>
 + #include <sys/systm.h>
 ++#include <os/atomic_private.h>
@@ -2738,7 +2806,7 @@ new file mode 100644
 +@@ -392,15 +393,50 @@
 + 	return read_nocancel(p, (struct read_nocancel_args *)uap, retval);
 + }
-+ 
++
 ++
 ++/* PICASSO_PREFLIGHT_BEGIN */
 ++#if DEVELOPMENT || DEBUG
@@ -2778,7 +2846,7 @@ new file mode 100644
 ++/* PICASSO_PREFLIGHT_END */
 + 	KERNEL_DEBUG_CONSTANT((BSDDBG_CODE(DBG_BSD_SC_EXTENDED_INFO, SYS_pread) | DBG_FUNC_NONE),
 + 	    uap->fd, uap->nbyte, (unsigned int)((uap->offset >> 32)), (unsigned int)(uap->offset), 0);
-+ 
++
 +-	return read_internal(p, uap->fd, uap->buf, uap->nbyte, uap->offset,
 +-	           FOF_OFFSET, retval);
 +-}
@@ -2786,14 +2854,14 @@ new file mode 100644
 ++	           FOF_OFFSET, retval));
 ++}
 ++#undef PICASSO_PID1_PREAD_RETURN
-+ 
++
 + /*
 +  * Pread system call
 +diff --git a/bsd/kern/kern_descrip.c b/bsd/kern/kern_descrip.c
 +--- a/bsd/kern/kern_descrip.c
 ++++ b/bsd/kern/kern_descrip.c
 +@@ -74,6 +74,7 @@
-+ 
++
 + #include <sys/param.h>
 + #include <sys/systm.h>
 ++#include <kern/thread.h>
@@ -2803,7 +2871,7 @@ new file mode 100644
 +@@ -2740,6 +2741,22 @@
 + 	return sys_fcntl_outdrop(p, fd, fp, vp, error);
 + }
-+ 
++
 ++
 ++/* PICASSO_PREFLIGHT_BEGIN */
 ++#if DEVELOPMENT || DEBUG
@@ -2826,7 +2894,7 @@ new file mode 100644
 +@@ -2761,13 +2778,31 @@
 + 	int has_entitlement = 0;
 + 	kauth_cred_t p_cred;
-+ 
++
 ++/* PICASSO_PREFLIGHT_BEGIN */
 ++#if DEVELOPMENT || DEBUG
 ++	static unsigned pid1_fcntl_count;
@@ -2847,28 +2915,28 @@ new file mode 100644
 ++
 + 	AUDIT_ARG(fd, uap->fd);
 + 	AUDIT_ARG(cmd, uap->cmd);
-+ 
++
 + 	proc_fdlock(p);
 + 	if ((error = fp_lookup(p, fd, &fp, 1))) {
 + 		proc_fdunlock(p);
 +-		return error;
 ++		PICASSO_PID1_FCNTL_RETURN(error);
 + 	}
-+ 
++
 + 	SYS_FCNTL_DECLARE_VFS_CONTEXT(context);
 +@@ -3838,7 +3873,7 @@
 + 		}
 + 		vp = (struct vnode *)fp_get_data(fp);
-+ 
++
 +-		return sys_fcntl__OPENFROM(p, fd, cmd, uap->arg, fp, vp, retval);
 ++		PICASSO_PID1_FCNTL_RETURN(sys_fcntl__OPENFROM(p, fd, cmd, uap->arg, fp, vp, retval));
 + 	}
-+ 
++
 + 	/*
 +@@ -4024,6 +4059,15 @@
 + 				goto outdrop;
 + 			}
-+ 
++
 ++
 ++/* PICASSO_PREFLIGHT_BEGIN */
 ++#if DEVELOPMENT || DEBUG
@@ -2883,24 +2951,24 @@ new file mode 100644
 + 			    proc_platform(p),
 +@@ -5293,11 +5337,12 @@
 + 	}
-+ 
++
 + outdrop:
 +-	return sys_fcntl_outdrop(p, fd, fp, vp, error);
 ++	PICASSO_PID1_FCNTL_RETURN(sys_fcntl_outdrop(p, fd, fp, vp, error));
-+ 
++
 + out:
 +-	return sys_fcntl_out(p, fd, fp, error);
 +-}
 ++	PICASSO_PID1_FCNTL_RETURN(sys_fcntl_out(p, fd, fp, error));
 ++}
 ++#undef PICASSO_PID1_FCNTL_RETURN
-+ 
-+ 
++
++
 + /*
 +@@ -5414,11 +5459,29 @@
 + 	vfs_context_t ctx = vfs_context_current();
 + 	void * sbptr;
-+ 
++
 ++/* PICASSO_PREFLIGHT_BEGIN */
 ++#if DEVELOPMENT || DEBUG
 ++	static unsigned pid1_fstat_count;
@@ -2919,9 +2987,9 @@ new file mode 100644
 ++#endif
 ++/* PICASSO_PREFLIGHT_END */
 ++
-+ 
++
 + 	AUDIT_ARG(fd, fd);
-+ 
++
 + 	if ((error = fp_lookup(p, fd, &fp, 0)) != 0) {
 +-		return error;
 ++		PICASSO_PID1_FSTAT_RETURN(error);
@@ -2937,14 +3005,14 @@ new file mode 100644
 ++	PICASSO_PID1_FSTAT_RETURN(error);
 ++}
 ++#undef PICASSO_PID1_FSTAT_RETURN
-+ 
-+ 
++
++
 + /*
 +diff --git a/bsd/kern/kern_mman.c b/bsd/kern/kern_mman.c
 +--- a/bsd/kern/kern_mman.c
 ++++ b/bsd/kern/kern_mman.c
 +@@ -79,6 +79,8 @@
-+ 
++
 + #include <sys/param.h>
 + #include <sys/systm.h>
 ++#include <os/atomic_private.h>
@@ -2978,7 +3046,7 @@ new file mode 100644
 +@@ -204,6 +222,24 @@
 + 	int fd = uap->fd;
 + 	int num_retries = 0;
-+ 
++
 ++/* PICASSO_PREFLIGHT_BEGIN */
 ++#if DEVELOPMENT || DEBUG
 ++	static unsigned pid1_mmap_count;
@@ -3002,7 +3070,7 @@ new file mode 100644
 + 	 * mmap() system call in libsyscall prior to entering the kernel.  The sanity
 +@@ -220,7 +256,7 @@
 + 	AUDIT_ARG(fd, uap->fd);
-+ 
++
 + 	if (vm_map_range_overflows(user_map, user_addr, user_size)) {
 +-		return EINVAL;
 ++		PICASSO_PID1_MMAP_RETURN(EINVAL);
@@ -3017,15 +3085,15 @@ new file mode 100644
 ++			PICASSO_PID1_MMAP_RETURN(EINVAL);
 + 		}
 + 	}
-+ 
++
 +@@ -282,7 +318,7 @@
-+ 
++
 + 	/* make sure mapping fits into numeric range etc */
 + 	if (os_add3_overflow(file_pos, user_size, vm_map_page_size(user_map) - 1, &sum)) {
 +-		return EINVAL;
 ++		PICASSO_PID1_MMAP_RETURN(EINVAL);
 + 	}
-+ 
++
 + 	if (flags & MAP_UNIX03) {
 +@@ -299,15 +335,15 @@
 + 		}
@@ -3045,7 +3113,7 @@ new file mode 100644
 ++			PICASSO_PID1_MMAP_RETURN(EINVAL);
 + 		}
 + 	}
-+ 
++
 +@@ -332,7 +368,7 @@
 + 		    (flags & MAP_RESILIENT_CODESIGN) ||
 + 		    (flags & MAP_RESILIENT_MEDIA) ||
@@ -3054,7 +3122,7 @@ new file mode 100644
 ++			PICASSO_PID1_MMAP_RETURN(EINVAL);
 + 		}
 + 	}
-+ 
++
 +@@ -341,7 +377,7 @@
 + 		if ((flags & MAP_ANON) ||
 + 		    (flags & MAP_JIT) ||
@@ -3090,7 +3158,7 @@ new file mode 100644
 ++			PICASSO_PID1_MMAP_RETURN(EPERM);
 + 		}
 + 	}
-+ 
++
 +@@ -400,7 +436,7 @@
 + 		 */
 + 		user_addr -= pageoff;
@@ -3107,7 +3175,7 @@ new file mode 100644
 +-		return EPERM;
 ++		PICASSO_PID1_MMAP_RETURN(EPERM);
 + 	}
-+ 
++
 + 	if (flags & MAP_ANON) {
 +@@ -436,7 +472,7 @@
 + 		error = mac_proc_check_map_anon(p, current_cached_proc_cred(p),
@@ -3117,24 +3185,24 @@ new file mode 100644
 ++			PICASSO_PID1_MMAP_RETURN(EINVAL);
 + 		}
 + #endif /* MAC */
-+ 
++
 +@@ -456,7 +492,7 @@
-+ 
++
 + 			if (vm_flags != fd) {
 + 				/* reject if there are any extra flags */
 +-				return EINVAL;
 ++				PICASSO_PID1_MMAP_RETURN(EINVAL);
 + 			}
-+ 
++
 + 			/*
 +@@ -497,7 +533,7 @@
 + 		vfs_context_t ctx = vfs_context_current();
-+ 
++
 + 		if (flags & MAP_JIT) {
 +-			return EINVAL;
 ++			PICASSO_PID1_MMAP_RETURN(EINVAL);
 + 		}
-+ 
++
 + 		/*
 +@@ -506,7 +542,7 @@
 + 		 */
@@ -3153,7 +3221,7 @@ new file mode 100644
 ++	PICASSO_PID1_MMAP_RETURN(error);
 + }
 ++#undef PICASSO_PID1_MMAP_RETURN
-+ 
++
 + int
 + msync(__unused proc_t p, struct msync_args *uap, int32_t *retval)
 +diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
@@ -3170,7 +3238,7 @@ new file mode 100644
 +@@ -5771,6 +5772,22 @@
 + #define CS_NATIVE4K_CHUNK       (1024 * 1024)
 + #define CS_NATIVE4K_UNCACHED    (32 * 1024 * 1024)
-+ 
++
 ++
 ++/* PICASSO_PREFLIGHT_BEGIN */
 ++#if DEVELOPMENT || DEBUG
@@ -3193,7 +3261,7 @@ new file mode 100644
 +@@ -5784,31 +5801,69 @@
 + 	int error = EBADEXEC, ioflags;
 + 	kern_return_t kr;
-+ 
++
 ++/* PICASSO_PREFLIGHT_BEGIN */
 ++#if DEVELOPMENT || DEBUG
 ++	static unsigned pid1_n4k_count, pid1_n4k_progress_count;
@@ -3390,18 +3458,18 @@ new file mode 100644
 ++++ b/osfmk/arm64/sleh.c
 +@@ -162,6 +162,9 @@
 + static void handle_kernel_breakpoint(arm_saved_state_t *, uint32_t);
-+ 
++
 + static void handle_breakpoint(arm_saved_state_t *, uint32_t) __dead2;
 ++#if DEVELOPMENT || DEBUG
 ++extern void picasso_user_breakpoint(void *, uint32_t, uint32_t, uint64_t);
 ++#endif
-+ 
++
 + typedef void (*abort_inspector_t)(uint32_t, fault_status_t *, vm_prot_t *);
 + static void inspect_instruction_abort(uint32_t, fault_status_t *, vm_prot_t *);
 +@@ -1230,6 +1233,10 @@
 + 	mach_exception_data_type_t codes[2]  = {EXC_ARM_BREAKPOINT};
 + 	mach_msg_type_number_t     numcodes  = 2;
-+ 
++
 ++#if DEVELOPMENT || DEBUG
 ++	picasso_user_breakpoint(state, esr, current_task()->task_shared_region_slide,
 ++	    current_task()->mach_header_vm_address);
@@ -3426,7 +3494,7 @@ new file mode 100644
 +@@ -2694,6 +2697,122 @@ is_io_service_match_property_table_bin(
 + 	return internal_io_service_match_property_table(service, matching, matchingCnt, matches);
 + }
-+ 
++
 ++/* PICASSO_SERVICE_TRACE_BEGIN */
 ++#if DEVELOPMENT || DEBUG
 ++/* No iterator consumption or serialized user-data logging. Counters are per
@@ -3548,7 +3616,7 @@ new file mode 100644
 + 	mach_port_t main_port,
 +@@ -2713,9 +2832,19 @@ internal_io_service_get_matching_services(
 + 	obj = OSUnserializeXML(matching, matching_size);
-+ 
++
 + 	if ((dict = OSDynamicCast( OSDictionary, obj))) {
 ++/* PICASSO_SERVICE_TRACE_BEGIN */
 ++#if DEVELOPMENT || DEBUG
@@ -3568,8 +3636,8 @@ new file mode 100644
 + 	}
 +@@ -2777,6 +2906,20 @@ is_io_service_get_matching_services_bin(
 + }
-+ 
-+ 
++
++
 ++#if DEVELOPMENT || DEBUG
 ++static unsigned
 ++picasso_watchdog_match_ticket(void)
@@ -3589,7 +3657,7 @@ new file mode 100644
 + 	mach_port_t main_port,
 +@@ -2796,9 +2939,28 @@ internal_io_service_get_matching_service(
 + 	obj = OSUnserializeXML(matching, matching_size);
-+ 
++
 + 	if ((dict = OSDynamicCast( OSDictionary, obj))) {
 ++#if DEVELOPMENT || DEBUG
 ++		OSString *provider = OSDynamicCast(OSString, dict->getObject("IOProviderClass"));
@@ -3626,7 +3694,7 @@ new file mode 100644
 ++#endif
 ++/* PICASSO_SERVICE_TRACE_END */
 ++
-+ 
++
 + 	if (main_port != main_device_port) {
 + 		return kIOReturnNotPrivileged;
 +@@ -2901,6 +3069,11 @@ internal_io_service_add_notification(
@@ -3639,12 +3707,12 @@ new file mode 100644
 ++#endif
 ++/* PICASSO_SERVICE_TRACE_END */
 + 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
-+ 
++
 + 		if ((sym == gIOPublishNotification)
 +@@ -2952,6 +3125,11 @@ internal_io_service_add_notification(
 + 		obj->release();
 + 	}
-+ 
++
 ++/* PICASSO_SERVICE_TRACE_BEGIN */
 ++#if DEVELOPMENT || DEBUG
 ++	picasso_service_end(trace, err, err, userNotify != NULL);
@@ -3652,11 +3720,11 @@ new file mode 100644
 ++/* PICASSO_SERVICE_TRACE_END */
 + 	return err;
 + }
-+ 
++
 +@@ -4386,13 +4564,28 @@ is_io_service_open_extended(
 + 		return kIOReturnBadArgument;
 + 	}
-+ 
++
 ++/* PICASSO_SERVICE_TRACE_BEGIN */
 ++#if DEVELOPMENT || DEBUG
 ++	picasso_service_trace trace = picasso_service_begin(3, NULL, service->getMetaClass()->getClassName(), connect_type);
@@ -3685,7 +3753,7 @@ new file mode 100644
 +@@ -4594,6 +4787,11 @@ is_io_service_open_extended(
 + 	*connection = client;
 + 	*result = res;
-+ 
++
 ++/* PICASSO_SERVICE_TRACE_BEGIN */
 ++#if DEVELOPMENT || DEBUG
 ++	picasso_service_end(trace, err, res, client != NULL);
@@ -3693,7 +3761,7 @@ new file mode 100644
 ++/* PICASSO_SERVICE_TRACE_END */
 + 	return err;
 + }
-+ 
++
 +@@ -6459,10 +6657,89 @@ is_io_device_tree_entry_exists_with_name(
 + }
 + } /* extern "C" */
@@ -3939,7 +4007,7 @@ new file mode 100644
 ++	return error;
 ++}
 ++#endif
-+ 
++
 + static int
 + native_owner_cache_prepare(proc_t p, user_addr_t scratch, user_addr_t *envp)
 +@@ -7142,6 +7159,8 @@
@@ -3985,7 +4053,6 @@ new file mode 100644
 + 	}
 + 	if (fdp->fd_rdir == olddp) {
 + 		old_rvp = olddp;
-
 diff --git a/patches/xnu/picasso-timebase-microtime.patch b/patches/xnu/picasso-timebase-microtime.patch
 new file mode 100644
 --- /dev/null
@@ -4157,3 +4224,527 @@ new file mode 100644
 +-
 ++
 + static kern_return_t
+diff --git a/patches/xnu/zzzzzz-picasso-ios16-framebuffer-swap.patch b/patches/xnu/zzzzzz-picasso-ios16-framebuffer-swap.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/zzzzzz-picasso-ios16-framebuffer-swap.patch
+@@ -0,0 +1,227 @@
++diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
++--- a/iokit/Kernel/IOUserClient.cpp
+++++ b/iokit/Kernel/IOUserClient.cpp
++@@ -6731,6 +6731,98 @@
++ #endif
++ /* PICASSO_FB_METHOD_TRACE_END */
++
+++#if DEVELOPMENT || DEBUG
+++/* Picasso runs iOS 16 IOMobileFramebuffer userland against the retained
+++ * iPadOS 17 (21H461) framebuffer user client. Swap submission (selector 5)
+++ * grew from 0x46c to 0x508 bytes: iPadOS 17 inserts event wait/signal values
+++ * at 0x50 and their mach ports at 0x260, plus a few bytes near brightness,
+++ * EDR and ambient-light fields. Each run below keeps the iOS 16 bytes and
+++ * moves them to their iPadOS 17 offset; inserted fields stay zero (no event
+++ * waits or signals). Runs were derived from the store offsets of every
+++ * kern_Swap and IOMobileFramebufferSwap setter in both dyld caches; the last
+++ * three insertion points are bounded by known fields, not pinned exactly. */
+++extern "C" void picasso_notifyd_snapshot_later(void);
+++#define PICASSO_IOS16_SWAP_BYTES 0x46c
+++#define PICASSO_IPADOS17_SWAP_BYTES 0x508
+++static const struct { uint16_t begin, end, shift; } picassoSwapRuns[] = {
+++	{0x000, 0x050, 0x00}, {0x050, 0x260, 0x48}, {0x260, 0x2e6, 0x6c}, {0x2e6, 0x2e8, 0x6d},
+++	{0x2e8, 0x30c, 0x70}, {0x30c, 0x37b, 0x78}, {0x37b, 0x467, 0x7c}, {0x467, 0x46c, 0x9c},
+++};
+++static void *
+++picasso_ios16_swap(const void *record)
+++{
+++	uint8_t *out = (uint8_t *)IOMallocZeroData(PICASSO_IPADOS17_SWAP_BYTES);
+++	if (!out) return NULL;
+++	for (size_t i = 0; i < sizeof(picassoSwapRuns) / sizeof(picassoSwapRuns[0]); ++i) {
+++		memcpy(out + picassoSwapRuns[i].begin + picassoSwapRuns[i].shift,
+++		    (const uint8_t *)record + picassoSwapRuns[i].begin,
+++		    picassoSwapRuns[i].end - picassoSwapRuns[i].begin);
+++	}
+++	return out;
+++}
+++/* The iOS 16 IOSurface client and the retained iPadOS 17 IOSurfaceRootUserClient
+++ * agree on selector numbers but not on two output structures. The limits query
+++ * (selector 13) grew from 0x18 to 0x28 bytes: iPadOS 17 inserts a root field after
+++ * the first eight bytes and widens the trailing byte and flag. The surface lock
+++ * result (create and lookup: selectors 0, 2, 4, 6, 7, 34 and their copies at +54)
+++ * grew from 0xa68 to 0xc68 bytes: the header from 0x68 to 0x88 (0x18 bytes before
+++ * the pixel format, 8 more before the plane count) and each of the 20 planes from
+++ * 0x80 to 0x98 (six 32-bit size fields became 64-bit). Offsets come from the kernel handlers and
+++ * the framework getters of both versions; new fields are dropped. */
+++#define PICASSO_IOS16_LIMITS 0x18
+++#define PICASSO_IPADOS17_LIMITS 0x28
+++#define PICASSO_IOS16_LOCK 0xa68
+++#define PICASSO_IPADOS17_LOCK 0xc68
+++static bool
+++picasso_surface_lock_selector(uint32_t selector)
+++{
+++	switch (selector % 54) {
+++	case 0: case 2: case 4: case 6: case 7: case 34: return true;
+++	default: return false;
+++	}
+++}
+++static void
+++picasso_ios16_limits(uint8_t *out, const uint8_t *in)
+++{
+++	bzero(out, PICASSO_IOS16_LIMITS);
+++	memcpy(out, in, 0x14);
+++	out[0x14] = in[0x20];
+++	memcpy(out + 0x16, in + 0x22, 2);
+++}
+++/* Copy a 64-bit iPadOS 17 field into its 32-bit iOS 16 slot. */
+++static void
+++picasso_narrow(uint8_t *out, unsigned to, const uint8_t *in, unsigned from)
+++{
+++	uint64_t wide;
+++	memcpy(&wide, in + from, sizeof(wide));
+++	uint32_t narrow = wide > UINT32_MAX ? UINT32_MAX : (uint32_t)wide;
+++	memcpy(out + to, &narrow, sizeof(narrow));
+++}
+++static void
+++picasso_ios16_lock(uint8_t *out, const uint8_t *in)
+++{
+++	/* Header: alloc size, width, height, bytes per row and offset are 64-bit in iPadOS 17. */
+++	static const uint8_t header[][2] = {{0x1c, 0x20}, {0x20, 0x28}, {0x24, 0x30}, {0x28, 0x38}, {0x2c, 0x40}};
+++	/* Plane: width, height, an unnamed word, offset, bytes per row and size likewise. */
+++	static const uint8_t plane[][2] = {{0x00, 0x00}, {0x04, 0x08}, {0x08, 0x10}, {0x0c, 0x18}, {0x10, 0x20}, {0x14, 0x28}};
+++	bzero(out, PICASSO_IOS16_LOCK);
+++	memcpy(out, in, 0x1c);
+++	for (size_t i = 0; i < sizeof(header) / sizeof(header[0]); ++i) {
+++		picasso_narrow(out, header[i][0], in, header[i][1]);
+++	}
+++	memcpy(out + 0x30, in + 0x48, 0x08);
+++	memcpy(out + 0x38, in + 0x58, 0x30);
+++	for (unsigned p = 0; p < 20; ++p) {
+++		uint8_t *to = out + 0x68 + p * 0x80;
+++		const uint8_t *from = in + 0x88 + p * 0x98;
+++		for (size_t i = 0; i < sizeof(plane) / sizeof(plane[0]); ++i) {
+++			picasso_narrow(to, plane[i][0], from, plane[i][1]);
+++		}
+++		memcpy(to + 0x18, from + 0x30, 0x80 - 0x18);
+++	}
+++}
+++#endif
+++
++ IOReturn
++ IOUserClient::callExternalMethod(uint32_t selector, IOExternalMethodArguments * args)
++ {
++@@ -6740,6 +6832,66 @@
++ 	picasso_fb_method_trace fbTrace = picasso_fb_method_begin(this, selector, args);
++ #endif
++ /* PICASSO_FB_METHOD_HOOK_END */
+++/* PICASSO_IOS16_ABI_PRE_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++	/* Bounded trace of framebuffer user-client selectors. An entry without a
+++	 * matching done line marks the call that blocks the compositor. */
+++	static unsigned picassoFbCalls, picassoSwapNotes;
+++	unsigned picassoFbTicket = 0;
+++	void *picassoSwap = NULL;
+++	const void *picassoSavedInput = NULL;
+++	/* Diagnostic: IOSurface root calls that fail, with their argument shape. */
+++	static unsigned picassoSurfaceFailures;
+++	bool picassoSurface = !strncmp(getMetaClass()->getClassName(), "IOSurfaceRootUserClient", 23);
+++	uint32_t picassoShape[4] = {args->scalarInputCount, args->scalarOutputCount,
+++	    args->structureInputSize, args->structureOutputSize};
+++	void *picassoSurfaceOut = NULL, *picassoSurfaceUser = NULL;
+++	uint32_t picassoSurfaceUserSize = 0, picassoSurfaceSize = 0;
+++	if (picassoSurface && args->structureOutput && !args->structureOutputDescriptor) {
+++		if (selector % 54 == 13 && args->structureOutputSize == PICASSO_IOS16_LIMITS) {
+++			picassoSurfaceSize = PICASSO_IPADOS17_LIMITS;
+++		} else if (picasso_surface_lock_selector(selector) && args->structureOutputSize == PICASSO_IOS16_LOCK) {
+++			picassoSurfaceSize = PICASSO_IPADOS17_LOCK;
+++		}
+++		if (picassoSurfaceSize && (picassoSurfaceOut = IOMallocZeroData(picassoSurfaceSize))) {
+++			picassoSurfaceUser = args->structureOutput;
+++			picassoSurfaceUserSize = args->structureOutputSize;
+++			args->structureOutput = picassoSurfaceOut;
+++			args->structureOutputSize = picassoSurfaceSize;
+++		}
+++	}
+++	if (!strncmp(getMetaClass()->getClassName(), "IOMobileFramebuffer", 19)) {
+++		unsigned value = __atomic_fetch_add(&picassoFbCalls, 1, __ATOMIC_RELAXED);
+++		if (value == 0) {
+++			picasso_notifyd_snapshot_later();
+++		}
+++		if (value < 160) {
+++			char name[32] = "?";
+++			picassoFbTicket = value + 1;
+++			proc_name(proc_selfpid(), name, sizeof(name));
+++			printf("PICASSO_FBUC call=%u pid=%d name=%s selector=%u sin=%u sout=%u in=%u out=%u\n",
+++			    picassoFbTicket, proc_selfpid(), name, selector, args->scalarInputCount,
+++			    args->scalarOutputCount, args->structureInputSize, args->structureOutputSize);
+++		}
+++		if (selector == 5 && args->structureInputSize == PICASSO_IOS16_SWAP_BYTES &&
+++		    args->structureInput && !args->structureInputDescriptor &&
+++		    (picassoSwap = picasso_ios16_swap(args->structureInput))) {
+++			picassoSavedInput = args->structureInput;
+++			args->structureInput = picassoSwap;
+++			args->structureInputSize = PICASSO_IPADOS17_SWAP_BYTES;
+++			if (__atomic_fetch_add(&picassoSwapNotes, 1, __ATOMIC_RELAXED) < 4) {
+++				printf("PICASSO_FBUC swap record re-laid 0x%x -> 0x%x\n",
+++				    PICASSO_IOS16_SWAP_BYTES, PICASSO_IPADOS17_SWAP_BYTES);
+++				/* Diagnostic: the nonzero iOS 16 words show which layers and surfaces were sent. */
+++				const uint32_t *words = (const uint32_t *)picassoSavedInput;
+++				for (unsigned w = 0, shown = 0; w < PICASSO_IOS16_SWAP_BYTES / 4 && shown < 96; ++w) {
+++					if (words[w]) { printf("PICASSO_FBUC swap16 +0x%03x=%08x\n", w * 4, words[w]); ++shown; }
+++				}
+++			}
+++		}
+++	}
+++#endif
+++/* PICASSO_IOS16_ABI_PRE_END */
++
++ 	ipcEnter(defaultLocking ? (defaultLockingSingleThreadExternalMethod ? kIPCLockWrite : kIPCLockRead) : kIPCLockNone);
++ 	if (uc2022) {
++@@ -6748,12 +6900,56 @@
++ 		ret = externalMethod(selector, args);
++ 	}
++ 	ipcExit(defaultLocking ? (defaultLockingSingleThreadExternalMethod ? kIPCLockWrite : kIPCLockRead) : kIPCLockNone);
+++/* PICASSO_IOS16_ABI_POST_BEGIN */
+++#if DEVELOPMENT || DEBUG
+++	if (picassoSwap) {
+++		args->structureInput = picassoSavedInput;
+++		args->structureInputSize = PICASSO_IOS16_SWAP_BYTES;
+++		IOFreeData(picassoSwap, PICASSO_IPADOS17_SWAP_BYTES);
+++	}
+++	/* Selector 12 = kern_RequestPowerChange (scalar: requested display power state). The
+++	 * GOP panel has no power switch; the retained family refuses it, after which backboardd
+++	 * stops presenting. Accept power-on. The lock screen renders but the display then drops;
+++	 * with picasso-fb-reject-off=1 the power-off transition is refused so backboardd keeps
+++	 * presenting the lock screen instead of believing the display went off. */
+++	if (selector == 12 && ret == kIOReturnUnsupported && args->scalarInputCount == 1 &&
+++	    !strncmp(getMetaClass()->getClassName(), "IOMobileFramebuffer", 19)) {
+++		unsigned rejectOff = 0;
+++		PE_parse_boot_argn("picasso-fb-reject-off", &rejectOff, sizeof(rejectOff));
+++		bool off = args->scalarInput[0] == 0;
+++		ret = (rejectOff && off) ? kIOReturnUnsupported : kIOReturnSuccess;
+++		printf("PICASSO_FBUC power change to %llu -> ret=%x\n",
+++		    (unsigned long long)args->scalarInput[0], ret);
+++	}
+++	if (picassoFbTicket) {
+++		printf("PICASSO_FBUC done=%u selector=%u ret=%x\n", picassoFbTicket, selector, ret);
+++	}
+++	if (picassoSurfaceOut) {
+++		if (ret == kIOReturnSuccess) {
+++			if (picassoSurfaceSize == PICASSO_IPADOS17_LIMITS) {
+++				picasso_ios16_limits((uint8_t *)picassoSurfaceUser, (const uint8_t *)picassoSurfaceOut);
+++			} else {
+++				picasso_ios16_lock((uint8_t *)picassoSurfaceUser, (const uint8_t *)picassoSurfaceOut);
+++			}
+++		}
+++		args->structureOutput = picassoSurfaceUser;
+++		args->structureOutputSize = picassoSurfaceUserSize;
+++		IOFreeData(picassoSurfaceOut, picassoSurfaceSize);
+++	}
+++	if (picassoSurface && ret && __atomic_fetch_add(&picassoSurfaceFailures, 1, __ATOMIC_RELAXED) < 200) {
+++		char name[32] = "?";
+++		proc_name(proc_selfpid(), name, sizeof(name));
+++		printf("PICASSO_SURF name=%s selector=%u sin=%u sout=%u in=%u out=%u ret=%x\n", name, selector,
+++		    picassoShape[0], picassoShape[1], picassoShape[2], picassoShape[3], ret);
+++	}
+++#endif
+++/* PICASSO_IOS16_ABI_POST_END */
+++
++ /* PICASSO_FB_METHOD_HOOK_BEGIN */
++ #if DEVELOPMENT || DEBUG
++ 	picasso_fb_method_end(fbTrace, args, ret);
++ #endif
++ /* PICASSO_FB_METHOD_HOOK_END */
++-
++ 	return ret;
++ }
++
+diff --git a/patches/xnu/zzzzzz-picasso-exec-failures.patch b/patches/xnu/zzzzzz-picasso-exec-failures.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/zzzzzz-picasso-exec-failures.patch
+@@ -0,0 +1,24 @@
++diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
++--- a/bsd/kern/kern_exec.c
+++++ b/bsd/kern/kern_exec.c
++@@ -2378,6 +2378,20 @@
++ 		}
++ 	}
++ bad:
+++#if DEVELOPMENT || DEBUG
+++	/* Picasso: launch-on-demand daemons that cannot start fail silently, and their
+++	 * clients wait forever for a reply. Name each image that fails to activate. */
+++	if (imgp->ip_strings) {
+++		static unsigned picassoExecFailures, picassoExecs;
+++		if (error && __atomic_fetch_add(&picassoExecFailures, 1, __ATOMIC_RELAXED) < 48) {
+++			printf("PICASSO_EXEC failed error=%d path=%.200s\n", error,
+++			    imgp->ip_strings + strlen(EXECUTABLE_KEY));
+++		} else if (!error && __atomic_fetch_add(&picassoExecs, 1, __ATOMIC_RELAXED) < 200) {
+++			printf("PICASSO_EXEC ok pid=%d path=%.200s\n", proc_getpid(p),
+++			    imgp->ip_strings + strlen(EXECUTABLE_KEY));
+++		}
+++	}
+++#endif
++ 	proc_transend(p, 0);
++
++ bad_notrans:
+diff --git a/patches/xnu/zzzzzz-picasso-ipc-queue-dump.patch b/patches/xnu/zzzzzz-picasso-ipc-queue-dump.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/zzzzzz-picasso-ipc-queue-dump.patch
+@@ -0,0 +1,166 @@
++diff --git a/osfmk/ipc/mach_debug.c b/osfmk/ipc/mach_debug.c
++--- a/osfmk/ipc/mach_debug.c
+++++ b/osfmk/ipc/mach_debug.c
++@@ -588,3 +588,162 @@
++ 	return KERN_NOT_SUPPORTED;
++ }
++ #endif
+++
+++#if DEVELOPMENT || DEBUG
+++#include <kern/task.h>
+++/* Picasso: a client waits forever for a reply from a daemon that sits idle. For each
+++ * receive right of one task, show how many messages wait in its queue and how a
+++ * receiver would be woken: port set member, kevent knote, or workloop link. */
+++struct picasso_knote_info { uint32_t sfflags, kq_count; uint16_t status, flags, kq_state; uint8_t tr_state, qos; };
+++void picasso_knote_info(struct knote *kn, struct picasso_knote_info *out);
+++void picasso_dump_receive_rights(task_t task, const char *who);
+++void
+++picasso_dump_receive_rights(task_t task, const char *who)
+++{
+++	struct { mach_port_name_t name; uint16_t count, limit; uint8_t flags;
+++	    struct picasso_knote_info kn; } rows[48];
+++	unsigned shown = 0, receive = 0, queued = 0;
+++	ipc_space_t space = task->itk_space;
+++	if (space == IS_NULL) return;
+++	is_read_lock(space);
+++	if (!is_active(space)) {
+++		is_read_unlock(space);
+++		return;
+++	}
+++	ipc_entry_table_t table = is_active_table(space);
+++	ipc_entry_num_t tsize = ipc_entry_table_count(table);
+++	for (mach_port_index_t index = 1; index < tsize; index++) {
+++		ipc_entry_t entry = ipc_entry_table_get_nocheck(table, index);
+++		ipc_entry_bits_t bits = entry->ie_bits;
+++		if (!(IE_BITS_TYPE(bits) & MACH_PORT_TYPE_RECEIVE)) continue;
+++		ipc_port_t port = ip_object_to_port(entry->ie_object);
+++		receive++;
+++		ip_mq_lock(port);
+++		uint16_t count = port->ip_messages.imq_msgcount;
+++		uint16_t limit = port->ip_messages.imq_qlimit;
+++		bool any = port->ip_sync_link_state == PORT_SYNC_LINK_ANY;
+++		uint8_t flags = (ip_in_pset(port) ? 1 : 0) |
+++		    (port->ip_specialreply ? 2 : 0) | (port->ip_service_port ? 4 : 0) |
+++		    (!port->ip_specialreply && any && SLIST_FIRST(&port->ip_klist) ? 8 : 0) |
+++		    (!port->ip_specialreply && !any ? 16 : 0);
+++		struct picasso_knote_info kn = { .tr_state = 0xfe };
+++		if (flags & 8) {
+++			picasso_knote_info(SLIST_FIRST(&port->ip_klist), &kn);
+++		}
+++		ip_mq_unlock(port);
+++		queued += count;
+++		if (shown < 48 && (count || (flags & 6))) {
+++			rows[shown].name = MACH_PORT_MAKE(index, IE_BITS_GEN(bits));
+++			rows[shown].count = count;
+++			rows[shown].limit = limit;
+++			rows[shown].flags = flags;
+++			rows[shown].kn = kn;
+++			shown++;
+++		}
+++	}
+++	is_read_unlock(space);
+++	printf("PICASSO_IPC %s receive=%u queued=%u\n", who, receive, queued);
+++	for (unsigned i = 0; i < shown; i++) {
+++		printf("PICASSO_IPC %s name=0x%x msgs=%u qlimit=%u pset=%u knote=%u workloop=%u srp=%u service=%u\n",
+++		    who, rows[i].name, rows[i].count, rows[i].limit, rows[i].flags & 1,
+++		    (rows[i].flags >> 3) & 1, (rows[i].flags >> 4) & 1, (rows[i].flags >> 1) & 1,
+++		    (rows[i].flags >> 2) & 1);
+++		if (rows[i].flags & 8) {
+++			printf("PICASSO_IPC %s name=0x%x kn_status=0x%x kn_flags=0x%x sfflags=0x%x qos=%u kq_state=0x%x kq_count=%u tr_state=%u\n",
+++			    who, rows[i].name, rows[i].kn.status, rows[i].kn.flags, rows[i].kn.sfflags,
+++			    rows[i].kn.qos, rows[i].kn.kq_state, rows[i].kn.kq_count, rows[i].kn.tr_state);
+++		}
+++	}
+++}
+++#include <kern/thread.h>
+++#include <kern/processor.h>
+++struct proc;
+++extern char *proc_name_address(struct proc *p);
+++/* Picasso: the workqueue creator thread of a daemon is chosen but never runs. Show the
+++ * scheduling state of each thread of one task, and which runnable threads compete for
+++ * the single CPU. Fields are read without thread locks: a diagnostic snapshot only. */
+++static void
+++picasso_print_thread(const char *who, thread_t thread, uint64_t now)
+++{
+++	task_t task = get_threadtask(thread);
+++	void *bsd = task ? get_bsdtask_info(task) : NULL;
+++	uint64_t ago = 0;
+++	if (thread->last_made_runnable_time && now > thread->last_made_runnable_time) {
+++		absolutetime_to_nanoseconds(now - thread->last_made_runnable_time, &ago);
+++	}
+++	printf("PICASSO_THR %s tid=%llu pid=%d name=%s state=0x%x pri=%d base=%d mode=%d bucket=%d runnable_ms=%llu\n",
+++	    who, thread->thread_id, task ? task_pid(task) : -1,
+++	    bsd ? proc_name_address(bsd) : "?", thread->state, thread->sched_pri,
+++	    thread->base_pri, thread->sched_mode, thread->th_sched_bucket, ago / NSEC_PER_MSEC);
+++}
+++#if __arm64__
+++#include <arm/thread.h>
+++#include <arm/proc_reg.h>
+++/* Frame-pointer walk of a thread that is off-CPU: its user registers were saved
+++ * on kernel entry and its stack does not move. Reads go through the task's map. */
+++static void
+++picasso_print_user_stack(const char *who, thread_t thread)
+++{
+++	arm_saved_state_t *state = get_user_regs(thread);
+++	if (!state || !is_saved_state64(state)) return;
+++	vm_map_t map = get_task_map(get_threadtask(thread));
+++	const uint64_t mask = 0x7fffffffffull;  /* drop pointer authentication bits */
+++	uint64_t frames[16] = { get_saved_state_pc(state) & mask, get_saved_state_lr(state) & mask };
+++	unsigned depth = 2;
+++	uint64_t fp = get_saved_state_fp(state);
+++	while (fp && depth < 16) {
+++		uint64_t pair[2];
+++		if (vm_map_read_user(map, fp, pair, sizeof(pair)) != KERN_SUCCESS || !pair[1]) break;
+++		frames[depth++] = pair[1] & mask;
+++		if (pair[0] <= fp) break;
+++		fp = pair[0];
+++	}
+++	for (unsigned i = 0; i < depth; i += 4) {
+++		printf("PICASSO_STK %s tid=%llu offset=%u %llx %llx %llx %llx\n", who, thread->thread_id, i,
+++		    frames[i], frames[i + 1], frames[i + 2], frames[i + 3]);
+++	}
+++}
+++#endif
+++void picasso_dump_threads(task_t task, const char *who);
+++void
+++picasso_dump_threads(task_t task, const char *who)
+++{
+++	uint64_t now = mach_absolute_time();
+++	thread_t thread, held[16];
+++	unsigned count = 0;
+++	task_lock(task);
+++	printf("PICASSO_STK %s main_header=%llx cache_slide=%x\n", who,
+++	    (unsigned long long)task->mach_header_vm_address, task->task_shared_region_slide);
+++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+++		picasso_print_thread(who, thread, now);
+++		/* With one CPU, every other thread is off-CPU while this runs, so a runnable
+++		 * thread's user registers are saved too (it was preempted). */
+++		if (count < 16 && thread != current_thread()) {
+++			thread_reference(thread);
+++			held[count++] = thread;
+++		}
+++	}
+++	task_unlock(task);
+++	for (unsigned i = 0; i < count; i++) {
+++#if __arm64__
+++		picasso_print_user_stack(who, held[i]);
+++#endif
+++		thread_deallocate(held[i]);
+++	}
+++}
+++void picasso_dump_runnable(void);
+++void
+++picasso_dump_runnable(void)
+++{
+++	uint64_t now = mach_absolute_time();
+++	unsigned shown = 0;
+++	thread_t thread;
+++	lck_mtx_lock(&tasks_threads_lock);
+++	queue_iterate(&threads, thread, thread_t, threads) {
+++		if ((thread->state & (TH_RUN | TH_IDLE)) != TH_RUN || thread == current_thread()) continue;
+++		if (shown++ < 40) picasso_print_thread("runnable", thread, now);
+++	}
+++	lck_mtx_unlock(&tasks_threads_lock);
+++	printf("PICASSO_THR runnable total=%u\n", shown);
+++}
+++#endif
+diff --git a/patches/xnu/zzzzzz-picasso-knote-info.patch b/patches/xnu/zzzzzz-picasso-knote-info.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/zzzzzz-picasso-knote-info.patch
+@@ -0,0 +1,32 @@
++diff --git a/bsd/kern/kern_event.c b/bsd/kern/kern_event.c
++--- a/bsd/kern/kern_event.c
+++++ b/bsd/kern/kern_event.c
++@@ -9422,3 +9422,28 @@
++     "get the ID of the bound kqueue");
++
++ #endif /* DEVELOPMENT || DEBUG */
+++
+++#if DEVELOPMENT || DEBUG
+++/* Picasso: messages wait on a port whose knote never wakes its daemon. Report the
+++ * knote and its kqueue as they are (no locks taken; a diagnostic snapshot only). */
+++struct picasso_knote_info { uint32_t sfflags, kq_count; uint16_t status, flags, kq_state; uint8_t tr_state, qos; };
+++void picasso_knote_info(struct knote *kn, struct picasso_knote_info *out);
+++void
+++picasso_knote_info(struct knote *kn, struct picasso_knote_info *out)
+++{
+++	struct kqueue *kq = knote_get_kq(kn);
+++	out->sfflags = kn->kn_sfflags;
+++	out->status = kn->kn_status;
+++	out->flags = kn->kn_flags;
+++	out->qos = kn->kn_qos_index;
+++	out->kq_state = kq->kq_state;
+++	out->kq_count = kq->kq_count;
+++	out->tr_state = 0xff;
+++	if (kq->kq_state & KQ_WORKLOOP) {
+++		out->tr_state = ((struct kqworkloop *)kq)->kqwl_request.tr_state;
+++	} else if ((kq->kq_state & KQ_WORKQ) && kn->kn_qos_index > 0 &&
+++	    kn->kn_qos_index <= KQWQ_NBUCKETS) {
+++		out->tr_state = kqworkq_get_request((struct kqworkq *)kq, kn->kn_qos_index)->tr_state;
+++	}
+++}
+++#endif
+diff --git a/patches/xnu/zzzzzz-picasso-workq-report.patch b/patches/xnu/zzzzzz-picasso-workq-report.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/zzzzzz-picasso-workq-report.patch
+@@ -0,0 +1,50 @@
++diff --git a/bsd/pthread/pthread_workqueue.c b/bsd/pthread/pthread_workqueue.c
++--- a/bsd/pthread/pthread_workqueue.c
+++++ b/bsd/pthread/pthread_workqueue.c
++@@ -4812,3 +4812,46 @@
++ 	thread_deallocate_daemon_register_queue(&workq_deallocate_queue,
++ 	    workq_deallocate_queue_invoke);
++ }
+++
+++#if DEVELOPMENT || DEBUG
+++/* Picasso: a workloop thread request stays QUEUED while the process keeps an idle
+++ * parked thread. Print the counters the admission check uses, and its answer for
+++ * a constrained request at each QoS, to see which limit refuses the request. */
+++void picasso_workq_report(proc_t p, const char *who);
+++void
+++picasso_workq_report(proc_t p, const char *who)
+++{
+++	static const thread_qos_t qos[] = { THREAD_QOS_BACKGROUND, THREAD_QOS_UTILITY,
+++		THREAD_QOS_LEGACY, THREAD_QOS_USER_INITIATED, THREAD_QOS_USER_INTERACTIVE };
+++	uint32_t allow[5], active[5], busy[5], sched[WORKQ_NUM_BUCKETS];
+++	struct workqueue *wq = proc_get_wqptr_fast(p);
+++	if (wq == NULL) {
+++		printf("PICASSO_WQ %s no workqueue\n", who);
+++		return;
+++	}
+++	workq_lock_spin(wq);
+++	wq_thactive_t v = _wq_thactive(wq);
+++	for (unsigned i = 0; i < 5; i++) {
+++		active[i] = _wq_thactive_aggregate_downto_qos(wq, v, qos[i], &busy[i], NULL);
+++		allow[i] = workq_constrained_allowance(wq, qos[i], NULL, false);
+++	}
+++	for (unsigned i = 0; i < WORKQ_NUM_BUCKETS; i++) {
+++		sched[i] = wq->wq_thscheduled_count[i];
+++	}
+++	uint32_t reqcount = wq->wq_reqcount, nthreads = wq->wq_nthreads;
+++	uint32_t idle = wq->wq_thidlecount, scheduled = wq->wq_threads_scheduled;
+++	uint32_t constrained = wq->wq_constrained_threads_scheduled;
+++	uint32_t flags = (uint32_t)os_atomic_load(&wq->wq_flags, relaxed);
+++	bool creator = wq->wq_creator != NULL;
+++	workq_unlock(wq);
+++	printf("PICASSO_WQ %s reqcount=%u nthreads=%u idle=%u scheduled=%u constrained=%u/%u flags=0x%x creator=%u\n",
+++	    who, reqcount, nthreads, idle, scheduled, constrained, wq_max_constrained_threads,
+++	    flags, creator);
+++	printf("PICASSO_WQ %s thscheduled=%u,%u,%u,%u,%u,%u,%u\n", who, sched[0], sched[1],
+++	    sched[2], sched[3], sched[4], sched[5], sched[6]);
+++	for (unsigned i = 0; i < 5; i++) {
+++		printf("PICASSO_WQ %s qos=%u parallelism=%u active=%u busy=%u allowance=%u\n",
+++		    who, qos[i], wq_max_parallelism[_wq_bucket(qos[i])], active[i], busy[i], allow[i]);
+++	}
+++}
+++#endif

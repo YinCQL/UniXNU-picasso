@@ -14,7 +14,7 @@ diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,3160 @@
+@@ -0,0 +1,3178 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -398,6 +398,7 @@ new file mode 100644
 +	bool        panic_reset;
 +	bool        cmd_pending;
 +	bool        reboot_pending;
++	uint64_t    session_deadline;
 +	bool        reset_pending;
 +	bool        hang_pending;
 +	bool        watchdog;
@@ -2549,6 +2550,15 @@ new file mode 100644
 +		return false;
 +	}
 +	ud_poll();
++	/* picasso_session_s=N: a bounded test session ends in Fastboot by itself, the
++	 * same way the reboot-fastboot console command does, so no button is needed. */
++	if (ud.session_deadline && !ud.panic_mode && !ud.reboot_pending &&
++	    mach_absolute_time() >= ud.session_deadline) {
++		ud.session_deadline = 0;
++		printf("PICASSO CDC: session time is over; reboot-fastboot\n");
++		picasso_usb_watchdog_terminal();
++		ud.reboot_pending = true;
++	}
 +	bool normal = !ud.panic_mode && !ud.reboot_pending && !ud.hang_pending &&
 +	    !ud.panic_pending && !ud.reset_pending;
 +	os_atomic_store(&ud.poll_lock, 0, release);
@@ -3013,6 +3023,7 @@ new file mode 100644
 +	int watchdog = 1;
 +	int trace_polling = 0;
 +	int control_ms = PICASSO_USB_CONTROL_DEFAULT_MS;
++	int session_s = 0;
 +	char reset_mode[16] = "psci";
 +
 +	PE_parse_boot_argn("picasso_usb", &enabled, sizeof(enabled));
@@ -3027,12 +3038,19 @@ new file mode 100644
 +	    sizeof(watchdog));
 +	PE_parse_boot_argn("picasso_usb_control_ms", &control_ms,
 +	    sizeof(control_ms));
++	PE_parse_boot_argn("picasso_session_s", &session_s, sizeof(session_s));
 +	PE_parse_boot_argn("picasso_usb_reset", reset_mode,
 +	    sizeof(reset_mode));
 +	ud.mps = 64;
 +	ud.hold = hold != 0;
 +	ud.trace_polling = trace_polling != 0;
 +	ud.control_ms = control_ms > 0 ? (unsigned)control_ms : 0;
++	if (session_s > 0) {
++		uint64_t interval = 0;
++		nanoseconds_to_absolutetime((uint64_t)session_s * NSEC_PER_SEC, &interval);
++		ud.session_deadline = mach_absolute_time() + interval;
++		printf("PICASSO CDC: session ends in Fastboot after %d s\n", session_s);
++	}
 +	ud.panic_test = panic_test != 0;
 +	ud.panic_reset = panic_reset != 0;
 +	ud.watchdog = watchdog != 0;

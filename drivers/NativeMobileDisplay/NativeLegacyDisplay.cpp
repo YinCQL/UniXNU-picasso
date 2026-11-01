@@ -30,6 +30,7 @@ extern "C" void native_legacy_swap_validation_observed(bool,unsigned,const void 
 extern "C" void native_legacy_surface_rejected(uint64_t,uint64_t,uint32_t,uint32_t,uint64_t,uint64_t,uint64_t);
 extern "C" bool native_legacy_prepare_scanout(void);
 extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
+extern "C" void native_legacy_swap_geometry_observed(const uint32_t *,const uint32_t *,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
 extern "C" void native_legacy_retirement_observed(IOService *);
 extern "C" void native_legacy_retirement_failed(IOService *);
@@ -333,12 +334,18 @@ public:
                native_legacy_single_layer_state(word(792),word(796),word(800))) {
                 reason=3;bool rectangles=true;
                 const unsigned rectOffsets[]={17,81};
-                for(unsigned offset: rectOffsets) {
-                    uint32_t rect[4]={};memcpy(rect,bytes+offset,sizeof(rect));
-                    rectangles=rectangles && rect[0]==0 && rect[1]==0 && rect[2]==width && rect[3]==height;
+                uint32_t rects[2][4]={};
+                for(unsigned i=0;i<2;++i) {
+                    uint32_t *rect=rects[i];memcpy(rect,bytes+rectOffsets[i],sizeof(rects[i]));
+                    // iOS 16 CoreAnimation leaves a full-screen layer's rectangles zero.
+                    bool unset=!rect[0] && !rect[1] && !rect[2] && !rect[3];
+                    rectangles=rectangles && (unset || (rect[0]==0 && rect[1]==0 && rect[2]==width && rect[3]==height));
                 }
                 bool options=true;for(unsigned offset=804;offset<=812;offset+=4)options=options && word(offset)==0;
-                if(width && height && rectangles && options && word(816)==width && word(820)==height) {
+                // The same userland leaves the destination size zero as well.
+                bool size=(word(816)==width && word(820)==height) || (!word(816) && !word(820));
+                native_legacy_swap_geometry_observed(rects[0],rects[1],word(804),word(808),word(812),word(816),word(820));
+                if(width && height && rectangles && options && size) {
                     reason=4;
                     IOMemoryDescriptor *memory=native_legacy_surface_descriptor(surface);
                     // A surface larger than the display (rows or lines padded to the GPU's alignment) is accepted: only the visible rectangle,

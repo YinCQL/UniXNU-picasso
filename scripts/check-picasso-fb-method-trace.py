@@ -44,6 +44,11 @@ def main():
             method.index('picasso_fb_method_end') < method.index('ipcExit('):
         raise ValueError('Missing or misplaced trace hooks')
     clean = re.sub(r'/\* PICASSO_FB_METHOD_HOOK_BEGIN \*/.*?/\* PICASSO_FB_METHOD_HOOK_END \*/\n', '', method, flags=re.S)
+    # The iOS 16 adapter changes argument layouts around this same dispatch.
+    # Its conversions are covered by check-picasso-ios16-surface-abi.py.
+    for phase in ('PRE', 'POST'):
+        marker = r'/\* PICASSO_IOS16_ABI_' + phase
+        clean = re.sub(marker + r'_BEGIN \*/.*?' + marker + r'_END \*/\n', '', clean, flags=re.S)
     expected = '''IOReturn
 IOUserClient::callExternalMethod(uint32_t selector, IOExternalMethodArguments * args)
 {
