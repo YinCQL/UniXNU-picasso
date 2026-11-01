@@ -11,6 +11,7 @@ import plistlib
 import stat
 import struct
 from unittest.mock import patch
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -29,6 +30,7 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     data = load('seed_prepare', ROOT / 'scripts/prepare-picasso-ram-data.py')
     check = load('seed_artifacts', ROOT / 'scripts/check-picasso-data-artifacts.py')
+    wrapper = load('seed_wrapper', ROOT / 'scripts/picasso-seed-skip-setup.py')
     check.ROOT = out / 'device'
     work = out / 'work'
     (work / 'ram-data').mkdir(parents=True)
@@ -60,7 +62,8 @@ def main():
     raw, blob, packed = specimen(b'B' * 4096)
     (work / 'ram-data/data.dbrdisk').write_bytes(base_blob)
     spec = dict(skip_setup_tool='scripts/picasso-seed-skip-setup.py',
-                skip_setup_args=['--no-auto-dim', '--inject-lib', 'out/picasso/libpicasso-sb.dylib'])
+                skip_setup_args=['--no-auto-dim', '--inject-lib', 'out/picasso/libpicasso-sb.dylib',
+                                 '--statusbar-provider', '_UIStatusBarVisualProvider_LegacyPhone'])
     path = work / 'payload' / ('data-skip-setup-' + base['packed_sha256'][:12] + '-'
                               + hashlib.sha256(' '.join(spec['skip_setup_args']).encode()).hexdigest()[:8] + '.dbr')
     path.write_bytes(blob)
@@ -122,9 +125,45 @@ def main():
 
     identity = '12345678-1234-5678-1234-567812345678'
     jobs = ['com.apple.CommCenter']
-    library = check.ROOT / spec['skip_setup_args'][-1]
+    library = check.ROOT / spec['skip_setup_args'][spec['skip_setup_args'].index('--inject-lib') + 1]
     library.parent.mkdir(parents=True)
     library.write_bytes(b'independent-library-fixture')
+    # Exercise the wrapper's actual merge hook with independent plist I/O.
+    seed_root = out / 'wrapper-seed'
+    prefs = seed_root / 'mobile/Library/Preferences'
+    prefs.mkdir(parents=True)
+    ui_path = prefs / 'com.apple.UIKit.plist'
+    ui_path.write_bytes(plistlib.dumps({'ExistingPreference': 42}))
+    merged = []
+
+    def merge_pref(var, name, values):
+        destination = var / 'mobile/Library/Preferences' / (name + '.plist')
+        previous = plistlib.loads(destination.read_bytes()) if destination.exists() else {}
+        destination.write_bytes(plistlib.dumps({**previous, **values}, fmt=plistlib.FMT_BINARY))
+        merged.append(name)
+
+    def wrapper_readback():
+        arguments = ['seed.py', 'base.dbr', 'output.dbr', *spec['skip_setup_args']]
+        provider = wrapper.consume_statusbar_provider(arguments)
+        assert arguments == ['seed.py', 'base.dbr', 'output.dbr', *spec['skip_setup_args'][:3]]
+        tool = SimpleNamespace(merge_pref=merge_pref)
+        wrapper.configure_seed(tool, library, provider)
+        tool.merge_pref(seed_root, 'com.apple.migration', {'LastSystemVersion': check.firmware.BUILD})
+        tool.merge_pref(seed_root, 'com.apple.springboard', {'SBDisableAutoDim': True})
+        assert plistlib.loads(ui_path.read_bytes()) == {
+            'ExistingPreference': 42, 'UIStatusBarVisualProviderClassName': '_UIStatusBarVisualProvider_LegacyPhone'}
+        assert merged.count('com.apple.UIKit') == 1
+        assert plistlib.loads((prefs / 'com.apple.springboard.plist').read_bytes()) == {
+            'SBDisableAutoDim': True, 'BSUIVibrancyEffectViewDisabled': True}
+        assert (seed_root / 'picasso/libpicasso-sb.dylib').read_bytes() == library.read_bytes()
+
+    case('wrapper writes UIKit suite and preserves existing preferences', wrapper_readback)
+    assert wrapper.consume_statusbar_provider(['seed.py', 'base', 'output']) is None
+    for arguments in (['--statusbar-provider'], ['--statusbar-provider', '_UIStatusBarFallbackVisualProvider'],
+                      ['--statusbar-provider', wrapper.STATUSBAR_PROVIDER, '--statusbar-provider', wrapper.STATUSBAR_PROVIDER]):
+        case('reject wrapper provider ' + ' '.join(arguments),
+             lambda arguments=arguments: wrapper.consume_statusbar_provider(list(arguments)),
+             'Duplicate' if arguments.count('--statusbar-provider') > 1 else 'reviewed Phone provider')
     state = {}
 
     def metadata(path):
@@ -155,7 +194,13 @@ def main():
                                          SetupVersion=11, daemonizeNeedsToRun=False),
             'com.apple.springboard': dict(BSUIVibrancyEffectViewDisabled=True, SBDisableAutoDim=True,
                                          SBDontDimOrLockOnAC=True, SBDisableIdleSleep=True),
+            'com.apple.UIKit': dict(UIStatusBarVisualProviderClassName=state.get(
+                'provider', '_UIStatusBarVisualProvider_LegacyPhone')),
         }.items():
+            if name == 'com.apple.UIKit' and state.get('missing_ui_domain'):
+                continue
+            if name == 'com.apple.UIKit' and state.get('missing_provider'):
+                values = {}
             (preferences / (name + '.plist')).write_bytes(plistlib.dumps(values))
         destination = target / 'picasso/libpicasso-sb.dylib'
         destination.parent.mkdir()
@@ -190,6 +235,9 @@ def main():
         ('bad_policy', True, 'Offline policy content'),
         ('build', '21H461', 'Setup preferences differ'),
         ('bad_setup', True, 'Setup preferences differ'),
+        ('provider', '_UIStatusBarFallbackVisualProvider', 'Setup preferences differ: com.apple.UIKit'),
+        ('missing_provider', True, 'Setup preferences differ: com.apple.UIKit'),
+        ('missing_ui_domain', True, 'Missing Setup preference: com.apple.UIKit'),
         ('bad_library', True, 'library differs'),
         ('bad_library_mode', True, 'library metadata'),
     ):

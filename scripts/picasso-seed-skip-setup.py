@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mark Setup as done in a copy of the Data seed for the selected iOS userland.
 
-  picasso-seed-skip-setup.py BASE.dbr OUTPUT.dbr [--no-auto-dim]
+  picasso-seed-skip-setup.py BASE.dbr OUTPUT.dbr [--no-auto-dim] [--statusbar-provider CLASS]
 
 Runs the upstream scripts/seed-data-skip-setup.py with this board's userland build and version
 (picasso_target) instead of the iPadOS 17.7.11 / 21H461 pair it carries. com.apple.migration's
@@ -11,6 +11,7 @@ for the software renderer. Everything else is the upstream tool unchanged.
 With --inject-lib PATH, that library is also copied into the Data seed at /picasso/ (runtime
 /private/var/picasso/), where the kernel's picasso_inject_sb boot-arg points, so dyld loads it
 into SpringBoard. The argument is consumed here; the upstream tool never sees it.
+--statusbar-provider selects the reviewed native UIKit status bar layout for this GOP mode.
 """
 import importlib.util
 import os
@@ -24,9 +25,24 @@ import picasso_target as target
 
 INJECT_DIR = 'picasso'
 INJECT_NAME = 'libpicasso-sb.dylib'
+STATUSBAR_PROVIDER = '_UIStatusBarVisualProvider_LegacyPhone'
+
+
+def consume_statusbar_provider(arguments):
+    if '--statusbar-provider' not in arguments:
+        return None
+    if arguments.count('--statusbar-provider') != 1:
+        raise ValueError('Duplicate --statusbar-provider')
+    at = arguments.index('--statusbar-provider')
+    if at + 1 >= len(arguments) or arguments[at + 1] != STATUSBAR_PROVIDER:
+        raise ValueError('--statusbar-provider requires the reviewed Phone provider')
+    value = arguments[at + 1]
+    del arguments[at:at + 2]
+    return value
 
 
 def main():
+    statusbar_provider = consume_statusbar_provider(sys.argv)
     inject_lib = None
     if '--inject-lib' in sys.argv:
         at = sys.argv.index('--inject-lib')
@@ -45,32 +61,38 @@ def main():
     tool = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tool)
     tool.BUILD, tool.VERSION = target.BUILD, target.VERSION
-    # No GPU here: CoreAnimation's software renderer draws a "vibrant" view (the lock screen's
-    # clock) as a red mask over an untoned wallpaper. BSUIVibrancyEffectViewDisabled makes such
-    # views draw their content as it is, as HackiOS sets it for SpringBoard without a GPU.
+    configure_seed(tool, inject_lib, statusbar_provider)
+    print(f'picasso: Setup marked done for {target.PRODUCT} {target.VERSION} ({target.BUILD})')
+    tool.main()
+
+
+def configure_seed(tool, inject_lib=None, statusbar_provider=None):
+    # Render vibrant content directly with the software renderer.
     merge_pref = tool.merge_pref
-    copied = {'done': False}
+    initialized = False
 
     def merge_springboard_pref(var, name, values):
-        # The first merge_pref call gives the Data volume root (var); copy the inject library then.
-        if inject_lib is not None and not copied['done']:
-            copied['done'] = True
-            if inject_lib.is_file():
+        nonlocal initialized
+        # __UIKitUserDefaults uses initWithSuiteName:@"com.apple.UIKit" in 20H392.
+        # Its provider override bypasses the screen-size lookup that selects the fallback label.
+        if not initialized:
+            initialized = True
+            if statusbar_provider is not None:
+                if statusbar_provider != STATUSBAR_PROVIDER:
+                    raise ValueError('Unreviewed status bar provider')
+                merge_pref(var, 'com.apple.UIKit', {'UIStatusBarVisualProviderClassName': statusbar_provider})
+            if inject_lib is not None:
                 dest_dir = Path(var) / INJECT_DIR
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 dest = dest_dir / INJECT_NAME
                 shutil.copyfile(inject_lib, dest)
                 os.chmod(dest, 0o644)
                 print(f'picasso: inject library placed at /{INJECT_DIR}/{INJECT_NAME} ({dest.stat().st_size} bytes)')
-            else:
-                print(f'picasso: no inject library at {inject_lib}; SpringBoard runs unmodified')
         if name == 'com.apple.springboard':
             values = {**values, 'BSUIVibrancyEffectViewDisabled': True}
         merge_pref(var, name, values)
 
     tool.merge_pref = merge_springboard_pref
-    print(f'picasso: Setup marked done for {target.PRODUCT} {target.VERSION} ({target.BUILD})')
-    tool.main()
 
 
 if __name__ == '__main__':

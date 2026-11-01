@@ -72,11 +72,18 @@ def verify_setup_preferences(target, spec):
         'com.apple.springboard': {'BSUIVibrancyEffectViewDisabled': True},
     }
     arguments = spec.get('skip_setup_args', [])
+    if '--statusbar-provider' in arguments:
+        require(arguments.count('--statusbar-provider') == 1, 'Duplicate Setup status bar provider')
+        index = arguments.index('--statusbar-provider') + 1
+        require(index < len(arguments) and arguments[index] == '_UIStatusBarVisualProvider_LegacyPhone',
+                'Invalid Setup status bar provider')
+        expected['com.apple.UIKit'] = {'UIStatusBarVisualProviderClassName': arguments[index]}
     if '--no-auto-dim' in arguments:
         expected['com.apple.springboard'].update(SBDisableAutoDim=True,
                                                 SBDontDimOrLockOnAC=True, SBDisableIdleSleep=True)
     for name, values in expected.items():
         path = target / 'mobile/Library/Preferences' / (name + '.plist')
+        require(path.exists(), f'Missing Setup preference: {name}')
         require(stat.S_ISREG(path.lstat().st_mode), f'Setup preference is not a file: {name}')
         actual = plistlib.loads(path.read_bytes())
         require(all(actual.get(key) == value for key, value in values.items()),

@@ -184,7 +184,8 @@ offline_disabled_jobs = [
 ]
 # Use the selected iOS build for Setup/migration flags and disable automatic dimming.
 skip_setup_tool = "scripts/picasso-seed-skip-setup.py"
-skip_setup_args = ["--no-auto-dim", "--inject-lib", "out/picasso/libpicasso-sb.dylib"]
+# Native phone status bar layout for the 360-point-wide GOP screen.
+skip_setup_args = ["--no-auto-dim", "--inject-lib", "out/picasso/libpicasso-sb.dylib", "--statusbar-provider", "_UIStatusBarVisualProvider_LegacyPhone"]
 # Fits the kernel, trust caches and packed Data seed within the 95% content limit.
 size_mib = 60
 loader = "firmware"
