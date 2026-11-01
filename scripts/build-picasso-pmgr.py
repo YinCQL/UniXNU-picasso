@@ -18,7 +18,8 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 RECORD = 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'
-SOURCES = ('PicassoPmgr', 'PicassoWatchdog', 'PicassoBootState')
+SOURCES = ('PicassoPmgr', 'PicassoWatchdog', 'PicassoBootState',
+           'PicassoPowerSource')
 
 
 def require(condition, message):

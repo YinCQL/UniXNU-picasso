@@ -313,7 +313,7 @@ CPU; this does not implement Apple's per-core checker for future SMP.
 
 The service prepares a workloop and high-priority timer before claiming hardware.
 Claim permanently retires USB's independent boot pets. Each 1-second callback
-executes the original policy check before petting the 15-second hardware
+executes the original policy check before petting the 30-second hardware
 watchdog. The original first deadline (600 seconds), subsequent checkin deadline
 (90 seconds) and daemon's normal target checkin interval (10 seconds) remain
 distinct. A policy panic cannot reach the subsequent pet.

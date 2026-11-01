@@ -25,12 +25,19 @@ HOST_TEST = r"""#include <cassert>
 #include <string>
 #include <vector>
 
+#ifdef __clang__
+#pragma clang diagnostic ignored "-Wmissing-field-initializers"
+#endif
+
+#ifndef __unused
 #define __unused [[maybe_unused]]
+#endif
 #define _Atomic /* Serial fixture; concurrent atomics are tested by the backend fixture. */
 #define NSEC_PER_MSEC 1000000ULL
 enum { acquire, release };
 using wait_result_t = int;
 using boolean_t = bool;
+using kern_return_t = int;
 static bool irq_enabled;
 static boolean_t ml_set_interrupts_enabled(bool enabled) {
     bool previous = irq_enabled;
@@ -42,6 +49,8 @@ struct {
     unsigned poll_lock;
     bool panic_mode, reboot_pending, hang_pending, panic_pending, reset_pending;
     bool watchdog_armed, hold, trace_polling, rx_busy;
+    bool start_kext_pending, register_pending;
+    int publish_pending;
     uintptr_t wdt;
     uint64_t events;
 } ud;
@@ -50,6 +59,7 @@ enum Action { NoAction, EnterPanic, RequestReboot, RequestHang, RequestPanic, Re
 static Action action;
 static unsigned poll_calls, pet_calls, reboot_calls, hang_calls, panic_calls;
 static unsigned wait_calls, yield_calls, stop_after;
+static unsigned simulated_control;
 static uint64_t fake_now_ns, yield_step;
 static volatile uint64_t armcpu_timer_interrupts;
 static bool in_poll, replay_console, in_printf, panic_on_yield;
@@ -81,15 +91,21 @@ static void ud_poll(void) {
 }
 static void usb_wr(uintptr_t base, unsigned off, unsigned value) {
     assert(!in_poll && ud.poll_lock == 0 && !ud.panic_mode && !irq_enabled);
-    assert(base == ud.wdt && off == 4u && value == 1);
+    assert(base == ud.wdt);
+    if (off == 8u) {
+        simulated_control = value;
+        return;
+    }
+    if (off == 0x10u || off == 0x14u) return;
+    assert(off == 4u && value == 1);
     ++pet_calls;
     sequence.emplace_back("pet");
 }
 static unsigned usb_rd(uintptr_t base, unsigned off) {
     assert(base == ud.wdt && !irq_enabled);
-    if (off == 8u) return 1u;
+    if (off == 8u) return simulated_control;
     assert(off == 0x10u || off == 0x14u);
-    return 491519u;
+    return 983039u;
 }
 static uint64_t mach_absolute_time(void) {
     sequence.emplace_back("clock");
@@ -130,6 +146,16 @@ static int test_printf(const char *format, ...) {
 #include "production.h"
 #undef printf
 
+int native_start_kext_and_report(const char *, const char *) {
+    return -1;
+}
+int native_register_display_and_report(void) {
+    return -1;
+}
+int native_publish_display_and_report(int) {
+    return -1;
+}
+
 static void reset(void) {
     ud = {};
     picasso_wdt_lock = picasso_wdt_terminal = 0;
@@ -141,6 +167,7 @@ static void reset(void) {
     action = NoAction;
     poll_calls = pet_calls = reboot_calls = hang_calls = panic_calls = 0;
     wait_calls = yield_calls = 0;
+    simulated_control = 1;
     stop_after = 1;
     fake_now_ns = 5000000000ULL;
     yield_step = 1000000;
@@ -364,8 +391,8 @@ def extract_production(patch, out):
              [extract_function(source, name) for name in names[:3]] + [definitions] +
              [extract_function(source, name) for name in names[3:]])
     (out / 'production.h').write_text('\n'.join(parts), encoding='utf-8', newline='\n')
-    if '#define APSS_WDT_TIMEOUT_MS 15000u' not in source:
-        raise ValueError('The 15-second watchdog timeout changed')
+    if '#define APSS_WDT_TIMEOUT_MS 30000u' not in source:
+        raise ValueError('The 30-second watchdog timeout changed')
     if 'extern volatile uint64_t armcpu_timer_interrupts __attribute__((weak_import));' not in source:
         raise ValueError('The diagnostic ArmCpu counter must remain an optional weak import')
     return {'patch_sha256': hashlib.sha256(patch.read_bytes()).hexdigest(),

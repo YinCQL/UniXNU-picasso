@@ -69,20 +69,24 @@ UART_SIZE = 0x4000
 PANIC_LOG_PADDR = 0xB7F00000
 PANIC_LOG_SIZE = 0x100000
 
-GPU_BASE = 0x05000000
+GPU_BASE = 0x03D00000
 GPU_SIZE = 0x40000
-GPU_CX_BASE = 0x0509E000
+GPU_CX_BASE = 0x03D61000
 GPU_CX_SIZE = 0x1000
 
-GMU_BASE = 0x0506A000
-GMU_SIZE = 0x32000
-GMU_PDC_CFG = 0x0B280000
+GMU_BASE = 0x03D6A000
+GMU_SIZE = 0x30000
+GMU_PDC_CFG = 0x0B290000
 GMU_PDC_CFG_SIZE = 0x10000
-GMU_PDC_SEQ = 0x0B480000
+GMU_PDC_SEQ = 0x0B490000
 GMU_PDC_SEQ_SIZE = 0x10000
 
-SMMU_GPU_BASE = 0x05040000
+SMMU_GPU_BASE = 0x03DA0000
 SMMU_GPU_SIZE = 0x10000
+GPUCC_BASE = 0x03D90000
+GPUCC_SIZE = 0x9000
+GCC_BASE = 0x00100000
+GCC_SIZE = 0x1F0000
 
 
 def node(name, properties=(), children=()):
@@ -141,6 +145,8 @@ def main():
                         help='/chosen/memory-map RAMDisk placeholder; the loader fills in the real range for a scratch Data seed')
     parser.add_argument('--trust-cache', action='store_true', help='Zeroed TrustCache sidecar handoff placeholder')
     parser.add_argument('--gpu-addon', action='store_true', help='Zeroed GpuAddon sidecar handoff placeholder')
+    parser.add_argument('--random-seed', metavar='HEX',
+                        help='Exact 64-byte /chosen/random-seed value, for reproducible A/B trees')
     args = parser.parse_args()
     if (args.unique_chip_id is None) != (args.chip_id is None):
         parser.error('--unique-chip-id and --chip-id must be supplied together')
@@ -150,6 +156,15 @@ def main():
             not 0x10000000 <= args.owned_memory_size <= 0x200000000
             or args.owned_memory_size % 0x200000):
         parser.error('Owned memory must be 256 MiB to 8 GiB, aligned to 2 MiB')
+    if args.random_seed is None:
+        random_seed = os.urandom(64)
+    else:
+        try:
+            random_seed = bytes.fromhex(args.random_seed)
+        except ValueError:
+            parser.error('--random-seed must be hexadecimal')
+        if len(random_seed) != 64:
+            parser.error('--random-seed must encode exactly 64 bytes')
 
     try:
         cpu_regs = [int(value, 0) for value in args.cpu_regs.split(',')]
@@ -182,7 +197,7 @@ def main():
         ('#address-cells', struct.pack('<I', 2)),
         ('#size-cells', struct.pack('<I', 2)),
     ], [
-        node('chosen', [('random-seed', os.urandom(64)),
+        node('chosen', [('random-seed', random_seed),
                         # Without these XNU never publishes IOPlatformUUID and gethostuuid() blocks forever
                         # for callers (configd) that pass a zero timeout.
                         *([('unique-chip-id', struct.pack('<Q', args.unique_chip_id)), ('chip-id', struct.pack('<I', args.chip_id))]
@@ -265,17 +280,35 @@ def main():
               # only; the driver takes the physical base from the board constants.
               node('serial', [('compatible', b'qcom,geni-debug-uart\0qcom,geni-uart\0'),
                               ('boot-console', b'')]),
-              # UFS (0x1d84000), the GPU blocks (0x5000000..) and the GPU SMMU all sit
+              # UFS (0x1d84000), the GPU blocks (0x3d00000..) and the GPU SMMU all sit
               # below the APSS window base, so none of them can carry a bus-offset reg.
-              # They exist for class matching only; the drivers read the physical
-              # windows from the board constants. This is the same shape
-              # make-sheng-adt.py uses for ufshc.
+              # Their reg properties therefore carry absolute physical addresses
+              # using the ADT's little-endian two-cell encoding.
               node('ufshc', [('compatible', b'qcom,sm7250-ufshc\0')]),
               node('ufsphy', [('compatible', b'qcom,sm7250-ufs-phy\0')]),
               node('gpu', [('compatible', b'qcom,adreno-620.0\0qcom,adreno\0'),
-                           ('iommus', struct.pack('<II', 0x10, 0x0))]),
-              node('gmu', [('compatible', b'qcom,adreno-gmu-620.0\0qcom,adreno-gmu\0')]),
+                           ('#address-cells', struct.pack('<I', 2)),
+                           ('#size-cells', struct.pack('<I', 2)),
+                           ('reg', struct.pack('<8Q',
+                                               GPU_BASE, GPU_SIZE,
+                                               GPU_CX_BASE, 0x800,
+                                               0x03DE0000, 0x1000,
+                                               0x03D8B000, 0x2000)),
+                           ('qcom,chipid', struct.pack('<I', 0x06020001)),
+                           ('gpucc-reg', struct.pack('<QQ', GPUCC_BASE, GPUCC_SIZE)),
+                           ('gcc-reg', struct.pack('<QQ', GCC_BASE, GCC_SIZE)),
+                           ('iommus', struct.pack('<4I', 0x10, 0x0, 0x10, 0x2))]),
+              node('gmu', [('compatible', b'qcom,adreno-gmu-620.0\0qcom,adreno-gmu\0'),
+                           ('#address-cells', struct.pack('<I', 2)),
+                           ('#size-cells', struct.pack('<I', 2)),
+                           ('reg', struct.pack('<6Q',
+                                               GMU_BASE, GMU_SIZE,
+                                               GMU_PDC_CFG, GMU_PDC_CFG_SIZE,
+                                               GMU_PDC_SEQ, GMU_PDC_SEQ_SIZE))]),
               node('adreno-smmu', [('compatible', b'qcom,adreno-smmu\0qcom,smmu-v2\0'),
+                                   ('#address-cells', struct.pack('<I', 2)),
+                                   ('#size-cells', struct.pack('<I', 2)),
+                                   ('reg', struct.pack('<QQ', SMMU_GPU_BASE, SMMU_GPU_SIZE)),
                                    ('#iommu-cells', struct.pack('<I', 1)),
                                    ('phandle', struct.pack('<I', 0x10))])]),
     ])

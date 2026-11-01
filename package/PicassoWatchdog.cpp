@@ -32,6 +32,7 @@ private:
   bool backendClaimed = false;
   bool policyReady = false;
   bool hardwareEnabled = false;
+  bool watchdogdPolicyDisabled = false;
   uint64_t successfulChecks = 0;
   uint32_t clientOpenLogCount = 0;
 
@@ -141,12 +142,19 @@ void PicassoWatchdogDriver::timerFired(OSObject *owner, IOTimerEventSource *send
 
   // The original function never pets hardware. It retains the original
   // 600-second first deadline, 90-second checkin deadline, APFS defang and
-  // shutdown policy. A panic never reaches the following hardware pet.
-  picasso_original_iowatchdog_policy_check(self);
+  // shutdown policy. During bring-up the launch job may be deliberately
+  // disabled, in which case its missing checkins are expected. Keep the
+  // original policy untouched by default, but do not let that diagnostic boot
+  // option trigger the policy's own sleep-wake panic.
+  if (!self->watchdogdPolicyDisabled) {
+    picasso_original_iowatchdog_policy_check(self);
+  }
   self->petWatchdogHardware();
   ++self->successfulChecks;
   if (self->successfulChecks == 1) {
-    IOLog("picasso-watchdog: first original policy check and hardware pet complete\n");
+    IOLog("picasso-watchdog: first policy step and hardware pet complete "
+          "(watchdogd-policy-disabled=%u)\n",
+          self->watchdogdPolicyDisabled ? 1U : 0U);
   }
   self->scheduleNextCheck();
 }
@@ -156,6 +164,11 @@ bool PicassoWatchdogDriver::start(IOService *provider)
   if (provider == nullptr || watchdogLoop != nullptr || backendClaimed) {
     return false;
   }
+  uint32_t disableWatchdogd = 0;
+  watchdogdPolicyDisabled =
+      PE_parse_boot_argn("sheng-disable-watchdogd", &disableWatchdogd,
+                         sizeof(disableWatchdogd)) &&
+      disableWatchdogd == 1;
   watchdogLoop = IOWorkLoop::workLoop();
   if (watchdogLoop == nullptr) {
     return false;

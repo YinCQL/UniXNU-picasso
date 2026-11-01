@@ -434,9 +434,12 @@ bool ArmCpu::start (IOService *provider)
   }
   controller->registerCPUInterruptController ();
   controller->enableCPUInterrupt (this);
-  if (controller->registerInterrupt (provider, logicalId, this, &ArmCpu::dispatch, nullptr) != kIOReturnSuccess) {
-    panic ("ArmCpu: CPU IRQ action registration failed");
-  }
+  // The shared controller waits until every CPU described by the device tree
+  // enables interrupts. A cpus=1 boot with multi-CPU ADT data never reaches
+  // that count, so start() would block before initCPU(). Install the boot
+  // dispatch directly, as the secondary-CPU path already does.
+  ml_install_interrupt_handler (this, static_cast<int> (logicalId), this,
+      reinterpret_cast<IOInterruptHandler> (&ArmCpu::dispatch), nullptr);
   gController = controller;
   initCPU (true);
   registerService ();

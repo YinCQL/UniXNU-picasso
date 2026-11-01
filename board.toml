@@ -63,12 +63,19 @@ archives = [
   # Stage 6: the UFS controller driver. Its board constants (GccUfs.h) carry
   # the SM7250 physical windows; the ADT ufshc/ufsphy nodes only match classes.
   "build-arm-driver.py NativeUfs",
+  # Native A620 transport and command-processor driver. The initial boot only
+  # probes its MMIO windows read-only; GPU power and firmware startup stay
+  # behind explicit boot arguments.
+  "build-arm-driver.py NativeAdreno",
   # Volatile APFS Data; shares NativeUfs's exact original IOStorage bindings.
   "build-arm-driver.py NativeRamBlock",
   # Publishes ApplePMGRNub, the original-policy SM7250 watchdog, and volatile boot-stage storage.
   # The archive lands in build/sheng-platform-power/libShengPlatformPower.a, the path
   # build-xnu-4k-baseline.sh force-loads when CONFIG_XNU_SHENG_PMGR=1.
   "build-picasso-pmgr.py",
+  # Owned CPU/GOP framebuffer subclass over the original Legacy family.
+  # It is entered only through the explicit CDC display commands.
+  "build-native-legacy-display.py",
 ]
 
 [kernel.prelink]
@@ -89,6 +96,13 @@ roots = [
   "com.apple.iokit.IOHIDFamily",
   # Original IOBSD-matched IOSurfaceRoot, required by graphics/media clients.
   "com.apple.iokit.IOSurface",
+  # IOAcceleratorES parent for the discovery-only accelerator service. This
+  # root intentionally does not include the Apple AGX provider.
+  "com.apple.iokit.IOGPUFamily",
+  # The owned NativeLegacyDisplay subclass calls the unchanged
+  # IOMobileFramebufferLegacy implementation at its qualified original
+  # addresses. Keep that family in the same audited prelink layout.
+  "com.apple.iokit.IOMobileGraphicsFamily",
   "com.apple.iokit.IOStorageFamily",
   "com.apple.kec.Libm",
   "com.apple.kec.corecrypto",
@@ -164,12 +178,12 @@ dram_size = "0x80000000"
 # nothing and left the boot without a console. debug=0x14e keeps DB_KPRT (0x8),
 # so kprintf is still enabled; the flags are 0x2 and 0x4 (NMI) plus 0x40 (ARP)
 # and 0x100 (obsolete), none of which halt early.
-# Also pin the platform explicitly: cpus=1 avoids spinning up seven secondary
-# cores before the platform expert has an interrupt controller.
+# SMP isolation test: compare two CPUs against the established single-CPU
+# baseline without changing any other boot argument.
 kernel_args = [
   "-v",
   "debug=0x14e",
-  "cpus=1",
+  "cpus=2",
   # Production root path. native-ufs-root=1 starts the root from the
   # root-device personality without the diagnostic media-report panic that
   # native-ufs-probe=12 ends with. Upstream's payload guard (check_native_root)
@@ -192,6 +206,18 @@ kernel_args = [
   # every other message. Set it back to 1 only when the UFS transport itself is
   # the question.
   "native-ufs-diagnostics=0",
+  # Use the 8 GiB packed Data seed and back changed pages with the reserved
+  # NativeUfs store window at the end of userdata.
+  "sheng-data-persist=2",
+  # Diagnostic bring-up isolation: the original watchdogd's service checks do
+  # not complete on this kernel yet. Disable only its launch job for this boot.
+  "sheng-disable-watchdogd=1",
+  # SpringBoard's synchronous CHSChronoServicesConnection XPC was the last wall
+  # before the UI: it waited on chronod forever because the no-radio/no-account
+  # jobs (identityservicesd, locationd, CommCenter, coreduetd, PerfPowerServices,
+  # duetexpertd, ...) kept the services around it stalled. sheng's production
+  # line sets this on the same 21H461 userland; with it the lock screen renders.
+  "sheng-lite=1",
   # IOKit matching trace is off for the same reason as the UFS one: it answers
   # whether a personality matched, which the earlier root and probe=12 runs have
   # already established, and it prints a very long log while doing so. Turn it
@@ -217,14 +243,51 @@ kernel_args = [
   # hold=1 parks bsd_init indefinitely for USB-only qualification; that mode
   # cannot exercise this branch's UFS/root/SystemOS path.
   "picasso_usb_hold=0",
-  # Keep the synchronous CDC command loop open before the timer-dependent
-  # background poller and UFS probe. This is long enough for the host tty to
-  # attach and issue status/reboot-fastboot; everything in this window pets the
-  # watchdog, and the boot continues automatically when it expires.
-  "picasso_usb_control_ms=60000",
+  # Bound the attended synchronous window while still leaving time to issue
+  # status/start-graphics/register-display/publish-display-start commands.
+  "picasso_usb_control_ms=15000",
+  # Host-gated deadman: keep the 32 s hardware watchdog petted while the host
+  # is alive, then force a Fastboot reset after 60 s of silence.
+  "picasso_usb_watchdog=1",
+  "picasso_usb_watchdog_ms=30000",
+  "picasso_usb_early_watchdog=1",
+  "picasso_usb_host_timeout_ms=60000",
+  "picasso_usb_host_boot_grace_ms=120000",
   # The XNU CDC panic/reset path uses PSHOLD as its final fallback and arms the
-  # IMEM Fastboot reason before either panic or command reset.
-  "picasso_usb_reset=pshold",
+  # IMEM Fastboot reason before either panic or command reset. The hardware
+  # watchdog path is the proven automatic Fastboot recovery route.
+  "picasso_usb_reset=watchdog",
+  # Qualified CPU/GOP display path. The family is loaded before the CDC
+  # window; registration/publication remain explicit CDC commands.
+  "offline-mobile-graphics-load=1",
+  "offline-legacy-register=1",
+  "offline-legacy-gop=1",
+  "offline-legacy-pm=1",
+  "offline-legacy-phase=4",
+  "offline-legacy-validate=1",
+  "offline-legacy-transfer=1",
+  "offline-legacy-cpu-present=1",
+  "sheng-vsync=60",
+  # State-only AppleKeyStore probe used by the display/keystore diagnostics.
+  "picasso-aks-state=1",
+  # Read GPUCC clock and GDSC state without touching the GPU core. SMMU and
+  # RBBM probes remain separate opt-in arguments because either block may be
+  # inaccessible until CX/GX power and clocks are established.
+  "sheng-gpu-probe=1",
+  # Opt-in write limited to GPUCC_CX_GDSCR.SW_COLLAPSE; no GPU core access.
+  "sheng-gpu-cx-power=1",
+  "sheng-gpu-gcc-probe=1",
+  # Official UniXNU boot-page UI trace. Keep the OS running, then take the
+  # panel back after 30 seconds without a system scanout so the sampled stacks
+  # and wait chain remain photographable even when SpringBoard is stuck.
+  "boot-progress=2",
+  "boot-diag-resume=30",
+  "sheng-build-tag=picasso-ui-trace",
+  "boot-ui-focus=chronod",
+  "boot-ui-focus2=SpringBoard",
+  "boot-ui-focus3=backboardd",
+  "boot-ui-focus4=liveactivitiesd",
+  "boot-ui-follow=1",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
@@ -319,6 +382,6 @@ root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 # Keep the existing 256 MiB contiguous kernel window request. It is separate
 # from the original FAT ramdisk mapping above. Packed Data does not expand it:
 # only resident seed/write pages consume RAM, and peak use needs device testing.
-owned_memory_size = "0x10000000"
+owned_memory_size = "0x30000000"
 cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
 unique_chip_id = "required"

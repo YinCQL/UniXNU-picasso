@@ -21,6 +21,8 @@
 extern "C" void sheng_pmgr_run(void);
 extern "C" void picasso_boot_state_run(void);
 extern "C" void picasso_watchdog_run(void);
+extern "C" void picasso_power_source_run(void);
+extern "C" void native_adreno_probe_run(void) __attribute__((weak_import));
 
 // Bring-up evidence for the boot-progress panel and the UFS log: 0 nothing tried, 1 class absent,
 // 2 allocation failed, 3 published, 4 discovery check failed.
@@ -45,6 +47,10 @@ extern "C" void sheng_pmgr_run(void)
   // before launchd can ask for the platform watchdog and boot-stage services.
   picasso_boot_state_run();
   picasso_watchdog_run();
+  picasso_power_source_run();
+  if (native_adreno_probe_run != nullptr) {
+    native_adreno_probe_run();
+  }
   unsigned mode = 0;
   if (!PE_parse_boot_argn("sheng-pmgr", &mode, sizeof(mode)) || (mode == 0)) {
     return;

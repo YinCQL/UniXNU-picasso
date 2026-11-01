@@ -57,7 +57,7 @@ def extract(device, out):
         assert declaration in source and declaration in header
     (out / 'PicassoWatchdogBackend.h').write_text(header, encoding='utf-8', newline='\n')
     constants = '\n'.join(re.findall(r'^#define APSS_WDT_[^\n]+', source, re.M))
-    assert '#define APSS_WDT_TIMEOUT_MS 15000u' in constants
+    assert '#define APSS_WDT_TIMEOUT_MS 30000u' in constants
     assert '#define APSS_WDT_RATE_HZ    32768u' in constants
     definitions = source[source.index('#define UD_WATCHDOG_INITIAL_REPORTS'):
                          source.index('static uint64_t\nud_monotonic_ns')]

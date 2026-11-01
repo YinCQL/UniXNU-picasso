@@ -45,6 +45,18 @@ def assert_modem_lines(fd):
     return before, after
 
 
+def parse_timed_command(value):
+    try:
+        at, command = value.split('=', 1)
+        at = float(at)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            'timed command must use SECONDS=COMMAND') from error
+    if at < 0 or not command:
+        raise argparse.ArgumentTypeError('invalid timed command')
+    return at, command
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', help='serial device, e.g. /dev/cu.usbmodem1101')
@@ -54,6 +66,15 @@ def main():
                         help='wait up to this many seconds for the serial port')
     parser.add_argument('--reconnect', action='store_true',
                         help='reopen the port if the device disappears and enumerates again')
+    parser.add_argument('--send', metavar='COMMAND',
+                        help='send COMMAND on the same serial handle (for example status)')
+    parser.add_argument('--send-interval', type=float, default=15,
+                        help='seconds between COMMAND writes (default: 15)')
+    parser.add_argument('--send-after', type=float, default=0,
+                        help='wait this many seconds after opening the port before the first COMMAND write')
+    parser.add_argument('--send-at', action='append', default=[],
+                        type=parse_timed_command, metavar='SECONDS=COMMAND',
+                        help='send COMMAND once after the port has been open this many seconds')
     parser.add_argument('--list', action='store_true', help='list matching serial devices')
     parser.add_argument('--no-stdout', action='store_true', help='write only to the log file')
     args = parser.parse_args()
@@ -66,6 +87,10 @@ def main():
         parser.error('--duration must be greater than zero')
     if args.wait < 0:
         parser.error('--wait must be zero or greater')
+    if args.send_interval <= 0:
+        parser.error('--send-interval must be greater than zero')
+    if args.send_after < 0:
+        parser.error('--send-after must be zero or greater')
     deadline = time.monotonic() + args.wait
     while not (os.path.exists(args.port) if args.port else ports):
         if time.monotonic() >= deadline:
@@ -118,7 +143,49 @@ def main():
                         f'(TIOCM={bits_before:#x}->{bits_after:#x}; Ctrl-C to stop)',
                         file=sys.stderr,
                     )
+                    command = ((args.send + '\r\n').encode('ascii')
+                               if args.send else None)
+                    next_send = (time.monotonic() + args.send_after
+                                 if command else None)
+                    opened_at = time.monotonic()
+                    timed = sorted(args.send_at)
+                    next_timed = 0
                     while deadline is None or time.monotonic() < deadline:
+                        now = time.monotonic()
+                        while (next_timed < len(timed) and
+                               now >= opened_at + timed[next_timed][0]):
+                            _, timed_command = timed[next_timed]
+                            try:
+                                os.write(fd, (timed_command + '\r\n').encode('ascii'))
+                                print(
+                                    f'Sent timed command {timed_command!r} on the capture handle',
+                                    file=sys.stderr,
+                                )
+                            except (BlockingIOError, OSError) as error:
+                                if not args.reconnect:
+                                    raise
+                                print(
+                                    f'Timed command write failed: {error}',
+                                    file=sys.stderr,
+                                )
+                                break
+                            next_timed += 1
+                        if command and time.monotonic() >= next_send:
+                            try:
+                                os.write(fd, command)
+                                print(
+                                    f'Sent {args.send!r} on the capture handle',
+                                    file=sys.stderr,
+                                )
+                            except (BlockingIOError, OSError) as error:
+                                if not args.reconnect:
+                                    raise
+                                print(
+                                    f'Command write failed: {error}',
+                                    file=sys.stderr,
+                                )
+                                break
+                            next_send = time.monotonic() + args.send_interval
                         timeout = 0.5
                         if deadline is not None:
                             timeout = min(timeout, max(0, deadline - time.monotonic()))
