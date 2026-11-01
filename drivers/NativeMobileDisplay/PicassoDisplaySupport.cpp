@@ -48,6 +48,7 @@ static struct {
 
 extern "C" bool native_legacy_display_probe_ready(void);
 extern "C" bool native_legacy_surface_ready(void);
+extern "C" int boot_progress_prepare_scanout(void) __attribute__((weak_import));
 
 extern "C" kern_return_t native_start_kext_and_report(const char *identifier,
     const char *class_name) {
@@ -299,6 +300,12 @@ extern "C" void native_legacy_display_state_report(void) {
 }
 
 extern "C" bool native_legacy_prepare_scanout(void) {
+    // The boot-page monitor writes directly into the same GOP mapping. Yield it
+    // before a system frame takes the screen; boot-diag-resume reclaims it when
+    // userland stops producing new scanouts.
+    if (boot_progress_prepare_scanout && !boot_progress_prepare_scanout()) {
+        return false;
+    }
     if (!screenReleased) {
         // Release the real XNU text console before the first system frame.
         // CDC owns its independent console ring and remains available.

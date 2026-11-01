@@ -63,6 +63,10 @@ archives = [
   # Stage 6: the UFS controller driver. Its board constants (GccUfs.h) carry
   # the SM7250 physical windows; the ADT ufshc/ufsphy nodes only match classes.
   "build-arm-driver.py NativeUfs",
+  # Native A620 transport and command-processor driver. The initial boot only
+  # probes its MMIO windows read-only; GPU power and firmware startup stay
+  # behind explicit boot arguments.
+  "build-arm-driver.py NativeAdreno",
   # Volatile APFS Data; shares NativeUfs's exact original IOStorage bindings.
   "build-arm-driver.py NativeRamBlock",
   # Publishes ApplePMGRNub, the original-policy SM7250 watchdog, and volatile boot-stage storage.
@@ -92,6 +96,9 @@ roots = [
   "com.apple.iokit.IOHIDFamily",
   # Original IOBSD-matched IOSurfaceRoot, required by graphics/media clients.
   "com.apple.iokit.IOSurface",
+  # IOAcceleratorES parent for the discovery-only accelerator service. This
+  # root intentionally does not include the Apple AGX provider.
+  "com.apple.iokit.IOGPUFamily",
   # The owned NativeLegacyDisplay subclass calls the unchanged
   # IOMobileFramebufferLegacy implementation at its qualified original
   # addresses. Keep that family in the same audited prelink layout.
@@ -171,12 +178,12 @@ dram_size = "0x80000000"
 # nothing and left the boot without a console. debug=0x14e keeps DB_KPRT (0x8),
 # so kprintf is still enabled; the flags are 0x2 and 0x4 (NMI) plus 0x40 (ARP)
 # and 0x100 (obsolete), none of which halt early.
-# Also pin the platform explicitly: cpus=1 avoids spinning up seven secondary
-# cores before the platform expert has an interrupt controller.
+# SMP isolation test: compare two CPUs against the established single-CPU
+# baseline without changing any other boot argument.
 kernel_args = [
   "-v",
   "debug=0x14e",
-  "cpus=1",
+  "cpus=2",
   # Production root path. native-ufs-root=1 starts the root from the
   # root-device personality without the diagnostic media-report panic that
   # native-ufs-probe=12 ends with. Upstream's payload guard (check_native_root)
@@ -205,6 +212,12 @@ kernel_args = [
   # Diagnostic bring-up isolation: the original watchdogd's service checks do
   # not complete on this kernel yet. Disable only its launch job for this boot.
   "sheng-disable-watchdogd=1",
+  # SpringBoard's synchronous CHSChronoServicesConnection XPC was the last wall
+  # before the UI: it waited on chronod forever because the no-radio/no-account
+  # jobs (identityservicesd, locationd, CommCenter, coreduetd, PerfPowerServices,
+  # duetexpertd, ...) kept the services around it stalled. sheng's production
+  # line sets this on the same 21H461 userland; with it the lock screen renders.
+  "sheng-lite=1",
   # IOKit matching trace is off for the same reason as the UFS one: it answers
   # whether a personality matched, which the earlier root and probe=12 runs have
   # already established, and it prints a very long log while doing so. Turn it
@@ -257,6 +270,24 @@ kernel_args = [
   "sheng-vsync=60",
   # State-only AppleKeyStore probe used by the display/keystore diagnostics.
   "picasso-aks-state=1",
+  # Read GPUCC clock and GDSC state without touching the GPU core. SMMU and
+  # RBBM probes remain separate opt-in arguments because either block may be
+  # inaccessible until CX/GX power and clocks are established.
+  "sheng-gpu-probe=1",
+  # Opt-in write limited to GPUCC_CX_GDSCR.SW_COLLAPSE; no GPU core access.
+  "sheng-gpu-cx-power=1",
+  "sheng-gpu-gcc-probe=1",
+  # Official UniXNU boot-page UI trace. Keep the OS running, then take the
+  # panel back after 30 seconds without a system scanout so the sampled stacks
+  # and wait chain remain photographable even when SpringBoard is stuck.
+  "boot-progress=2",
+  "boot-diag-resume=30",
+  "sheng-build-tag=picasso-ui-trace",
+  "boot-ui-focus=chronod",
+  "boot-ui-focus2=SpringBoard",
+  "boot-ui-focus3=backboardd",
+  "boot-ui-focus4=liveactivitiesd",
+  "boot-ui-follow=1",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
