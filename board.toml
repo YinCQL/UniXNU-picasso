@@ -141,7 +141,7 @@ BUILDID_STRING = "picasso-research"
 [payload]
 volume = "PICASSOESP"
 # Volatile Data excludes unavailable hardware, account and background services.
-# The current bring-up policy also excludes watchdogd; core UI dependencies stay enabled.
+# watchdogd stays disabled; wdt=0 disables its checkin policy below.
 offline_disabled_jobs = [
   "com.apple.watchdogd",
   "com.apple.BTServer.avrcp", "com.apple.BTServer.le", "com.apple.BTServer.map",
@@ -193,6 +193,8 @@ dram_size = "0x80000000"
 kernel_args = [
   "-v",
   "debug=0x14e",
+  # Disable original userspace checkins; retain the native 15 s hardware watchdog.
+  "wdt=0",
   "cpus=8",
   "sheng-smp=1",
   "armcpu-self-ipi=1",

@@ -139,9 +139,9 @@ void PicassoWatchdogDriver::timerFired(OSObject *owner, IOTimerEventSource *send
     return;
   }
 
-  // The original function never pets hardware. It retains the original
-  // 600-second first deadline, 90-second checkin deadline, APFS defang and
-  // shutdown policy. A panic never reaches the following hardware pet.
+  // The original function never pets hardware. Its wdt boot flags control
+  // userspace checkins; wdt=0 disables those deadlines. A panic never reaches
+  // the following hardware pet.
   picasso_original_iowatchdog_policy_check(self);
   self->petWatchdogHardware();
   ++self->successfulChecks;
@@ -204,7 +204,7 @@ bool PicassoWatchdogDriver::start(IOService *provider)
   }
 
   IOLog("picasso-watchdog: original IOWatchdog policy published, size=%lu; "
-        "SM7250 owner active, hardware=15s policy=600/90s poll=1s\n",
+        "SM7250 owner active, hardware=15s poll=1s; userspace policy follows wdt boot flags\n",
         static_cast<unsigned long>(sizeof(IOWatchdog)));
   // Current board boots cpus=1. A stalled timer/CPU stops hardware feed. The
   // Apple per-CPU cross-call implementation is not compatible with SM7250;
