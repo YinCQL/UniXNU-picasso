@@ -103,7 +103,7 @@ def main():
         assert sum('virtual-timer-intid' in node for node in nodes.values()) == 1
         assert intc['compatible'] == b'arm,gic-v3\0'
         assert struct.unpack('<4Q', intc['reg']) == (0, 0x10000, 0x60000, 0x100000)
-        assert struct.unpack('<Q', intc['redistributor-stride']) == (0x40000,)
+        assert struct.unpack('<Q', intc['redistributor-stride']) == (0x20000,)
         cpu_nodes = [node for path, node in nodes.items() if path.startswith('/cpus/')]
         assert len(cpu_nodes) == (1 if name == 'minimal' else len(adt['cpu_regs'].split(',')))
         assert all(node['timebase-frequency'] == struct.pack('<I', 19200000) for node in cpu_nodes)

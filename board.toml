@@ -194,7 +194,11 @@ kernel_args = [
   "debug=0x14e",
   # Keep backboardd presenting on the firmware-backed panel.
   "picasso-fb-reject-off=1",
-  "cpus=1",
+  "cpus=8",
+  "sheng-smp=1",
+  "armcpu-self-ipi=1",
+  "armcpu-spi-ipi=1",
+  "armcpu-cpufreq=1",
   # Production root path. native-ufs-root=1 starts the root from the
   # root-device personality without the diagnostic media-report panic that
   # native-ufs-probe=12 ends with. Upstream's payload guard (check_native_root)

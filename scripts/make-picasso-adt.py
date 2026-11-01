@@ -5,7 +5,7 @@ The tree mirrors the proven sheng/QEMU entry structure with real pinned picasso
 SM7250 values taken from the compiled board DT:
 
   - GICv3 distributor 0x17A00000/0x10000, redistributor 0x17A60000/0x100000
-    (arm-io child offsets under an APSS range at 0x17A00000), stride 0x40000
+    (arm-io child offsets under an APSS range at 0x17A00000), stride 0x20000
   - CPU timebase 19200000 Hz (Qualcomm SM7250 architectural counter)
   - Virtual timer GIC_PPI 3: absolute INTID 19, from picasso's live board DT
   - DRAM base 0x80000000; size comes from the actual device observation and
@@ -259,7 +259,9 @@ def main():
                             ('reg', struct.pack('<4Q',
                                                 GIC_DIST - ARMIO_BASE, GIC_DIST_SIZE,
                                                 GIC_REDIST - ARMIO_BASE, GIC_REDIST_SIZE)),
-                            ('redistributor-stride', struct.pack('<Q', 0x40000)),
+                            # Eight cores share the 0x100000 redistributor region: one 0x20000
+                            # frame pair (RD + SGI) each. 0x40000 skipped every odd core's frame.
+                            ('redistributor-stride', struct.pack('<Q', 0x20000)),
                             ('virtual-timer-intid', struct.pack('<I', VIRTUAL_TIMER_INTID))]),
               # The GENI UART (0x988000) also sits below the APSS window, so a bus-offset
               # reg would be negative. Like ufshc below, the node is for class matching

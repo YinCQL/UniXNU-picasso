@@ -31,7 +31,7 @@ volatile uint64_t armcpu_ipi_selftest_sent = 0;
 // 3 GICD_TYPER, 4 IGRPMODR0, 5 ICC_PMR_EL1, 6 ICC_IGRPEN1_EL1, 7 ICC_SRE_EL1.
 volatile uint32_t armcpu_gic_boot[8];
 volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];   // per logical core: architectural timer interrupts and SGI 0 taken
-static bool gSpiIpi = false;                // boot-arg armcpu-spi-ipi=1: IPIs are software-pended SPIs 1008+core routed to that core (ICC_SGI1R_EL1 generates nothing on this board)
+static bool gSpiIpi = false;                // boot-arg armcpu-spi-ipi=1: IPIs are software-pended SPIs kIpiSpiBase+core routed to that core (ICC_SGI1R_EL1 generates nothing on this board)
 static bool gSelfIpi = false;               // boot-arg armcpu-self-ipi=1: every core sends itself SGI 0 from initCPU
 volatile uint32_t armcpu_irq_phase = 0,armcpu_irq_id = 1023;
 volatile uint32_t armcpu_quiesce_calls = 0,armcpu_halt_calls = 0;
@@ -91,7 +91,9 @@ OSDefineMetaClassAndStructors (ArmCpu, IOCPU)
 // Picasso supplies PPI 19. An absent ADT property keeps upstream's PPI 27.
 static uint32_t gVirtualTimerIntid = 27;
 
-static const uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
+// INTIDs 952..959 stand for 'IPI to logical core 0..7'. SM7250's GICD_TYPER.ITLinesNumber is 29, so SPIs end at
+// INTID 959 and 1008..1015 do not exist; the board DT's highest device SPI is INTID 725.
+static const uint32_t kIpiSpiBase = 952;
 
 static uint32_t read32 (uintptr_t base, unsigned offset)
 {
@@ -371,6 +373,43 @@ void ArmCpu::enableGic (void)
 }
 
 
+// armcpu-cpufreq=1: run every SM7250 frequency domain at the top row of its lookup table. Firmware leaves the cores at a
+// modest speed and expects the OS to ask for more; the OSM block switches clock source and voltage by itself once a row
+// is requested. Bases are the board DT's qcom,cpufreq-hw domains (A55 x6, A76 core 6, A76 core 7); the layout is the
+// non-EPSS one of Linux drivers/cpufreq/qcom-cpufreq-hw.c: LUT rows of 32 bytes from 0x110, perf state at 0x920.
+static void raiseCpuFrequency (void)
+{
+  static const uint64_t kDomains[] = { 0x18323000, 0x18325800, 0x18327800 };
+  const uint64_t kXoHz = 19200000, kCpuHwHz = 300000000;
+  for (unsigned domain = 0; domain < 3; domain++) {
+    OSSharedPtr<IOMemoryDescriptor> memory (IOMemoryDescriptor::withPhysicalAddress (kDomains[domain], 0x1000,
+        kIODirectionInOut), OSNoRetain);
+    OSSharedPtr<IOMemoryMap> map (memory ? memory->map (kIOMapAnywhere | kIOMapInhibitCache) : nullptr, OSNoRetain);
+    if (!map) { IOLog ("ArmCpu: cpufreq domain %u map failed\n", domain); continue; }
+    const uintptr_t base = static_cast<uintptr_t> (map->getVirtualAddress ());
+    const uint32_t enabled = read32 (base, 0x0), before = read32 (base, 0x920);
+    uint64_t previous = 0, top = 0, current = 0;
+    unsigned rows = 0;
+    for (unsigned row = 0; row < 40; row++) {
+      const uint32_t data = read32 (base, 0x110 + row * 32);
+      const uint64_t hz = ((data >> 30) & 3) ? kXoHz * (data & 0xff) : kCpuHwHz;
+      if (row > 0 && hz == previous) { break; }   // the table repeats its last row to the end
+      if (row == before) { current = hz; }
+      previous = hz; top = hz; rows = row + 1;
+    }
+    if (rows == 0) {
+      IOLog ("ArmCpu: cpufreq domain %u has no lookup table (enable 0x%x), left alone\n", domain, enabled);
+      continue;
+    }
+    // The two A76 domains read enable 0x2, not bit 0, yet carry a valid table; request their top row as well and let the
+    // readback (and the next boot's "row" before) show whether the hardware takes it.
+    write32 (base, 0x920, rows - 1);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    IOLog ("ArmCpu: cpufreq domain %u enable 0x%x row %u (%llu MHz) -> row %u (%llu MHz) of %u, readback %u\n", domain,
+        enabled, before, current / 1000000, rows - 1, top / 1000000, rows, read32 (base, 0x920));
+  }
+}
+
 bool ArmCpu::start (IOService *provider)
 {
   unsigned skip = 0;
@@ -406,6 +445,9 @@ bool ArmCpu::start (IOService *provider)
     __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (bootMpidr));
     armcpu_boot_mpidr = static_cast<uint32_t> (bootMpidr);
     if ((!skipGic && !prepareGic ()) || !IOCPU::start (provider)) { return false; }
+    unsigned cpufreq = 0;
+    PE_parse_boot_argn ("armcpu-cpufreq", &cpufreq, sizeof (cpufreq));
+    if (cpufreq == 1) { raiseCpuFrequency (); }
   }
   cpuName = OSSymbol::withCStringNoCopy ("ARM architectural boot CPU");
   if (cpuName == nullptr) { return false; }
@@ -511,7 +553,31 @@ void ArmCpu::startThread (void *argument, wait_result_t)
   ArmCpu *self = static_cast<ArmCpu *> (argument);
   armcpu_smp_step[self->logicalId] = 3;
   // Blocks until the new core reaches the scheduler; a core that never arrives only stalls this helper thread.
-  processor_start (self->machProcessor);
+  kern_return_t status = processor_start (self->machProcessor);
+  const uint32_t id = self->logicalId;
+  IOLog ("ArmCpu: CPU %u start kr=%d step=%u fail=%u psci=%d mpidr=0x%x running=%u\n", id, status,
+      armcpu_smp_step[id], armcpu_smp_fail[id], armcpu_smp_psci_rc[id], armcpu_smp_seen_mpidr[id], armcpu_smp_running);
+  // processor_start returns once CPU_ON is issued; report where the core actually got to a few seconds later,
+  // and whether it takes timer interrupts and SGIs (the IPIs a stackshot or scheduler sends it).
+  IOSleep (5000);
+  IOLog ("ArmCpu: CPU %u after 5s step=%u fail=%u mpidr=0x%x timer=%u sgi=%u running=%u ipi_sent=%llu\n", id,
+      armcpu_smp_step[id], armcpu_smp_fail[id], armcpu_smp_seen_mpidr[id], armcpu_core_timer[id & 7],
+      armcpu_core_sgi[id & 7], armcpu_smp_running, armcpu_ipi_sent);
+  if (id == 1 && gDist != 0) {
+    // Once: the boot core's GIC readback (GICD_TYPER bits 4:0 bound the implemented SPIs) and, for the IPI SPIs,
+    // whether they are enabled, Group 1, still pending (sent but never taken) and routed to the intended core.
+    IOLog ("ArmCpu: GIC igroupr0=0x%x isenabler0=0x%x gicd_ctlr=0x%x gicd_typer=0x%x igrpmodr0=0x%x pmr=0x%x igrpen1=0x%x sre=0x%x\n",
+        armcpu_gic_boot[0], armcpu_gic_boot[1], armcpu_gic_boot[2], armcpu_gic_boot[3], armcpu_gic_boot[4],
+        armcpu_gic_boot[5], armcpu_gic_boot[6], armcpu_gic_boot[7]);
+    const uint32_t word = kIpiSpiBase / 32;
+    IOLog ("ArmCpu: IPI SPI %u.. igroupr=0x%x isenabler=0x%x ispendr=0x%x igrpmodr=0x%x\n", kIpiSpiBase,
+        read32 (gDist, 0x80 + word * 4), read32 (gDist, 0x100 + word * 4), read32 (gDist, 0x200 + word * 4),
+        read32 (gDist, 0xd00 + word * 4));
+    for (uint32_t core = 0; core < 8; core++) {
+      IOLog ("ArmCpu: IPI SPI %u irouter=0x%llx\n", kIpiSpiBase + core,
+          *reinterpret_cast<volatile uint64_t *> (gDist + 0x6000 + 8ULL * (kIpiSpiBase + core)));
+    }
+  }
   thread_terminate (current_thread ());
 }
 
