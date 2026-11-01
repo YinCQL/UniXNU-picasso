@@ -4851,3 +4851,72 @@ new file mode 100644
 + 	/* Save space for envv[] NULL terminator */
 + 	if (imgp->ip_argspace < new_ptr_size) {
 + 		error = E2BIG;
+diff --git a/patches/xnu/zzzzzz-picasso-user-abort.patch b/patches/xnu/zzzzzz-picasso-user-abort.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/zzzzzz-picasso-user-abort.patch
+@@ -0,0 +1,64 @@
++diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
++--- a/bsd/kern/kern_exit.c
+++++ b/bsd/kern/kern_exit.c
++@@ -1379,6 +1379,38 @@
++ }
++ #endif
++
+++/* PICASSO_USER_ABORT_BEGIN: failed EL0 VM faults only, register-only output. */
+++#if __arm64__ && (DEVELOPMENT || DEBUG)
+++void picasso_user_abort(void *, uint32_t, uint64_t, int, uint32_t, uint64_t);
+++void
+++picasso_user_abort(void *saved, uint32_t esr, uint64_t far, int error,
+++    uint32_t shared_cache_slide, uint64_t main_header)
+++{
+++    arm_saved_state_t *state = saved;
+++    proc_t p = current_proc();
+++    if (!p || !state || !is_saved_state64(state) ||
+++        !PSR64_IS_USER64(get_saved_state_cpsr(state))) return;
+++    unsigned service;
+++    if (!strcmp(p->p_name, "SpringBoard")) service = 0;
+++    else if (!strcmp(p->p_name, "mediaserverd")) service = 1;
+++    else return;
+++    static unsigned reports[2];
+++    unsigned ticket = picasso_pid1_trace_ticket(&reports[service], 8);
+++    if (!ticket) return;
+++    printf("PICASSO_ABORT sample=%u pid=%d name=%.31s thread=%llu code=%x ESR=%x FAR=%llx PC=%llx LR=%llx SP=%llx FP=%llx main_header=%llx cache_slide=%x\n",
+++        ticket, proc_getpid(p), p->p_name, (unsigned long long)thread_tid(current_thread()), error, esr,
+++        (unsigned long long)far, (unsigned long long)get_saved_state_pc(state),
+++        (unsigned long long)get_saved_state_lr(state), (unsigned long long)get_saved_state_sp(state),
+++        (unsigned long long)get_saved_state_fp(state), (unsigned long long)main_header, shared_cache_slide);
+++    printf("PICASSO_ABORT x0=%llx x1=%llx x2=%llx x3=%llx x19=%llx x20=%llx x21=%llx\n",
+++        (unsigned long long)get_saved_state_reg(state, 0), (unsigned long long)get_saved_state_reg(state, 1),
+++        (unsigned long long)get_saved_state_reg(state, 2), (unsigned long long)get_saved_state_reg(state, 3),
+++        (unsigned long long)get_saved_state_reg(state, 19), (unsigned long long)get_saved_state_reg(state, 20),
+++        (unsigned long long)get_saved_state_reg(state, 21));
+++}
+++#endif
+++/* PICASSO_USER_ABORT_END */
+++
++ /* PICASSO_USER_FAULT_BEGIN: register-only capture; bounded ordinary-exit report. */
++ #if __arm64__ && (DEVELOPMENT || DEBUG)
++ struct picasso_user_fault {
++diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
++--- a/osfmk/arm64/sleh.c
+++++ b/osfmk/arm64/sleh.c
++@@ -164,6 +164,7 @@
++ static void handle_breakpoint(arm_saved_state_t *, uint32_t) __dead2;
++ #if DEVELOPMENT || DEBUG
++ extern void picasso_user_breakpoint(void *, uint32_t, uint32_t, uint64_t);
+++extern void picasso_user_abort(void *, uint32_t, uint64_t, int, uint32_t, uint64_t);
++ #endif
++
++ typedef void (*abort_inspector_t)(uint32_t, fault_status_t *, vm_prot_t *);
++@@ -1681,6 +1682,10 @@
++ 	}
++ #endif /* __has_feature(ptrauth_calls) */
++
+++#if DEVELOPMENT || DEBUG
+++	picasso_user_abort(state, esr, fault_addr, (int)codes[0],
+++	    current_task()->task_shared_region_slide, current_task()->mach_header_vm_address);
+++#endif
++ 	boot_progress_user_abort(state, esr, fault_addr);
++ 	if (user_fault_in_self_restrict_mode(thread) &&
++ 	    task_is_jit_exception_fatal(get_threadtask(thread))) {

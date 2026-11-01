@@ -174,6 +174,20 @@ int main(int argc,char **argv) {
  for(unsigned i=0;i<29;++i) state.x[i]=0x3000+i;
  state.x[0]=0x8000;
  thread.tid=42;cp=&proc;ct=(task_t)&task;
+ if(scenario>=72) {
+  if(scenario!=73)strcpy(proc.p_name,scenario==74?"mediaserverd":"SpringBoard");
+  for(unsigned n=0;n<(scenario==75?20u:1u);++n)
+   picasso_user_abort(&state,0x92000004,0xdeadbeef,10,task.cached_slide,task.main_header);
+  assert(reads==0);
+  if(scenario==73)assert(lines==0);
+  else {
+   contains("code=a ESR=92000004 FAR=deadbeef PC=10000ab0c");
+   contains(scenario==74?"name=mediaserverd":"name=SpringBoard");
+   assert(lines==(scenario==75?16u:2u));
+   if(scenario==75){contains("sample=8");assert(!strstr(output,"sample=9"));}
+  }
+  goto pass;
+ }
  uint32_t instruction=0xd4200000;
  struct user64_dyld_all_image_infos info={0};info.version=17;info.infoArrayCount=1;info.infoArray=0xa000;
  struct user64_dyld_image_info image={UINT64_C(0x100000000),0xb000,0};
@@ -231,7 +245,7 @@ int main(int argc,char **argv) {
   if(scenario==60) {++thread.tid;picasso_report_service_exit(&proc,rv);contains("record=missing");assert(lines==3 && !reads);goto pass;}
   if(scenario==61) {proc.p_exit_reason=NULL;picasso_report_service_exit(&proc,rv);contains("offset=0 text=\n");contains("namespace=0 code=0");assert(lines==3 && !reads);goto pass;}
   if(scenario==62) {
-   const char *names[]={"backboardd","SpringBoard","mediaserverd","audiomxd","CommCenter","powerd","mobiletimerd","liveactivitiesd"};
+   const char *names[]={"backboardd","SpringBoard","mediaserverd","audiomxd","notifyd","powerd","mobiletimerd","liveactivitiesd"};
    for(unsigned n=0;n<8;++n) {
     strcpy(proc.p_name,names[n]);
     for(unsigned i=0;i<20;++i) {++proc.pid;picasso_report_service_exit(&proc,0);}

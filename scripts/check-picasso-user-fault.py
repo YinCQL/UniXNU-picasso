@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 
-CASE_COUNT = 72
+CASE_COUNT = 76
 
 
 def one(pattern, source):
@@ -31,6 +31,11 @@ def extract(xnu, out):
     sleh = (xnu / 'osfmk/arm64/sleh.c').read_text(encoding='utf-8')
     dyld = (xnu / 'osfmk/kdp/kdp_dyld.h').read_text(encoding='utf-8')
     capture = one(r'/\* PICASSO_USER_FAULT_BEGIN.*?/\* PICASSO_USER_FAULT_END \*/', kernel)
+    abort = one(r'/\* PICASSO_USER_ABORT_BEGIN.*?/\* PICASSO_USER_ABORT_END \*/', kernel)
+    abort_call = one(r'^\s*picasso_user_abort\(state, esr, fault_addr, \(int\)codes\[0\],\s*'
+                     r'current_task\(\)->task_shared_region_slide, current_task\(\)->mach_header_vm_address\);', sleh)
+    if sleh.index(abort_call) > sleh.index('boot_progress_user_abort(state, esr, fault_addr);'):
+        raise ValueError('Abort capture must precede the original user-abort reporter')
     ticket = one(r'^static unsigned\npicasso_pid1_trace_ticket\(.*?\n}', kernel)
     signature = 'void picasso_user_breakpoint(void *, uint32_t, uint32_t, uint64_t);'
     if signature not in capture or 'extern ' + signature not in sleh:
@@ -44,7 +49,7 @@ def extract(xnu, out):
         raise ValueError('BSD capture must preserve the supplied slide value')
     if capture.count('f->main_header = main_header;') != 1:
         raise ValueError('BSD capture must preserve the supplied executable header address')
-    production = ticket + '\n' + capture + '\n'
+    production = ticket + '\n' + abort + '\n' + capture + '\n'
     (out / 'actual-helper.inc').write_text(production, encoding='utf-8', newline='\n')
     types = '\n'.join(one(r'^struct ' + name + r' \{.*?^\};', dyld)
                       for name in ('user64_dyld_image_info', 'user64_dyld_all_image_infos')) + '\n'
