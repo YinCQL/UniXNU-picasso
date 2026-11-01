@@ -67,6 +67,12 @@ jobs:
           python3 scripts/check-picasso-root-inputs-host.py --output out/picasso/host-checks/root-inputs
           cp out/picasso/host-checks/root-inputs/results.json out/picasso/logs/root-inputs-host.json
 
+      - name: Check bounded virtual input gestures
+        if: ${{ !inputs.fast }}
+        run: |
+          python3 scripts/check-picasso-hid-plan.py --output out/picasso/host-checks/hid-plan
+          cp out/picasso/host-checks/hid-plan/results.json out/picasso/logs/hid-plan-host.json
+
       - name: Verify firmware volume and DTB are present
         if: ${{ !inputs.fast }}
         run: |

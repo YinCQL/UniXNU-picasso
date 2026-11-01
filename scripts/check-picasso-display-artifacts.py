@@ -58,10 +58,15 @@ def check(tree, work, kernelcache, output):
         builder.require(member == (directory / name).read_bytes(), 'Stale display archive member ' + name)
     builder.require(set(build['members']) == {'NativeLegacyDisplay.late.o', 'PicassoDisplay.o',
         'NativeKeyStoreEvents.late.o', 'PicassoKeyStore.o', 'PicassoAccelerator.late.o',
-        'original-bindings.o'}, 'Wrong display/state archive members')
+        'original-bindings.o', 'NativeHidInput.late.o', 'PicassoHidInput.o',
+        'hid-original-bindings.o'}, 'Wrong display/state/input archive members')
     kernel = work / 'kernel/kernel.macho'
     plan = json.loads(kernel.with_suffix('.json').read_text())
     report = builder.verify_kernel(aes, native, original, kernel.read_bytes(), plan, audit)
+    hid = load(tree / 'scripts/build-picasso-hid.py')
+    from picasso_original_abi import OriginalReference
+    report['hid'] = hid.verify(platform, native, OriginalReference(kernelcache, board),
+                               directory, kernel.read_bytes(), plan)
     config = (work / '.config').read_text()
     builder.require(config.splitlines().count('CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y') == 1, 'Display disabled in actual config')
     builder.require('CONFIG_XNU_NATIVE_ADRENO=y' not in config, 'Unexpected GPU configuration')

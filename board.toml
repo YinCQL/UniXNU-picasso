@@ -1,6 +1,4 @@
-# Board description of the Redmi K30 5G (picasso, SM7250), read by the unixnu build driver.
-# Minimal skeleton to build the UniXNU UEFI firmware. Kernel/IPSW/UserData sections are
-# placeholders to be filled during kernel bring-up.
+# Redmi K30 5G (picasso, SM7250) firmware and kernel configuration.
 
 [board]
 name = "picasso"
@@ -8,8 +6,7 @@ soc = "SM7250"
 description = "Redmi K30 5G"
 kit = "picasso"
 
-# iPhone X userland target. Retain XNU 10063 / Darwin 23 and the qualified
-# 21H461 native kext backend. Cross-version userspace qualification is pending.
+# iPhone X iOS 16 userland with the pinned Darwin 23 / 21H461 kernel backend.
 [ipsw]
 url = "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
 product = "iPhone10,3"
@@ -28,17 +25,8 @@ fetch = ["DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache"]
 "087-86698-044.dmg.trustcache" = "63e01c03b31e1532a5581a24865490673f0b5c297b0199fe0095637c6100ef4b"
 "087-86593-047.dmg.trustcache" = "9cc478fe3525e2683b5b9ea1eea0851eaebebdab21d206556233400e59d2e361"
 
-# UserData partition geometry (GPT entry "userdata" of LUN 0).
-# Measured on this device: "fastboot getvar partition-size:userdata" =
-# 0xBDEBFB000 = 50,981,744,640 bytes = 47.48 GiB = 12,446,715 x 4-KiB LBA.
-# Only the capacity (last_lba - first_lba + 1) * lba_bytes is consumed, by
-# "unixnu build userdata" (scripts/unixnu/userdata.py), to refuse an image that
-# would not fit the partition; the kernel and payload steps never read it and
-# the image itself is written from offset 0. first_lba stays 0 because it is not
-# derivable from a partition size alone -- fill the real GPT start LBA here if it
-# ever needs to describe the physical layout rather than the capacity.
-# The silenzio111 branch's 0x200000/0x3A00000 encode 224 GiB, i.e. a different
-# partition table; they are not this device's geometry.
+# UserData capacity: 0xBDEBFB000 bytes (47.48 GiB), 4096-byte sectors.
+# This capacity bounds image creation; first_lba=0 is not a measured GPT start.
 [userdata]
 first_lba = 0x0
 last_lba = 0xBDEBFA
@@ -48,15 +36,10 @@ windows = [
   { name = "SystemOS", component = "Cryptex1,SystemOS" },
 ]
 
-# Kernel configuration. PLACEHOLDER for kernel bring-up.
+# Native kernel and platform archives.
 [kernel]
 defconfig = "picasso_defconfig"
-# First-console archives: only what the minimal picasso_defconfig selects
-# (corecrypto, ArmDTPlatform, ArmCpu, arch timer). UFS / VirtIO / display /
-# Adreno are added in later stages once the platform reaches the console:
-# configs/picasso_platform_defconfig lists the stage-6 draft, and its archives
-# would be "build-libpthread-kernel.py", "build-arm-driver.py NativeUfs" and
-# "build-arm-driver.py NativeAdreno" appended below.
+# Build selected platform, storage, security and display providers in order.
 archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
@@ -64,22 +47,18 @@ archives = [
   "build-arm-driver.py ArmCpu",
   # AppleImage4 waits for this real software-key IOAESAccelerator provider.
   "build-picasso-aes.py",
-  # Stage 6: the UFS controller driver. Its board constants (GccUfs.h) carry
-  # the SM7250 physical windows; the ADT ufshc/ufsphy nodes only match classes.
+  # UFS physical windows are defined in the board driver.
   "build-arm-driver.py NativeUfs",
   # Volatile APFS Data; shares NativeUfs's exact original IOStorage bindings.
   "build-arm-driver.py NativeRamBlock",
-  # Publishes ApplePMGRNub, the original-policy SM7250 watchdog, and volatile boot-stage storage.
-  # The archive lands in build/sheng-platform-power/libShengPlatformPower.a, the path
-  # build-xnu-4k-baseline.sh force-loads when CONFIG_XNU_SHENG_PMGR=1.
+  # Publishes the power-management nub, watchdog and volatile boot-stage storage.
   "build-picasso-pmgr.py",
-  # CPU/GOP scanout using the exact original MobileGraphics/IOSurface ABI.
+  # CPU/GOP scanout and virtual input use the pinned original graphics and HID ABIs.
   "build-picasso-display.py",
 ]
 
 [kernel.prelink]
-# Retains the stock emitter, then binds watchdogd's single service-class rule
-# to the real native watchdog class before the kernel enters the FAT payload.
+# Prelink the original components and bind the native watchdog service class.
 tool = "scripts/prelink-picasso.py"
 kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
 kernelcache_sha256 = "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7"
@@ -102,14 +81,11 @@ roots = [
   "com.apple.kec.pthread",
   "com.apple.kext.CoreTrust",
   "com.apple.security.AppleImage4",
-  # The original system library queries the Sandbox MAC policy during
-  # _container_init(), before launchd main. Include its genuine handler;
-  # the prelink dependency closure also brings in AppleMatch.
+  # Required for sandbox policy queries before launchd starts.
   "com.apple.security.sandbox",
 ]
 
-# The native kext donor is separate from [ipsw], which supplies the iPhone OS,
-# SystemOS, trust caches and Data. Never feed the iPhone kernel to these bindings.
+# Kernel ABI donor is independent of the OS and SystemOS userland inputs.
 [kernel.prelink.ipsw]
 url = "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
 product = "iPad7,1"
@@ -121,26 +97,21 @@ board_id = 12
 kernel_member = "kernelcache.release.ipad7"
 kernel_member_sha256 = "13b97fa2c5ce97f04408dcc28c41fb6b0d60b9440065197879acf44b2572bf7b"
 
-# Firmware step: build the picasso Mu-Silicium UEFI firmware via unixnu.
+# UEFI boot image layout.
 [bootimg.image]
 base = 0x0
 kernel_offset = 0x8000
 tags_offset = 0x1e00000
 pagesize = 4096
 header_version = 1
-# Keep the offset used by the working 55 MiB images. The current committed FD
-# maps Boot Ramdisk Gap at 0xAD000000..0xBC000000; the historical ABL-base estimate
-# puts a 60 MiB ramdisk end at 0xB8313000, within that map. Earlier comments about
-# a hard 0xB7E00000 end described an older failed mapping, not this FD's limit.
-# The new 60 MiB image still needs a device boot; see docs/ram-data-bootstrap-investigation.md.
+# The 60 MiB ramdisk fits the committed firmware mapping at this offset.
 ramdisk_offset = 0x200000
 [firmware]
-config = "picasso"                   # Resources/Configs/picasso.toml in the Mu-Silicium checkout (--uefi)
+config = "picasso"                   # Firmware configuration name
 dsc = "Platforms/Xiaomi/picassoPkg/picasso.dsc"
 fd = "Build/picassoPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
 preflight = []
-# Openssl submodule is required by Silicon/Silicium OpensslPkg (same as sheng and the
-# stock picasso DeviceBuild.py RequiredSubmodules).
+# Required firmware cryptography submodule.
 submodules = ["Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl"]
 patches = []
 packages = [
@@ -159,24 +130,18 @@ packages = [
 ]
 
 [firmware.defines]
-# Full set aligned with sheng so SecureBootHandler.c and other #if-gated code compile
-# (ENABLE_SECUREBOOT must be 0/1, not empty, or '#if ENABLE_SECUREBOOT == 1' is a syntax error).
+# ENABLE_SECUREBOOT must be a numeric 0 or 1 for conditional compilation.
 ENABLE_SECUREBOOT = "1"
 DEVICE_MODEL = "picasso"
 MEMORY_PROTECTION = "TRUE"
 SHIP_MODE = "FALSE"
 BUILDID_STRING = "picasso-research"
 
-# Payload: a FAT volume with UniXNU config + kernel + ADT. Loader (DarwinBoot) is in the firmware.
+# FAT payload containing the config, kernel, trust caches and ADT.
 [payload]
 volume = "PICASSOESP"
-# With one CPU, the ~530 stock jobs leave notifyd's background workqueue thread too
-# little time to answer SpringBoard. A fresh volatile Data seed disables the jobs for
-# hardware this board has not got (telephony, radios, camera, NFC, biometrics, USB
-# accessories), for a paired Watch or car, and for accounts, Siri, analytics, updates
-# and restore, after HackiOS's DENY list. It also disables watchdogd, which traps in its own code
-# during bring-up and panics the system as a critical process (HackiOS denies it too). notifyd and
-# what SpringBoard waits on stay enabled (PROTECTED_JOBS in scripts/prepare-picasso-ram-data.py).
+# Volatile Data excludes unavailable hardware, account and background services.
+# The current bring-up policy also excludes watchdogd; core UI dependencies stay enabled.
 offline_disabled_jobs = [
   "com.apple.watchdogd",
   "com.apple.BTServer.avrcp", "com.apple.BTServer.le", "com.apple.BTServer.map",
@@ -215,31 +180,16 @@ offline_disabled_jobs = [
   "com.apple.wifi.hostapd", "com.apple.wifi.wapic", "com.apple.wifiFirmwareLoader",
   "com.apple.wifianalyticsd", "com.apple.wifip2pd", "com.apple.wifivelocityd"
 ]
-# --skip-setup: Setup and per-boot data migration are skipped, and the display does
-# not dim or sleep (the board has no input yet). The wrapper names the iOS userland.
+# Use the selected iOS build for Setup/migration flags and disable automatic dimming.
 skip_setup_tool = "scripts/picasso-seed-skip-setup.py"
 skip_setup_args = ["--no-auto-dim", "--inject-lib", "out/picasso/libpicasso-sb.dylib"]
-# Room for the kernel, original trust caches and packed APFS Data seed.
-# The payload builder retains its 95% content limit; CI checks the actual seed.
+# Fits the kernel, trust caches and packed Data seed within the 95% content limit.
 size_mib = 60
 loader = "firmware"
 title = "Boot"
 dram_size = "0x80000000"
-# serial=3 was dead weight here and could stall early boot: pe_serial.c only
-# registers PI3_UART, APPLE_UART, DOCKCHANNEL_UART and VMAPPLE_UART. SM7250 is a
-# Qualcomm GENI UART, so serial_init() returns 0 and PE_kputc falls back to
-# console_write_unbuffered -> vcputc_options, which is a no-op until the IOKit
-# video console binds the framebuffer. Asking for serial output therefore bought
-# nothing and left the boot without a console. debug=0x14e keeps DB_KPRT (0x8),
-# so kprintf is still enabled; the flags are 0x2 and 0x4 (NMI) plus 0x40 (ARP)
-# and 0x100 (obsolete), none of which halt early.
-# All eight cores: ArmCpu maps the GIC on the boot core, then starts each
-# secondary core with PSCI CPU_ON (sheng-smp=1) once the boot core is registered.
-# armcpu-self-ipi=1 makes every core take one IPI from initCPU, which XNU needs
-# before it will signal that core. ICC_SGI1R_EL1 SGIs reach no core here (0 taken
-# on every secondary), so armcpu-spi-ipi=1 sends IPIs as software-pended SPIs
-# routed to the target core. With one core, background daemons starved notifyd
-# and MobileGestaltHelper for minutes.
+# Keep kprintf enabled; the console is carried by USB CDC.
+# Enable eight cores with PSCI, routed SPI IPIs and the initial self-IPI.
 kernel_args = [
   "-v",
   "debug=0x14e",
@@ -247,82 +197,38 @@ kernel_args = [
   "sheng-smp=1",
   "armcpu-self-ipi=1",
   "armcpu-spi-ipi=1",
-  # Every frequency domain at the top of its lookup table (ArmCpu raiseCpuFrequency):
-  # firmware leaves the cores slow. No thermal governor runs yet; the SoC's own limits
-  # management hardware still applies.
+  # Request the top CPU frequency row; hardware limits still apply.
   "armcpu-cpufreq=1",
-  # SpringBoard library injection for bring-up (bsd/kern/kern_exec.c): the kernel starts
-  # SpringBoard with DYLD_INSERT_LIBRARIES set to this path. The library is ad-hoc signed and
-  # not in the trust cache, so AMFI is told to accept any signature and code-signing enforcement
-  # is relaxed. These loosen code signing for the whole system and are a research/bring-up setting.
+  # Inject the ad-hoc signed SpringBoard probe from volatile Data.
   "picasso_inject_sb=/private/var/picasso/libpicasso-sb.dylib",
-  # amfi_allow_any_signature=1 lets AMFI accept the ad-hoc, non-trust-cached inject library into
-  # SpringBoard. cs_enforcement_disable is deliberately NOT set: with both, early boot hung before
-  # the console came up, and amfi_allow_any_signature alone is the targeted lever (developer mode is
-  # already on here because protected data is unavailable).
+  # Permit the probe signature for bring-up; keep cs_enforcement_disable unset.
   "amfi_allow_any_signature=1",
-  # The lock screen renders but the display then drops; refuse the framebuffer power-off
-  # transition so backboardd keeps presenting it (selector 12, IOUserClient.cpp).
+  # Reject framebuffer power-off during bring-up; black frames can still be presented.
   "picasso-fb-reject-off=1",
-  # No picasso_session_s timer: after a long run the bootloader ignores the armed
-  # IMEM Fastboot reason and boots normally, and the first boot on volatile Data
-  # rebuilds the LaunchServices database for longer than a short session lasts.
-  # Production root path. native-ufs-root=1 starts the root from the
-  # root-device personality without the diagnostic media-report panic that
-  # native-ufs-probe=12 ends with. Upstream's payload guard (check_native_root)
-  # requires sheng-pmgr=2 and a linked _sheng_pmgr_run for this mode, because
-  # the unchanged target AMFI otherwise panics with "No PMGR?" while looking
-  # for ApplePMGRNub in its configuration settings; package/PicassoPmgr.cpp
-  # publishes that nub, and CONFIG_XNU_SHENG_PMGR links it.
+  # Start the authenticated UFS root and required power-management nub.
   "native-ufs-root=1",
   "sheng-pmgr=2",
-  # Let bsd_init start the CDC console before the UFS publication diagnostic
-  # runs, so a later UFS panic still has a complete host-side log.
+  # Delay UFS publication until the USB console is available.
   "native-ufs-start-delay=5",
-  # IOSleep does not reliably make progress this early with cpus=1. The
-  # timebase+yield path has been exercised on hardware; scans also yield at
-  # every 128 KiB batch so CDC keeps draining.
+  # Use timebase/yield waits and bounded scan batches during early UFS startup.
   "native-ufs-delay-yield=1",
-  # Command tracing stays off. It prints two lines per SCSI/query command
-  # (NATIVE_UFS_NOP clear=begin/end, named for the UCD clear they share), and a
-  # boot that is reading the root volume emits them continuously, which buries
-  # every other message. Set it back to 1 only when the UFS transport itself is
-  # the question.
+  # Keep verbose UFS command tracing disabled during system boot.
   "native-ufs-diagnostics=0",
-  # IOKit matching trace is off for the same reason as the UFS one: it answers
-  # whether a personality matched, which the earlier root and probe=12 runs have
-  # already established, and it prints a very long log while doing so. Turn it
-  # back on when a driver is suspected of never being matched; the bits are
-  # kIOLogMatch(0x10) | kIOLogProbe(0x2) | kIOLogConfig(0x20) | kIOLogCatalogue(0x200).
-  # Diagnostic-only: keep console output flowing when an early kernel path
-  # logs with interrupts disabled. Without this XNU panics at
-  # serial_console.c:175 before CDC can deliver the surrounding context.
+  # Allow interrupt-context diagnostics to reach the USB console.
   "nointr_consio=1",
-  # IOLog has a separate interrupt-context assertion in IOLib.cpp. This
-  # diagnostic-only escape hatch lets those messages reach the CDC console.
+  # Also allow IOLog diagnostics in interrupt context.
   "nointr_iolog=1",
-  # USB console (usb branch): 1 = state probe only, 2 = run the CDC-ACM
-  # console streaming (DWC3 device mode; the PC sees a serial port carrying
-  # the last 256 KiB of console text and then live output).
+  # USB CDC streaming: 1 = state probe, 2 = live console.
   "picasso_usb=2",
-  # The pre-existing apps-SMMU route only matches after the USB console
-  # driver installs its guarded plan/apply bypass for stream 0xe0. Without
-  # this, the read-only guard sees zero matches and deliberately leaves the
-  # controller untouched.
+  # Apply the guarded USB stream 0xe0 bypass before controller startup.
   "picasso_usb_smmu=6",
-  # Let bsd_init continue to root mounting after the CDC poller starts.
-  # hold=1 parks bsd_init indefinitely for USB-only qualification; that mode
-  # cannot exercise this branch's UFS/root/SystemOS path.
+  # Continue to root mounting after the console starts.
   "picasso_usb_hold=0",
-  # Keep the synchronous CDC command loop open before the timer-dependent
-  # background poller and UFS probe. This is long enough for the host tty to
-  # attach and issue status/reboot-fastboot; everything in this window pets the
-  # watchdog, and the boot continues automatically when it expires.
+  # Allow 10 seconds for the host console to attach before continuing boot.
   "picasso_usb_control_ms=10000",
-  # The XNU CDC panic/reset path uses PSHOLD as its final fallback and arms the
-  # IMEM Fastboot reason before either panic or command reset.
+  # Arm the Fastboot reason and use PSHOLD as the reset fallback.
   "picasso_usb_reset=pshold",
-  # Existing fixed-pin early class init and post-IOBSD display lifecycle.
+  # Original graphics class loading and post-IOBSD GOP handoff.
   "offline-mobile-graphics-load=1",
   "offline-legacy-register=1",
   "offline-legacy-phase=4",
@@ -335,98 +241,29 @@ kernel_args = [
   "picasso-aks-state=1",
   # Software refresh notifications only; panel timing remains firmware-owned.
   "sheng-vsync=60",
+  # Virtual input: after HID and two frames are ready, wake at 120 s and swipe at 125 s.
+  # Repeat at 60 s intervals, up to eight attempts; failure releases the contact.
+  "offline-hid-input=1",
+  "sheng-touch-hid=1",
+  "offline-hid-auto-home-count=8",
+  "offline-hid-swipe=8",
 ]
-# Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
-# scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
-# to this kernel via the symbol table) paints a blue bar at the kernel entry,
-# a magenta bar just before the MMU comes on, and reboots the device via PSCI
-# SYSTEM_RESET entry_probe_reset_delay seconds after the MMU is enabled --
-# a spontaneous reboot after that delay is the signal that start.s completed.
-# panic_screen redirects panic() to a renderer that draws on the kernel's own
-# framebuffer mapping. The Picasso CDC console captures the panic stream
-# synchronously, so keep this disabled while CDC is the evidence path.
-# Bisect deeper with entry_probe_reset_after (one call per run; payload.py keys
-# map to the script's --reset-after/--in/--occurrence options).
-# Bisect log (2026-10-24), one probe per run; ~6 s reboot = the call completed:
-#   run 1  after-MMU        -> reboot : start.s complete (genuine: cave 16-aligned)
-#   run 2  _arm_vm_init     -> VOID   : tight-packing bug (below) made cave4 bl
-#   run 3  _PE_create_console -> VOID   : land at callee-4 (previous function tail)
-#   run 4  _PE_init_platform #2 -> hang + panic text: the miswired bl landed on
-#         PE_slide_devicetree's `bl .cold` tail = exactly the observed
-#         "pe_init.c:418 Assertion failed: PE_state.initialized". The text
-#         itself proves PE_create_console/PE_init_printf/cpu_machine_idle_init
-#         all completed (those calls were untouched).
-#   run 5  same target, caves 16-aligned -> ~6 s reboot: the real second
-#         PE_init_platform (pe_arm_init_interrupts, GIC MMIO 0x17A00000)
-#         completed. Transitively proves arm_vm_init, PE_create_console,
-#         PE_init_printf (runs 2/3 were void; the flow covers them).
-#         panic screen now reports lr=/PEini=/fb= and mirrors the message
-#         to the /pram region: dump-picasso-panic.py --fastboot --paddr 0xB7F00000.
-#   run 6  _fiq_context_init #1 -> ~6 s reboot: ml_map_cpu_pio, cpu_timebase_init,
-#         kptimer_curcpu_up, PE_init_cpu all complete; arm_init is at its tail.
-#   run 7  _vm_mem_bootstrap in _kernel_bootstrap -> ~6 s reboot, no text:
-#         kernel_bootstrap runs and vm_mem_bootstrap completes. The missing
-#         version line is BY DESIGN: printf goes to vcputc_options, which is
-#         gated on gc_enabled, and the screen is only acquired at
-#         kPEAcquireScreen (startup.c) -- in _kernel_bootstrap_thread, after
-#         PE_init_iokit, the EARLY_BOOT startup phase and spllo(). Early boot
-#         is console-less on a board without the display driver, exactly as
-#         the earlier note about pe_serial predicted.
-#   run 8  _initialize_screen in _kernel_bootstrap_thread -> ~6 s reboot, no
-#         wipe: PE_init_iokit (prelinked kexts), EARLY_BOOT and spllo() all
-#         passed. No wipe is by design: v_display=1 puts the boot in graphics
-#         mode, so kPEAcquireScreen calls gc_enable(FALSE) and the console
-#         stays off -- fixed by the vendored DarwinBoot in UniXNU-picasso
-#         (drivers/DarwinBoot, v_display = 0 = text console from acquire on).
-#   run 9  FREE RUN -> the text console came up and the kernel log scrolled;
-#         first visible panic: kern_trustcache.c:477 "amfi interface not
-#         available" (lr=_trust_cache_runtime_init.cold.3). The AMFI
-#         interface is registered by the early security initializer that
-#         emit_prelink records per board; picasso left it empty.
-#   run 10 early_security_init: the same pinned iPad7,1 kernelcache as sheng,
-#         so the ORIGINAL_VA of AMFI's initializer is identical
-#         (0xFFFFFFF005AB4AE0, prelink/kext region below the kernel text);
-#         emit_prelink slides it into our coalesced segments (-0x1000000,
-#         uniform) and the runtime adds vm_kernel_slide (0 on picasso).
-#         (First attempt put the key in [payload] where nothing read it --
-#         the panic repeated; fixed in a4a1162 and the panic advanced.)
-#   run 11 result: trust_cache_init PASSED (AMFI registered) -- the kernel
-#         advanced to pthread_shims.c:318 "pthread kernel extension not
-#         loaded". picasso_defconfig keeps CONFIG_XNU_SOURCE_PTHREAD unset,
-#         so the pthread shims need the libpthread KEXT from the kernelcache
-#         (sheng instead builds pthread from source). The kernelcache's kext
-#         is com.apple.kec.pthread (libpthread's kext.xcconfig MODULE_NAME;
-#         "com.apple.kec.libpthread" does not exist and fails the closure);
-#         its pthread_kext_register call fills the function table.
+# Keep framebuffer panic rendering off while USB CDC captures diagnostics.
 panic_screen = false
-# The original static and System trust caches, bundled by
-# scripts/prepare-original-trust.py from the pinned IPSW. DarwinBoot copies the
-# bundle into the kernel window and fills the ADT TrustCache placeholder with its
-# address and size; without it the kernel logs "no external trust caches found"
-# and has no original Apple hashes to check userspace binaries against. The
-# allow-list below pins the exact bundle this board accepts, so a mismatched or
-# substituted input fails the payload step instead of booting.
+# Pin the original static and System trust-cache bundle passed through the ADT.
 trust_cache_sha256 = ["eb1475f643f45a974ebd40596f6e2b1cdf40205d2ca3c6094d774886099399c3"]
 
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"
 chip_id = "7250"
-# DarwinBoot passes only packed nonzero pages; NativeRamBlock allocates pages
-# as needed. The seed is volatile and /chosen/ephemeral-storage remains enabled.
+# Pass packed nonzero Data pages; allocate writes on demand with ephemeral storage.
 packed_data_ramdisk = true
-# Matching iPhone X identity from the original d22ap ADT and MobileGestalt guide.
-# Root compatible remains Qualcomm/Picasso; artwork uses phone/2436/3/P3.
-# The existing dev-board security tuple is preserved; no key/activation stubs.
+# Use the original iPhone X identity and phone/2436/3/P3 artwork.
 iphone_identity = true
-# Select the authenticated OS APFS volume by its published IOMedia UUID. The
-# VerifiedRoot window identity check independently binds this UUID to the
-# owner-signed image before the block device is published.
+# Select the authenticated OS volume by UUID; verify its signed image independently.
 root_match_volume_uuid = "DADD93F8-DBBF-4B17-A1DF-0F11E64172F7"
-# Build77 reaches Jetsam VM-page shortage with the old 256 MiB window.
-# Request 768 MiB of real contiguous conventional memory for XNU and volatile
-# Data. DarwinBoot must allocate the entire range before setting boot_args;
-# failure stays in firmware. This is separate from dram_size and FAT capacity.
-# See docs/memory-pressure-investigation.md for the firmware audit and limits.
+# Reserve 768 MiB of contiguous conventional memory for XNU and volatile Data.
+# Firmware must allocate the whole range; this is separate from FAT and dram_size.
 owned_memory_size = "0x30000000"
 cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
 unique_chip_id = "required"

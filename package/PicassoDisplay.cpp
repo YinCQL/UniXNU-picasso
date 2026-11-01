@@ -25,6 +25,8 @@ void picasso_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_PicassoAccel
 IOService *picasso_accelerator_allocate(void);
 bool picasso_power_source_publish(void);
 void picasso_keystore_probe(void);
+void picasso_hid_start_later(void);
+void picasso_hid_frame_presented(void);
 IOService *native_legacy_display_allocate(void);
 kern_return_t OSKextLoadKextWithIdentifier(const char *);
 }
@@ -123,6 +125,7 @@ extern "C" void native_legacy_swap_geometry_observed(const uint32_t *a, const ui
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t bytes) { report(10, ticks, bytes, 0); }
 extern "C" void native_legacy_vsync_observed(unsigned event, unsigned hz) { report(11, event, hz, 0); }
 extern "C" void native_legacy_frame_observed(unsigned kind, uint64_t pixels, uint64_t, uint64_t, uint64_t, uint64_t) {
+    picasso_hid_frame_presented();
     static unsigned count, frames;
     // Every one of the first 200 frames, then every 64th: the pictures between the boot logo and the
     // display-off request show whether SpringBoard drew a lock screen before backboardd turned it off.
@@ -319,6 +322,7 @@ extern "C" void native_legacy_display_late_probe(void) {
         activeDisplay = display; activeNub = nub;
         publishDisplayModes(display, (uint32_t)video.v_width, (uint32_t)video.v_height);
         publishAcceleratorStub();
+        picasso_hid_start_later();
     }
     else {
         if (attached) display->detach(nub);

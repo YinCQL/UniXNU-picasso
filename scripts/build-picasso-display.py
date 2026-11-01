@@ -268,6 +268,10 @@ def main():
     _, _, syms = platform.inspect_object(bindings, native)
     require({s['name']: s['value'] for s in syms if s['kind'] == 3} == audit['bindings'], 'Wrong compiled display aliases')
     objects.append(bindings)
+    hid = load(ROOT / 'scripts/build-picasso-hid.py')
+    hid_objects, hid_sources = hid.build(ROOT, platform, native, record, out, board)
+    objects += hid_objects
+    sources += hid_sources
     pending = Path(tempfile.mkdtemp(prefix='qualified-display-', dir=out)) / 'libNativeLegacyDisplay.late.a'
     platform.run(['xcrun', 'ar', 'rcs', pending, *objects], out / 'archive.log')
     members = platform.check_archive_members(platform.run(['xcrun', 'ar', 't', pending], out / 'members.log').splitlines(), objects)
