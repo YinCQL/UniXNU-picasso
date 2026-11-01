@@ -144,6 +144,8 @@ extern volatile unsigned boot_ui_trace_index __attribute__((weak_import));
 extern void boot_process_capture(void) __attribute__((weak_import));
 extern void boot_process_snapshot(void) __attribute__((weak_import));
 extern void boot_log_tick(unsigned) __attribute__((weak_import));
+// SM7250 cpufreq-hw probe (sheng-cpufreq=<1..4>); maps the domains once and starts the mode 4 governor.
+extern void sheng_cpufreq_probe(void) __attribute__((weak_import));
 extern void sheng_cpufreq_poll(void) __attribute__((weak_import));
 extern char boot_process_rows[10][120] __attribute__((weak_import));
 extern unsigned boot_ui_trace_role_rows(unsigned,char [][120],unsigned,unsigned) __attribute__((weak_import));
@@ -1179,6 +1181,9 @@ static void touch_monitor(void *arg, wait_result_t result) {
 static void monitor(void *arg, wait_result_t result) {
   (void)arg;(void)result;
   unsigned capture_at=0,capture_attempt=~0U,named=0;
+  // Board CPU frequency control (sheng-cpufreq=<1..4>). Inert without the boot argument; the poll below refreshes the
+  // report row each round and votes domains that only read enabled once their cores come online.
+  if(sheng_cpufreq_probe)sheng_cpufreq_probe();
   for (;;) {
     __atomic_fetch_add(&thread_count,1,__ATOMIC_RELAXED);
     boot_progress_poll();

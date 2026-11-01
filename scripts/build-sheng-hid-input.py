@@ -84,7 +84,12 @@ for name in ('NativeHidInput.late.o', 'hid-original-bindings.o'):
         raise SystemExit(f'missing qualified object: {HID_OUT / name}')
 
 probe = OUT / 'HidInputProbe.o'
-compile_cpp(ROOT / RECORD, ROOT / 'package/HidInputProbe.cpp', probe)
+# The assembled tree's package/ is the upstream package module; the device package is kits/<kit>. Prefer the kit
+# source so a re-prepared tree never compiles the stale copy (or the upstream package without a probe at all).
+probe_source = ROOT / 'kits/picasso/HidInputProbe.cpp'
+if not probe_source.is_file():
+    probe_source = ROOT / 'package/HidInputProbe.cpp'
+compile_cpp(ROOT / RECORD, probe_source, probe)
 
 archive = OUT / 'libShengHidInput.a'
 archive.unlink(missing_ok=True)

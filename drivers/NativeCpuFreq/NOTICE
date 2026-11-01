@@ -1,0 +1,19 @@
+NativeCpuFreq (picasso, SM7250)
+
+CpuFreqProbe.cpp is adapted from the SM8550 board's Linux-independent CpuFreqProbe.cpp in UniXNU-sheng
+(https://github.com/UniXNU/UniXNU-sheng, BSD-2-Clause-Patent): the boot-argument modes, domain vote and report-row
+structure, the touch-boost/frame-floor governor and its 16 ms window arithmetic. This port replaces the EPSS register
+layout with SM7250's cpufreq-hw v1 OSM layout and the three picasso windows, reads the current frequency from the
+perf-state index instead of a domain-state register, and filters LUT rows by the DT's per-domain max_cores. It is
+distributed under the same license.
+
+The register facts were read from Linux's drivers/cpufreq/qcom-cpufreq-hw.c (GPL-2.0-only, qcom_soc_data:
+reg_enable 0x0, reg_dcvs_ctrl 0xbc, reg_freq_lut 0x110 with 32-byte rows, reg_volt_lut 0x114, reg_current_vote 0x704,
+reg_perf_state 0x920), from the picasso-r-oss vendor driver's cpufreq_qcom_std_offsets (same layout plus
+reg_cycle_cntr 0x9c0), and from picasso.dtb (three windows 0x18323000/0x18325800/0x18327800, compatible
+"qcom,cpufreq-hw", CPU-to-domain cells 0 6 / 1 2 / 2 2). No Linux code is copied.
+
+Only the perf-state register and, when the engine reports per-core DCVS, its per-core copies are written. The frequency
+and voltage LUTs are XBL-programmed and hypervisor-write-protected on this SoC; the bootloader notes cited by the
+mainline OSM work state that writing them faults. The idle-time helper used by the governor is the board's own
+osfmk/kern/processor.c addition (patches/picasso-cpu-idle-xnu.patch).

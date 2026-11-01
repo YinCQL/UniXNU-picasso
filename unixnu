@@ -18,7 +18,9 @@ def prepare(device=DEVICE, source=None):
         raise ValueError('upstream.rev must contain a full Git commit ID')
     patch = device / 'patches/unixnu-source-kernel.patch'
     usb_patch = device / 'patches/picasso-usb-console-xnu.patch'
-    fingerprint = hashlib.sha256(patch.read_bytes() + b'\0' + usb_patch.read_bytes()).hexdigest()
+    cpu_idle_patch = device / 'patches/picasso-cpu-idle-xnu.patch'
+    fingerprint = hashlib.sha256(patch.read_bytes() + b'\0' + usb_patch.read_bytes() +
+                                 b'\0' + cpu_idle_patch.read_bytes()).hexdigest()
     cache = device / '.cache'
     target = cache / f'upstream-{revision[:12]}-{fingerprint[:12]}'
     if target.is_dir():
@@ -53,6 +55,10 @@ def prepare(device=DEVICE, source=None):
         if not embedded_usb_patch.is_file():
             raise FileNotFoundError(f'{embedded_usb_patch} missing from source patch')
         embedded_usb_patch.write_bytes(usb_patch.read_bytes())
+        # Appends the board CPU-idle helper to processor.c. It applies last among the picasso patches; unlike the USB
+        # patch it is not present in the source overlay, so this tree copy is its only carrier.
+        (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzz-picasso-cpu-idle.patch').write_bytes(
+            cpu_idle_patch.read_bytes())
         tree.rename(target)
     return target
 
