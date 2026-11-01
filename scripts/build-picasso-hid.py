@@ -14,6 +14,39 @@ from picasso_original_abi import OriginalReference, qualify_hid
 
 OWNED = [0, 1, 7, 14, 86, 87, 111, 171, 173, 180]
 MEMBERS = ['NativeHidInput.late.o', 'PicassoHidInput.o', 'hid-original-bindings.o']
+EVENT_DRIVER = 'com.apple.iokit.IOHIDEventDriver'
+
+
+def verify_matching_metadata(platform, native, original, kernel, plan):
+    """Require the original codeless matching bundle in the emitted image."""
+    require = platform.require
+
+    def entry(data):
+        image = native.macho(data)
+        sections = [section for segment in image['segments']
+                    if segment['name'] == '__PRELINK_INFO'
+                    for section in segment['sections'] if section['name'] == '__info']
+        require(len(sections) == 1, 'Expected one HID prelink metadata section')
+        section = sections[0]
+        offset = native.backed_offset(image['segments'], section['va'], section['size'], len(data))
+        metadata = native.unserialize_xml(data[offset:offset + section['size']])
+        matches = [item for item in metadata['_PrelinkInfoDictionary']
+                   if item['CFBundleIdentifier'] == EVENT_DRIVER]
+        require(len(matches) == 1, 'Missing or duplicate codeless HID event driver')
+        return matches[0]
+
+    expected = entry(original)
+    require(not any(key in expected for key in ('CFBundleExecutable', '_PrelinkExecutableLoadAddr',
+            '_PrelinkExecutableSourceAddr', '_PrelinkExecutableSize', '_PrelinkKmodInfo')),
+            'HID matching bundle must be codeless')
+    personalities = expected.get('IOKitPersonalities', {})
+    require(isinstance(personalities, dict) and
+            {'Peppy Touch Display', 'HID Buttons', 'HID Keyboard Driver', 'HID Sensor'} <= personalities.keys(),
+            'Missing original HID matching personalities')
+    require(plan.get('codeless_components', []).count(EVENT_DRIVER) == 1,
+            'HID matching bundle was not selected by prelink')
+    require(entry(kernel) == expected, 'Changed original HID matching metadata')
+    return dict(identifier=EVENT_DRIVER, personalities=sorted(personalities), original_metadata_preserved=True)
 
 
 def header():
@@ -129,6 +162,7 @@ def build(root, platform, native, record, out, board):
 def verify(platform, aes, native, reference, directory, kernel, plan):
     import json
     require = platform.require
+    matching = verify_matching_metadata(platform, native, reference.data, kernel, plan)
     require((directory / 'OriginalHidDeviceABI.h').read_text(encoding='utf-8') == header(), 'Changed generated HID header')
     slot_names = []
     audit = audit_object(platform, native, directory / 'NativeHidInput.o', reference, slot_names=slot_names)
@@ -160,4 +194,4 @@ def verify(platform, aes, native, reference, directory, kernel, plan):
                  '_native_hid_input_requested', '_native_touch_set_sink', '_native_buttons_set_sink',
                  '_native_hid_input_allocate', initializer):
         require(name in names, 'Missing HID lifecycle ' + name)
-    return dict(audit, linked_local_methods=sorted(local))
+    return dict(audit, linked_local_methods=sorted(local), matching=matching)

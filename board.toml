@@ -72,6 +72,8 @@ roots = [
   "com.apple.driver.ApplePMGR",
   "com.apple.filesystems.apfs",
   "com.apple.iokit.IOHIDFamily",
+  # Codeless personalities match the virtual keyboard and digitizer.
+  "com.apple.iokit.IOHIDEventDriver",
   # Original IOBSD-matched IOSurfaceRoot, required by graphics/media clients.
   "com.apple.iokit.IOSurface",
   "com.apple.iokit.IOMobileGraphicsFamily",
