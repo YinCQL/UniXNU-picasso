@@ -54,6 +54,23 @@ jobs:
           TREE=$(python3 ./unixnu --prepare)
           echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
 
+      - name: Check payload kernel command line before compiling
+        run: |
+          python3 - <<'PY'
+          import os, sys, tomllib
+          from pathlib import Path
+          sys.path.insert(0, str(Path(os.environ['UNIXNU_TREE']) / 'scripts'))
+          from unixnu.payload import check_args
+          from unixnu.util import Error
+          with open('board.toml', 'rb') as stream:
+              arguments = tomllib.load(stream)['payload']['kernel_args']
+          try:
+              line = check_args(arguments)
+          except Error as exc:
+              raise SystemExit(f'payload preflight: {exc}')
+          print(f'Payload kernel command line: {len(line)} / 1000 bytes')
+          PY
+
       - name: Check packed Data format and seed validation
         run: |
           # Fixtures contain intentional symlinks. Upload only the result JSON.
