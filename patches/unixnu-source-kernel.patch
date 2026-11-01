@@ -3823,6 +3823,8 @@ new file mode 100644
 ++		    pid, sample);
 ++		return;
 ++	}
+++	printf("PICASSO_WAIT process pid=%d sample=%u name=%.32s\n",
+++	    pid, sample, p->p_name);
 ++	task_t task = proc_task(p);
 ++	if (!task) {
 ++		printf("PICASSO_WAIT task pid=%d sample=%u unavailable=no-task\n",
@@ -4350,20 +4352,20 @@ new file mode 100644
 ++struct picasso_process_row {
 ++	int pid;
 ++	int stat;
-++	char name[17];
+++	char name[33];
 ++};
 ++
 ++void
 ++picasso_live_process_list(unsigned sample)
 ++{
-++	struct picasso_process_row rows[128] = {};
+++	struct picasso_process_row rows[256] = {};
 ++	unsigned count = 0, total = 0;
 ++	proc_t p;
 ++
 ++	proc_list_lock();
 ++	ALLPROC_FOREACH(p) {
 ++		++total;
-++		if (count == 128) {
+++		if (count == 256) {
 ++			continue;
 ++		}
 ++		rows[count].pid = proc_getpid(p);
@@ -4693,3 +4695,149 @@ new file mode 100644
 + }
 + 
 + 
+diff --git a/patches/xnu/zzzzzzzzzzzzzzz-picasso-sync-ipc-trace.patch b/patches/xnu/zzzzzzzzzzzzzzz-picasso-sync-ipc-trace.patch
+new file mode 100644
+index 0000000..13b4281
+--- /dev/null
++++ b/patches/xnu/zzzzzzzzzzzzzzz-picasso-sync-ipc-trace.patch
+@@ -0,0 +1,140 @@
++diff --git a/osfmk/ipc/ipc_port.c b/osfmk/ipc/ipc_port.c
++index 301e8c4..8b15d58 100644
++--- a/osfmk/ipc/ipc_port.c
+++++ b/osfmk/ipc/ipc_port.c
++@@ -1814,6 +1814,57 @@ ipc_port_rcv_turnstile(ipc_port_t port)
++ 	return *port_rcv_turnstile_address(port);
++ }
++ 
+++#if DEVELOPMENT || DEBUG
+++/* Bounded sync-IPC dependency trace. The special reply port remains linked to
+++ * the service port while a synchronous client is blocked; printing both PIDs
+++ * identifies the actual endpoint instead of guessing from wait-event values. */
+++static unsigned picasso_sync_ipc_trace_count;
+++
+++static boolean_t
+++picasso_sync_ipc_wanted(const char *name)
+++{
+++	static const char * const names[] = {
+++		"SpringBoard", "backboardd", "chronod", "liveactivitiesd",
+++		"coreduetd", "duetexpertd", "routined", "assistantd",
+++		"studentd", "mediaremoted", "contextstored",
+++	};
+++
+++	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+++		if (strcmp(name, names[i]) == 0) {
+++			return TRUE;
+++		}
+++	}
+++	return FALSE;
+++}
+++
+++static void
+++picasso_sync_ipc_trace(ipc_port_t special_reply_port, ipc_port_t dest_port,
+++    unsigned link_state, unsigned msg_sent, unsigned lost_link,
+++    unsigned bootstrap_checkin)
+++{
+++	task_t client_task = current_task();
+++	if (client_task == TASK_NULL) {
+++		return;
+++	}
+++	char client_name[32] = {};
+++	task_best_name(client_task, client_name, sizeof(client_name));
+++	if (!picasso_sync_ipc_wanted(client_name)) {
+++		return;
+++	}
+++	unsigned ticket =
+++	    os_atomic_inc_orig(&picasso_sync_ipc_trace_count, relaxed);
+++	if (ticket >= 512) {
+++		return;
+++	}
+++	int client_pid = task_pid(client_task);
+++	pid_t dest_pid = ipc_port_get_receiver_task(dest_port, NULL);
+++	printf("PICASSO_SYNC link sample=%u client=%d name=%.32s srp=%p "
+++	    "dest=%d state=%u sent=%u lost=%u bootstrap=%u\n",
+++	    ticket + 1, client_pid, client_name, special_reply_port,
+++	    dest_pid, link_state, msg_sent, lost_link, bootstrap_checkin);
+++}
+++#endif
+++
++ 
++ /*
++  *	Routine:	ipc_port_link_special_reply_port
++@@ -1832,6 +1883,9 @@ ipc_port_link_special_reply_port(
++ {
++ 	boolean_t drop_turnstile_ref = FALSE;
++ 	boolean_t special_reply = FALSE;
+++	boolean_t linked = FALSE;
+++	unsigned link_state = 0, msg_sent = 0, lost_link = 0;
+++	unsigned bootstrap_checkin = 0;
++ 
++ 	/* Check if dest_port needs a turnstile */
++ 	ipc_port_send_turnstile_prepare(dest_port);
++@@ -1855,8 +1909,15 @@ ipc_port_link_special_reply_port(
++ 		ip_reference(dest_port);
++ 		special_reply_port->ip_sync_inheritor_port = dest_port;
++ 		special_reply_port->ip_sync_link_state = PORT_SYNC_LINK_PORT;
+++		linked = TRUE;
++ 	}
++ 
+++	link_state = special_reply_port->ip_sync_link_state;
+++	bootstrap_checkin = special_reply_port->ip_sync_bootstrap_checkin;
+++#if DEVELOPMENT || DEBUG
+++	msg_sent = special_reply_port->ip_srp_msg_sent;
+++	lost_link = special_reply_port->ip_srp_lost_link;
+++#endif
++ 	ip_mq_unlock(special_reply_port);
++ 
++ 	if (special_reply) {
++@@ -1872,6 +1933,13 @@ ipc_port_link_special_reply_port(
++ 		ipc_port_send_turnstile_complete(dest_port);
++ 	}
++ 
+++#if DEVELOPMENT || DEBUG
+++	if (linked) {
+++		picasso_sync_ipc_trace(special_reply_port, dest_port, link_state,
+++		    msg_sent, lost_link, bootstrap_checkin);
+++	}
+++#endif
+++
++ 	return;
++ }
++ 
++diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
++index 4450490..4273d7b 100644
++--- a/osfmk/kern/task.c
+++++ b/osfmk/kern/task.c
++@@ -10353,6 +10353,7 @@ picasso_live_task_snapshot(task_t task, int pid, unsigned sample)
++ 	struct {
++ 		thread_t thread;
++ 		uint64_t tid, pc, lr, sp, fp;
+++		uint64_t srp, option;
++ 		event64_t wait_event;
++ 		uint32_t valid, user64, state, hint;
++ 	} rows[32] = {};
++@@ -10384,6 +10385,9 @@ picasso_live_task_snapshot(task_t task, int pid, unsigned sample)
++ 				rows[count].valid = 1;
++ 				rows[count].state = thread->state;
++ 				rows[count].hint = thread->block_hint;
+++				rows[count].srp =
+++				    (uintptr_t)thread->ith_special_reply_port;
+++				rows[count].option = (uint64_t)thread->ith_option;
++ 				if (thread->state & TH_WAIT) {
++ 					rows[count].wait_event = thread->wait_event;
++ 				}
++@@ -10408,11 +10412,13 @@ picasso_live_task_snapshot(task_t task, int pid, unsigned sample)
++ 	    (unsigned long long)main_header, slide);
++ 	for (unsigned i = 0; i < count; i++) {
++ 		printf("PICASSO_WAIT thread pid=%d sample=%u tid=%llu valid=%u "
++-		    "state=%x hint=%u wait_event=%llx user64=%u "
+++		    "state=%x hint=%u wait_event=%llx srp=%llx rcv_option=%llx user64=%u "
++ 		    "pc=%llx lr=%llx sp=%llx fp=%llx\n",
++ 		    pid, sample, (unsigned long long)rows[i].tid, rows[i].valid,
++ 		    rows[i].state, rows[i].hint,
++-		    (unsigned long long)rows[i].wait_event, rows[i].user64,
+++		    (unsigned long long)rows[i].wait_event,
+++		    (unsigned long long)rows[i].srp,
+++		    (unsigned long long)rows[i].option, rows[i].user64,
++ 		    (unsigned long long)rows[i].pc, (unsigned long long)rows[i].lr,
++ 		    (unsigned long long)rows[i].sp, (unsigned long long)rows[i].fp);
++ 	}
