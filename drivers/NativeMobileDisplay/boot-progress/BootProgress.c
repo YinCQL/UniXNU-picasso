@@ -721,10 +721,29 @@ static uint32_t bp_cpu_cnt[8][64];
 enum {BpKernSamples = 32768};
 static uint32_t bp_kern[BpKernSamples][4];
 static uint32_t bp_kern_head;
+// Interrupt context must not use getCpuDatap(): it is current_thread()->machine.CpuDatap, a field that a
+// context switch/thread creation updates asynchronously and that a mismatched header layout can read at the
+// wrong offset (the shipped wf8 object read machine.preemption_count, value 1, as the pointer: panic far=1).
+// TPIDR_EL0 carries this CPU's encoded cpu/cluster id and cswitch.s set_thread_registers reloads it from the
+// running CPU's cpu_data on every switch, so the local CPU comes from there; the per-CPU data itself is a
+// static array reachable through cpu_datap(), never through the interrupted thread.
+#define BpTpidrCpuMask 0x0000000000000fffull
+static unsigned bp_cpu_number(void) {
+  uint64_t tpidr=0;
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tpidr));
+  return (unsigned)(tpidr&BpTpidrCpuMask);
+}
+static cpu_data_t *bp_cpu_datap(void) {
+  const int max=ml_get_max_cpu_number();
+  const unsigned cpu=bp_cpu_number();
+  if(max<0 || cpu>(unsigned)max)return NULL;
+  return cpu_datap((int)cpu);
+}
 static void bp_kernel_chain(uint64_t pc) {
   uint32_t *e=bp_kern[__atomic_fetch_add(&bp_kern_head,1,__ATOMIC_RELAXED)%BpKernSamples];
   e[0]=(uint32_t)pc;e[1]=e[2]=e[3]=0;
-  const arm_saved_state_t *s=getCpuDatap()->cpu_int_state;thread_t thread=current_thread();
+  cpu_data_t *cdp=bp_cpu_datap();
+  const arm_saved_state_t *s=cdp?cdp->cpu_int_state:NULL;thread_t thread=current_thread();
   if(!s || !thread || !thread->kernel_stack)return;
   const uint64_t low=(uint64_t)thread->kernel_stack,high=low+(uint64_t)kernel_stack_size;
   uint64_t fp=(uint64_t)get_saved_state_fp(s);
@@ -744,7 +763,7 @@ void boot_progress_irq(uint64_t pc,uint64_t psr,uint64_t sp) {
         const uint64_t kernel=(psr&0x1f)!=0;
         const uint32_t at=__atomic_fetch_add(&bp_prof_head,1,__ATOMIC_RELAXED);
         bp_prof[at%BpProfSamples]=((uint64_t)(pid&0xffff)<<48)|(kernel<<47)|(pc&((1ull<<47)-1));
-        bp_cpu_cnt[getCpuDatap()->cpu_number&7][pid%61]++;
+        bp_cpu_cnt[bp_cpu_number()&7][pid%61]++;
         if(kernel)bp_kernel_chain(pc);
       }
     }

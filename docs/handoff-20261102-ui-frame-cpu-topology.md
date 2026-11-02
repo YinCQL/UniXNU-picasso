@@ -24,10 +24,11 @@ tagged **[verified]** (with the evidence: a log file, command output, or source 
   `iPad7,1`, contains the eight picasso CPUs, and carries neither `cluster-type` nor
   `capacity-dmips-mhz`. Passing `--dtb` to `unixnu bootimg` does not change it.
   **[verified: /tmp/wf6-capture.log, /tmp/wf7-capture.log]**
-- An **interrupt-stack panic in the diagnostic `boot_progress_irq` probe** (garbage
-  `current_thread()->machine.CpuDatap`) is intermittent and independent of the scheduler: it hit
-  the AMP build (wf5) and the clutch build (wf8), while wf4 and wf7 survived 300 s.
-  **[verified: /tmp/wf5-capture.log, /tmp/wf8-capture.log]**
+- The **interrupt-stack panic in the diagnostic `boot_progress_irq` probe** was called a
+  `current_thread()->machine.CpuDatap` race in this round; **that diagnosis was wrong**. wf9 proved
+  it was a struct-layout mismatch in the prebuilt BootProgress object (`CpuDatap` read at 0x1d8,
+  which is `machine.preemption_count`). Fixed and verified over 3 × 300 s — see §9.
+  **[verified: /tmp/wf5-capture.log, /tmp/wf8-capture.log, out/wf9-runs/run{1,2,3}.log]**
 - The two-cluster/AMP attempt is committed but the default build was returned to `sched_clutch`
   (no `__ARM_AMP__`) because the firmware DT cannot express E/P (see §6.3).
 
@@ -253,6 +254,12 @@ encoding / `ml_get_cpu_number_local()` instead of `getCpuDatap()->cpu_number`, o
 pointer before dereferencing it. Until then, boot with `boot-progress=0` for stability runs (the
 probe is diagnostics-only; the boot-progress display and UI trace disappear with it).
 
+**Correction (wf9, §9):** it was not a race at all. The BootProgress object was compiled against a
+struct layout with `CpuDatap` at 0x1d8; the kernel core uses 0x1d0, so the probe read
+`machine.preemption_count` (value 1) as the pointer. The TPIDR fix is still right — an
+interrupt-context probe should never take the local CPU from the interrupted thread — but the
+prebuilt-object mismatch was the actual panic.
+
 ### 6.2 wf6: same kernel + live-DT diagnostics, flat topology confirmed
 
 Ran 120 s without a panic (short window); the DT lines above come from this boot.
@@ -293,10 +300,10 @@ scheduler. **[verified: /tmp/wf8-capture.log]**
 
 ## 7. Next steps, in priority order
 
-1. **Fix the `boot_progress_irq` race first.** It can reboot the device on any boot (wf8 hit it
-   within 45 s). Use a TPIDR-based CPU number / `ml_get_cpu_number_local()` instead of
-   `getCpuDatap()->cpu_number`, or bounds-check the pointer. For pure stability testing,
-   `boot-progress=0` removes the probe.
+1. ~~**Fix the `boot_progress_irq` race first.**~~ **DONE in wf9 (§9).** The probe now takes its
+   CPU number from TPIDR_EL0, reaches `cpu_data_t` through `cpu_datap()`, and never dereferences
+   the interrupted thread's `CpuDatap`. Three consecutive 300 s boots, one boot each, zero
+   panics. Before the next `__ARM_AMP__` build, read the build-order hazard in §9.2.
 2. **GPU (Goal B)**: continue from the cpf6 state (GMU + HFI verified). Next per mainline
    `a6xx_gpu.c` for the a650 family: GX GDSC/clock, `a6xx_pwrup`/`hw_init`, CP/SQE and ring. This is
    the only path to a smooth UI; CPU rendering cannot reach usable frame rates.
@@ -310,10 +317,76 @@ scheduler. **[verified: /tmp/wf8-capture.log]**
 ## 8. Open questions / risks
 
 - The runtime DT's origin is **[unverified]**; the FD is the leading hypothesis.
-- The interrupt-stack panic is a race in the diagnostic `boot_progress_irq` probe, reproduced
-  with both AMP (wf5) and clutch (wf8) builds; it is intermittent (wf4 and wf7 each survived
-  300 s). Fix or guard the probe (§6.1) before treating any image as stable.
+- ~~The interrupt-stack panic is a race in the diagnostic `boot_progress_irq` probe.~~ Resolved:
+  it was an ABI offset mismatch in a prebuilt object, not a race (§9). The "intermittent"
+  observation is explained by which side of the bootstrap→normal pass the archive was built on.
 - `bench2` takes a second mapping of the source; it was active in the boot that later panicked
   (wf3). Treat it as a diagnostic only.
 - The device returns to fastboot on panic automatically (`IMEM Fastboot reason armed`), so a
   failed image is recoverable with `fastboot boot`.
+
+## 9. P0 resolved — the boot_progress_irq panic was an ABI mismatch (wf9)
+
+### 9.1 Root cause and evidence
+
+- wf8's panic is at `pc = 0xfffffff007c4f874 = _boot_progress_irq+0xc8`, executing
+  `ldrh w8, [x9]` with `x9 = 0x1`, `far = 0x1`. The preceding instruction
+  (`lr = ...+0xc4`) is `ldr x9, [x0, #0x1d8]` after `bl _current_thread`; `x0` equals the
+  panic's `TPIDR_EL1` thread pointer. So the probe loaded `[thread+0x1d8]` as `CpuDatap`.
+  **[verified: /tmp/wf8-capture.log, kernel disassembly]**
+- The kernel core's own layout puts `machine.CpuDatap` at **0x1d0**: `genassym` emits
+  `ACT_CPUDATAP 464` (`.../osfmk/DEVELOPMENT/assym.s:19`), and `_machine_thread_create` stores
+  the NULL `CpuDatap` with `stp x8, xzr, [x0, #0x1c8]` while `str wzr, [x0, #0x1d8]` is
+  `machine.preemption_count`. Value 1 at 0x1d8 is exactly a preemption count.
+  **[verified: pcb.o, assym.s, llvm-objdump]**
+- The wf8 BootProgress.o was built against an **AMP-era header layout**, where
+  `__ARM_AMP__` → `__AMP__` → `CONFIG_SCHED_EDGE=1` adds 8 bytes before `machine`, making
+  `CpuDatap` 0x1d8. The `xnu-work` snapshots at 12:07/12:23/12:29 still had
+  `#define __ARM_AMP__ 1`; 12:40 and 12:42 dropped it. `struct machine_thread` itself never
+  changed; only the AMP conditional block did. **[verified: snapshot diffs, clang record layouts]**
+- The build order is what mixed them: `build-xnu-4k-baseline.sh:85` runs
+  `build-boot-progress.py` **before** `make`/installhdrs (line 878), and the archive identity
+  fingerprint covers only the archive bytes. The 12:42 pass compiled BootProgress.c against
+  the bootstrap-era record and stale `EXPORT_HDRS` (AMP layout) while `make` compiled the
+  kernel core from the refreshed non-AMP headers. **[verified: build-xnu-4k-baseline.sh,
+  kernel.py bootstrap path, .boot-progress-mode timestamps]**
+
+### 9.2 Fix and build-order hazard
+
+- `drivers/NativeMobileDisplay/boot-progress/BootProgress.c` no longer calls `getCpuDatap()` in
+  interrupt context. The CPU number comes from `TPIDR_EL0` (`cswitch.s set_thread_registers`
+  reloads it from the running CPU's `cpu_data` on every switch), and `cpu_data_t` is reached
+  through `cpu_datap(cpu)` with a bounds check against `ml_get_max_cpu_number()`.
+  `bp_kernel_chain()` takes `cpu_int_state` from that per-CPU pointer. The probe is now
+  independent of the `struct thread` layout.
+- **Hazard for the next ABI/header change (in particular enabling `__ARM_AMP__` for P1):**
+  the boot-progress archive is compiled before `installhdrs` in the same build, so the first
+  normal pass can still link an archive built with the previous layout. After any such change,
+  run `unixnu build kernel prelink` twice, or delete
+  `out/picasso/tree/build/boot-progress/libBootProgress.a` and
+  `out/picasso/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.boot-progress-mode` after
+  `make` has refreshed `EXPORT_HDRS`, then rebuild. Verify with `llvm-objdump`: the shipped
+  `_boot_progress_irq` must not load `[x0,#0x1d0]`/`[x0,#0x1d8]` at all now; for any other
+  object that does touch `machine.CpuDatap`, its offset must equal `ASSYM ACT_CPUDATAP`
+  (0x1d0 without AMP, 0x1d8 with AMP).
+- The console tty path (`scripts/picasso-cdc-command.py`) hangs on this device; use
+  `scripts/capture-picasso-usb-raw.py` with `--send`/`--reboot-fastboot` instead. **[verified
+  this round: the tty invocation blocked until timeout, the libusb one worked]**
+
+### 9.3 Acceptance on hardware (wf9)
+
+Image: wf8 payload and boot args unchanged (`sheng-gpu=0`, `boot-progress=2`), only
+`PAYLOADS/kernel.macho` replaced; built kernel sha256
+`8edab2a37a925ebde446a881ef71da0c4e7daefba4e6c0e252affcdca4fed092` (old wf8
+`c6b42517…`), extracted payload kernel hash identical.
+
+| round | window | PSHOLD boot markers | panic(cpu / Unexpected abort / Debugger | userland |
+|---|---|---|---|---|
+| 1 | 13:14:51–13:20:03 | 1 | 0 | SpringBoard/backboardd sync, NVT touch, CDC live |
+| 2 | 13:20:03–13:25:16 | 1 | 0 | same |
+| 3 | 13:25:16–13:30:29 | 1 | 0 | same |
+
+Logs: `out/wf9-runs/run{1,2,3}.log`, `out/wf9-runs/harness.log`; each round ends with an
+active `PICASSO_SYNC`/`PICASSO_CPUFREQ` sample, not a panic. The diagnostic IRQ probe
+(`boot-progress=2`) stayed enabled throughout, i.e. the previously crashing path ran for
+900 s of booted userland without a fault.
