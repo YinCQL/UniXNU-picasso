@@ -45,6 +45,25 @@ struct NativeAdrenoMetalDiag {
 extern "C" {volatile uint32_t native_adreno_view_diag[6],native_adreno_view_kept;}   /* kept: BoCpuUnmap calls that left the view for another lease */
 }
 
+/* The plugin's own two report lines and its connection counters, for the board
+ * probe's addon report (the struct above is private to this file). */
+extern "C" const char *native_adreno_metal_report(void) {return native_adreno_metal_diag.report;}
+extern "C" const char *native_adreno_metal_report2(void) {return native_adreno_metal_diag.report2;}
+extern "C" uint32_t native_adreno_metal_opens(void) {return native_adreno_metal_diag.opens;}
+extern "C" uint32_t native_adreno_metal_foreign_opens(void) {return native_adreno_metal_diag.foreign_opens;}
+extern "C" uint32_t native_adreno_metal_last(uint32_t *selector, uint32_t *status)
+{
+    if(selector)*selector=native_adreno_metal_diag.last_selector;
+    if(status)*status=native_adreno_metal_diag.last_status;
+    return native_adreno_metal_diag.calls;
+}
+extern "C" uint32_t native_adreno_metal_marks(uint32_t *out, uint32_t capacity)
+{
+    const uint32_t total=native_adreno_metal_diag.marks_total, shown=total<capacity?total:capacity;
+    for(uint32_t i=0;i<shown;++i)out[i]=native_adreno_metal_diag.marks[(total-shown+i)&15];
+    return total;
+}
+
 /* The open type the Adreno plugin passes to IOServiceOpen ('AG'); it lets the driver tell the plugin from the original IOGPU library
  * (type 1 plus an API value) and from any other client of the accelerator. */
 enum : UInt32 {NativeAdrenoPluginOpenType=0x4147,NativeAdrenoTunnelMagic=0x4e544e4c /* 'NTNL' */};
@@ -213,6 +232,15 @@ static void nativeAdrenoHangcheck(void *,wait_result_t)
                 }
                 NativeAdrenoRecovery result{};
                 const IOReturn status=g.submit->recover(g.restart,g.restart_cookie,&g.clock,&result);
+                /* The first few restarts print what the hang looked like: the fence that stopped, the board's result, how many
+                 * submissions were replayed, and whether the SMMU had latched a fault (endFault's FSR/FAR). Bounded like the stall print. */
+                static uint32_t restart_prints;
+                if(restart_prints<6) {
+                    ++restart_prints;
+                    printf("PICASSO_GPU hang: fence=%u status=%x replayed=%u guilty=%d fault=%x/%x/%x/%x\n",
+                        result.fence, unsigned(status?status:result.status), result.replayed,
+                        result.guilty?1:0, fault[0], fault[1], fault[2], fault[3]);
+                }
                 native_adreno_recovery[3]=result.fence;native_adreno_recovery[4]=uint32_t(status?status:result.status);
                 native_adreno_recovery[5]=native_adreno_recovery[5]+result.replayed;
                 if(result.guilty)native_adreno_recovery[6]=native_adreno_recovery[6]+1;
@@ -230,6 +258,20 @@ static void nativeAdrenoHangcheck(void *,wait_result_t)
                 }
                 if(status)g.status.noteFault();
                 if(!status)g.status.noteSuspend();
+            } else {
+                /* A board without a restart hook (this one installs none): the hang is only counted, so print what the bank and the
+                 * fence page hold now. A TTBR0 that is still the client's table means the switch landed and the CP stalled elsewhere. */
+                static uint32_t no_restart_prints;
+                if(no_restart_prints<4) {
+                    ++no_restart_prints;
+                    uint64_t seen=0;
+                    const IOReturn read=g.context?g.context->readTtbr0(&seen):kIOReturnNotReady;
+                    uint32_t cpFence=0;
+                    if(g.ring)(void)g.ring->fenceValue(&cpFence);
+                    printf("PICASSO_GPU hang: no restart hook read=%x ttbr0=%llx cpFence=%u rptr=%u wptr=%u\n",
+                        unsigned(read), (unsigned long long)seen, cpFence,
+                        g.ring?g.ring->readPointer():0, g.ring?g.ring->writePointer():0);
+                }
             }
         }
         IOLockUnlock(g.lock);
@@ -339,6 +381,11 @@ bool AGXDeviceUserClient::mount(bool kernel)
     if(!opened && !vm)opened=kIOReturnNotReady;
     if(!opened)opened=core->open(NativeAdrenoAbiVersion,vm,g.submit,g.ring,g.input_bits,g.output_bits);
     if(opened!=kIOReturnSuccess) {native_adreno_mount_fail[0]=space?2:1;native_adreno_mount_fail[1]=uint32_t(opened);native_adreno_mount_fail[2]=0;native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;}
+    if(opened!=kIOReturnSuccess)
+        printf("PICASSO_GPU mount: open=%x vm=%p submit=%p ring=%p bits=%u/%u poison=%d/%d/%d abi=%u\n",
+            unsigned(opened),vm,g.submit,g.ring,g.input_bits,g.output_bits,
+            vm?vm->poisoned():-1,g.submit?g.submit->poisoned():-1,g.ring?g.ring->poisoned():-1,
+            unsigned(NativeAdrenoAbiVersion));
     if(opened==kIOReturnSuccess) {
         if(g.timer)core->attachTimer(g.timer);
         if(g.info)core->attachDeviceInfo(g.info);
@@ -503,6 +550,19 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
         descriptor->retain();*memory=descriptor;
         *options=kIOMapAnywhere;
         native_adreno_view_diag[1]=native_adreno_view_diag[1]+1;
+        /* Bounded probe: the client's CPU writes only reach the GPU's BO if this view maps the same pages its spans name. */
+        static uint32_t view_prints;
+        if(view_prints<8 && backing->spanCount()) {
+            ++view_prints;
+            IOByteCount length=0;
+            const addr64_t first=descriptor->getPhysicalSegment(0,&length,kIOMemoryMapperNone);
+            const NativeAdrenoPhysicalSpan &span=backing->spans()[0];
+            printf("PICASSO_GPU view: token=%u bytes=%llu wc=%d pages=%llu first=%llx span=%llx/%llu spans=%llu\n",
+                unsigned(type),(unsigned long long)descriptor->getLength(),backing->writeCombined()?1:0,
+                (unsigned long long)(backing->bytes()/4096),(unsigned long long)first,
+                (unsigned long long)span.physical,(unsigned long long)span.bytes,
+                (unsigned long long)backing->spanCount());
+        }
         status=kIOReturnSuccess;
     }
     else if(backing) {
@@ -856,12 +916,16 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
         const uint32_t *header=static_cast<const uint32_t *>(arguments->structureInput);
         if(header[1]==0xffffffffu) {
             native_adreno_metal_diag.probes=native_adreno_metal_diag.probes+1;
+            if(native_adreno_metal_diag.probes==1)
+                printf("PICASSO_GPU tunnel: probe admitted selector=%u\n",selector);
             return kIOReturnSuccess;
         }
         native_adreno_metal_diag.tunnel_calls=native_adreno_metal_diag.tunnel_calls+1;
         const IOReturn tunneled=run(header[1],reinterpret_cast<const uint8_t *>(arguments->structureInput)+8,
             arguments->structureInputSize-8,arguments->structureOutput,arguments->structureOutputSize);
         native_adreno_metal_diag.ext_status=uint32_t(tunneled);
+        if(native_adreno_metal_diag.tunnel_calls<=32)
+            printf("PICASSO_GPU tunnel: call=%u status=%x\n",header[1],unsigned(tunneled));
         return tunneled;
     }
     native_adreno_metal_diag.ext_selector=selector;
@@ -983,6 +1047,12 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
         native_adreno_metal_diag.foreign_type=type;
         return kIOReturnUnsupported;
     }
+    /* The Adreno plugin reached the published service (the addon mount and the plugin's Metal discovery worked). */
+    {
+        char plugin[20]={};
+        proc_selfname(plugin,sizeof plugin);
+        printf("PICASSO_GPU open: plugin type=%x pid=%d name=%s\n",type,proc_selfpid(),plugin);
+    }
     /* Every process that runs the Adreno plugin opens with its type: on Apple hardware every Metal process opens the AGX user client, and the
      * original profiles here name no class of this driver for the render server (MACF 1 for the plugin's types at every boot since int-038).
      * The plugin's two open types are granted here, by this driver: the grant is a property of the client object that the kernel's open path
@@ -1011,12 +1081,17 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
         IOLockLock(g.lock);
         if(record) {record->refused=record->refused+1;record->last_refusal=uint32_t(refusal);}
         IOLockUnlock(g.lock);
+        if(type==NativeAdrenoPluginOpenType)
+            printf("PICASSO_GPU plugin: mount refused=%x fail=%u/%x\n",
+                unsigned(refusal),native_adreno_mount_fail[0],native_adreno_mount_fail[1]);
         return refusal;
     }
     IOLockLock(g.lock);
     if(record)record->opens=record->opens+1;
     IOLockUnlock(g.lock);
     native_adreno_metal_diag.opens=native_adreno_metal_diag.opens+1;
+    if(type==NativeAdrenoPluginOpenType)
+        printf("PICASSO_GPU plugin: mount ok opens=%u\n",native_adreno_metal_diag.opens);
     *handler=connection;
     return kIOReturnSuccess;
 }
@@ -1164,10 +1239,14 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
         [](void *cookie,uint64_t ttbr0)->IOReturn {return static_cast<NativeAdrenoGpuContext *>(cookie)->writeTtbr0(ttbr0);},g.context);
     native_adreno_table_switches[6]=uint32_t(switching);
     if(switching)g.context=nullptr;
-    else if(submit->tableMode()==2) {
-        /* The CP's switch must reach the bank: one NOP submission on a fresh address space, then the bank's TTBR0 is read back. A
-         * switch that did not land falls back to the CPU's. */
+    else if(submit->tableMode()==2 || submit->tableMode()==1) {
+        /* The switch must reach the bank: one NOP submission on a fresh address space, then the bank's TTBR0 is read back. A
+         * switch that did not land falls back to the CPU's. (Mode 1 runs it too: the CPU-write switch was never proven, and this
+         * self-check is the only controlled reproduction of a client's first submission on its own table.) */
         const IOReturn checked=checkCpSwitch();
+        printf("PICASSO_GPU cpcheck: mode=%u result=%x steps=%x/%x/%x/%x/%x fence=%u\n", submit->tableMode(),
+            unsigned(checked), native_adreno_cp_check[0], native_adreno_cp_check[1], native_adreno_cp_check[2],
+            native_adreno_cp_check[3], native_adreno_cp_check[4], native_adreno_cp_check[5]);
         native_adreno_cp_aperture[2]=uint32_t(checked);
         if(checked && !submit->outstanding())(void)submit->setTableSwitching(1,
             [](void *cookie,uint64_t ttbr0)->IOReturn {return static_cast<NativeAdrenoGpuContext *>(cookie)->writeTtbr0(ttbr0);},g.context);

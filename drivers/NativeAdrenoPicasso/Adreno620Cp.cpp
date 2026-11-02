@@ -43,8 +43,40 @@
 #include <libkern/c++/OSSymbol.h>
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
+#include <kern/task.h>
+#include <kern/thread.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/* The driver's client-BO reader falls back to a board DRAM reader when a BO has no kernel mapping (system BOs). This port had none
+ * installed, so a stall's IB dump was all 0xdeadbeef. Reads one word through a temporary kernel mapping of its page. */
+extern "C" int (*native_adreno_dram_read32)(uint64_t physical, uint32_t *value);
+extern "C" int (*native_adreno_cached_read32)(uint64_t physical, uint32_t *value);
+static int dramRead32(uint64_t physical, uint32_t *value)
+{
+    if (!value) return -1;
+    IOMemoryDescriptor *page = IOMemoryDescriptor::withPhysicalAddress(physical & ~UINT64_C(0xfff), 4096, kIODirectionIn);
+    if (!page) return -1;
+    IOMemoryMap *map = page->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly);
+    page->release();
+    if (!map) return -1;
+    const uint8_t *base = reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(map->getAddress()));
+    *value = *reinterpret_cast<volatile const uint32_t *>(base + (physical & 0xfff));
+    map->release();
+    return 0;
+}
+/* The kernel's cacheable physical aperture (the direct map), which is how the driver's line audit sees a client's dirty cache lines:
+ * an IO mapping of the same page takes the page's IO attribute and would read DRAM instead. */
+extern "C" vm_offset_t phystokv(uint64_t pa);
+extern "C" uint64_t gPhysBase, gPhysSize;
+static int cachedRead32(uint64_t physical, uint32_t *value)
+{
+    if (!value || physical < gPhysBase || physical - gPhysBase >= gPhysSize) return -1;
+    const vm_offset_t alias = phystokv(physical & ~UINT64_C(0xfff));
+    if (!alias) return -1;
+    *value = *reinterpret_cast<volatile const uint32_t *>(static_cast<uintptr_t>(alias) + (physical & 0xfff));
+    return 0;
+}
 
 /* NativeAdrenoPublish.cpp has no header: these are its exported entry points. */
 extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *,
@@ -62,6 +94,30 @@ extern "C" IOService *native_adreno_accelerator_allocate(void) __attribute__((we
 extern "C" unsigned native_adreno_accelerator_instance_size(void) __attribute__((weak));
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
 extern "C" kmod_info_t g_kernel_kmod_info;
+
+/* The boot addon's progress (bsd/kern/kern_exec.c): extensions mount, daemons
+ * mount, wallpaper overlay, each stage/status. Read by the report thread below
+ * once launchd has run the first exec that triggers the mount. */
+extern "C" volatile int native_gpu_addon_stage, native_gpu_addon_status;
+extern "C" volatile int native_gpu_addon2_stage, native_gpu_addon2_status;
+extern "C" volatile int native_gpu_addon3_stage, native_gpu_addon3_status;
+/* Submissions and IBs the production submit object has seen: the plugin's
+ * arrival is visible here even though its own report is not printed. */
+extern "C" volatile uint32_t native_adreno_submit_ibs[4];
+/* The plugin's own report lines and connection counters (NativeAdrenoPublish). */
+extern "C" const char *native_adreno_metal_report(void);
+extern "C" const char *native_adreno_metal_report2(void);
+extern "C" uint32_t native_adreno_metal_opens(void);
+extern "C" uint32_t native_adreno_metal_foreign_opens(void);
+extern "C" uint32_t native_adreno_metal_last(uint32_t *selector, uint32_t *status);
+extern "C" uint32_t native_adreno_metal_marks(uint32_t *out, uint32_t capacity);
+/* Why the latest user connection's mount failed ([0] 1 no address space,
+ * 2 the core's open, 3 the window scope; [1] its IOReturn; [3] count), the
+ * table-switch proof and the CP switch check. */
+extern "C" volatile uint32_t native_adreno_mount_fail[4];
+extern "C" volatile uint32_t native_adreno_table_switches[8];
+extern "C" volatile uint32_t native_adreno_cp_aperture[4];
+extern "C" volatile uint32_t native_adreno_cp_check[6];
 
 namespace {
 
@@ -284,6 +340,19 @@ void printCpStatus(const char *where)
         gpuRead(A620_RBBM_STATUS), gpuRead(A620_RBBM_STATUS3),
         gpuRead(A620_RBBM_INT_0_STATUS), gpuRead(A620_CP_HW_FAULT),
         gpuRead(A620_CP_INTERRUPT_STATUS), gpuRead(A620_CP_SQE_STAT_DATA));
+}
+
+/* For a stalled client fence (NativeAdrenoSubmit's ring state carries no CP_INT): the SQE error code, the hardware fault register, the
+ * register-protection status (0x824) and one SQE state sample. Reads only. */
+extern "C" uint32_t native_adreno_cp_fault_regs(uint32_t *out, uint32_t count)
+{
+    if (!out || count < 4) return 0;
+    gpuWrite(A620_CP_SQE_STAT_ADDR, 0);
+    out[0] = gpuRead(A620_CP_INTERRUPT_STATUS);
+    out[1] = gpuRead(A620_CP_HW_FAULT);
+    out[2] = gpuRead(0x0824);   /* CP_PROTECT_STATUS (a6xx.xml) */
+    out[3] = gpuRead(A620_CP_SQE_STAT_DATA);
+    return 1;
 }
 
 /* Wait until the CP's read pointer shadow reaches `target` and no submit is in
@@ -684,6 +753,10 @@ bool publishGpu()
     info.ubwc_swizzle = 0x6;                  /* levels 2 and 3 (qcom_ubwc_swizzle) */
     info.macrotile_mode = 0;
     info.ubwc_version = 3;
+    /* The client chooses its BO addresses inside the window mount() gave it and BoMap validates every one; Turnip requires the flag to
+     * initialize the address heap that darwin_bo_init allocates from (without it the heap stays zeroed and the first allocation walks a
+     * NULL hole: SIGSEGV in every process, after GetDeviceInfo). */
+    info.flags = NativeAdrenoDeviceClientIova;
     NativeAdrenoRingClock clock;
     clock.cookie = nullptr;
     clock.now_us = ringNowUs;
@@ -764,9 +837,13 @@ bool publishMetal()
         return false;
     }
     /* The two keys the original _MTLRegisterDevices helper reads, plus the
-     * sandbox grant installed by patches/xnu/zzw-native-adreno-sandbox-grant.patch. */
+     * process names this kernel's grant honours in place of the sandbox
+     * verdict (this upstream's native_sandbox_grant matches names literally;
+     * names are the first 16 characters proc_selfname reports). */
     accelerator->setProperty("MetalPluginName", "NativeAdrenoMetal");
-    accelerator->setProperty("NativeSandboxGrantProcess", "*");
+    accelerator->setProperty("NativeSandboxGrantProcess",
+        "backboardd,SpringBoard,mediaserverd,WidgetRenderer_D,"
+        "iconservicesagent,posterboardd,Wallpaper");
     accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
     stage = 4;
     if (!accelerator->attach(IOService::getPlatform())) {
@@ -780,6 +857,48 @@ bool publishMetal()
     printf("PICASSO_GPU cp: metal stage=%u status=%08x registered=1\n",
         stage, unsigned(kIOReturnSuccess));
     return true;
+}
+
+/* The boot addon's report (sheng-gpu-addon=1): launchd's first exec runs the
+ * mount, so read the three stage/status pairs from a thread after it. Stages:
+ * 1 source probed, 2 mounted, 3.. the visible paths checked; status is the
+ * last error (0 mounted). */
+void addonReport(void *, wait_result_t)
+{
+    IOSleep(20000);
+    printf("PICASSO_GPU addon: extensions=%d/%x daemons=%d/%x wallpaper=%d/%x\n",
+        native_gpu_addon_stage, native_gpu_addon_status,
+        native_gpu_addon2_stage, native_gpu_addon2_status,
+        native_gpu_addon3_stage, native_gpu_addon3_status);
+    printf("PICASSO_GPU submits: submissions=%u ibs=%u max=%u many=%u\n",
+        native_adreno_submit_ibs[0], native_adreno_submit_ibs[1],
+        native_adreno_submit_ibs[2], native_adreno_submit_ibs[3]);
+    printf("PICASSO_GPU metal diag: opens=%u foreign=%u report=%s report2=%s\n",
+        native_adreno_metal_opens(), native_adreno_metal_foreign_opens(),
+        native_adreno_metal_report(), native_adreno_metal_report2());
+    printf("PICASSO_GPU mount: fail=%u/%x count=%u ttbr=%u/%u cp=%x/%x check=%x/%x/%x/%x/%x/%x\n",
+        native_adreno_mount_fail[0], native_adreno_mount_fail[1], native_adreno_mount_fail[3],
+        native_adreno_table_switches[6], native_adreno_table_switches[7],
+        native_adreno_cp_aperture[2], native_adreno_cp_aperture[3],
+        native_adreno_cp_check[0], native_adreno_cp_check[1], native_adreno_cp_check[2],
+        native_adreno_cp_check[3], native_adreno_cp_check[4], native_adreno_cp_check[5]);
+    IOSleep(40000);
+    uint32_t selector = 0, status = 0;
+    const uint32_t calls = native_adreno_metal_last(&selector, &status);
+    uint32_t marks[8] = {};
+    const uint32_t total = native_adreno_metal_marks(marks, 8);
+    char list[64] = {};
+    size_t at = 0;
+    for (uint32_t i = 0; i < 8 && i < total && at < sizeof list - 8; ++i)
+        at += snprintf(list + at, sizeof list - at, " %x", marks[i]);
+    printf("PICASSO_GPU client: calls=%u last=%u/%x marks=%u%s\n",
+        calls, selector, status, total, list);
+    printf("PICASSO_GPU submits later: submissions=%u ibs=%u max=%u many=%u\n",
+        native_adreno_submit_ibs[0], native_adreno_submit_ibs[1],
+        native_adreno_submit_ibs[2], native_adreno_submit_ibs[3]);
+    printf("PICASSO_GPU metal later: opens=%u foreign=%u report=%s report2=%s\n",
+        native_adreno_metal_opens(), native_adreno_metal_foreign_opens(),
+        native_adreno_metal_report(), native_adreno_metal_report2());
 }
 
 /* One entry of the production user-client dispatch, with the record sizes the
@@ -927,6 +1046,9 @@ bool acquireBuffers()
 
 extern "C" int native_adreno620_cp_start(void)
 {
+    /* The driver's diagnostic reader of client BOs reads DRAM through this hook, and the cacheable alias through the other. */
+    native_adreno_dram_read32 = dramRead32;
+    native_adreno_cached_read32 = cachedRead32;
     if (!gState) gState = new CpState;
     CpState &s = *gState;
     if (s.started) {
@@ -1096,6 +1218,17 @@ extern "C" int native_adreno620_cp_start(void)
         }
         printf("PICASSO_GPU cp: client test ok\n");
     }
+
+    /* Report the boot addon's mount stages once launchd has run them. */
+    uint32_t addonValue = 0;
+    if (PE_parse_boot_argn("sheng-gpu-addon", &addonValue,
+        static_cast<int>(sizeof addonValue)) && addonValue) {
+        thread_t report = nullptr;
+        if (kernel_thread_start(addonReport, nullptr, &report) == KERN_SUCCESS)
+            thread_deallocate(report);
+        else
+            printf("PICASSO_GPU addon: report thread failed\n");
+    }
     return 0;
 }
 
@@ -1104,6 +1237,12 @@ extern "C" int native_adreno620_cp_submit(uint32_t *fence)
     if (!gState || !gState->started) return adreno620::ProbeHookAbsent;
     if (!fence) return -1;
     if (!submitNoop(fence)) return -1;
+    /* The published ring class must follow this submission (it was adopted
+     * before it): otherwise the service's hangcheck sees a fence page ahead
+     * of the class's newest number and poisons the ring, and the class's
+     * write pointer stays behind the CP's, which makes every later submit
+     * look like a full ring. */
+    if (NativeAdrenoRing *ring = ringObject()) ring->noteExternalSubmit(gState->next, *fence);
     return 0;
 }
 

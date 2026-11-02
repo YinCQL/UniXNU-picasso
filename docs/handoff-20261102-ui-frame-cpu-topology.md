@@ -737,6 +737,103 @@ then `make-gpu-addon.py` plus the boot-time addon mount (`--gpu-addon`/`sheng-gp
 XNU sandbox grant patch. The GPU-side prerequisites (accelerator registration, service, client
 submission) are now in place.
 
+### 12.3 Stage 5 — the Metal plugin in the image and the first client submission (wf54–wf68)
+
+**The image pairing.** The plugin speaks NativeAdreno ABI v2 (`NativeAdrenoAbiVersion = 2`, submit
+record 3104 B). Turnip's `dw_open_connection` probes the version before anything else and refuses
+every later call on a mismatch, so a kernel from this tree must be paired with an addon built from
+the same tree: `build-turnip-darwin.py --target ios` (the iOS `libvulkan_freedreno.dylib`),
+`build-adreno-metal-plugin.py` (`NativeAdrenoMetal.bundle`), `make-owner-trust-bundle.py`
+(`owner-trust.bundle`), `make-gpu-addon.py --publish` (the addon blob), then
+`unixnu build payload --gpu-addon <blob>` with kernel args `sheng-gpu-metal=1 sheng-gpu-addon=1`.
+The plugin source is `drivers/NativeMetal/NativeAdrenoMetalPlugin.mm` in the main checkout (not in
+this device worktree); its crash reporter and the 0x68xx/0x69xx marker protocol live there. Every
+`out/wfNN` image embeds its own addon; never pair one tag's addon with another tag's kernel.
+
+**Accelerator and grant.** §12.2's `NativeSandboxGrantProcess=*` does not work on this XNU: its
+`native_sandbox_grant` compares the first 16 characters `proc_selfname` reports, literally. The
+board lists `backboardd,SpringBoard,mediaserverd,WidgetRenderer_D,iconservicesagent,posterboardd,Wallpaper`.
+backboardd (pid 56) and mediaserverd (pid 29) reach `newUserClient` with the plugin's open type
+0x4147 and mount (`PICASSO_GPU open: plugin type=4147 ...`, `plugin: mount ok opens=N`).
+
+**Bug #1 — a zeroed address heap (wf59→wf61).** After GetDeviceInfo, every client process died in
+`util_vma_heap_alloc` (the plugin's SIGSEGV; mark 0x690B proved the crash handler ran, while the
+text channel stays closed because backboardd's sandbox refuses `/dev/console`). Turnip allocates
+`device->vma` only when `NativeAdrenoDeviceClientIova` is set in DeviceInfo.flags; the board
+published flags=0, and `darwin_bo_init` still allocates from that heap on the first BO, walking
+`list_entry(NULL)`. Fix: `info.flags = NativeAdrenoDeviceClientIova` (`Adreno620Cp.cpp`). wf61:
+tunnel calls 2/3/13 (BoAlloc/BoMap/BoCpuMap) all status=0; the next refusal moved to Submit.
+
+**Bug #2 — the write pointer the board moved (wf61→wf62).** Submit then returned 0xe00002d5
+(kIOReturnBusy): the board's post-publish probe (`checkCpSwitch`) had advanced the CP's read
+pointer past the class's adopted `next_`, so `used = (next_ - rptr) & mask` wrapped to 8182 of 8192
+words (nearly full ring). Fix: `NativeAdrenoRing::noteExternalSubmit(wptr, value)` takes the probe
+pair's write pointer and fence after the board's submission (`Adreno620Cp.cpp`). wf62: tunnel
+call=5 status=0; call=6 (WaitFence) then returned 0xe00002d6 (timeout), which is the next problem.
+
+**The first client submission stalls (wf63–wf68).** The submission is accepted and the per-process
+page-table switch lands (TTBR0 readback 0x100000ec661000, ASID 0x1000). The board's own NOP
+submission on a fresh VM completes (`cpcheck: mode=1 result=0 steps=0/0/0/0/0 fence=2`), so the
+CPU-written TTBR0 switch and the fence path both work. Turnip's submission then leaves the CP busy:
+RBBM_STATUS 0x800005, CP_HW_FAULT 0, CP_STATUS_1 0x8000430e, SMMU FSR 0x400 (the AArch64 format
+value; no fault), CP_RB_RPTR/WPTR 0x24, IB1 0x1_00027000 with REM 0, fence page still 2. The job is
+one IB of 4 words (`70bf8003 27000 1 bd`, i.e. CP_INDIRECT_BUFFER to 0x1_00027000, 0xbd dwords).
+Reading the IB through the client VM's own mapping after installing the board's DRAM reader
+(`native_adreno_dram_read32`) gives eight zero dwords at 0x1_00027000 (wf67:
+`stall ib1 100027000 read=0: 0 0 ...`): the command stream Turnip submitted is not in the BO's
+DRAM. wf68 measures the two candidate causes: the client view's pages against the BO's first span
+(`PICASSO_GPU view: token=... first=... span=...`), and the same IB words through the kernel's
+cacheable direct map and through DRAM (`stall ib1c: cached/dram ...`), controlled by a CP-written
+page the driver already reads (the fence page, `stall fencepage: ...`). wf68 answered all three:
+every client view maps exactly the BO's own first page (`view: token=1..5 ... first=<span0>`), the
+fence page reads 2 through both the cacheable alias and DRAM (so both readers work), and the IB's
+eight words read zero through both (`stall ib1c: 0/0 ...`). There is no dirty cache line: the
+command stream the client named is not in that BO at all. wf69 records the submit-time state instead
+of the post-stall state: for the first submissions it prints the wire buffer (handle, iova, bytes),
+the mapping's extent (`describe`), the word at the wire iova through both readers, and the BO's first
+eight words, with the board's own NOP probe as the control. wf69's probe read its own IB word
+(`70108000`); the first client submission read its whole page as zero (`h=16 iova=100027000
+bytes=756 map=100027000/16384 sample=0/0/0`), and a second submission about 100 ms later, naming the
+same handle and address, read a valid Turnip stream (`70460001 31 40bb0801 fffff 70268000 ...`). The
+stalled job is the first (fence 3); the board's own probe (fence 2) completed. The stall record also
+reported mapping handle 10 at the IB address while the submit named 16, so the ring's address may
+name a different BO by stall time. wf70 therefore identifies every wire record and the stall by pid,
+VM and the VM's next handle, and reads the stalled job's own buffer handle.
+
+**wf70 result — the stalled job is backboardd's first submission, and its page reads zero in both
+readers.** The wire record is `pid=56 vm=0xfffffff2e32cad28 next=17 h=16 iova=100027000 bytes=756
+map=100027000/16384 sample=0/0/0 bo= 0 0 0 0 0 0 0 0`; the stall for fence 3 names the same job
+(`stall ids: pid=56 fence=3 jvm=0xfffffff2e32cad28 ... snext=17 buf0=16`), `stall bufinfo` still
+describes handle 16 as 16384 B at that address and reads zeros, and the fence page reads 2 through
+both the cacheable alias and DRAM (`stall fencepage: read=0 cached=2 dram=2`), so the readers are
+validated on this boot. The later wire record with a valid Turnip stream is pid 29 (mediaserverd),
+a different process and VM (the same addresses because Turnip's allocator and the client IOVA heap
+are deterministic), so wf69's "second submission with content" was another process, not a
+resubmission. The stall also finds a live mapping with handle 10 over the IB address while the job
+named 16 (`stall fencepage ... handle=10`): either two live mappings cover one GPU address, or the
+address-based readers return the first matching mapping and ignore the region. A page of zeros is a
+type-0 NOP sled, while `RBBM_INT_0_STATUS` carries `CP_HW_ERROR` and `CP_INTERRUPT_STATUS` (which
+names the SQE error) was never read, so whether the CP fault is caused by the IB content at all is
+still open. The wf71 kernel therefore adds a full mapping dump at wire and stall time and the CP
+fault registers. **[verified: out/wf70-runs/run1.log]**
+
+**wf71 result — the diagnostic kernel is valid, the image is not.** The kernel
+(sha256 `65e94a034c1eaa2615cca149a95a1804380a8de5eb162b84e3d829aaf14634f3`) contains the new
+diagnostics, but the payload was packed without `sheng-gpu-metal=1 sheng-gpu-addon=1`:
+`publishGpu()` never ran, backboardd's plugin opens returned `0xe00002f0` (kIOReturnNotFound), and
+no client submission occurred. Repack the same kernel with those arguments as wf72 (verify
+`payload.json`) and run it; the continuation handoff is
+`docs/handoff-20261102-gpu-first-submit-stall.md`. **[verified: out/wf71-runs/run1.log;
+out/wf71/picasso/payload/payload.json]**
+
+**One operational trap.** `unixnu build kernel` runs the archive stages before the XNU pass, and
+those archives read `out/picasso/tree/build/xnu/ios-obj/.../link.filelist` (written by the previous
+XNU pass) to survey kernel symbols. Interrupting a build leaves the XNU object tree pruned while
+that list still names the removed objects, so the next build dies at archive 1 with
+`nm: ... startup.o: No such file or directory`. The list is only a survey input and the next XNU
+pass rewrites it: filter the missing entries (keep the lines whose files exist) and rebuild; the XNU
+pass recreates the objects and the file. Do not delete the object tree.
+
 
 ## 13. Boot time: the UEFI menu timeout is 3 s of the first-console time
 

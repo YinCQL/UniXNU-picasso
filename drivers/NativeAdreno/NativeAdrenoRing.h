@@ -115,6 +115,21 @@ public:
      * (thread-control) submissions are refused; only the plain path is valid
      * on a6xx. Set before the first submit. */
     void setA6xxFence(bool on) {a6xx_=on;}
+    /* A submission the board issued on this ring outside the class (stage 4's
+     * own probe pair, after the ring was adopted): its write pointer and fence
+     * become the class's own, so the next submission appends after the words
+     * the CP already read. Without the write pointer, next_ stays where adopt
+     * found it (the probe pair's two submissions moved the CP past it), and
+     * used = (next_ - rptr) & mask wraps to almost the whole ring: every
+     * submit is then refused as NoResources ("ring full"). The completion
+     * value stays what the class last observed; the next wait reads it. */
+    void noteExternalSubmit(uint32_t wptr,uint32_t value)
+    {
+        if(!attached_ || poisoned_ || !ring_bytes_) return;
+        const uint32_t words=(uint32_t)(ring_bytes_/sizeof(uint32_t));
+        if(wptr<words) next_=wptr;
+        if((int32_t)(value-seqno_)>0) seqno_=value;
+    }
     /* Programs nothing. Refuses while submissions are unobserved or poisoned,
      * because only the caller can establish real GPU quiescence and unmap. */
     IOReturn detach();

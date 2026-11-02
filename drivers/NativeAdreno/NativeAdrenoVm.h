@@ -152,6 +152,9 @@ public:
     /* Map handles count up and are never reused, so they order mappings in time: the next one, and the one over a GPU address (0: none). */
     uint64_t nextHandle() const {return next_handle_;}
     uint64_t handleAt(uint64_t iova) const;
+    /* Diagnostic, for the board log only: every live mapping (slot, handle, GPU address, size, spans mapped/of, permissions,
+     * attributes, region, kind) and the first four dwords of its GPU memory through the uncached reader. Bounded by `limit`. */
+    void dumpMappings(const char *tag,uint32_t limit) const;
     /* Only a scheduler's actual successful GPU completion may call this.
      * A timeout, interrupt bit alone or CPU-written timestamp is insufficient. */
     IOReturn retireJobAfterCompletion(uint64_t handle);

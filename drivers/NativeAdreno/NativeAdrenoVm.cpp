@@ -596,6 +596,26 @@ uint64_t NativeAdrenoVm::handleAt(uint64_t iova) const
     }
     return 0;
 }
+/* The whole mapping table with each mapping's own first words: where a client's command stream really is after it names a buffer whose
+ * page reads zero, and whether a freed mapping still matches an address (handleAt walks this same array). */
+void NativeAdrenoVm::dumpMappings(const char *tag,uint32_t limit) const
+{
+    if(!attached_ || !mappings_ || !tag)return;
+    uint32_t printed=0;
+    for(size_t i=0;i<high_ && printed<limit;++i) {
+        const Mapping &m=mappings_[i];
+        if(!m.memory)continue;
+        uint32_t head[4]={0xdeadbeef,0xdeadbeef,0xdeadbeef,0xdeadbeef};
+        const IOReturn read=peekWordsUncached(m.iova,head,4);
+        printf("PICASSO_GPU map %s: slot=%u h=%llu iova=%llx bytes=%llu spans=%llu/%llu perm=%u wb=%u sh=%u up=%u "
+               "sys=%d wc=%d imp=%d read=%x words=%x %x %x %x\n", tag, unsigned(i),
+            (unsigned long long)m.handle, (unsigned long long)m.iova, (unsigned long long)m.memory->bytes(),
+            (unsigned long long)m.mapped_spans, (unsigned long long)m.spans, m.permissions, m.writeback, m.shareability, m.upper,
+            m.memory->system()?1:0, m.memory->writeCombined()?1:0, m.memory->imported()?1:0, unsigned(read),
+            head[0], head[1], head[2], head[3]);
+        ++printed;
+    }
+}
 IOReturn NativeAdrenoVm::faultState(uint32_t out[4]) const
 {
     if(!out || !attached_ || poisoned_)return kIOReturnBadArgument;
