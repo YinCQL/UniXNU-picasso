@@ -24,6 +24,7 @@ REPLAY_SOURCES = (
     'bsd/vfs/vfs_attrlist.c', 'bsd/kern/bsd_init.c', 'osfmk/arm/rtclock.c',
     'osfmk/kern/task.c', 'osfmk/arm/model_dep.c',
     'osfmk/kern/ipc_tt.c', 'osfmk/kern/task.h', 'osfmk/mach/task.defs',
+    'security/mac_base.c',
 )
 
 

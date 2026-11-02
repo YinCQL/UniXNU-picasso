@@ -4772,12 +4772,12 @@ diff --git a/patches/xnu/zzzzzz-picasso-springboard-inject.patch b/patches/xnu/z
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzzz-picasso-springboard-inject.patch
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,173 @@
 +diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +index 8bba078..49d986d 100644
 +--- a/bsd/kern/kern_exec.c
 ++++ b/bsd/kern/kern_exec.c
-+@@ -5823,10 +5823,84 @@ bad:
++@@ -5823,10 +5823,101 @@ bad:
 +  * Note:	The argument and environment vectors are user space pointers
 +  *		to arrays of user space pointers.
 +  */
@@ -4837,6 +4837,23 @@ new file mode 100644
 ++	return true;
 ++}
 ++
+++/* Keep dyld path-variable policy local to the executables that receive the
+++ * board's explicit injection. The executing process keeps its text vnode alive. */
+++bool
+++picasso_dyld_inject_target(proc_t p)
+++{
+++	char library[200];
+++	if (p != current_proc() ||
+++	    !PE_parse_boot_argn("picasso_inject_sb", library, sizeof(library)) || library[0] != '/') return false;
+++	if (!strcmp(p->p_name, "SpringBoard")) return true;
+++	int applications = 0;
+++	if (!PE_parse_boot_argn("picasso_inject_apps", &applications, sizeof(applications)) ||
+++	    applications != 1 || p->p_textvp == NULL) return false;
+++	char executable[MAXPATHLEN];
+++	int length = sizeof(executable);
+++	return !vn_getpath(p->p_textvp, executable, &length) && picasso_statusbar_app_path(executable);
+++}
+++
 ++/* Read-only load acknowledgement. Some sandboxes may deny this read;
 ++ * only a captured acknowledgement establishes that the library constructor ran. */
 ++static int
@@ -4862,7 +4879,7 @@ new file mode 100644
 + 	int error = 0;
 + 	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
 + 	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
-+@@ -5996,6 +6070,22 @@ exec_extract_strings(struct image_params *imgp)
++@@ -5996,6 +6087,22 @@ exec_extract_strings(struct image_params *imgp)
 + 		imgp->ip_envc++;
 + 	}
 +
@@ -4885,19 +4902,63 @@ new file mode 100644
 + 	/* Save space for envv[] NULL terminator */
 + 	if (imgp->ip_argspace < new_ptr_size) {
 + 		error = E2BIG;
++diff --git a/security/mac_base.c b/security/mac_base.c
++--- a/security/mac_base.c
+++++ b/security/mac_base.c
++@@ -1560,6 +1560,30 @@
++  *                !0                      Not success
++  *
++  */
+++#if DEVELOPMENT || DEBUG
+++extern bool picasso_dyld_inject_target(proc_t);
+++/* 20H392 amfi_check_dyld_policy_self uses AMFI call 90 with two uint64_t
+++ * words: input flags and a user pointer to output flags. Keep the MAC policy's
+++ * decision/error; only allow DYLD path variables for the board-selected UI. */
+++static void
+++picasso_dyld_path_policy(proc_t p, int call, const char *policy, user_addr_t arg, int error)
+++{
+++	if (error || call != 90 || strcmp(policy, "AMFI") || !picasso_dyld_inject_target(p)) return;
+++	uint64_t request[2], flags = 0, original = 0;
+++	int result = copyin(arg, request, sizeof(request));
+++	if (!result) result = copyin((user_addr_t)request[1], &flags, sizeof(flags));
+++	if (!result) {
+++		original = flags;
+++		flags |= 1ULL << 1; /* AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS only. */
+++		result = copyout(&flags, (user_addr_t)request[1], sizeof(flags));
+++	}
+++	static unsigned reports;
+++	if (__atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED) < 16)
+++		printf("PICASSO_INJECT dyld policy pid=%d old=%llx new=%llx result=%d\n",
+++		    proc_getpid(p), (unsigned long long)original, (unsigned long long)flags, result);
+++}
+++#endif
+++
++ int
++ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
++ {
++@@ -1614,6 +1638,9 @@
++ 	}
++
++ done:
+++#if DEVELOPMENT || DEBUG
+++	picasso_dyld_path_policy(p, uap->call, target, uap->arg, error);
+++#endif
++ 	return error;
++ }
++
 diff --git a/patches/xnu/zzzzzz-picasso-user-abort.patch b/patches/xnu/zzzzzz-picasso-user-abort.patch
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzzz-picasso-user-abort.patch
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,66 @@
 +diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 +--- a/bsd/kern/kern_exit.c
 ++++ b/bsd/kern/kern_exit.c
-+@@ -1379,6 +1379,38 @@
++@@ -1379,6 +1379,40 @@
 + }
 + #endif
 +
-++/* PICASSO_USER_ABORT_BEGIN: failed EL0 VM faults only, register-only output. */
+++/* PICASSO_USER_ABORT_BEGIN: failed EL0 access faults only, register-only output. */
 ++#if __arm64__ && (DEVELOPMENT || DEBUG)
 ++void picasso_user_abort(void *, uint32_t, uint64_t, int, uint32_t, uint64_t);
 ++void
@@ -4911,8 +4972,10 @@ new file mode 100644
 ++    unsigned service;
 ++    if (!strcmp(p->p_name, "SpringBoard")) service = 0;
 ++    else if (!strcmp(p->p_name, "mediaserverd")) service = 1;
+++    else if (!strcmp(p->p_name, "backboardd")) service = 2;
+++    else if (!strcmp(p->p_name, "Preferences")) service = 3;
 ++    else return;
-++    static unsigned reports[2];
+++    static unsigned reports[4];
 ++    unsigned ticket = picasso_pid1_trace_ticket(&reports[service], 8);
 ++    if (!ticket) return;
 ++    printf("PICASSO_ABORT sample=%u pid=%d name=%.31s thread=%llu code=%x ESR=%x FAR=%llx PC=%llx LR=%llx SP=%llx FP=%llx main_header=%llx cache_slide=%x\n",

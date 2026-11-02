@@ -13,7 +13,12 @@
 #include <unistd.h>
 
 typedef NSDirectionalEdgeInsets (*PicassoEdgeInsets)(id, SEL);
+typedef CGFloat (*PicassoMetric)(id, SEL);
 static PicassoEdgeInsets original_edge_insets;
+static PicassoMetric original_height, original_baseline;
+
+// DevicesOverlay.apk: 34.259979 px top padding / current 3x scale.
+static const CGFloat picasso_top_padding = 11.42;
 
 static CGFloat picasso_statusbar_offset(CGSize size)
 {
@@ -28,26 +33,53 @@ static CGFloat picasso_statusbar_offset(CGSize size)
 static NSDirectionalEdgeInsets picasso_edge_insets(id receiver, SEL selector)
 {
     NSDirectionalEdgeInsets insets = original_edge_insets(receiver, selector);
+    // 26.729980 panel pixels puts the clock slightly inside the rounded corner.
+    insets.leading = 8.91;
     // Pad's native trailing margin is 5 pt; the previous LegacyPhone margin
     // was 5.5 pt. Keep that origin before applying the requested extra shift.
     insets.trailing += 0.5 + picasso_statusbar_offset(UIScreen.mainScreen.bounds.size);
     return insets;
 }
 
+static CGFloat picasso_height(id receiver, SEL selector)
+{
+    return original_height(receiver, selector) + picasso_top_padding;
+}
+
+static CGFloat picasso_baseline(id receiver, SEL selector)
+{
+    return original_baseline(receiver, selector) + picasso_top_padding;
+}
+
+static BOOL picasso_metric_compatible(Method method, const char *expected)
+{
+    if (!method || method_getNumberOfArguments(method) != 2) return NO;
+    char *return_type = method_copyReturnType(method);
+    BOOL compatible = return_type && !strcmp(return_type, expected);
+    free(return_type);
+    return compatible;
+}
+
 static BOOL picasso_install_statusbar(void)
 {
     Class provider = objc_getClass("_UIStatusBarVisualProvider_Pad");
     Method method = class_getClassMethod(provider, @selector(edgeInsets));
-    if (!method || method_getNumberOfArguments(method) != 2) return NO;
+    Method height = class_getClassMethod(provider, @selector(height));
+    Method baseline = class_getClassMethod(provider, @selector(baselineOffset));
     // 20H392 returns NSDirectionalEdgeInsets in d0-d3, not CGRect or an
     // instance metric. Refuse an incompatible UIKit rather than guessing ABI.
-    char *return_type = method_copyReturnType(method);
-    BOOL compatible = return_type && !strcmp(return_type, @encode(NSDirectionalEdgeInsets));
-    free(return_type);
-    if (!compatible) return NO;
+    if (!picasso_metric_compatible(method, @encode(NSDirectionalEdgeInsets)) ||
+        !picasso_metric_compatible(height, @encode(CGFloat)) ||
+        !picasso_metric_compatible(baseline, @encode(CGFloat))) return NO;
     original_edge_insets = (PicassoEdgeInsets)method_getImplementation(method);
+    original_height = (PicassoMetric)method_getImplementation(height);
+    original_baseline = (PicassoMetric)method_getImplementation(baseline);
     class_replaceMethod(object_getClass(provider), @selector(edgeInsets),
                         (IMP)picasso_edge_insets, method_getTypeEncoding(method));
+    class_replaceMethod(object_getClass(provider), @selector(height),
+                        (IMP)picasso_height, method_getTypeEncoding(height));
+    class_replaceMethod(object_getClass(provider), @selector(baselineOffset),
+                        (IMP)picasso_baseline, method_getTypeEncoding(baseline));
     return YES;
 }
 
@@ -61,7 +93,7 @@ static void picasso_sb_probe(void)
     // environment message alone does not establish that this constructor ran.
     sysctlbyname("kern.picasso_inject_ack", &value, &size, NULL, 0);
 
-    const char *line = installed ? "PICASSO_SBINJECT statusbar metric installed (14.5 mm)\n"
+    const char *line = installed ? "PICASSO_SBINJECT statusbar metrics installed (left 8.91 pt, down 11.42 pt, battery shift 14.5 mm)\n"
                                  : "PICASSO_SBINJECT statusbar metric unavailable\n";
     int fd = open("/dev/console", O_WRONLY);
     if (fd >= 0) {
