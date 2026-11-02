@@ -439,6 +439,22 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
         }
         /* Where this process's command stream is, if its named buffer reads zero: every mapping and that mapping's own first words. */
         if(wire_prints<=4)vm_->dumpMappings("wire",24);
+        /* The whole submitted buffer, and the whole address space, through the truly uncached DRAM reader: whether the client's
+         * words are anywhere at all (an offset, another BO) or nowhere (never stored, or still in a write-combine buffer). The
+         * Turnip prologue's first word (CP_EVENT_WRITE cache-invalidate) is the needle. Bounded and client submissions only. */
+        static uint32_t scan_prints;
+        if(scan_prints<2 && proc_selfpid()!=0) {
+            ++scan_prints;
+            uint64_t scanned=0,nz=0,first_off=0,needle_off=UINT64_MAX;uint32_t first_word=0;
+            if(vm_->scanMapping(buffers[0].handle,0x70460001,65536,&scanned,&nz,&first_off,&first_word,&needle_off))
+                printf("PICASSO_GPU scan wire: h=%llu scanned=%llu nz=%llu first=%llx:%x needle=70460001 at=%llx\n",
+                    (unsigned long long)buffers[0].handle,(unsigned long long)scanned,(unsigned long long)nz,
+                    (unsigned long long)first_off,first_word,(unsigned long long)needle_off);
+            uint64_t sh=0,soff=0;uint32_t sw=0;
+            const uint32_t hits=vm_->scanVm(0x70460001,65536,512*1024,&sh,&soff,&sw);
+            printf("PICASSO_GPU scan vm: needle=70460001 hits=%u h=%llu off=%llx word=%x\n",hits,
+                (unsigned long long)sh,(unsigned long long)soff,sw);
+        }
     }
     /* int-098/099: with write-combined user BOs and no maintenance the CP stopped at the end of the first IB, as in int-065..069 when an
      * IB sat in a CPU cache. While write-combined BOs are trusted, every line of this submission's IBs is compared as a CPU cache and
@@ -726,6 +742,14 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
             if(stall_map_dumps<2) {
                 ++stall_map_dumps;
                 space->dumpMappings("stall",48);
+                /* Whether the client's stream appeared in its buffer after the first snapshot, through the uncached reader. */
+                if(job->count) {
+                    uint64_t scanned=0,nz=0,first_off=0,needle_off=UINT64_MAX;uint32_t first_word=0;
+                    if(space->scanMapping(job->handles[0],0x70460001,65536,&scanned,&nz,&first_off,&first_word,&needle_off))
+                        printf("PICASSO_GPU scan stall: h=%llu scanned=%llu nz=%llu first=%llx:%x needle at=%llx\n",
+                            (unsigned long long)job->handles[0],(unsigned long long)scanned,(unsigned long long)nz,
+                            (unsigned long long)first_off,first_word,(unsigned long long)needle_off);
+                }
             }
         }
     }

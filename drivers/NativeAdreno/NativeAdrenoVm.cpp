@@ -3,7 +3,9 @@
 #include "NativeAdrenoVmAlias.h"
 extern "C" volatile uint32_t native_adreno_trace_stage;
 extern "C" {int (*native_adreno_dram_read32)(uint64_t,uint32_t *);int (*native_adreno_cached_read32)(uint64_t,uint32_t *);
-    int (*native_adreno_line_audit)(uint64_t,size_t,uint32_t *,uint32_t *);}
+    int (*native_adreno_line_audit)(uint64_t,size_t,uint32_t *,uint32_t *);
+    /* Batch form of the uncached DRAM reader for the scan diagnostics: up to `count` dwords from one physical page; the dwords read. */
+    int (*native_adreno_dram_read_words)(uint64_t,uint32_t *,size_t);}
 #include <string.h>
 #include <IOKit/IOLib.h>
 /* 1 once the board proved the GPU's cacheable inner-shareable accesses coherent with the CPU's caches in both directions (the A740's
@@ -615,6 +617,107 @@ void NativeAdrenoVm::dumpMappings(const char *tag,uint32_t limit) const
             head[0], head[1], head[2], head[3]);
         ++printed;
     }
+}
+/* One mapping's span table, one physical page at a time through the batch DRAM reader. `scan` is called for each dword with the
+ * buffer offset; it returns true to stop early. False when the board has no reader, the span table is inconsistent, or a page read fails.
+ * `budget` bounds the bytes touched so a diagnostic on a stalled submission cannot flood the console or the bus. */
+static bool scanSpans(const NativeAdrenoMemory &memory,size_t limit,bool (*scan)(void *,size_t,uint32_t),
+    void *cookie,uint64_t *scanned)
+{
+    if(!native_adreno_dram_read_words || !scan)return false;
+    const size_t bytes=memory.bytes()<limit?memory.bytes():limit;
+    uint32_t page[1024];
+    for(size_t at=0;at<bytes;) {
+        const NativeAdrenoPhysicalSpan *span=nullptr;
+        for(size_t j=0;j<memory.spanCount();++j) {
+            const auto &s=memory.spans()[j];
+            if(at>=s.offset && at-s.offset<s.bytes) {span=&s;break;}
+        }
+        if(!span || (span->physical&4095) || (span->bytes&4095))return false;
+        size_t run=bytes-at;
+        if(run>span->offset+span->bytes-at)run=span->offset+span->bytes-at;
+        if(run>sizeof(page))run=sizeof(page);
+        size_t words=run/4;
+        const int got=native_adreno_dram_read_words(span->physical+(at-span->offset),page,words);
+        if(got<=0)return false;
+        for(size_t i=0;i<size_t(got);++i)if(scan(cookie,at+4*i,page[i])) {if(scanned)*scanned=at+4*(i+1);return true;}
+        at+=4*size_t(got);
+        if(scanned)*scanned=at;
+    }
+    return true;
+}
+namespace {
+struct MappingScan {
+    uint64_t nonzero=0,first_offset=0,needle_offset=UINT64_MAX;
+    uint32_t first_word=0,needle=0;
+};
+struct VmScan {
+    uint64_t handle=0,offset=0,hits=0;
+    uint32_t word=0,needle=0;
+};
+bool mappingWord(void *cookie,size_t offset,uint32_t word)
+{
+    MappingScan &s=*static_cast<MappingScan *>(cookie);
+    if(word && !s.nonzero) {s.first_offset=offset;s.first_word=word;}
+    if(word)++s.nonzero;
+    if(word==s.needle && s.needle_offset==UINT64_MAX)s.needle_offset=offset;
+    return false;
+}
+bool vmWord(void *cookie,size_t offset,uint32_t word)
+{
+    VmScan &s=*static_cast<VmScan *>(cookie);
+    if(word!=s.needle)return false;
+    if(!s.hits) {s.offset=offset;s.word=word;}
+    ++s.hits;
+    return true;
+}
+}
+bool NativeAdrenoVm::scanMapping(uint64_t handle,uint32_t needle,size_t budget,uint64_t *scanned,uint64_t *nonzero,
+    uint64_t *first_offset,uint32_t *first_word,uint64_t *needle_offset) const
+{
+    if(scanned)*scanned=0;
+    if(nonzero)*nonzero=0;
+    if(first_offset)*first_offset=0;
+    if(first_word)*first_word=0;
+    if(needle_offset)*needle_offset=UINT64_MAX;
+    if(!attached_ || poisoned_ || !budget)return false;
+    const Mapping *m=find(handle);
+    if(!m || !m->memory)return false;
+    MappingScan state;state.needle=needle;
+    const bool ok=scanSpans(*m->memory,budget,mappingWord,&state,scanned);
+    if(nonzero)*nonzero=state.nonzero;
+    if(first_offset)*first_offset=state.first_offset;
+    if(first_word)*first_word=state.first_word;
+    if(needle_offset)*needle_offset=state.needle_offset;
+    return ok;
+}
+uint32_t NativeAdrenoVm::scanVm(uint32_t needle,size_t per_mapping,size_t budget,uint64_t *handle,uint64_t *offset,
+    uint32_t *word) const
+{
+    uint64_t found_handle=0,found_offset=0;
+    uint32_t found_word=0;
+    if(!attached_ || poisoned_ || !per_mapping || !budget) {
+        if(handle)*handle=0;if(offset)*offset=0;if(word)*word=0;return 0;
+    }
+    VmScan state;state.needle=needle;
+    for(size_t i=0;i<high_ && budget;++i) {
+        const Mapping &m=mappings_[i];
+        if(!m.memory)continue;
+        size_t limit=m.memory->bytes()<per_mapping?m.memory->bytes():per_mapping;
+        if(limit>budget)limit=budget;
+        const uint64_t before=state.hits;
+        if(!scanSpans(*m.memory,limit,vmWord,&state,nullptr))break;
+        budget-=limit;
+        if(state.hits!=before) {
+            /* vmWord stopped at this mapping's first hit; the mapping itself is known only here. */
+            found_handle=m.handle;found_offset=state.offset;found_word=state.word;
+            break;   /* the first hit is all the log needs */
+        }
+    }
+    if(handle)*handle=found_handle;
+    if(offset)*offset=found_offset;
+    if(word)*word=found_word;
+    return uint32_t(state.hits>UINT32_MAX?UINT32_MAX:state.hits);
 }
 IOReturn NativeAdrenoVm::faultState(uint32_t out[4]) const
 {

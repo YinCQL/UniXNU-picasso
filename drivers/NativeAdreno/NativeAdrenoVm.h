@@ -155,6 +155,15 @@ public:
     /* Diagnostic, for the board log only: every live mapping (slot, handle, GPU address, size, spans mapped/of, permissions,
      * attributes, region, kind) and the first four dwords of its GPU memory through the uncached reader. Bounded by `limit`. */
     void dumpMappings(const char *tag,uint32_t limit) const;
+    /* Diagnostic, for the board log only: the whole of one mapping's buffer through the uncached DRAM reader (bounded by `budget`
+     * bytes), for a submission whose named page reads zero. Reports the bytes scanned, the number of nonzero dwords, the first one
+     * (offset and word), and the first offset holding `needle`. False when the board's reader is absent. */
+    bool scanMapping(uint64_t handle,uint32_t needle,size_t budget,uint64_t *scanned,uint64_t *nonzero,
+        uint64_t *first_offset,uint32_t *first_word,uint64_t *needle_offset) const;
+    /* Diagnostic: every live mapping, at most `per_mapping` bytes each and `budget` in all, for the first dword equal to `needle`.
+     * Sets the first hit's handle/offset/word; returns the number of hits. */
+    uint32_t scanVm(uint32_t needle,size_t per_mapping,size_t budget,uint64_t *handle,uint64_t *offset,
+        uint32_t *word) const;
     /* Only a scheduler's actual successful GPU completion may call this.
      * A timeout, interrupt bit alone or CPU-written timestamp is insufficient. */
     IOReturn retireJobAfterCompletion(uint64_t handle);

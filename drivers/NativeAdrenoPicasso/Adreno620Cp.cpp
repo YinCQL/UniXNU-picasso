@@ -52,19 +52,30 @@
  * installed, so a stall's IB dump was all 0xdeadbeef. Reads one word through a temporary kernel mapping of its page. */
 extern "C" int (*native_adreno_dram_read32)(uint64_t physical, uint32_t *value);
 extern "C" int (*native_adreno_cached_read32)(uint64_t physical, uint32_t *value);
-static int dramRead32(uint64_t physical, uint32_t *value)
+extern "C" int (*native_adreno_dram_read_words)(uint64_t physical, uint32_t *out, size_t count);
+/* One fresh mapping per page, kIOMapInhibitCache: a default-cache mapping of a physical page is cacheable, so it would both read a
+ * stale cache line and leave one behind for the next reader (the earlier form omitted the flag and could report a zero the CPU had
+ * cached, which is exactly the diagnostic this reader exists to answer). */
+static int dramReadPage(uint64_t physical, uint32_t *out, size_t count)
 {
-    if (!value) return -1;
-    IOMemoryDescriptor *page = IOMemoryDescriptor::withPhysicalAddress(physical & ~UINT64_C(0xfff), 4096, kIODirectionIn);
-    if (!page) return -1;
-    IOMemoryMap *map = page->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly);
-    page->release();
+    if (!out || !count) return -1;
+    const uint64_t page = physical & ~UINT64_C(0xfff);
+    const size_t offset = size_t(physical & 0xfff);
+    if (offset + count * sizeof(uint32_t) > 4096) count = (4096 - offset) / sizeof(uint32_t);
+    IOMemoryDescriptor *descriptor = IOMemoryDescriptor::withPhysicalAddress(page, 4096, kIODirectionIn);
+    if (!descriptor) return -1;
+    IOMemoryMap *map = descriptor->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly | kIOMapInhibitCache);
+    descriptor->release();
     if (!map) return -1;
     const uint8_t *base = reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(map->getAddress()));
-    *value = *reinterpret_cast<volatile const uint32_t *>(base + (physical & 0xfff));
+    for (size_t i = 0; i < count; ++i) out[i] = *reinterpret_cast<volatile const uint32_t *>(base + offset + 4 * i);
     map->release();
-    return 0;
+    return int(count);
 }
+static int dramRead32(uint64_t physical, uint32_t *value)
+{return dramReadPage(physical, value, 1) == 1 ? 0 : -1;}
+static int dramReadWords(uint64_t physical, uint32_t *out, size_t count)
+{return dramReadPage(physical, out, count);}
 /* The kernel's cacheable physical aperture (the direct map), which is how the driver's line audit sees a client's dirty cache lines:
  * an IO mapping of the same page takes the page's IO attribute and would read DRAM instead. */
 extern "C" vm_offset_t phystokv(uint64_t pa);
@@ -1049,6 +1060,7 @@ extern "C" int native_adreno620_cp_start(void)
     /* The driver's diagnostic reader of client BOs reads DRAM through this hook, and the cacheable alias through the other. */
     native_adreno_dram_read32 = dramRead32;
     native_adreno_cached_read32 = cachedRead32;
+    native_adreno_dram_read_words = dramReadWords;
     if (!gState) gState = new CpState;
     CpState &s = *gState;
     if (s.started) {
