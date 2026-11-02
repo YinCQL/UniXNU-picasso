@@ -2,7 +2,7 @@
 // Default-off CPU frequency control for the SM7250 (lito) cpufreq-hw domains. `sheng-cpufreq=<n>`:
 //   1  read-only: report each domain's enable bit, current/requested level and its highest LUT entry
 //   2  additionally request that highest non-turbo level in domain 0 (the boot CPU's cluster)
-//   3  the same in every domain once it reads enabled
+//   3  the same in every domain once its LUT reads valid
 //   4  mode 3, and a governor for the domains (below)
 // Optional `sheng-cpufreq-cap=<MHz>`: modes 3/4 stay at or below it.
 //
@@ -17,8 +17,9 @@
 // LUT row: bits 31:30 source (0 = GPLL0/2, else XO), 18:16 core count (1 = turbo), 7:0 L value. Source 0 is the same
 // fixed clock the downstream driver computes as clk_get_rate("alternate") / 2; lito's "alternate" is GCC GPLL0
 // (clock id 0, not rpmhcc), which XBL programs to 600 MHz on this SoC, so 300 MHz.
-// A cluster whose cores are all off reads enable 0, so the probe maps the windows once and sheng_cpufreq_poll(), called
-// every boot-progress round, votes each domain the first time it reads enabled and refreshes the report row.
+// REG_ENABLE bit 0 is not a reliable gate on this board: both big-core domains read 0 while their cores run and their
+// LUTs are complete, so the probe maps the windows once, judges each by its LUT (domainUsable) and sheng_cpufreq_poll(),
+// called every boot-progress round, votes each usable domain the first time it sees it and refreshes the report row.
 //
 // Mode 4's governor runs every 16 ms: a CPU's busy share is 1 - its idle time over the window (sheng_cpu_idle_mach, a
 // kernel helper over recount -- see patches/picasso-cpu-idle-xnu.patch), a domain's the share of its busiest CPU. The
@@ -60,7 +61,7 @@ constexpr unsigned kDomainCpus[3] = {6, 1, 1};       // CPUs that can appear in 
 constexpr unsigned kDomainMaxCores[3] = {6, 2, 2};   // qcom,freq-domain's max_cores cell (DT)
 constexpr uint64_t kWindowSize = 0x1000;
 constexpr uint32_t kRegEnable = 0x0, kRegDcvsCtrl = 0xbc, kRegFreqLut = 0x110, kRegPerfState = 0x920;
-constexpr uint32_t kRegCurrentVote = 0x704;
+constexpr uint32_t kRegCurrentVote = 0x704, kRegCycleCounter = 0x9c0;
 constexpr unsigned kLutEntries = 40, kLutRowSize = 32;
 constexpr uint32_t kXoKHz = 19200;        // rpmhcc xo_clk_src (bi_tcxo / 2)
 constexpr uint32_t kGpllHalfKHz = 300000; // GCC GPLL0 600 MHz / CLK_HW_DIV 2
@@ -70,9 +71,10 @@ struct Window {
     uintptr_t va;
     int voted;          // level written, -1 none
     uint32_t votedKHz;
-    uint32_t preKHz;    // current frequency the first time it read enabled, before the vote
+    uint32_t preKHz;    // current frequency the first time the domain read usable, before the vote
 };
 Window gDomain[3];
+bool gUsable[3];    // the window's LUT describes this device, whatever REG_ENABLE bit 0 says
 unsigned gMode;
 uint32_t gCapKHz;
 IOLock *gLock;
@@ -107,6 +109,23 @@ int pickLevel(unsigned d, uint32_t *khzOut, unsigned *rowsOut) {
     if (khzOut) *khzOut = bestKHz;
     if (rowsOut) *rowsOut = rows;
     return best;
+}
+
+// REG_ENABLE bit 0 describes the state the boot firmware left the OSM in, and on this board it reads 0 for both
+// big-core domains even though their cores run and their LUTs are complete (the vendor driver would skip them only
+// when the DT says qcom,skip-enable-check; the vote register is REG_PERF_STATE either way). Judge a domain by its
+// LUT instead: a rising, terminated table from a plausible idle frequency to a plausible top frequency.
+bool domainUsable(unsigned d) {
+    const uintptr_t va = gDomain[d].va;
+    uint32_t first = 0, prev = 0, top = 0;
+    for (unsigned i = 0; i < kLutEntries; ++i) {
+        const uint32_t row = rd32(va, kRegFreqLut + i * kLutRowSize), khz = lutKHz(row);
+        if (i > 0 && (khz == prev || khz < prev)) break;
+        if (i == 0) first = khz;
+        prev = khz;
+        top = khz;
+    }
+    return first >= 100000 && first <= 1000000 && top > 1000000 && top <= 3500000 && top > first;
 }
 
 bool mapWindow(Window &w, uint64_t base) {
@@ -212,11 +231,22 @@ void governorThread(void *, wait_result_t) {
     uint32_t submits = &native_adreno_method_stats ? native_adreno_method_stats[5][0] : 0, recent = 0;
     uint64_t winNs = 0, khzNs[3] = {}, busyNs[3] = {};
     uint32_t changes[3] = {};
+    // 0x9c0 counts the domain's CPU cycles (the counter the vendor exposes to the scheduler); its delta over the window
+    // is the only register-independent readout of the clock the OSM really applied.
+    uint32_t cycPrev[3] = {};
+    uint64_t cycDelta[3] = {};
+    for (unsigned d = 0; d < 3; ++d) if (gUsable[d]) cycPrev[d] = rd32(gDomain[d].va, kRegCycleCounter);
     for (;;) {
         IOSleep(16);
         const uint64_t t = mach_absolute_time(), dt = t - lastT;
         lastT = t;
         if (!dt) continue;
+        for (unsigned d = 0; d < 3; ++d) {
+            if (!gUsable[d]) continue;
+            const uint32_t now = rd32(gDomain[d].va, kRegCycleCounter);
+            cycDelta[d] += (uint32_t)(now - cycPrev[d]);
+            cycPrev[d] = now;
+        }
         if (boostAbs && &native_hid_input_events && native_hid_input_events[6] != touches) {
             touches = native_hid_input_events[6];
             if (t >= boostEnd) native_cpufreq_boosts = native_cpufreq_boosts + 1;
@@ -248,7 +278,7 @@ void governorThread(void *, wait_result_t) {
         IOLockLock(gLock);
         for (unsigned d = 0; d < 3; ++d) {
             Window &w = gDomain[d];
-            if (!w.va || !(rd32(w.va, kRegEnable) & 1)) continue;
+            if (!w.va || !gUsable[d]) continue;
             Levels &l = gLevels[d];
             if (!ready[d]) {
                 buildLevels(d);
@@ -290,18 +320,27 @@ void governorThread(void *, wait_result_t) {
                 native_cpufreq_gov[d * 3 + 2] = (uint32_t)(busyNs[d] / winNs);
                 changes[d] = 0; khzNs[d] = busyNs[d] = 0;
             }
+            uint32_t cycMHz[3] = {};
+            for (unsigned d = 0; d < 3; ++d) {
+                cycMHz[d] = winNs ? (uint32_t)(cycDelta[d] * 1000 / winNs) : 0;
+                cycDelta[d] = 0;
+            }
             winNs = 0;
             refreshRow();
             // ps is the index the engine reads back, rd the frequency that row decodes to: a vote the OSM refused or an
-            // LMh cap keeps ps/rd below the mean MHz above.
-            printf("PICASSO_CPUFREQ gov d0 chg=%u mhz=%u busy=%u ps=%u rd=%u d1 chg=%u mhz=%u busy=%u ps=%u rd=%u "
-                   "d2 chg=%u mhz=%u busy=%u ps=%u rd=%u boosts=%u\n",
+            // LMh cap keeps ps/rd below the mean MHz above. cyc is the 0x9c0 cycle-counter delta over the same window,
+            // i.e. the clock the cores actually ran at.
+            printf("PICASSO_CPUFREQ gov d0 chg=%u mhz=%u busy=%u ps=%u rd=%u cyc=%u d1 chg=%u mhz=%u busy=%u ps=%u "
+                   "rd=%u cyc=%u d2 chg=%u mhz=%u busy=%u ps=%u rd=%u cyc=%u boosts=%u\n",
                    native_cpufreq_gov[0], native_cpufreq_gov[1], native_cpufreq_gov[2],
                    gDomain[0].va ? rd32(gDomain[0].va, kRegPerfState) : 0, windowKHz(gDomain[0]) / 1000,
+                   cycMHz[0],
                    native_cpufreq_gov[3], native_cpufreq_gov[4], native_cpufreq_gov[5],
                    gDomain[1].va ? rd32(gDomain[1].va, kRegPerfState) : 0, windowKHz(gDomain[1]) / 1000,
+                   cycMHz[1],
                    native_cpufreq_gov[6], native_cpufreq_gov[7], native_cpufreq_gov[8],
                    gDomain[2].va ? rd32(gDomain[2].va, kRegPerfState) : 0, windowKHz(gDomain[2]) / 1000,
+                   cycMHz[2],
                    native_cpufreq_boosts);
         }
     }
@@ -352,11 +391,11 @@ extern "C" void sheng_cpufreq_poll(void) {
     for (unsigned d = 0; d < 3; ++d) {
         Window &w = gDomain[d];
         bool wanted = (gMode == 2 && d == 0) || gMode == 3 || gMode == 4;
-        if (w.va && wanted && w.voted < 0 && (rd32(w.va, kRegEnable) & 1)) {
+        if (w.va && wanted && w.voted < 0 && gUsable[d]) {
             voteDomain(d);
             // The index after the store is what the OSM accepted; the decoded frequency is what it means.
-            printf("PICASSO_CPUFREQ vote d%u level=%d khz=%u pre=%u ps=%u rd=%u\n", d, w.voted, w.votedKHz, w.preKHz,
-                   rd32(w.va, kRegPerfState), currentKHz(w.va));
+            printf("PICASSO_CPUFREQ vote d%u level=%d khz=%u pre=%u enable=%u ps=%u rd=%u\n", d, w.voted, w.votedKHz,
+                   w.preKHz, rd32(w.va, kRegEnable), rd32(w.va, kRegPerfState), currentKHz(w.va));
         }
     }
     refreshRow();
@@ -382,6 +421,7 @@ extern "C" void sheng_cpufreq_probe(void) {
     native_cpufreq_stage = 1;
     gCapKHz = capMHz * 1000;
     for (unsigned d = 0; d < 3; ++d) mapWindow(gDomain[d], kDomainBase[d]);
+    for (unsigned d = 0; d < 3; ++d) gUsable[d] = gDomain[d].va && domainUsable(d);
     for (unsigned c = 0; c < kCpus; ++c) native_cpufreq_usage[c] = UINT32_MAX;
     gMode = mode;
     printf("PICASSO_CPUFREQ probe mode=%u caps=%u min=%u boost=%u/%u frame=%u/%u maps=%u%u%u\n",
@@ -394,9 +434,9 @@ extern "C" void sheng_cpufreq_probe(void) {
         if (!w.va) {printf("PICASSO_CPUFREQ d%u nomap\n", d); continue;}
         uint32_t khz = 0; unsigned rows = 0;
         int level = pickLevel(d, &khz, &rows);
-        printf("PICASSO_CPUFREQ d%u enable=%u perf=%u cur=%ukHz vote704=%u best=%d@%ukHz rows=%u\n",
-               d, rd32(w.va, kRegEnable) & 1, rd32(w.va, kRegPerfState), currentKHz(w.va),
-               rd32(w.va, kRegCurrentVote) & 0x3ff, level, khz, rows);
+        printf("PICASSO_CPUFREQ d%u enable=%u raw=%08x usable=%u perf=%u cur=%ukHz vote704=%u best=%d@%ukHz rows=%u\n",
+               d, rd32(w.va, kRegEnable) & 1, rd32(w.va, kRegEnable), gUsable[d], rd32(w.va, kRegPerfState),
+               currentKHz(w.va), rd32(w.va, kRegCurrentVote) & 0x3ff, level, khz, rows);
         // Raw LUT rows (hex) up to the terminator: src/lval/core-count decode is in the file header, and a row that
         // does not match the expected max_cores is visible here.
         printf("PICASSO_CPUFREQ d%u lut=", d);
