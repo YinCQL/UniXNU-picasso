@@ -1,0 +1,310 @@
+# Handoff — picasso UI frame path, big.LITTLE topology, GPU state (2026-11-02)
+
+This document is for the next agent taking over the Redmi K30 5G (`picasso`, SM7250) UniXNU port.
+It records what was measured on hardware, what was changed, and what is still open. Every claim is
+tagged **[verified]** (with the evidence: a log file, command output, or source line) or
+**[unverified]** / **[hypothesis]**.
+
+## 0. TL;DR
+
+- The device boots iPadOS 17.7.11 userland through Mu-Silicium UEFI + UniXNU XNU with
+  `fastboot boot` only. Touch works; the UI is nearly unusable because everything is rendered on
+  the CPU: only **8 full-frame scanout copies in ~5 minutes** were observed, and the user reports
+  the home screen taking ~30 s to appear. **[verified: /tmp/wf4-capture.log]**
+- The scanout copy is **not** memory-bandwidth bound. A first-frame benchmark measured 1 MB reads
+  through the real IOSurface mapping at 19,479 ticks cold / 5,820 warm (19.2 MHz counter), 1 MB
+  framebuffer stores at 5,781 ticks, while whole 10.4 MB copies alternate between ~15 ms and
+  ~130 ms. The 130 ms frames are stalls (scheduling/preemption), not stores or reads.
+  **[verified: /tmp/wf3-capture.log]**
+- XNU had **no big.LITTLE awareness at all**: the kernel was built with `MAX_CPU_CLUSTERS=1` and
+  without `__ARM_AMP__` (single-cluster `sched_clutch`), and `ArmCpu` registered every CPU with
+  `ml_get_boot_cluster_type()` instead of its own type. **[verified: source + build config]**
+- The device tree XNU parses is an **iPad7,1-modelled picasso DT that does not contain the
+  `cluster-type` properties added to the boot image DTB**; passing `--dtb` to `unixnu bootimg` does
+  not change what XNU sees. **[verified: /tmp/wf6-capture.log]**
+- A patch enabling a two-cluster AMP build plus a capacity-based E/P fallback is committed
+  (`3ce14fc`, `c1d2369`); the on-device result of the first image using it is in §7.
+
+## 1. Environment and hard constraints
+
+- Device: Redmi K30 5G (`picasso`), SM7250, serial `52cc791d`. Boot only with
+  `fastboot boot <image>`; **never flash any partition**. **[verified: every session]**
+- Kernel: prelinked iPadOS 17.7.11 kernelcache (`21H461`), `slide=-0x1000000`, booted with
+  `-v debug=0x14e cpus=8 ... sheng-*` boot arguments (see the payload TOML).
+- SSH/serial console: the CDC-ACM console on `/dev/cu.usbmodemPICASSO011`; the capture script must
+  own that port (stop other captures first).
+- The worktree is shared with other agents. Never `git reset`/`checkout`/`stash pop`; prefer WIP
+  commits.
+
+## 2. Build, package, and boot (all verified this session)
+
+Kernel (the kernelcache path must be the **main checkout**, not the worktree — the worktree has no
+`out/ipsw`):
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+UNIXNU_KERNELCACHE=/Users/silenzio/Desktop/development/ios/UniXNU/out/ipsw/21H461/kernelcache.decompressed \
+python3 unixnu build kernel prelink
+# artifact: out/picasso/kernel/kernel.macho (sha256 printed at the end)
+```
+
+Payload (base payload from `out/gmu14-20261102/payload.img`; drop `offline-legacy-bench=N` unless
+benchmarking):
+
+```sh
+mkdir -p out/<tag>
+cp out/gmu14-20261102/payload.img out/<tag>/payload.img
+sed 's/ offline-legacy-bench=[0-9]//' out/wf2-20261102/unixnu.toml > out/<tag>/unixnu.toml
+mcopy -o -i out/<tag>/payload.img out/picasso/kernel/kernel.macho ::/EFI/UNIXNU/PAYLOADS/kernel.macho
+mcopy -o -i out/<tag>/payload.img out/<tag>/unixnu.toml ::/EFI/UNIXNU/unixnu.toml
+```
+
+Boot image:
+
+```sh
+python3 unixnu bootimg --uefi /Users/silenzio/Desktop/development/ios/Mu-Silicium \
+  --edk2 /Users/silenzio/Desktop/development/ios/Mu-Silicium/Mu_Basecore \
+  --fd uefi/SILICIUM_UEFI.fd --dtb uefi/mu-silicium/Resources/DTBs/picasso.dtb \
+  --ramdisk out/<tag>/payload.img -o out/<tag>/picasso/boot/<tag>.img
+```
+
+Run + capture (start the capture immediately after `fastboot boot`; the CDC port appears when the
+kernel console initializes):
+
+```sh
+fastboot boot out/<tag>/picasso/boot/<tag>.img
+python3 scripts/capture-picasso-usb-raw.py --output /tmp/<tag>-capture.log \
+  --wait 900 --duration 300 --fastboot-timeout 240 --fastboot-serial 52cc791d
+# return to fastboot without touching the device:
+python3 scripts/picasso-cdc-command.py --command reboot-fastboot \
+  --fastboot-timeout 240 --fastboot-serial 52cc791d
+```
+
+Build pitfalls that cost time this session **[verified]**:
+
+- `xcrun: error: SDK "iphoneos" cannot be located` unless `DEVELOPER_DIR` is exported.
+- `UNIXNU_KERNELCACHE=.../out/ipsw/21H461/kernelcache.decompressed` must point at the main
+  checkout (`/Users/silenzio/Desktop/development/ios/UniXNU/out/ipsw/...`).
+- Adding a new kernel patch requires updating `unixnu`'s `prepare()` (it copies the patch into the
+  prepared tree and includes it in the fingerprint). The patch then applies with the other
+  `patches/xnu/*.patch` files, ordered by filename (the port's convention is `zzz…-picasso-*`).
+- Deleting `out/picasso/tree/build/xnu` forces a bootstrap pass. The bootstrap pass runs with
+  `XNU_BOOT_PROGRESS=0`, and the build script's archive builders must be skipped in that pass
+  (`scripts/build-xnu-4k-baseline.sh` was patched to do this; without it the HID/cpufreq/GPU
+  builders fail looking for compile records).
+
+## 3. Verified milestones before this round
+
+- **CPU frequency (Goal A)**: the SM7250 OSM domains d1 (gold) and d2 (prime) are now driven past
+  the unreliable `REG_ENABLE` bit; the LUT gate (`domainUsable`) is used instead. d1 reaches
+  2,208,000 kHz and d2 2,400,000 kHz. **[verified: /tmp/cpf6-capture.log]**
+  - `PICASSO_CPUFREQ d1 enable=0 raw=00000002 usable=1 ... best=7@2208000kHz rows=8`
+  - `PICASSO_CPUFREQ d2 enable=0 raw=00000002 usable=1 ... best=7@2400000kHz rows=8`
+  - The 0x9c0 cycle counter delta independently matches the decoded MHz.
+  - PR: https://github.com/YinCQL/UniXNU-picasso/pull/12 — **state MERGED** **[verified via `gh`]**
+- **GPU (Goal B)**: GMU cold start and HFI startup work end to end; the a650-family PDC path
+  (`PDC_ENABLE=0x80000001`, no TCS programming) removed the ~122–128 s restartable-range panic that
+  GPU-on boots used to hit. cpf6 ran 360 s with zero panics.
+  **[verified: /tmp/cpf6-capture.log]**
+  - `PICASSO_GPU gmu: cold start complete`
+  - `PICASSO_GPU gmu: PDC enabled (AOP-owned TCS; mx=30010 cx=30000 xo=0 vrm=0)`
+  - `PICASSO_GPU hfi: run status=0 stage=8 transport=0 fw=0 commands=4 polls=8 elapsed=4661 skipped=0`
+  - `PICASSO_GPU hfi: core firmware started`
+  - cpf6 boot args contained `sheng-gpu=3`; the current wf images use `sheng-gpu=0` (GPU stage off).
+- **Touch**: the Novatek NT36672C driver reports contacts, and SpringBoard receives them.
+  **[verified: /tmp/wf4-capture.log contains `PICASSO_NVT report contacts=1` / `PICASSO_NVT point id=1 x=… y=…`]**
+
+## 4. What was measured this round
+
+### 4.1 UI frame production is the bottleneck
+
+In a 300 s wf4 boot (GPU stage off), `PICASSO_DISPLAY event=10` reported only **8 copies total**,
+and no `PICASSO_DISPLAY_STATE` dump (it is emitted every 64 submissions) ever appeared, i.e.
+fewer than 64 swap submissions in 5 minutes. Copy times:
+129.7, 127.9, 128.7, 15.2, 16.4, 21.5, 138.2, 129.4 ms. **[verified: /tmp/wf4-capture.log]**
+
+The user independently reported the home screen taking ~30 s to appear, and that touch eventually
+responds. So input is fine; rendering/presentation is the bottleneck.
+
+### 4.2 The copy is not bandwidth bound (bench2, wf3)
+
+`offline-legacy-bench=2` (in `drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp`) times, on the
+first real swap, reads through the swap's own source mapping and through a second
+`kIOMapCopybackCache` mapping of the same descriptor (two passes each), a cached control buffer,
+and a store into the real GOP mapping. All times in cntpct ticks (19.2 MHz):
+**[verified: /tmp/wf3-capture.log]**
+
+| probe | ticks | ms | notes |
+|---|---|---|---|
+| src pass 0 / 1 (default map) | 19479 / 5820 | 1.01 / 0.30 | opts=0x1001 (default cache) |
+| alt pass 0 / 1 (copyback map) | 36428 / 5914 | 1.90 / 0.31 | opts=0x1301 |
+| ctrl store / read | 4385 / 3964 | 0.23 / 0.21 | cached buffer |
+| fb store 1 MB | 5781 | 0.30 | write-combined destination |
+
+A full 10.4 MB copy should therefore take ~5–15 ms, which matches the fast samples. The ~130 ms
+samples are thread stalls. The same boot later panicked (see §6.1); whether bench2 itself
+contributed is **[unverified]**.
+
+### 4.3 big.LITTLE: XNU did not know about the big cores
+
+- `pexpert/pexpert/arm64/board_config.h`, BCM2837 block: `MAX_CPU_CLUSTERS 1` and **no**
+  `__ARM_AMP__`; `__ARM_AMP__` is only defined by the Apple H13/H14 headers. The compiled kernel's
+  `sched_prim.o` references `_sched_clutch_dispatch` (not `sched_amp_dispatch`).
+  **[verified: source and `nm`]**
+- `drivers/ArmCpu/ArmCpu.cpp` registered every CPU with
+  `info.cluster_type = ml_get_boot_cluster_type()` (both the boot and secondary paths), so all CPUs
+  looked like the boot cluster.
+- Observed load: little cluster busy 91–98 %, the single A76 gold 27–35 %, the A76 prime 31–36 %
+  (governor's per-domain sample, `/tmp/wf4-capture.log` and `/tmp/wf3-capture.log`).
+
+### 4.4 The device tree XNU parses is not the one passed to `bootimg`
+
+The boot image embeds `uefi/mu-silicium/Resources/DTBs/picasso-topology.dtb` (sha256
+`dd026351…`, verified by extracting the appended FDT from the gzip kernel blob and by
+`boot.json`'s `dtb_sha256`). Nevertheless a boot with a diagnostic read of the live SecureDT
+reported:
+**[verified: /tmp/wf6-capture.log]**
+
+```
+PICASSO_CPUFREQ topo cpus=8 clusters=1 types=1 en=0 pn=0 cl-e=0 cl-p=0
+PICASSO_CPUFREQ topo cpu=6 phys=600 cluster=0 type=0        (type 0 = CLUSTER_TYPE_SMP)
+PICASSO_CPUFREQ topo dt cpu600-cluster-type missing
+PICASSO_CPUFREQ topo dt model iPad7,1
+PICASSO_CPUFREQ topo dt /cpus/cpu@0 capacity missing
+PICASSO_CPUFREQ topo dt /cpus/cpu@600 capacity missing
+```
+
+The live DT also has **no `capacity-dmips-mhz`** (wf7 boot), so it is not the picasso DTB at
+all: the firmware builds a synthetic tree containing the eight CPUs (`reg` 0x0…0x700) but none of
+the Qualcomm topology properties. A capacity-based E/P fallback therefore cannot work against this
+DT. **[verified: /tmp/wf7-capture.log]**
+
+So the live DT is a picasso tree (8 CPUs, `reg` 0x0…0x700) whose `/model` is `iPad7,1` and that
+lacks the properties added to the boot-image DTB. The UEFI FD (`uefi/SILICIUM_UEFI.fd`) contains
+no raw FDT (the picasso DTB is therefore embedded compressed, or the firmware builds the DT at
+runtime) — **[hypothesis]**: the runtime DT comes from the FD/firmware, not from the boot image's
+appended DTB. Rebuilding the FD with a modified `Resources/DTBs/picasso.dtb` was not attempted
+(the local Mu build needs Python deps such as `coloredlogs` that are not installed).
+
+## 5. Changes committed this round
+
+Commits `3ce14fc` and `c1d2369` on `stage12/picasso-cpufreq-big` (remote `fork` =
+`silenzio111/UniXNU-picasso`) include:
+
+- `drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp`: per-copy timing, bench=1 (boot) and
+  bench=2 (first swap) benchmarks, sample window widened to 32 for event 10.
+- `drivers/NativeMobileDisplay/PicassoDisplaySupport.cpp`: state dump every 64 submissions.
+- `drivers/ArmCpu/ArmCpu.cpp`: report each CPU's own topology cluster type via
+  `armcpu_cluster_type()` (falls back to the boot type if the topology lookup fails).
+- `drivers/NativeCpuFreq/CpuFreqProbe.cpp`: one-line topology dump plus live-DT reads
+  (`cluster-type`, `/model`, `capacity-dmips-mhz`) under `sheng-cpufreq`.
+- `patches/picasso-cpu-topology-xnu.patch` (new, applied last): BCM2837 board config becomes
+  `MAX_CPU_CLUSTERS 2` + `__ARM_AMP__ 1`, and `ml_parse_cpu_topology()` classifies CPUs by
+  `capacity-dmips-mhz` (fastest group = P) when `cluster-type` is absent.
+- `unixnu`: copies the new patch into the prepared tree and fingerprints it.
+- `uefi/mu-silicium/Resources/DTBs/picasso-topology.dtb` (new): picasso DTB + `cluster-type`
+  (`E` for cpu@0…500, `P` for cpu@600/700). Verified to differ from the original only by those
+  8 properties (`dtc` round-trip diff).
+- `scripts/build-xnu-4k-baseline.sh`: in the bootstrap pass (`XNU_BOOTSTRAP=1`) the archive
+  builders are skipped and their `BOOT_PROGRESS` checks relaxed; they run in the normal pass once
+  the compile records exist.
+- Untracked GPU/WLAN sources from earlier work (`drivers/NativeAdrenoPicasso/`,
+  `drivers/NativeWlan/`) were committed so they are not lost.
+
+## 6. AMP experiments and what went wrong
+
+### 6.1 wf5 (`3ce14fc`-era kernel): AMP enabled, flat topology → panic
+
+With `MAX_CPU_CLUSTERS=2` + `__ARM_AMP__=1` but the topology still flat (all `CLUSTER_TYPE_SMP`,
+because the live DT has no cluster types), `processor_bootstrap` treats the boot cluster as P, and
+every CPU lands in one P pset (`ecore_set == NULL`). The boot printed the flat topology line and
+then, minutes in, panicked:
+**[verified: /tmp/wf5-capture.log]**
+
+```
+panic(cpu 2 caller 0xfffffff007cbb968): Unexpected abort while on interrupt stack.
+  at pc 0xfffffff007c58ed4, lr 0xfffffff007c58ed0
+  esr: 0x96000005  far: 0x000000005c77c000
+```
+
+Symbol resolution (current kernel, `nm` + `llvm-objdump`): `pc` is `_boot_progress_irq+0xc8`, at
+`ldr x9, [x0, #0x1d8]; ldrh w8, [x9]` after `bl _current_thread`. In this XNU
+`getCpuDatap()` is `current_thread()->machine.CpuDatap`, so the interrupted thread's saved
+`CpuDatap` was `0x5c77c000` and the load of `cpu_number` aborted.
+
+**This panic is NOT caused by the AMP change.** The clutch build (wf8, no `sched_amp_dispatch`,
+verified with `nm`) panicked at the *same instruction* (`_boot_progress_irq+0xc8`,
+`ldr x9,[x0,#0x1d8]; ldrh w8,[x9]`) within ~45 s; wf4 and wf7 each survived their 300 s windows
+without it. It is an intermittent race in the diagnostic IRQ probe: in interrupt context
+`current_thread()->machine.CpuDatap` can be transiently stale/garbage (the thread pointer in
+TPIDR and the thread's saved CpuDatap are updated at different points of the switch). The probe
+must not dereference it unguarded. **[verified: /tmp/wf8-capture.log]**
+
+**Recommended fix:** in `boot_progress_irq()`, either take the CPU number from the TPIDR_EL0
+encoding / `ml_get_cpu_number_local()` instead of `getCpuDatap()->cpu_number`, or validate the
+pointer before dereferencing it. Until then, boot with `boot-progress=0` for stability runs (the
+probe is diagnostics-only; the boot-progress display and UI trace disappear with it).
+
+### 6.2 wf6: same kernel + live-DT diagnostics, flat topology confirmed
+
+Ran 120 s without a panic (short window); the DT lines above come from this boot.
+
+### 6.3 wf7: capacity fallback cannot work against the firmware's DT
+
+The `capacity-dmips-mhz` fallback in `ml_parse_cpu_topology()` was built on the assumption that
+the live DT is the picasso DT. The live-DT reads in wf7 disprove that: both `cluster-type` and
+`capacity-dmips-mhz` are missing, and `/model` is `iPad7,1` (see §4.4). The fallback therefore
+stays inert and the topology stays flat (`clusters=1 types=1`).
+
+On hardware, the AMP build in that configuration booted, reached SpringBoard, and the 300 s
+capture ended with **0 panics**, but the UI stayed just as slow: 3 frame copies (14.8, 14.7,
+128.6 ms) and no `PICASSO_DISPLAY_STATE` dump (fewer than 64 submissions) in the whole window.
+The wf5 interrupt-stack panic did not recur in this window; it is not explained yet.
+**[verified: /tmp/wf7-capture.log]**
+
+Consequences for the next agent:
+
+- **A DT-based E/P split is blocked by the firmware.** The runtime DT is built by the UEFI
+  firmware (the boot image's appended DTB is not used), and it does not carry the Qualcomm
+  topology properties. To get a DT-based split, rebuild the UEFI FD from a Mu-Silicium checkout
+  whose `Resources/DTBs/picasso.dtb` carries `cluster-type`.
+- **A kernel-side split is the workable shortcut.** In `ml_parse_cpu_topology()`, when neither
+  `cluster-type` nor capacity is present, classify by the DT `reg`/MPIDR value for this board:
+  `phys_id` 0x600 and 0x700 are the two A76s (P), 0x0…0x500 the A55s (E). The live DT does carry
+  those `reg` values (verified in the topology dump), so this needs no firmware change.
+- **The committed default was returned to the stable scheduler.** The board patch keeps
+  `MAX_CPU_CLUSTERS 2` but no longer defines `__ARM_AMP__`, so the kernel builds with
+  `sched_clutch` again (the configuration of the verified-stable wf4 image). Re-add
+  `#define __ARM_AMP__ 1` only together with a working E/P classification. wf8 is the
+  clutch-baseline image built from this state; its on-device result is recorded below.
+
+**wf8 result (clutch baseline, `MAX_CPU_CLUSTERS 2`, no `__ARM_AMP__`):** the kernel contains no
+`sched_amp_dispatch` (`nm`), the topology dump is again flat (`clusters=1 types=1 en=0 pn=0`), and
+the boot panicked within ~45 s in `_boot_progress_irq` — the probe race described in §6.1, not the
+scheduler. **[verified: /tmp/wf8-capture.log]**
+
+## 7. Next steps, in priority order
+
+1. **Verify the E/P split and its stability** (`wf7`). If the capacity fallback works, the P pset
+   exists and the wf5-style panic should not recur; measure frame cadence with the existing
+   `event=10`/`PICASSO_DISPLAY_STATE` prints before and after.
+2. **GPU (Goal B)**: continue from the cpf6 state (GMU + HFI verified). Next per mainline
+   `a6xx_gpu.c` for the a650 family: GX GDSC/clock, `a6xx_pwrup`/`hw_init`, CP/SQE and ring. This is
+   the only path to a smooth UI; CPU rendering cannot reach usable frame rates.
+3. **Display path**: replace the full-frame copy with `native_legacy_copy_diff()` (already in
+   `NativeLegacyCopy.h`/`NativeLegacyRequest.h`) or raise the display work loop's QoS so the copy
+   stops being preempted. Note the source mapping is already cacheable (opts=0x1001).
+4. **DT delivery**: if the topology must come from the DT (instead of the capacity fallback),
+   find where the runtime iPad7,1 DT is built (UEFI FD is the leading hypothesis) and rebuild it
+   with `cluster-type`.
+
+## 8. Open questions / risks
+
+- The runtime DT's origin is **[unverified]**; the FD is the leading hypothesis.
+- The interrupt-stack panic is a race in the diagnostic `boot_progress_irq` probe, reproduced
+  with both AMP (wf5) and clutch (wf8) builds; it is intermittent (wf4 and wf7 each survived
+  300 s). Fix or guard the probe (§6.1) before treating any image as stable.
+- `bench2` takes a second mapping of the source; it was active in the boot that later panicked
+  (wf3). Treat it as a diagnostic only.
+- The device returns to fastboot on panic automatically (`IMEM Fastboot reason armed`), so a
+  failed image is recoverable with `fastboot boot`.

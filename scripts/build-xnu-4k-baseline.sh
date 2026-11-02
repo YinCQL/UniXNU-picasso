@@ -90,11 +90,11 @@ if [ "$SHENG_HIDINPUT" != 0 ] && [ "$SHENG_HIDINPUT" != 1 ]; then
   exit 1
 fi
 if [ "$SHENG_HIDINPUT" = 1 ]; then
-  if [ "$BOOT_PROGRESS" != 1 ]; then
+  if [ "$BOOT_PROGRESS" != 1 ] && [ "$BOOTSTRAP" != 1 ]; then
     echo 'ShengHidInput needs the boot-progress build: its probe call site lives in BootProgress.c' >&2
     exit 1
   fi
-  python3 scripts/build-sheng-hid-input.py
+  if [ "$BOOTSTRAP" = 0 ]; then python3 scripts/build-sheng-hid-input.py; fi
 fi
 NOVATEK_TOUCH=${XNU_NOVATEK_TOUCH:-0}
 if [ "$NOVATEK_TOUCH" != 0 ] && [ "$NOVATEK_TOUCH" != 1 ]; then
@@ -102,13 +102,13 @@ if [ "$NOVATEK_TOUCH" != 0 ] && [ "$NOVATEK_TOUCH" != 1 ]; then
   exit 1
 fi
 if [ "$NOVATEK_TOUCH" = 1 ]; then
-  if [ "$BOOT_PROGRESS" != 1 ]; then
+  if [ "$BOOT_PROGRESS" != 1 ] && [ "$BOOTSTRAP" != 1 ]; then
     echo 'NativeNovatekTouch needs the boot-progress build: its probe call site lives in BootProgress.c' >&2
     exit 1
   fi
   # NOVATEK_TOUCH_FW points at a bare Novatek image (or one of the 0x22000 arrays
   # carved from the stock kernel; the probe skips that trailer itself).
-  python3 scripts/build-native-novatek-touch.py ${NOVATEK_TOUCH_FW:+--firmware "$NOVATEK_TOUCH_FW"}
+  if [ "$BOOTSTRAP" = 0 ]; then python3 scripts/build-native-novatek-touch.py ${NOVATEK_TOUCH_FW:+--firmware "$NOVATEK_TOUCH_FW"}; fi
 fi
 PICASSO_CPUFREQ=${XNU_PICASSO_CPUFREQ:-0}
 if [ "$PICASSO_CPUFREQ" != 0 ] && [ "$PICASSO_CPUFREQ" != 1 ]; then
@@ -116,12 +116,12 @@ if [ "$PICASSO_CPUFREQ" != 0 ] && [ "$PICASSO_CPUFREQ" != 1 ]; then
   exit 1
 fi
 if [ "$PICASSO_CPUFREQ" = 1 ]; then
-  if [ "$BOOT_PROGRESS" != 1 ]; then
+  if [ "$BOOT_PROGRESS" != 1 ] && [ "$BOOTSTRAP" != 1 ]; then
     echo 'PicassoCpuFreq needs the boot-progress build: its probe call site lives in BootProgress.c' >&2
     exit 1
   fi
   # Inert unless the boot arguments carry sheng-cpufreq=<1..4>.
-  python3 scripts/build-picasso-cpufreq.py
+  if [ "$BOOTSTRAP" = 0 ]; then python3 scripts/build-picasso-cpufreq.py; fi
 fi
 ADRENO620_PROBE=${XNU_ADRENO620_PROBE:-0}
 if [ "$ADRENO620_PROBE" != 0 ] && [ "$ADRENO620_PROBE" != 1 ]; then
@@ -129,12 +129,12 @@ if [ "$ADRENO620_PROBE" != 0 ] && [ "$ADRENO620_PROBE" != 1 ]; then
   exit 1
 fi
 if [ "$ADRENO620_PROBE" = 1 ]; then
-  if [ "$BOOT_PROGRESS" != 1 ]; then
+  if [ "$BOOT_PROGRESS" != 1 ] && [ "$BOOTSTRAP" != 1 ]; then
     echo 'AdrenoPicasso needs the boot-progress build: its probe call site lives in BootProgress.c' >&2
     exit 1
   fi
   # Inert unless the boot arguments carry sheng-gpu=<1..5>.
-  python3 scripts/build-arm-driver.py AdrenoPicasso
+  if [ "$BOOTSTRAP" = 0 ]; then python3 scripts/build-arm-driver.py AdrenoPicasso; fi
 fi
 python3 - "$BOOT_PROGRESS" <<'PY'
 from pathlib import Path

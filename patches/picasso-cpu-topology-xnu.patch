@@ -1,12 +1,11 @@
 --- a/pexpert/pexpert/arm64/board_config.h
 +++ b/pexpert/pexpert/arm64/board_config.h
-@@ -135,7 +135,8 @@
+@@ -135,7 +135,7 @@
  
  #define MAX_L2_CLINE                   6
  #define MAX_CPUS                       8 /* sheng: SM8550 has eight cores */
 -#define MAX_CPU_CLUSTERS               1
 +#define MAX_CPU_CLUSTERS               2 /* sheng: SM7250: six A55 (E) and two A76 (P) cores */
-+#define __ARM_AMP__                    1
  
  #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
  #endif  /* ARM64_BOARD_CONFIG_BCM2837 */
