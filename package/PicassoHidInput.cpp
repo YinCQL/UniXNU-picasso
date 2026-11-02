@@ -35,7 +35,6 @@ static PicassoHidPlan gesture;
 static void (*touchSink)(void *);
 static void *touchContext;
 static unsigned reports[8];
-static unsigned failures[8];
 static int results[8];
 static unsigned autoStop;
 
@@ -70,15 +69,8 @@ extern "C" void native_hid_input_observed(unsigned event, int result) {
     if (event >= 8) return;
     __atomic_store_n(&results[event], result, __ATOMIC_RELEASE);
     unsigned n = __atomic_add_fetch(&reports[event], 1, __ATOMIC_ACQ_REL);
-    if (event < 3)
+    if (event < 3 || ((event == 4 || event == 5 || event == 6) && result && n <= 8))
         IOLog("PICASSO_HID event=%u sample=%u result=%x\n", event, n, result);
-    else if ((event == 4 || event == 5 || event == 6) && result) {
-        // Count failures separately: successful touch reports must not exhaust
-        // the diagnostic budget before memory pressure causes a later error.
-        unsigned failed = __atomic_add_fetch(&failures[event], 1, __ATOMIC_RELAXED);
-        if (failed <= 8)
-            IOLog("PICASSO_HID event=%u sample=%u result=%x failure_sample=%u\n", event, n, result, failed);
-    }
 }
 
 static IORegistryEntry *eventDriver(IORegistryEntry *parent, unsigned depth) {
