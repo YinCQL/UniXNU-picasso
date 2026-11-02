@@ -233,8 +233,8 @@ kernel_args = [
   "picasso_usb_smmu=6",
   # Continue to root mounting after the console starts.
   "picasso_usb_hold=0",
-  # Allow 10 seconds for the host console to attach before continuing boot.
-  "picasso_usb_control_ms=10000",
+  # Keep a 1-second synchronous command window after the USB enumeration handoff.
+  "picasso_usb_control_ms=1000",
   # Arm the Fastboot reason and use PSHOLD as the reset fallback.
   "picasso_usb_reset=pshold",
   # Original graphics class loading and post-IOBSD GOP handoff.
