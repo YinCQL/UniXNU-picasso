@@ -121,6 +121,7 @@ WEAK volatile uint64_t native_adreno_audit_ticks;
 WEAK void boot_log_tick(unsigned now) { (void)now; }
 WEAK void sheng_cpufreq_probe(void) {}
 WEAK void sheng_cpufreq_poll(void) {}
+WEAK void native_adreno_probe(void) {}
 
 WEAK uint64_t boot_diag_scan(uint64_t value) {
     (void)value;

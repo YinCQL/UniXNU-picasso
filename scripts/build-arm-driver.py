@@ -272,10 +272,49 @@ def build_adreno(record: dict):
             print('NativeAdreno: integrated staged AGXAccelerator and original IOAcceleratorES imports')
 
 
+def build_adreno_picasso(record: dict):
+    """A620 platform probe (drivers/NativeAdrenoPicasso): board inputs, firmware container checks, stage machine and the
+    kernel adapter. Stages 1-2 need no kit; the GMU/CP hooks resolve to the weak imports until a later archive provides
+    them, and a missing hook stops its stage with a diagnostic."""
+    out = ROOT / 'build/adreno-picasso'
+    out.mkdir(parents=True, exist_ok=True)
+    # Embedded firmware comes from ADRENO620_FW_DIR (default /tmp/picasso-gpu-fw); no blob is committed. Missing files
+    # produce empty arrays and probe stage 3 reports "blobs were not staged".
+    generator = ROOT / 'scripts/build-adreno-picasso-firmware.py'
+    if generator.is_file():
+        env = os.environ.copy()
+        env.setdefault('ADRENO620_FW_OUT', str(out))
+        subprocess.run([sys.executable, str(generator)], check=True, env=env)
+    extra_flags = ['-I', str(ROOT / 'drivers/NativeAdrenoPicasso'),
+                   '-I', str(ROOT / 'drivers/NativeAdreno'),
+                   '-I', str(ROOT / 'kits/ArmSmmu4K'),
+                   '-I', str(ROOT / 'kits/AdrenoFirmware')]
+    cpp_sources = [ROOT / 'drivers/NativeAdrenoPicasso' / name for name in
+                   ('Adreno620Board.cpp', 'Adreno620ProbeCore.cpp', 'Adreno620Probe.cpp', 'Adreno620Hooks.cpp',
+                    'Adreno620Integration.cpp', 'Adreno620Gmu.cpp')]
+    c_sources = [ROOT / 'drivers/NativeAdrenoPicasso' / 'Adreno620Firmware.c']
+    embedded = out / 'adreno620_embedded_firmware.c'
+    if embedded.is_file():
+        c_sources.append(embedded)
+    objects = []
+    for src in cpp_sources:
+        dst = out / f'{src.stem}.o'
+        compile_file(src, dst, record, extra_flags, is_c=False)
+        objects.append(dst)
+    for src in c_sources:
+        dst = out / f'{src.stem}.o'
+        compile_file(src, dst, record, extra_flags, is_c=True)
+        objects.append(dst)
+    archive = out / 'libAdrenoPicasso.a'
+    archive.unlink(missing_ok=True)
+    subprocess.run(['xcrun', 'ar', 'rcs', str(archive)] + [str(o) for o in objects], check=True)
+    print(f'AdrenoPicasso: ARM64/iOS 17 A620 probe archive built ({len(objects)} objects)')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('component', choices=['ArmDTPlatform', 'ArmCpu', 'NativeRamBlock', 'NativeUfs', 'NativeAdreno',
-                                              'NativeHidInput'])
+                                              'AdrenoPicasso', 'NativeHidInput'])
     args = parser.parse_args()
 
     recipe = ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'
@@ -283,6 +322,9 @@ def main():
 
     if args.component == 'NativeAdreno':
         build_adreno(record)
+        return
+    if args.component == 'AdrenoPicasso':
+        build_adreno_picasso(record)
         return
 
     out_map = {

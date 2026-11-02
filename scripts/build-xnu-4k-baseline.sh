@@ -123,6 +123,19 @@ if [ "$PICASSO_CPUFREQ" = 1 ]; then
   # Inert unless the boot arguments carry sheng-cpufreq=<1..4>.
   python3 scripts/build-picasso-cpufreq.py
 fi
+ADRENO620_PROBE=${XNU_ADRENO620_PROBE:-0}
+if [ "$ADRENO620_PROBE" != 0 ] && [ "$ADRENO620_PROBE" != 1 ]; then
+  echo 'XNU_ADRENO620_PROBE must be 0 or 1' >&2
+  exit 1
+fi
+if [ "$ADRENO620_PROBE" = 1 ]; then
+  if [ "$BOOT_PROGRESS" != 1 ]; then
+    echo 'AdrenoPicasso needs the boot-progress build: its probe call site lives in BootProgress.c' >&2
+    exit 1
+  fi
+  # Inert unless the boot arguments carry sheng-gpu=<1..5>.
+  python3 scripts/build-arm-driver.py AdrenoPicasso
+fi
 python3 - "$BOOT_PROGRESS" <<'PY'
 from pathlib import Path
 import hashlib, sys
@@ -813,6 +826,12 @@ PY_BINDINGS
   if [ "$PICASSO_CPUFREQ" = 1 ]; then
     KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$ROOT/build/picasso-cpufreq/libPicassoCpuFreq.a"
     KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $ROOT/build/picasso-cpufreq/libPicassoCpuFreq.a"
+  fi
+  if [ "$ADRENO620_PROBE" = 1 ]; then
+    ADRENO620_ARCHIVE=$ROOT/build/adreno-picasso/libAdrenoPicasso.a
+    test -f "$ADRENO620_ARCHIVE"
+    KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$ADRENO620_ARCHIVE"
+    KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $ADRENO620_ARCHIVE"
   fi
   KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES ${XNU_EXTRA_LD_ARCHIVES:-}"
   EXTRA_MAKE_ARGS+=("LD_KERNEL_ARCHIVES=$KERNEL_EXTRA_ARCHIVES")

@@ -1,0 +1,49 @@
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -135,7 +135,8 @@
+ 
+ #define MAX_L2_CLINE                   6
+ #define MAX_CPUS                       8 /* sheng: SM8550 has eight cores */
+-#define MAX_CPU_CLUSTERS               1
++#define MAX_CPU_CLUSTERS               2 /* sheng: SM7250: six A55 (E) and two A76 (P) cores */
++#define __ARM_AMP__                    1
+ 
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ #endif  /* ARM64_BOARD_CONFIG_BCM2837 */
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1026,6 +1026,24 @@
+ 		cluster_max_cpu_phys_id[i] = 0;
+ 	}
+ 
++	// Qualcomm's device trees describe asymmetric capacity instead of naming E/P clusters, so when the
++	// cluster-type property is absent classify by capacity-dmips-mhz: the fastest group is the P cluster.
++	// A separate pass is needed because the maximum has to be known before any CPU is classified.
++	uint64_t capacity_max = 0, capacity_min = ~(uint64_t)0;
++	{
++		OpaqueDTEntryIterator capacity_iter;
++		OpaqueDTEntry capacity_child;
++		if (SecureDTInitEntryIterator(entry, &capacity_iter) == kSuccess) {
++			while (kSuccess == SecureDTIterateEntries(&capacity_iter, &capacity_child)) {
++				uint64_t capacity = ml_readprop(capacity_child, "capacity-dmips-mhz", 0);
++				if (capacity) {
++					if (capacity > capacity_max) capacity_max = capacity;
++					if (capacity < capacity_min) capacity_min = capacity;
++				}
++			}
++		}
++	}
++
+ 	while (kSuccess == SecureDTIterateEntries(&iter, &child)) {
+ 		boolean_t is_boot_cpu = ml_is_boot_cpu(child);
+ 		boolean_t cpu_enabled = cpumask_boot_arg & 1;
+@@ -1082,6 +1100,9 @@
+ 			cpu->cluster_type = CLUSTER_TYPE_E;
+ 		} else if (cluster_type == 'P') {
+ 			cpu->cluster_type = CLUSTER_TYPE_P;
++		} else if (capacity_max > capacity_min) {
++			uint64_t capacity = ml_readprop(child, "capacity-dmips-mhz", 0);
++			cpu->cluster_type = (capacity == capacity_max) ? CLUSTER_TYPE_P : CLUSTER_TYPE_E;
+ 		}
+ 
+ 		topology_info.cluster_type_num_cpus[cpu->cluster_type]++;

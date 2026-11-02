@@ -20,6 +20,21 @@ extern "C" void thread_deallocate (thread_t);
 extern "C" thread_t current_thread (void);
 extern "C" kern_return_t thread_terminate (thread_t);
 
+// Every CPU used to register with the boot cluster's type, which flattens the
+// big.LITTLE topology: XNU created one processor set for all eight cores and no
+// E/P placement could happen. Report the core's own class from the parsed
+// topology so the two clusters become two processor sets.
+static cluster_type_t armcpu_cluster_type (uint32_t physical)
+{
+  const ml_topology_info_t *topology = ml_get_topology_info ();
+  if (topology) {
+    for (unsigned int i = 0; i < topology->num_cpus; ++i) {
+      if (topology->cpus[i].phys_id == physical) return topology->cpus[i].cluster_type;
+    }
+  }
+  return ml_get_boot_cluster_type ();
+}
+
 extern "C" {
 volatile uint32_t armcpu_registered = 0;
 volatile uint32_t armcpu_gic_ready = 0;
@@ -416,7 +431,7 @@ bool ArmCpu::start (IOService *provider)
   info.phys_id = physical;
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (physical));
-  info.cluster_type = ml_get_boot_cluster_type ();
+  info.cluster_type = armcpu_cluster_type (physical);
   perfmon_interrupt_handler_func pmi = nullptr;
   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
   if (status != KERN_SUCCESS) { panic ("ArmCpu: CPU %u registration failed: %d", logicalId, status); }
@@ -469,7 +484,7 @@ bool ArmCpu::finishSecondary (void)
   info.phys_id = static_cast<uint32_t> (affinity);
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (static_cast<uint32_t> (affinity)));
-  info.cluster_type = ml_get_boot_cluster_type ();
+  info.cluster_type = armcpu_cluster_type (static_cast<uint32_t> (affinity));
   perfmon_interrupt_handler_func pmi = nullptr;
   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
   if (status != KERN_SUCCESS) { armcpu_smp_fail[logicalId] = 4; return false; }

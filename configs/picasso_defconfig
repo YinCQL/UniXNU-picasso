@@ -66,6 +66,8 @@ CONFIG_XNU_SHENG_HIDINPUT=y
 CONFIG_XNU_NOVATEK_TOUCH=y
 # SM7250 cpufreq-hw probe and governor (sheng-cpufreq=<1..4>, inert without it).
 CONFIG_XNU_PICASSO_CPUFREQ=y
+# A620 GPU platform/firmware/stage probe (sheng-gpu=<1..5>, inert without it).
+CONFIG_XNU_ADRENO620_PROBE=y
 
 # prepare-picasso-ram-data.py writes the formatted APFS volume's actual UUID
 # into out/picasso/.config before compilation. An unprepared build must fail.

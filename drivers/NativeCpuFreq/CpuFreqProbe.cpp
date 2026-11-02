@@ -38,6 +38,8 @@
 #include <pexpert/pexpert.h>
 #include <kern/thread.h>
 #include <mach/mach_time.h>
+#include <machine/machine_routines.h>
+#include <pexpert/device_tree.h>
 
 extern "C" {
 char native_cpufreq_row[120];
@@ -427,6 +429,44 @@ extern "C" void sheng_cpufreq_probe(void) {
     printf("PICASSO_CPUFREQ probe mode=%u caps=%u min=%u boost=%u/%u frame=%u/%u maps=%u%u%u\n",
            mode, gCapKHz, gFloorKHz, gBoostMs, gFrameMs, gFramePct, gFrameMs,
            gDomain[0].va != 0, gDomain[1].va != 0, gDomain[2].va != 0);
+    // The scheduler's view of the CPU clusters: one line is enough to tell a flat eight-core topology from an E/P one.
+    {
+        const ml_topology_info_t *topology = ml_get_topology_info();
+        if (topology) {
+            printf("PICASSO_CPUFREQ topo cpus=%u clusters=%u types=%x en=%u pn=%u cl-e=%u cl-p=%u\n",
+                   topology->num_cpus, topology->num_clusters, topology->cluster_types,
+                   ml_get_cpu_number_type(CLUSTER_TYPE_E, true, true),
+                   ml_get_cpu_number_type(CLUSTER_TYPE_P, true, true),
+                   ml_get_cluster_number_type(CLUSTER_TYPE_E),
+                   ml_get_cluster_number_type(CLUSTER_TYPE_P));
+            for (unsigned i = 0; i < topology->num_cpus; ++i)
+                printf("PICASSO_CPUFREQ topo cpu=%u phys=%x cluster=%u type=%u\n",
+                       topology->cpus[i].cpu_id, topology->cpus[i].phys_id,
+                       topology->cpus[i].cluster_id, topology->cpus[i].cluster_type);
+        }
+        // Read the same property straight from the boot device tree: separates a missing property from a parser that
+        // did not consume it.
+        DTEntry entry = NULL;
+        void const *prop = nullptr;
+        unsigned int propSize = 0;
+        if (SecureDTLookupEntry(NULL, "/cpus/cpu@600", &entry) == kSuccess &&
+            SecureDTGetProperty(entry, "cluster-type", &prop, &propSize) == kSuccess)
+            printf("PICASSO_CPUFREQ topo dt cpu600-cluster-type size=%u value=%x\n",
+                   propSize, propSize ? *(const uint8_t *)prop : 0);
+        else
+            printf("PICASSO_CPUFREQ topo dt cpu600-cluster-type missing\n");
+        if (SecureDTLookupEntry(NULL, "/", &entry) == kSuccess &&
+            SecureDTGetProperty(entry, "model", &prop, &propSize) == kSuccess)
+            printf("PICASSO_CPUFREQ topo dt model %.48s\n", (const char *)prop);
+        for (const char *cpu : {"/cpus/cpu@0", "/cpus/cpu@600"}) {
+            if (SecureDTLookupEntry(NULL, cpu, &entry) == kSuccess &&
+                SecureDTGetProperty(entry, "capacity-dmips-mhz", &prop, &propSize) == kSuccess)
+                printf("PICASSO_CPUFREQ topo dt %s capacity size=%u value=%u\n",
+                       cpu, propSize, propSize == 4 ? *(const uint32_t *)prop : 0);
+            else
+                printf("PICASSO_CPUFREQ topo dt %s capacity missing\n", cpu);
+        }
+    }
     // Read-only first look: enable, perf-state index, the engine's current frequency, the 0x704 vote (diagnostic) and
     // the highest LUT row. This line is what a mode 1 boot reports.
     for (unsigned d = 0; d < 3; ++d) {

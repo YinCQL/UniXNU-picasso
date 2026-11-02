@@ -336,7 +336,7 @@ extern "C" void native_legacy_swap_validation_observed(bool ok, unsigned reason,
     if (reason < 8) __atomic_add_fetch(&displayStats.rejectReasons[reason], 1, __ATOMIC_RELAXED);
     __atomic_store_n(&displayStats.lastSubmitTick, mach_absolute_time(), __ATOMIC_RELAXED);
     report(6, ok, reason, 0, !ok);
-    if ((total % 600) == 0) reportDisplayState("submissions");
+    if ((total % 64) == 0) reportDisplayState("submissions");
 }
 extern "C" void native_legacy_surface_rejected(uint64_t width, uint64_t height, uint32_t format,
     uint32_t planes, uint64_t stride, uint64_t allocation, uint64_t length) {
@@ -366,7 +366,14 @@ extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t byte
     __atomic_add_fetch(&displayStats.copyBytes, bytes, __ATOMIC_RELAXED);
     __atomic_store_n(&displayStats.lastCopyTicks, ticks, __ATOMIC_RELAXED);
     __atomic_store_n(&displayStats.lastCopyBytes, bytes, __ATOMIC_RELAXED);
-    report(10, ticks, bytes, 0);
+    // Keep more than the generic four samples: the copy cost alternates between two source surfaces, so a handful of
+    // consecutive frames is what separates a real per-surface cost from a scheduling delay.
+    static unsigned copySamples;
+    if (copySamples < 32) {
+        unsigned sample = __atomic_add_fetch(&copySamples, 1, __ATOMIC_RELAXED);
+        printf("PICASSO_DISPLAY event=10 sample=%u a=%llx b=%llx c=%llu failure=0\n",
+            sample, ticks, bytes, __atomic_load_n(&displayStats.copies, __ATOMIC_RELAXED));
+    }
 }
 extern "C" void native_legacy_vsync_observed(unsigned event, unsigned hz) {
     if (event == 1) {

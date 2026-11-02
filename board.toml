@@ -67,6 +67,10 @@ archives = [
   # probes its MMIO windows read-only; GPU power and firmware startup stay
   # behind explicit boot arguments.
   "build-arm-driver.py NativeAdreno",
+  # A620 board/firmware/stage probe (sheng-gpu=<1..5>): platform inputs, the
+  # vendor container checks and the CX/SMMU identity readback. It is inert
+  # without the boot argument and never publishes a Metal device.
+  "build-arm-driver.py AdrenoPicasso",
   # Volatile APFS Data; shares NativeUfs's exact original IOStorage bindings.
   "build-arm-driver.py NativeRamBlock",
   # Publishes ApplePMGRNub, the original-policy SM7250 watchdog, and volatile boot-stage storage.

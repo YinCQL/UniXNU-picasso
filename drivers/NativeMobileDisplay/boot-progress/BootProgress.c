@@ -147,6 +147,10 @@ extern void boot_log_tick(unsigned) __attribute__((weak_import));
 // SM7250 cpufreq-hw probe (sheng-cpufreq=<1..4>); maps the domains once and starts the mode 4 governor.
 extern void sheng_cpufreq_probe(void) __attribute__((weak_import));
 extern void sheng_cpufreq_poll(void) __attribute__((weak_import));
+// A620 GPU platform/firmware/stage probe (sheng-gpu=<1..5>); returns immediately and never publishes a Metal device.
+// The firmware setter is a strong definition from the build-time embedded arrays, or a weak no-op when no blob was staged.
+extern void native_adreno620_set_embedded_firmware(void) __attribute__((weak_import));
+extern void native_adreno_probe(void) __attribute__((weak_import));
 extern char boot_process_rows[10][120] __attribute__((weak_import));
 extern unsigned boot_ui_trace_role_rows(unsigned,char [][120],unsigned,unsigned) __attribute__((weak_import));
 extern char native_touch_rows[4][120] __attribute__((weak_import));
@@ -1184,6 +1188,10 @@ static void monitor(void *arg, wait_result_t result) {
   // Board CPU frequency control (sheng-cpufreq=<1..4>). Inert without the boot argument; the poll below refreshes the
   // report row each round and votes domains that only read enabled once their cores come online.
   if(sheng_cpufreq_probe)sheng_cpufreq_probe();
+  // A620 GPU probe: platform inputs and firmware-container checks only; stages 4-5 stay behind hooks that do not exist
+  // yet, so this cannot start the GPU or change what userland sees.
+  if(native_adreno620_set_embedded_firmware)native_adreno620_set_embedded_firmware();
+  if(native_adreno_probe)native_adreno_probe();
   for (;;) {
     __atomic_fetch_add(&thread_count,1,__ATOMIC_RELAXED);
     boot_progress_poll();

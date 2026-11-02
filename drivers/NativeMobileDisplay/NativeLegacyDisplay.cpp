@@ -280,6 +280,50 @@ public:
         if(!native_legacy_prepare_scanout()) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
+        /* offline-legacy-bench=2: on the first real frame, time reads of the swap's own source memory through the
+         * swap's mapping and through a copyback mapping of the same descriptor, each twice (cold and warm), plus a
+         * cached control buffer and a store to the real destination. Together with the frame copy that follows, this
+         * separates source-read cost, attribute choice and scheduling delays from destination store cost. */
+        unsigned bench=0;PE_parse_boot_argn("offline-legacy-bench",&bench,sizeof bench);
+        if(bench>=2 && frameCount==1) {
+            const uint64_t benchBytes=1u<<20,benchWords=benchBytes/8;
+            const volatile uint64_t *srcWords=(const volatile uint64_t *)source->getVirtualAddress();
+            volatile uint64_t *fb=(volatile uint64_t *)bootMapping->getVirtualAddress();
+            IOMemoryMap *alt=memory->map(kIOMapAnywhere|kIOMapReadOnly|kIOMapCopybackCache);
+            uint64_t *ctrl=(uint64_t *)IOMalloc(benchBytes);
+            uint64_t t0=0,t1=0,sum=0;
+            if(ctrl)for(uint64_t i=0;i<benchWords;++i)ctrl[i]=i*0x9e3779b97f4a7c15ull;
+            for(unsigned pass=0;pass<2;++pass) {
+                sum=0;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+                for(uint64_t i=0;i<benchWords;++i)sum+=srcWords[i];
+                __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+                printf("PICASSO_DISPLAY bench2 src pass=%u ticks=%llu sum=%llx opts=%x\n",pass,t1-t0,sum,(unsigned)source->getMapOptions());
+            }
+            if(alt && alt->getVirtualAddress()) {
+                const volatile uint64_t *altWords=(const volatile uint64_t *)alt->getVirtualAddress();
+                for(unsigned pass=0;pass<2;++pass) {
+                    sum=0;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+                    for(uint64_t i=0;i<benchWords;++i)sum+=altWords[i];
+                    __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+                    printf("PICASSO_DISPLAY bench2 alt pass=%u ticks=%llu sum=%llx opts=%x\n",pass,t1-t0,sum,(unsigned)alt->getMapOptions());
+                }
+            } else printf("PICASSO_DISPLAY bench2 alt unavailable\n");
+            if(ctrl) {
+                __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+                for(uint64_t i=0;i<benchWords;++i)ctrl[i]=i*0xd1b54a32d192ed03ull;
+                __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+                printf("PICASSO_DISPLAY bench2 ctrlstore ticks=%llu\n",t1-t0);
+                sum=0;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+                for(uint64_t i=0;i<benchWords;++i)sum+=ctrl[i];
+                __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+                printf("PICASSO_DISPLAY bench2 ctrlread ticks=%llu sum=%llx\n",t1-t0,sum);
+            }
+            __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+            for(uint64_t i=0;i<benchWords;++i)fb[i]=0xdeadbeef00000000ull|i;
+            __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+            printf("PICASSO_DISPLAY bench2 fbstore ticks=%llu\n",t1-t0);
+            OSSafeReleaseNULL(alt);if(ctrl)IOFree(ctrl,benchBytes);
+        }
         uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
         if(!native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
             bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
@@ -404,7 +448,11 @@ public:
         PE_Video video={};IOService *provider=getProvider();
         if(!provider || PE_current_console(&video) ||
            !picasso_gop_video(video))return false;
-        IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
+        /* The scanout store dominates a frame: 1080x2400x4 = 10.4 MB per copy. An inhibit-cache (strongly ordered)
+         * mapping turns every 8-byte store into its own bus transaction (~130 ms per frame at 19.2 MHz cntpct, measured
+         * as PICASSO_DISPLAY event=10). Write-combining lets the CPU merge sequential stores into 64-byte lines, which
+         * is the standard attribute for a framebuffer the display controller also reads. */
+        IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapWriteCombineCache);
         if(!mapping)return false;
         bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                    mapping->getLength()==video.v_rowBytes*video.v_height;
@@ -415,6 +463,31 @@ public:
             if(valid) {
                 OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=true; // Text/graphics is console policy, not display identity.
                 valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
+                /* offline-legacy-bench=1: measure the three sides of a frame copy once, through this exact mapping.
+                 * The 10.4 MB frame copy costs ~130 ms here (PICASSO_DISPLAY event=10); these one-megabyte timings
+                 * separate destination stores, destination reads and a cached-to-cached memcpy. */
+                unsigned bench=0;PE_parse_boot_argn("offline-legacy-bench",&bench,sizeof bench);
+                if(valid && bench==1) {
+                    volatile uint64_t *fb=(volatile uint64_t *)bootMapping->getVirtualAddress();
+                    uint64_t *a=(uint64_t *)IOMalloc(1u<<20),*b=(uint64_t *)IOMalloc(1u<<20);
+                    if(a && b) {
+                        uint64_t t0=0,t1=0;
+                        for(uint64_t i=0;i<(1u<<17);++i)a[i]=i*0x9e3779b97f4a7c15ull;
+                        __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+                        for(uint64_t i=0;i<(1u<<17);++i)b[i]=a[i];
+                        __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+                        printf("PICASSO_DISPLAY bench memcpy1m ticks=%llu\n",t1-t0);
+                        __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+                        for(uint64_t i=0;i<(1u<<17);++i)fb[i]=0xdeadbeef00000000ull|i;
+                        __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+                        printf("PICASSO_DISPLAY bench fbwrite1m ticks=%llu\n",t1-t0);
+                        __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+                        uint64_t sum=0;for(uint64_t i=0;i<(1u<<17);++i)sum+=fb[i];
+                        __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+                        printf("PICASSO_DISPLAY bench fbread1m ticks=%llu sum=%llx\n",t1-t0,sum);
+                    }
+                    if(a)IOFree(a,1u<<20);if(b)IOFree(b,1u<<20);
+                }
             }
         }
         OSSafeReleaseNULL(mapping);return valid;
