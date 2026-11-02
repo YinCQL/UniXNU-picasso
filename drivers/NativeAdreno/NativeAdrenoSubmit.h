@@ -134,6 +134,8 @@ private:
     NativeAdrenoSubmitStats stats_{};
     void noteStall(uint32_t observed,const NativeAdrenoRingClock *clock);   /* the CP's state for a fence that stopped advancing (native_adreno_stall) */
     bool attached_=false,poisoned_=false;
+    /* The A6xx plain profile (setA6xxPlain): no thread-control framing, no preemption. */
+    bool a6xx_=false;
     uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */
     /* submit()'s distinct buffers and ring words: too large for the kernel stack at 128 IBs (callers serialize every method) */
     uint64_t scratch_handles_[NativeAdrenoSubmitMaxBuffers]{};
@@ -183,6 +185,12 @@ public:
     NativeAdrenoSubmit(const NativeAdrenoSubmit &)=delete;
     NativeAdrenoSubmit &operator=(const NativeAdrenoSubmit &)=delete;
     IOReturn attach(NativeAdrenoVm *,NativeAdrenoRing *);
+    /* A6xx (a620) submission profile: a submission is the caller's ring words
+     * alone, followed by the ring's plain CP_EVENT_WRITE timestamp fence. The
+     * A7XX thread-control framing and the two-ring preemption are not used.
+     * Set before the first submission. */
+    void setA6xxPlain(bool on) {a6xx_=on;}
+    bool a6xxPlain() const {return a6xx_;}
     /* Refuses while jobs are outstanding or poisoned; the caller must have
      * stopped the GPU and observed every fence before calling this. */
     IOReturn detach();

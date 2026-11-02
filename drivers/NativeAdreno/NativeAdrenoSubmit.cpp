@@ -484,7 +484,8 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     uint32_t base=fence_issued_;
     for(unsigned i=0;i<ring_count_;++i)if((int32_t)(ring(i)->lastSubmitted()-base)>0)base=ring(i)->lastSubmitted();
     const uint32_t number=(value=base)+1;
-    status=preemption()?target->submitFramed(words,word_count,number,&value):target->submitFramed(words,word_count,&value);
+    status=a6xx_?target->submit(words,word_count,&value):
+        preemption()?target->submitFramed(words,word_count,number,&value):target->submitFramed(words,word_count,&value);
     if(status) {
         if(!value)fence_issued_=base;
         /* A poisoned ring may already have consumed the WPTR write, so the

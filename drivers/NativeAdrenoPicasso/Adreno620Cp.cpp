@@ -32,10 +32,16 @@
 #include "NativeAdrenoRing.h"
 #include "NativeAdrenoSubmit.h"
 #include "NativeAdrenoTimer.h"
+#include "NativeAdrenoUserClient.h"
 #include "AdrenoPM4.h"
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOPlatformExpert.h>
+#include <IOKit/IOService.h>
+#include <libkern/c++/OSMetaClass.h>
+#include <libkern/c++/OSSymbol.h>
+#include <mach/kmod.h>
 #include <pexpert/pexpert.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -45,6 +51,17 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *
     NativeAdrenoRing *, const NativeAdrenoRingClock *, const NativeAdrenoTimer *,
     const NativeAdrenoAbiDeviceInfo *, uint32_t, uint32_t);
 extern "C" IOService *native_adreno_published_service(void);
+
+/* The staged AGXAccelerator (drivers/NativeAdreno/NativeAdrenoAccelerator.cpp).
+ * build-native-adreno-accelerator.py removes its initializer from
+ * __mod_init_func and exports it, because the class must be registered after
+ * the original IOGPUFamily kext has published IOAcceleratorES. */
+extern "C" void native_adreno_accelerator_static_init(void)
+    __asm__("__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp") __attribute__((weak));
+extern "C" IOService *native_adreno_accelerator_allocate(void) __attribute__((weak));
+extern "C" unsigned native_adreno_accelerator_instance_size(void) __attribute__((weak));
+extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
+extern "C" kmod_info_t g_kernel_kmod_info;
 
 namespace {
 
@@ -630,6 +647,12 @@ bool ringSmoke()
     return true;
 }
 
+/* The production submit object and the VM it serves, attached by publishGpu()
+ * and used by the client test and by every user connection from then on. */
+NativeAdrenoSubmit gSubmit;
+NativeAdrenoVm *gPublishedVm = nullptr;
+bool gServicePublished = false;
+
 /* Publish the live GPU context through the production service: the same VM,
  * ring and submit object the A740 board hands over, with this chip's device
  * information. No user client can submit yet (the Metal plugin is not part of
@@ -643,8 +666,8 @@ bool publishGpu()
         printf("PICASSO_GPU cp: publish refused ring=%p vm=%p ias=%u\n", ring, vm, ias);
         return false;
     }
-    static NativeAdrenoSubmit submit;
-    const IOReturn attached = submit.attach(vm, ring);
+    gSubmit.setA6xxPlain(true);
+    const IOReturn attached = gSubmit.attach(vm, ring);
     if (attached) {
         printf("PICASSO_GPU cp: submit attach failed %08x\n", unsigned(attached));
         return false;
@@ -665,12 +688,222 @@ bool publishGpu()
     clock.cookie = nullptr;
     clock.now_us = ringNowUs;
     clock.idle = nullptr;
-    const IOReturn published = native_adreno_publish(vm, &submit, ring, &clock,
+    const IOReturn published = native_adreno_publish(vm, &gSubmit, ring, &clock,
         nullptr, &info, ias, 40);
     printf("PICASSO_GPU cp: publish status=%08x service=%p va_size=%llx\n",
         unsigned(published), native_adreno_published_service(),
         static_cast<unsigned long long>(info.va_size));
+    if (published == kIOReturnSuccess) {
+        gPublishedVm = vm;
+        gServicePublished = true;
+    }
     return published == kIOReturnSuccess;
+}
+
+/* Register the staged AGXAccelerator for the original Metal discovery: load
+ * the original IOGPUFamily, find its IOAcceleratorES, run the staged class's
+ * initializer under preModLoad/postModLoad (the sequence in the reference
+ * board probe), then publish an accelerator carrying the Metal plugin keys.
+ * Stages: 1 class present and kext load attempted, 2 parent metatype found,
+ * 3 class registered, 4 object created and initialised, 5 published. */
+bool publishMetal()
+{
+    volatile unsigned stage = 1;
+    kern_return_t status = kIOReturnSuccess;
+    if (!native_adreno_accelerator_static_init ||
+        !native_adreno_accelerator_allocate ||
+        !native_adreno_accelerator_instance_size) {
+        printf("PICASSO_GPU cp: metal stage=1 status=%08x staged class missing\n",
+            unsigned(kIOReturnUnsupported));
+        return false;
+    }
+    const kern_return_t loaded = OSKextLoadKextWithIdentifier("com.apple.iokit.IOGPUFamily");
+    if (loaded) {
+        printf("PICASSO_GPU cp: metal stage=1 status=%08x kext=%d\n",
+            unsigned(loaded), int(loaded));
+        return false;
+    }
+    const OSSymbol *name = OSSymbol::withCString("IOAcceleratorES");
+    const OSMetaClass *parent = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
+    OSSafeReleaseNULL(name);
+    if (!parent || parent->getClassSize() != 136) {
+        printf("PICASSO_GPU cp: metal stage=1 status=%08x parent=%p size=%u\n",
+            unsigned(kIOReturnNotFound), parent,
+            parent ? parent->getClassSize() : 0u);
+        return false;
+    }
+    stage = 2;
+    void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
+    if (!handle) {
+        printf("PICASSO_GPU cp: metal stage=2 status=%08x premod refused\n",
+            unsigned(kIOReturnNoResources));
+        return false;
+    }
+    native_adreno_accelerator_static_init();
+    status = OSMetaClass::postModLoad(handle);
+    if (status) {
+        printf("PICASSO_GPU cp: metal stage=2 status=%08x postmod\n", unsigned(status));
+        return false;
+    }
+    if (native_adreno_accelerator_instance_size() != 136) {
+        printf("PICASSO_GPU cp: metal stage=2 status=%08x instance=%u\n",
+            unsigned(kIOReturnInvalid), native_adreno_accelerator_instance_size());
+        return false;
+    }
+    stage = 3;
+    IOService *accelerator = native_adreno_accelerator_allocate();
+    if (!accelerator) {
+        printf("PICASSO_GPU cp: metal stage=3 status=%08x allocate\n",
+            unsigned(kIOReturnNoMemory));
+        return false;
+    }
+    if (!accelerator->init()) {
+        accelerator->release();
+        printf("PICASSO_GPU cp: metal stage=3 status=%08x init\n",
+            unsigned(kIOReturnError));
+        return false;
+    }
+    /* The two keys the original _MTLRegisterDevices helper reads, plus the
+     * sandbox grant installed by patches/xnu/zzw-native-adreno-sandbox-grant.patch. */
+    accelerator->setProperty("MetalPluginName", "NativeAdrenoMetal");
+    accelerator->setProperty("NativeSandboxGrantProcess", "*");
+    accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
+    stage = 4;
+    if (!accelerator->attach(IOService::getPlatform())) {
+        accelerator->release();
+        printf("PICASSO_GPU cp: metal stage=4 status=%08x attach\n",
+            unsigned(kIOReturnNotAttached));
+        return false;
+    }
+    accelerator->registerService();
+    stage = 5;
+    printf("PICASSO_GPU cp: metal stage=%u status=%08x registered=1\n",
+        stage, unsigned(kIOReturnSuccess));
+    return true;
+}
+
+/* One entry of the production user-client dispatch, with the record sizes the
+ * class declares (the same pair the IOKit wrapper copies for a real caller). */
+IOReturn clientCall(NativeAdrenoUserClient &client, uint32_t method,
+    const void *input, void *output, const NativeAdrenoRingClock *clock)
+{
+    const size_t in = NativeAdrenoUserClient::inputSize(method);
+    const size_t out = NativeAdrenoUserClient::outputSize(method);
+    return client.dispatch(method, in ? input : nullptr, in,
+        out ? output : nullptr, out, clock);
+}
+
+/* Open one client of the published service through the production user-client
+ * class and submit one IB through NativeAdrenoSubmit's A620 profile: allocate
+ * an IB and a target in the GPU context's aperture, write three CP_MEM_WRITE
+ * packets, submit, wait on the CP timestamp fence and read the target back
+ * (sheng-gpu-client-test=1). This is the path the Metal plugin will use, with
+ * the IOKit wrapper and sandbox in front of it. */
+bool clientTest()
+{
+    NativeAdrenoRing *ring = ringObject();
+    NativeAdrenoVm *vm = NativeAdrenoGpuContextVm();
+    const uint32_t ias = NativeAdrenoGpuContextInputBits();
+    if (!ring || !vm || !gServicePublished) {
+        printf("PICASSO_GPU cp: client test refused ring=%p vm=%p published=%d\n",
+            ring, vm, gServicePublished ? 1 : 0);
+        return false;
+    }
+    static NativeAdrenoUserClient client;
+    NativeAdrenoRingClock clock;
+    clock.cookie = nullptr;
+    clock.now_us = ringNowUs;
+    clock.idle = nullptr;
+    const IOReturn opened = client.open(NativeAdrenoAbiVersion, vm, &gSubmit, ring,
+        ias, 40);
+    printf("PICASSO_GPU cp: client open status=%08x ias=%u\n", unsigned(opened), ias);
+    if (opened) return false;
+
+    NativeAdrenoAbiParams params = {};
+    IOReturn status = clientCall(client, NativeAdrenoMethodQuery, nullptr, &params, &clock);
+    printf("PICASSO_GPU cp: client query status=%08x abi=%u in=%u out=%u\n",
+        unsigned(status), params.abi_version, params.input_bits, params.output_bits);
+    if (status) return false;
+
+    /* System BOs have no kernel mapping until a client view maps them, so
+     * the self-test asks for one contiguous run, which allocates through the
+     * kernel-mapped path (the Metal plugin itself uses system BOs with its own
+     * views). */
+    const NativeAdrenoAbiBoAlloc alloc = {4096, 12, 1};
+    NativeAdrenoAbiBoAllocReply ib = {}, target = {};
+    status = clientCall(client, NativeAdrenoMethodBoAlloc, &alloc, &ib, &clock);
+    if (status) {
+        printf("PICASSO_GPU cp: client test ib alloc %08x\n", unsigned(status));
+        return false;
+    }
+    status = clientCall(client, NativeAdrenoMethodBoAlloc, &alloc, &target, &clock);
+    if (status) {
+        printf("PICASSO_GPU cp: client test target alloc %08x\n", unsigned(status));
+        return false;
+    }
+    const uint64_t ibIova = GpuClientVaStart;
+    const uint64_t targetIova = GpuClientVaStart + 0x1000;
+    const NativeAdrenoAbiBoMap mapIb = {ib.handle, ibIova, 1, 0, 2, 0};
+    const NativeAdrenoAbiBoMap mapTarget = {target.handle, targetIova, 3, 0, 2, 0};
+    NativeAdrenoAbiBoMapReply reply = {};
+    if (clientCall(client, NativeAdrenoMethodBoMap, &mapIb, &reply, &clock)) return false;
+    if (clientCall(client, NativeAdrenoMethodBoMap, &mapTarget, &reply, &clock)) return false;
+
+    NativeAdrenoMemory *ibMemory = client.memoryOf(ib.handle);
+    NativeAdrenoMemory *targetMemory = client.memoryOf(target.handle);
+    if (!ibMemory || !targetMemory) {
+        printf("PICASSO_GPU cp: client test memory lookup failed\n");
+        return false;
+    }
+    volatile uint32_t *ibWords = static_cast<volatile uint32_t *>(ibMemory->mapping());
+    volatile uint32_t *targetWords = static_cast<volatile uint32_t *>(targetMemory->mapping());
+    if (!ibWords || !targetWords) {
+        printf("PICASSO_GPU cp: client test memory mapping ib=%p target=%p\n",
+            ibWords, targetWords);
+        return false;
+    }
+    for (unsigned i = 0; i < 1024; ++i) targetWords[i] = 0xdeadbeef;
+    const uint32_t values[3] = {0x5e9a7400u, 0xa1658bffu, 0x600d0001u};
+    uint32_t words[12] = {};
+    for (unsigned i = 0; i < 3; ++i) {
+        if (AdrenoPM4Type7(0x3d, 3, &words[i * 4]) != AdrenoPM4Success) return false;
+        words[i * 4 + 1] = uint32_t(targetIova + i * 4);
+        words[i * 4 + 2] = uint32_t(targetIova >> 32);
+        words[i * 4 + 3] = values[i];
+    }
+    for (unsigned i = 0; i < 12; ++i) ibWords[i] = words[i];
+    if (ibMemory->publishForDevice(0, 4096, false) ||
+        targetMemory->publishForDevice(0, 4096, true)) {
+        printf("PICASSO_GPU cp: client test publish failed\n");
+        return false;
+    }
+
+    NativeAdrenoAbiSubmit request = {};
+    request.buffer_count = 1;
+    request.buffers[0] = {ib.handle, ibIova, sizeof words};
+    NativeAdrenoAbiSubmitReply submitted = {};
+    status = clientCall(client, NativeAdrenoMethodSubmit, &request, &submitted, &clock);
+    printf("PICASSO_GPU cp: client submit status=%08x fence=%llu\n",
+        unsigned(status), static_cast<unsigned long long>(submitted.fence));
+    int matched = 0;
+    if (!status && submitted.fence) {
+        NativeAdrenoAbiWaitFence wait = {submitted.fence, 200000000ull};
+        const IOReturn waited = clientCall(client, NativeAdrenoMethodWaitFence, &wait,
+            nullptr, &clock);
+        if (!waited && !targetMemory->acquireDeviceWrites(0, 4096)) {
+            matched = (targetWords[0] == values[0]) + (targetWords[1] == values[1]) +
+                (targetWords[2] == values[2]) + (targetWords[3] == 0xdeadbeef);
+        }
+        printf("PICASSO_GPU cp: client fence wait=%08x matched=%d/4\n",
+            unsigned(waited), matched);
+    }
+
+    const NativeAdrenoAbiBoFree freeIb = {ib.handle}, freeTarget = {target.handle};
+    (void)clientCall(client, NativeAdrenoMethodBoFree, &freeIb, nullptr, &clock);
+    (void)clientCall(client, NativeAdrenoMethodBoFree, &freeTarget, nullptr, &clock);
+    const IOReturn closed = client.close();
+    printf("PICASSO_GPU cp: client close=%08x\n", unsigned(closed));
+    return !status && matched == 4 && !closed;
 }
 
 bool acquireBuffers()
@@ -820,13 +1053,48 @@ extern "C" int native_adreno620_cp_start(void)
     }
 
     uint32_t publishValue = 0;
+    bool service = false;
     if (PE_parse_boot_argn("sheng-gpu-publish", &publishValue,
         static_cast<int>(sizeof publishValue)) && publishValue) {
         if (!publishGpu()) {
             printf("PICASSO_GPU cp: publish failed\n");
             return -1;
         }
+        service = true;
         printf("PICASSO_GPU cp: published\n");
+    }
+
+    /* Register the accelerator for Metal (sheng-gpu-metal=1). The plugin's
+     * user client opens the service published just above, so publishing is
+     * implied when it was not requested separately. */
+    uint32_t metalValue = 0;
+    if (PE_parse_boot_argn("sheng-gpu-metal", &metalValue,
+        static_cast<int>(sizeof metalValue)) && metalValue) {
+        if (!service && !publishGpu()) {
+            printf("PICASSO_GPU cp: metal publish failed\n");
+            return -1;
+        }
+        if (!publishMetal()) {
+            printf("PICASSO_GPU cp: metal failed\n");
+            return -1;
+        }
+        printf("PICASSO_GPU cp: metal published\n");
+    }
+
+    /* One user client of the published service, submitting through the A620
+     * plain profile (sheng-gpu-client-test=1). */
+    uint32_t clientValue = 0;
+    if (PE_parse_boot_argn("sheng-gpu-client-test", &clientValue,
+        static_cast<int>(sizeof clientValue)) && clientValue) {
+        if (!gServicePublished && !publishGpu()) {
+            printf("PICASSO_GPU cp: client test publish failed\n");
+            return -1;
+        }
+        if (!clientTest()) {
+            printf("PICASSO_GPU cp: client test failed\n");
+            return -1;
+        }
+        printf("PICASSO_GPU cp: client test ok\n");
     }
     return 0;
 }

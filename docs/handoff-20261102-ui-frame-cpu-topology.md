@@ -682,6 +682,62 @@ content/CP aperture paths are fundamentally blocked on zap/PIL.
 chain left it and no `CP_SET_SECURE_MODE` packet is sent; stage 4 proves the CP runs. The next
 piece is the SMMU/Metal path (stage 5) and then the userland GPU stack.
 
+### 12.2 Stage 5 — accelerator registered and one A620 user-client submission (wf51–wf53)
+
+**Accelerator registration.** The staged class already rides in the kernel image: an upstream tree
+script, `scripts/build-native-adreno-accelerator.py`, compiles
+`drivers/NativeAdreno/NativeAdrenoAccelerator.cpp`, removes its initializer from
+`__mod_init_func`, globalizes `__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp`, and adds the late
+object plus the three audited `IOAcceleratorES` import bindings to `libNativeAdreno.a` (the kernel
+link is whole-archive, so `nm` shows `AGXAccelerator`, its metaclass, the allocator and the
+initializer). What was missing was the call site. `sheng-gpu-metal=1` now runs, after publishing
+the service: `OSKextLoadKextWithIdentifier("com.apple.iokit.IOGPUFamily")`, the original
+`IOAcceleratorES` metaclass (class size 136) through `OSMetaClass::getMetaClassWithName`, the
+staged initializer between `preModLoad`/`postModLoad`, then an `AGXAccelerator` instance with
+`MetalPluginName=NativeAdrenoMetal`, `MetalPluginClassName=NativeAdrenoMetalDevice` and
+`NativeSandboxGrantProcess=*`, attached to `IOService::getPlatform()` and registered:
+
+    PICASSO_GPU cp: publish status=00000000 service=0xfffffff9bf8b1560 va_size=ffff00000000
+    PICASSO_GPU cp: metal stage=5 status=00000000 registered=1
+    PICASSO_GPU cp: metal published
+
+The boot continues with `panic=0`, and userland sees the class: backboardd and SpringBoard probe
+`provider=AGXAccelerator` (`PICASSO_IOKIT begin op=0 ... provider=AGXAccelerator`), and
+backboardd's type-1 open is logged and refused cleanly, as designed (the original IOGPU library's
+foreign open type is not the plugin's). **[verified: out/wf51-runs/run1.log]**
+
+**A620 submission profile.** `NativeAdrenoSubmit::setA6xxPlain(true)` makes a submission the
+caller's ring words plus the ring's own `CP_EVENT_WRITE`/`CACHE_FLUSH_TS` timestamp fence, instead
+of A7XX thread-control framing; `submitFramed` stays refused on an A6xx ring. `sheng-gpu-client-test=1`
+then opens one `NativeAdrenoUserClient` on the published VM/ring/submit, queries the ABI, allocates
+an IB and a target, maps both in the client aperture (`GpuClientVaStart`), writes three
+`CP_MEM_WRITE` packets, submits through the production path, waits on the CP fence and reads the
+target back:
+
+    PICASSO_GPU cp: client open status=00000000 ias=48
+    PICASSO_GPU cp: client query status=00000000 abi=2 in=48 out=40
+    PICASSO_GPU cp: client submit status=00000000 fence=2
+    PICASSO_GPU cp: client fence wait=00000000 matched=4/4
+    PICASSO_GPU cp: client close=00000000
+    PICASSO_GPU cp: client test ok
+
+Stage 4 ends `done=1` and the boot continues. This is the whole path the Metal plugin will use
+(minus the IOKit wrapper and sandbox), now proven on A620. **[verified: out/wf53-runs/run1.log]**
+
+**Trap found on the way (wf52).** User BOs from `allocateSystem` have **no kernel mapping** until a
+client view maps them ("mapped nowhere until a client view maps it"), so the first version of the
+test dereferenced `memoryOf(handle)->mapping() == nullptr` and panicked in `clientTest()`
+(`Adreno620Cp.cpp:848`, data abort, `far=0`, `x9=0xdeadbeef`). The self-test now allocates one
+contiguous run (the kernel-mapped `allocate()` path) and checks both mappings before use. The
+plugin itself uses system BOs through its own client views and is unaffected.
+
+**Remaining for Metal.** The plugin bundle is not in this image: `build-adreno-metal-plugin.py`
+needs the Turnip `libvulkan_freedreno.dylib` (iOS), the bridge archive and the recorded replay,
+then `make-gpu-addon.py` plus the boot-time addon mount (`--gpu-addon`/`sheng-gpu-addon`) and the
+XNU sandbox grant patch. The GPU-side prerequisites (accelerator registration, service, client
+submission) are now in place.
+
+
 ## 13. Boot time: the UEFI menu timeout is 3 s of the first-console time
 
 Method: `/tmp/measure-boot.sh` starts a libusb reader on 1209:0001 before issuing `fastboot boot`
