@@ -60,6 +60,13 @@ constexpr uint32_t kGmuGmu2HostIntrClr = 0x1F991;
 constexpr uint32_t kGmuGmu2HostIntrInfo = 0x1F992;
 constexpr uint32_t kGmuGmu2HostIntrMask = 0x1F993;
 constexpr uint32_t kGmuHost2GmuIntrSet = 0x1F994;
+constexpr uint32_t kGmuHost2GmuIntrRaw = 0x1F996;
+/* RSCC sleep/wake handshake. mainline's a6xx_rpmh_start (gmu-gmu2host intr space); the RGB side reuses the
+ * GMU CSR window. ACK bit0 = the GPU RSC is asleep, bit1 = wake acknowledged. */
+constexpr uint32_t kGmuRsccControlReq = 0x23B07;
+constexpr uint32_t kGmuRsccControlAck = 0x23B08;
+constexpr uint32_t kGmuGxPwrStatus = 0x1F8D0;   /* GMU_SPTPRAC_PWR_CLK_STATUS (sheng kGxStatus) */
+constexpr uint32_t kGmuRpmhPowerState = 0x1F8EC; /* GPU_GMU_CX_GMU_RPMH_POWER_STATE (a6xx_gmu_check_idle_level) */
 constexpr uint32_t kGmuGeneral7 = 0x1F9CC;
 constexpr uint32_t kGmuAoHostIntrClr = 0x23B04;
 constexpr uint32_t kGmuAoHostIntrStatus = 0x23B05;
@@ -110,6 +117,10 @@ constexpr uint32_t kRscHiddenTcsCmd0Addr = 0x0D;
 constexpr uint32_t kRscHiddenTcsCmd0Data = 0x0E;
 constexpr uint32_t kRscOverrideStartAddr = 0x100;
 constexpr uint32_t kRscSeqBusyDrv0 = 0x101;
+constexpr uint32_t kRscTcs0Status = 0x346;
+constexpr uint32_t kRscTcs1Status = 0x3EE;
+constexpr uint32_t kRscTcs2Status = 0x496;
+constexpr uint32_t kRscTcs3Status = 0x53E;
 constexpr uint32_t kRscSeqMem0Drv0 = 0x180;
 
 /* PDC config/sequencer dword offsets (a6xx_reg.h). */
@@ -147,6 +158,8 @@ struct CmdDb {
     uint16_t gfx[32], mx[32], cx[32];
     size_t gfxCount, mxCount, cxCount, scratchCount;
     uint32_t mxAddress, cxAddress, xoAddress, vrmAddress;
+    /* RPMh BCM resources used by the GMU bandwidth table (kgsl msm-bus paths for grp3d/cnoc). */
+    uint32_t sh0Address, mc0Address, acvAddress, cn0Address;
 };
 
 struct GmuState {
@@ -283,6 +296,11 @@ bool cmdDbAux(const volatile uint8_t *data, size_t dataBytes, const char *id,
         const size_t dataOffset = header[2];
         const size_t entries = header[3];
         for (size_t index = 0; index < entries; ++index) {
+            /* rsc_hdr.header_offset/data_offset are offsets from the end of cmd_db_header (cmd-db.c
+             * rsc_to_entry_header/rsc_offset), i.e. from data[]; data is passed here as that base. An
+             * offset used from the mapping base instead lands 144 bytes (exactly 6 entries at stride 24)
+             * early: the table still walks because the stride is right, but every aux table (the VLVL
+             * votes) reads the entry/id bytes. */
             const size_t at = headerOffset + index * 24;
             if (at + 24 > dataBytes) return false;
             bool match = true;
@@ -301,8 +319,9 @@ bool cmdDbAux(const volatile uint8_t *data, size_t dataBytes, const char *id,
             if (aux + words * 2 > dataBytes) return false;
             for (size_t word = 0; word < words; ++word)
                 values[word] = uint16_t(data[aux + word * 2] | (data[aux + word * 2 + 1] << 8));
-            /* kgsl_gmu.c rpmh_arc_cmds: trailing zero padding ends the table. */
-            while (words > 1 && values[words - 1] == 0 && values[words - 2] != 0) --words;
+            /* kgsl_gmu.c rpmh_arc_cmds: the table ends at the first zero after a nonzero value. */
+            for (size_t word = 1; word < words; ++word)
+                if (values[word - 1] != 0 && values[word] == 0) { words = word; break; }
             *count = words;
             return true;
         }
@@ -335,41 +354,75 @@ bool readCmdDb(CmdDb &cmd)
             header[resource][word] = uint16_t(data[at + word * 2] |
                 (data[at + word * 2 + 1] << 8));
     }
+    /* rsc_hdr.header_offset/data_offset are offsets from the end of cmd_db_header (cmd-db.c
+     * rsc_to_entry_header/rsc_offset): the helper walks data[] (base + 144), not the mapping base. Using the
+     * mapping base instead lands 144 bytes (exactly 6 entries at stride 24) early: the ids still line up
+     * after six garbage entries, but every aux table is read from the wrong bytes, which corrupts the ARC
+     * VLVL votes (measured gmu-vote=6d6d0800, ASCII "mm", wf34). */
+    const volatile uint8_t *db = data + kCmdDbHeaderBytes;
+    const size_t dbBytes = kCmdDbBytes - kCmdDbHeaderBytes;
+
     /* Every value is read from the mapped region directly; the helpers take byte counts, so the size used is
      * what the header could reference (the region is 128 KiB and offsets are 16-bit). */
     cmd.valid = true;
-    cmd.valid = cmdDbAux(data, kCmdDbBytes - kCmdDbHeaderBytes, "gfx.lvl",
+    cmd.valid = cmdDbAux(db, dbBytes, "gfx.lvl",
         (const uint16_t (*)[8])header, cmd.gfx, 32, &cmd.gfxCount, nullptr) && cmd.valid;
-    cmd.valid = cmdDbAux(data, kCmdDbBytes - kCmdDbHeaderBytes, "mx.lvl",
+    cmd.valid = cmdDbAux(db, dbBytes, "mx.lvl",
         (const uint16_t (*)[8])header, cmd.mx, 32, &cmd.mxCount, &cmd.mxAddress) && cmd.valid;
-    cmd.valid = cmdDbAux(data, kCmdDbBytes - kCmdDbHeaderBytes, "cx.lvl",
+    cmd.valid = cmdDbAux(db, dbBytes, "cx.lvl",
         (const uint16_t (*)[8])header, cmd.cx, 32, &cmd.cxCount, &cmd.cxAddress) && cmd.valid;
     bool xoFound = false, vrmFound = false;
-    xoFound = cmdDbAux(data, kCmdDbBytes - kCmdDbHeaderBytes, "xo.lvl",
+    xoFound = cmdDbAux(db, dbBytes, "xo.lvl",
         (const uint16_t (*)[8])header, nullptr, 0, &cmd.scratchCount, &cmd.xoAddress);
-    vrmFound = cmdDbAux(data, kCmdDbBytes - kCmdDbHeaderBytes, "vrm.soc",
+    vrmFound = cmdDbAux(db, dbBytes, "vrm.soc",
         (const uint16_t (*)[8])header, nullptr, 0, &cmd.scratchCount, &cmd.vrmAddress);
     printf("PICASSO_GPU gmu: cmd-db xo.lvl=%d addr=%x vrm.soc=%d addr=%x\n",
         xoFound, cmd.xoAddress, vrmFound, cmd.vrmAddress);
+    /* The BW table commands are RPMh BCM addresses. mainline's generic a6xx table hardcodes a630-era values
+     * (0x50000/0x5005c/0x5000c, cnoc 0x50034/0x5007c/0x5004c); print what this device's DB actually has so a
+     * vote that targets a resource this target lacks can be recognised. */
+    {
+        const char *names[4] = {"SH0", "MC0", "ACV", "CN0"};
+        uint32_t *targets[4] = {&cmd.sh0Address, &cmd.mc0Address, &cmd.acvAddress, &cmd.cn0Address};
+        size_t scratch = 0;
+        printf("PICASSO_GPU gmu: cmd-db bcm");
+        for (unsigned index = 0; index < 4; ++index) {
+            const bool found = cmdDbAux(db, dbBytes, names[index],
+                (const uint16_t (*)[8])header, nullptr, 0, &scratch, targets[index]);
+            printf(" %s=%s%x", names[index], found ? "" : "?", *targets[index]);
+        }
+        printf("\n");
+    }
+    printf("PICASSO_GPU gmu: cmd-db vlvl gfx[%u]=%x,%x,%x,%x mx[%u]=%x,%x,%x,%x cx[%u]=%x,%x,%x,%x\n",
+        cmd.gfxCount,
+        cmd.gfxCount > 0 ? cmd.gfx[0] : 0, cmd.gfxCount > 1 ? cmd.gfx[1] : 0,
+        cmd.gfxCount > 2 ? cmd.gfx[2] : 0, cmd.gfxCount > 3 ? cmd.gfx[3] : 0,
+        cmd.mxCount,
+        cmd.mxCount > 0 ? cmd.mx[0] : 0, cmd.mxCount > 1 ? cmd.mx[1] : 0,
+        cmd.mxCount > 2 ? cmd.mx[2] : 0, cmd.mxCount > 3 ? cmd.mx[3] : 0,
+        cmd.cxCount,
+        cmd.cxCount > 0 ? cmd.cx[0] : 0, cmd.cxCount > 1 ? cmd.cx[1] : 0,
+        cmd.cxCount > 2 ? cmd.cx[2] : 0, cmd.cxCount > 3 ? cmd.cx[3] : 0);
     /* If a required rail is missing, name every entry whose id starts with its first letter so the DB's own
      * identifier spelling is on the record. */
     if (!xoFound || !vrmFound) {
         for (unsigned resource = 0; resource < 8; ++resource) {
             const uint16_t *h = header[resource];
             if (!h[0]) break;
+            printf("PICASSO_GPU gmu: cmd-db slv=%u cnt=%u off=%x:", h[0], h[3], h[1]);
             for (size_t index = 0; index < h[3]; ++index) {
                 const size_t at = h[1] + index * 24;
-                if (at + 24 > kCmdDbBytes - kCmdDbHeaderBytes) break;
-                if (data[at] != 'x' && data[at] != 'v') continue;
+                if (at + 24 > dbBytes) break;
                 char id[9] = {};
                 for (unsigned byte = 0; byte < 8; ++byte) {
-                    const uint8_t c = data[at + byte];
-                    id[byte] = c >= 0x20 && c < 0x7F ? char(c) : '?';
+                    const uint8_t c = db[at + byte];
+                    id[byte] = c >= 0x20 && c < 0x7F ? char(c) : '.';
                 }
-                printf("PICASSO_GPU gmu: cmd-db id '%s' addr=%02x%02x%02x%02x len=%u\n", id,
-                    data[at + 19], data[at + 18], data[at + 17], data[at + 16],
-                    unsigned(data[at + 20] | (data[at + 21] << 8)));
+                const uint32_t addr = uint32_t(db[at + 16]) | (uint32_t(db[at + 17]) << 8) |
+                    (uint32_t(db[at + 18]) << 16) | (uint32_t(db[at + 19]) << 24);
+                printf(" %s=%x", id, addr);
             }
+            printf("\n");
         }
     }
     /* The mapped alias is kept for the boot; nothing unmaps a region the GMU may later read. */
@@ -419,6 +472,18 @@ uint32_t readSpeedBin()
     }
     const uint16_t word = uint16_t(qfprom.base[0x1ea] | (qfprom.base[0x1eb] << 8));
     return (word >> 5) & 0xFFu;
+}
+
+/* msm_gpu nvmem-cells isense_slope: qfprom@780000 isense_slope@45c8, 4 bytes (picasso.dts). The LM feature's
+ * CS0 slope is this fuse; kgsl_hfi.c hfi_send_lm_feature_ctrl sends it through H2F_MSG_SET_VALUE. */
+uint32_t readIsenseSlope()
+{
+    Mapping qfprom = {};
+    if (!mapRange(0x780000u, 0x7000u, qfprom)) {
+        printf("PICASSO_GPU gmu: QFPROM did not map; isense slope 0\n");
+        return 0;
+    }
+    return read32(qfprom, 0x45c8);
 }
 
 /* gmu_clk_src: ROOT_EN, parent/divider, UPDATE, then release the force enable (clk-rcg2.c). */
@@ -796,9 +861,39 @@ int hfiNotify(void *)
     return 0;
 }
 
+/* The boot chain can leave the GPU RSC asleep. While it is, the RSC TCS refuses every RPMh command, and the
+ * GMU's first GX vote fails inside GmuPwrGxBwVote (measured: F2H_MSG_ERR 115/184 with that name). q2msm's
+ * a650 port documents the same failure and the same fix; the sequence is mainline a6xx_rpmh_start. */
+int rscWake()
+{
+    const uint32_t ack = coreRead(kGmuRsccControlAck);
+    printf("PICASSO_GPU gmu: rsc control ack=%08x seqbusy=%08x\n", ack, rsccRead(kRscSeqBusyDrv0));
+    if (!(ack & 1u)) return 0;   /* bit0 clear: the RSC is not asleep */
+    coreWrite(kGmuRsccControlReq, 1u << 1);
+    barrier();
+    bool woken = false;
+    uint32_t value = 0;
+    for (unsigned attempt = 0; attempt < 100; ++attempt) {
+        value = coreRead(kGmuRsccControlAck);
+        if (value & (1u << 1)) { woken = true; break; }
+        IODelay(100);
+    }
+    bool idle = false;
+    for (unsigned attempt = 0; attempt < 100; ++attempt) {
+        if (!rsccRead(kRscSeqBusyDrv0)) { idle = true; break; }
+        IODelay(100);
+    }
+    coreWrite(kGmuRsccControlReq, 0);
+    barrier();
+    printf("PICASSO_GPU gmu: rsc wake ack=%08x woken=%d seqbusy=%08x idle=%d\n",
+        value, woken, rsccRead(kRscSeqBusyDrv0), idle);
+    return (woken && idle) ? 0 : -1;
+}
+
 void rscAndPdc()
 {
     GmuState &s = *gState;
+    if (rscWake()) printf("PICASSO_GPU gmu: RSC wake did not complete\n");
     /* a6xx_load_rsc_ucode: RSCC sequencer ucode for sleep/wakeup (a650-family values, shared by a620). */
     rsccWrite(kRscStatus0Drv0, 1u << 24);
     rsccWrite(kRscPdcSlaveIdDrv0, 1);
@@ -816,16 +911,46 @@ void rscAndPdc()
     for (unsigned index = 0; index < 5; ++index)
         rsccWrite(kRscSeqMem0Drv0 + index, sequence[index]);
 
-    /* a650 family (a620 included): mainline's a6xx_gmu_rpmh_init sets pdc_in_aop for this family, so the AOP owns
-     * the PDC sequencer and TCS: it skips the sequencer ucode and every TCS write, and only starts the sequencer and
-     * enables the PDC. The PDC must not be left disabled while the HFI is live: the GMU's power requests are
-     * sequenced through it, and an unserviced PDC handshake wedges the GMU's RSC path. */
+    /* This target is not pdc_in_aop: adreno-gpulist.h sets that flag only for a650/a650v2, and a620's core
+     * struct leaves it false. Mainline treats the whole a650 family as AOP-owned, which is the divergence that
+     * left the GPU PDC unprogrammed here: its TCS banks carry the RPMh commands the GMU firmware submits for
+     * GX power and DCVS, so with no TCS every vote fails inside GmuPwrGxBwVote (wf21-wf29). Program exactly
+     * what vendor a6xx_load_pdc_ucode does for a620. */
+    Mapping &seq = s.pdcSeq;
+    const uint32_t pdcSequence[5] = {0xFEBEA1E1u, 0xA5A4A3A2u, 0x8382A6E0u, 0xBCE3E284u, 0x002081FCu};
+    for (unsigned index = 0; index < 5; ++index) write32(seq, uint64_t(index) * 4, pdcSequence[index]);
     Mapping &cfg = s.pdcCfg;
+    const uint32_t mx = s.cmdDb.mxAddress;
+    const uint32_t cx = s.cmdDb.cxAddress;
+    /* This command DB has no xo.lvl entry; mainline's non-AOP default XO resource is 0x30080. */
+    const uint32_t xo = s.cmdDb.xoAddress ? s.cmdDb.xoAddress : 0x30080u;
+    const uint32_t vrm = s.cmdDb.vrmAddress;
+    /* One TCS command is three consecutive dwords; PDC_CMD_OFFSET (4) is the stride (a6xx_reg.h). */
+    auto pdcCommand = [&](uint32_t messageBase, unsigned index, uint32_t address, uint32_t data) {
+        const uint32_t at = messageBase + index * kPdcCmdOffset;
+        write32(cfg, uint64_t(at) * 4, kPdcMsgId);
+        write32(cfg, uint64_t(at + 1) * 4, address);
+        write32(cfg, uint64_t(at + 2) * 4, data);
+    };
+    write32(cfg, kPdcTcs1CmdEnable * 4, 7);
+    write32(cfg, kPdcTcs1CmdWait * 4, 0);
+    write32(cfg, kPdcTcs1Control * 4, 0);
+    pdcCommand(kPdcTcs1Cmd0MsgId, 0, mx, 1);
+    pdcCommand(kPdcTcs1Cmd0MsgId, 1, cx, 0);
+    pdcCommand(kPdcTcs1Cmd0MsgId, 2, xo, 0);
+    if (vrm) pdcCommand(kPdcTcs1Cmd0MsgId, 3, vrm + 4, 0);
+    write32(cfg, kPdcTcs3CmdEnable * 4, 7);
+    write32(cfg, kPdcTcs3CmdWait * 4, 0);
+    write32(cfg, kPdcTcs3Control * 4, 0);
+    pdcCommand(kPdcTcs3Cmd0MsgId, 0, mx, 2);
+    pdcCommand(kPdcTcs3Cmd0MsgId, 1, cx, 2);
+    pdcCommand(kPdcTcs3Cmd0MsgId, 2, xo, 3);
+    if (vrm) pdcCommand(kPdcTcs3Cmd0MsgId, 3, vrm + 4, 1);
     write32(cfg, kPdcSeqStartAddr * 4, 0);
     write32(cfg, kPdcEnable * 4, 0x80000001u);
     barrier();
-    printf("PICASSO_GPU gmu: PDC enabled (AOP-owned TCS; mx=%x cx=%x xo=%x vrm=%x)\n",
-        s.cmdDb.mxAddress, s.cmdDb.cxAddress, s.cmdDb.xoAddress, s.cmdDb.vrmAddress);
+    printf("PICASSO_GPU gmu: PDC programmed (cpu TCS; mx=%x cx=%x xo=%x vrm=%x)\n",
+        mx, cx, xo, vrm);
 }
 
 int hfiHealthy(void *)
@@ -1090,6 +1215,216 @@ int startCm3()
     return 0;
 }
 
+int gxWait(void *cookie)
+{
+    /* AdrenoHfiExchange calls wait_once(void *) between poll iterations; one ~1 ms sleep each. */
+    return hfiWait(cookie, 100);
+}
+
+AdrenoHfiStatus hfiExchangeSimple(unsigned id, const uint32_t *payload, size_t words)
+{
+    uint32_t output[16] = {};
+    size_t count = 0;
+    uint32_t error = 0;
+    const AdrenoHfiStatus status = AdrenoHfiExchange(&gState->hfi, id, payload, words, 1000, gxWait,
+        output, 16, &count, &error);
+    printf("PICASSO_GPU hfi: id=%u status=%d fw=%x words=%lu\n",
+        id, int(status), error, static_cast<unsigned long>(count));
+    return status;
+}
+
+/* kgsl_hfi.c hfi_send_lm_feature_ctrl: H2F_MSG_FEATURE_CTRL {feature=LM(7), enable=1, throttle_mask} then
+ * H2F_MSG_SET_VALUE {type=HFI_VALUE_LM_CS0(115), subtype=0, data=isense_slope}, both before CORE_FW_START.
+ * KGSL gates both on ADRENO_LM_CTRL; qcom,gpu-pwrlevels-1 carries no qcom,throttle-pwrlevel, so no level is
+ * throttled. */
+AdrenoHfiStatus hfiSendLm()
+{
+    const uint32_t slope = readIsenseSlope();
+    printf("PICASSO_GPU hfi: lm slope=%u\n", slope);
+    const uint32_t feature[3] = {7, 1, 0};
+    AdrenoHfiStatus status = hfiExchangeSimple(11, feature, 3);
+    if (status != AdrenoHfiSuccess) return status;
+    const uint32_t value[3] = {115, 0, slope};
+    return hfiExchangeSimple(13, value, 3);
+}
+
+/* a6xx_gmu_resume (mainline) and kgsl gmu_start (vendor) both run the full HFI startup through
+ * HFI_H2F_MSG_START, and only then set the first frequency. Drive the same validated stage encoder through
+ * StageStart here; gxPowerOn() then clears the GMU2HOST latch, votes the boot level and takes the GPU_SET OOB
+ * exactly where a6xx_gmu_set_initial_freq() and the first hw_init OOB sit. wf20-wf22 ran START before the vote
+ * too, but with the GPU PDC unprogrammed, so this run isolates the PDC TCS as the variable. */
+int gxPowerOn(unsigned perfIndex);
+
+AdrenoHfiStatus hfiStartupBeforeStart(const AdrenoHfiStartupConfig &config, unsigned perfIndex,
+    unsigned *lastStage)
+{
+    GmuState &s = *gState;
+    if (hfiHealthy(nullptr)) return AdrenoHfiUnexpected;
+    for (unsigned step = AdrenoHfiStagePerformance; step <= AdrenoHfiStageStart; ++step) {
+        const AdrenoHfiStartupStage stage = AdrenoHfiStartupStage(step);
+        if ((stage == AdrenoHfiStageAcdEnable || stage == AdrenoHfiStageAcdTable) &&
+            !config.acd_enable_mask) continue;
+        if (stage == AdrenoHfiStageIfpc && !config.enable_ifpc) continue;
+        if (lastStage) *lastStage = step;
+        if (stage == AdrenoHfiStageCoreStart) {
+            const AdrenoHfiStatus lm = hfiSendLm();
+            if (lm != AdrenoHfiSuccess) return lm;
+        }
+        uint32_t id = 0;
+        uint32_t payload[159] = {};
+        size_t words = 0;
+        if (AdrenoHfiStartupEncode(&config, stage, &id, payload, 159, &words) !=
+            AdrenoHfiStartupSuccess) {
+            printf("PICASSO_GPU hfi: stage %u refused by encoder\n", step);
+            return AdrenoHfiInvalid;
+        }
+        uint32_t output[16] = {};
+        size_t count = 0;
+        uint32_t error = 0;
+        const AdrenoHfiStatus status = AdrenoHfiExchange(&s.hfi, id, payload, words, 1000, gxWait,
+            output, 16, &count, &error);
+        if (stage == AdrenoHfiStageStart) {
+            /* No console output between START and the vote. */
+            const int gx = gxPowerOn(perfIndex);
+            printf("PICASSO_GPU hfi: stage=%u id=%u status=%d fw=%x words=%lu gx=%d\n",
+                step, id, int(status), error, static_cast<unsigned long>(count), gx);
+            return (status == AdrenoHfiSuccess && gx == 0) ? AdrenoHfiSuccess : AdrenoHfiUnexpected;
+        }
+        printf("PICASSO_GPU hfi: stage=%u id=%u status=%d fw=%x words=%lu\n",
+            step, id, int(status), error, static_cast<unsigned long>(count));
+        if (status != AdrenoHfiSuccess) return status;
+    }
+    return AdrenoHfiSuccess;
+}
+
+int gxPowerOn(unsigned perfIndex)
+{
+    GmuState &s = *gState;
+
+    /* a6xx_gmu_resume order: the HFI startup has already acked START (encoder StageStart above); clear the
+     * GMU2HOST interrupt it latched, vote the initial frequency (H2F_MSG_GX_BW_PERF_VOTE; bw =
+     * INVALID_DCVS_IDX, as kgsl_gmu.c gmu_dcvs_set() does for the boot level), then take the GPU_SET OOB the
+     * way the first hw_init does and let the GMU bring GX up. The vote needs the PDC TCS banks programmed
+     * (rscAndPdc) or the firmware fails it inside GmuPwrGxBwVote. */
+    coreWrite(kGmuGmu2HostIntrClr, 0xFFFFFFFFu);
+    barrier();
+    const uint32_t vote[3] = {1, perfIndex, 0xFF};
+    AdrenoHfiStatus voteStatus = AdrenoHfiUnexpected;
+    {
+        uint32_t output[16] = {};
+        size_t count = 0;
+        uint32_t error = 0;
+        voteStatus = AdrenoHfiExchange(&s.hfi, 30, vote, 3, 1000, gxWait,
+            output, 16, &count, &error);
+        printf("PICASSO_GPU gx: vote status=%d fw=%x words=%lu skipped=%u perf=%u bw=%u\n",
+            int(voteStatus), error, static_cast<unsigned long>(count), s.hfi.skipped, vote[1], vote[2]);
+    }
+
+    /* a6xx_gmu_oob_bits[GMU_OOB_GPU_SET] non-legacy: request 30, ack 31, clear 31. The set/ack pair is the
+     * GMU's "hold GX on" handshake. KGSL gives the request 100 ms (q2msm's a650 notes) and mainline's
+     * gmu_poll_timeout budget is 100 us x 100000; a 10 ms budget can miss a rail that ramps slowly, so use
+     * KGSL's 100 ms before calling the OOB failed. The request bit stays set until a6xx_gmu_clear_oob
+     * (HOST2GMU_INTR_SET bit 31) after hw_init has touched the GPU. */
+    const uint32_t before = coreRead(kGmuGxPwrStatus);
+    coreWrite(kGmuHost2GmuIntrSet, 1u << 30);
+    barrier();
+    unsigned polls = 0;
+    uint32_t info = 0;
+    for (; polls < 1000; ++polls) {
+        info = coreRead(kGmuGmu2HostIntrInfo);
+        if (info & (1u << 31)) break;
+        IODelay(100);
+    }
+    const bool acked = (info & (1u << 31)) != 0;
+    coreWrite(kGmuGmu2HostIntrClr, 1u << 31);
+    barrier();
+
+    /* The ACK means the firmware started the rail, not that it finished; read the status the way
+     * a6xx_gmu_gx_is_on does for A6XX: GX is on when GX_HM_GDSC_POWER_OFF (bit 6) and GX_HM_CLK_OFF (bit 7)
+     * are clear. (Bits 0/1 are the A7XX variant's fields and the A6XX SPTPRAC powering state.) */
+    constexpr uint32_t kGxOffBits = (1u << 6) | (1u << 7);
+    uint32_t after = coreRead(kGmuGxPwrStatus);
+    unsigned settle = 0;
+    while ((after & kGxOffBits) && settle < 1000) {
+        IODelay(100);
+        after = coreRead(kGmuGxPwrStatus);
+        ++settle;
+    }
+    const bool on = (after & kGxOffBits) == 0;
+    printf("PICASSO_GPU gx: oob polls=%u info=%08x settle=%u status=%08x->%08x %s\n",
+        polls, info, settle, before, after, on ? "on" : "off");
+
+    if (!on || voteStatus != AdrenoHfiSuccess) {
+        /* Wire-level evidence: did the firmware write a response packet, and what do the queue headers
+         * say? Queue table layout is AdrenoHfiInitializeStopped's; q.read/write are v[10]/v[11]. */
+        volatile uint32_t *m = s.hfi.shared;
+        const uint32_t cmdmask = 1023;
+        const unsigned cmdWrite = m[17];
+        printf("PICASSO_GPU gx: hfi q r/w %u/%u %u/%u %u/%u pending=%08x seq=%u "
+               "resp %08x %08x %08x %08x\n",
+            m[16], m[17], m[28], m[29], m[40], m[41], s.hfi.pending_header, s.hfi.sequence,
+            m[2 * 1024 + 0], m[2 * 1024 + 1], m[2 * 1024 + 2], m[2 * 1024 + 3]);
+        printf("PICASSO_GPU gx: cmd write=%u last", cmdWrite);
+        for (unsigned index = 0; index < 8; ++index)
+            printf(" %08x", m[1024 + ((cmdWrite - 8 + index) & cmdmask)]);
+        printf("\n");
+        /* Official F2H debug queue: every packet is {header, payload}; F2H_MSG_ERR (100) carries
+         * {error_code, ASCII text} (kgsl receive_err_req) and F2H_MSG_DEBUG (101) {type, timestamp, data}
+         * (receive_debug_req). This is where the firmware names the request it refused. */
+        volatile uint32_t *debug = m + 3 * 1024;
+        unsigned dbgRead = m[40];
+        const unsigned dbgWrite = m[41];
+        for (unsigned packet = 0; packet < 8 && dbgRead != dbgWrite; ++packet) {
+            const uint32_t header = debug[dbgRead & cmdmask];
+            const unsigned id = header & 0xFFu, words = (header >> 8) & 0xFFu;
+            if (words < 2 || words > 64) break;
+            printf("PICASSO_GPU gx: dbg id=%u", id);
+            if (id == 100) {
+                printf(" err=%08x \"", debug[(dbgRead + 1) & cmdmask]);
+                for (unsigned word = 2; word < words; ++word) {
+                    const uint32_t value = debug[(dbgRead + word) & cmdmask];
+                    for (unsigned byte = 0; byte < 4; ++byte) {
+                        const char ch = char((value >> (byte * 8)) & 0xFFu);
+                        if (ch >= 0x20 && ch < 0x7F) printf("%c", ch);
+                    }
+                }
+                printf("\"");
+            } else {
+                for (unsigned word = 1; word < words; ++word)
+                    printf(" %08x", debug[(dbgRead + word) & cmdmask]);
+            }
+            printf("\n");
+            dbgRead = (dbgRead + ((words + 3) & ~3u)) & cmdmask;
+        }
+        volatile uint32_t *log = reinterpret_cast<volatile uint32_t *>(
+            aliasBytes(s.buffer[3].alias));
+        printf("PICASSO_GPU gx: log");
+        for (unsigned index = 0; index < 64; ++index) printf(" %08x", log[index]);
+        printf("\n");
+        printf("PICASSO_GPU gx: diag hfi=%08x fwinit=%08x g2h=%08x h2g=%08x raw=%08x\n",
+            coreRead(kGmuHfiCtrlStatus), coreRead(kCm3FwInitResult),
+            coreRead(kGmuGmu2HostIntrInfo), coreRead(kGmuHost2GmuIntrSet),
+            coreRead(kGmuHost2GmuIntrRaw));
+        /* Power-path snapshot for a refused GX vote: what the RSC/PDC and GPUCC think the GX rail is doing.
+         * RSCC TCS0..3 status bit0 is KGSL's a6xx_complete_rpmh_votes() completion check. */
+        printf("PICASSO_GPU gx: diag rsc status0=%08x seqbusy=%08x tcs=%08x/%08x/%08x/%08x "
+               "rpmh_state=%08x\n",
+            rsccRead(kRscStatus0Drv0), rsccRead(kRscSeqBusyDrv0),
+            rsccRead(kRscTcs0Status), rsccRead(kRscTcs1Status),
+            rsccRead(kRscTcs2Status), rsccRead(kRscTcs3Status),
+            coreRead(kGmuRpmhPowerState));
+        printf("PICASSO_GPU gx: diag pdc enable=%08x tcs1=%08x tcs3=%08x\n",
+            read32(s.pdcCfg, uint64_t(kPdcEnable) * 4),
+            read32(s.pdcCfg, uint64_t(kPdcTcs1CmdEnable) * 4),
+            read32(s.pdcCfg, uint64_t(kPdcTcs3CmdEnable) * 4));
+        printf("PICASSO_GPU gx: diag gpucc gx_gdscr=%08x gx_cfg=%08x clamp=%08x cx_gdscr=%08x "
+               "gx_gmu=%08x\n",
+            read32(s.gpucc, 0x100cu), read32(s.gpucc, 0x1010u), read32(s.gpucc, 0x1508u),
+            read32(s.gpucc, 0x106cu), read32(s.gpucc, 0x1064u));
+    }
+    return (on && voteStatus == AdrenoHfiSuccess) ? 0 : -1;
+}
+
 } // namespace
 
 extern "C" int native_adreno620_gmu_boot(const uint8_t *gmu, size_t gmuBytes,
@@ -1223,29 +1558,36 @@ extern "C" int native_adreno620_hfi_handshake(void)
             config.gmu[1].vote = vote;
     }
 
-    /* Mainline a6xx_build_bw_table: one "off" bandwidth level for the targets whose GMU does not scale bus
-     * bandwidth itself (gmu_core_scales_bandwidth() is false before A640, which includes A620). */
+    /* Mainline's generic a6xx table (the one it picks for a620) hardcodes a630-era RPMh BCM addresses. This
+     * device's command DB has SH0=0x50004, MC0=0x50000, ACV=0x5007c (the a650_build_bw_table DDR trio) and
+     * CN0=0x50074, while the generic table's cnoc trio (0x50034/0x5007c/0x5004c) contains no CN0 at all.
+     * The GMU votes the CNOC/DDR BCMs from this table while it powers GX (bw = INVALID_DCVS_IDX derives the
+     * level), so a table without the target's CN0 makes the first vote fail (wf37 measured the addresses;
+     * q2msm's a650 port hit the same class of bug: "XR2 has CN0 at 0x50074, not 0x500a4"). Use the a650
+     * firmware's own table shape with this device's CN0. */
     config.bandwidth_count = 1;
-    config.cnoc_count = 3;
+    config.cnoc_count = 1;
     config.ddr_count = 3;
-    config.cnoc_wait_mask = 0x05;
-    config.ddr_wait_mask = 0x07;
-    const uint32_t cnocAddresses[3] = {0x50034, 0x5007C, 0x5004C};
-    const uint32_t ddrAddresses[3] = {0x50000, 0x5005C, 0x5000C};
-    for (unsigned index = 0; index < 3; ++index) {
-        config.cnoc_addresses[index] = cnocAddresses[index];
-        config.ddr_addresses[index] = ddrAddresses[index];
-    }
+    config.cnoc_wait_mask = 0x01;
+    config.ddr_wait_mask = 0x01;
+    config.cnoc_addresses[0] = s.cmdDb.cn0Address;
+    config.ddr_addresses[0] = s.cmdDb.mc0Address;
+    config.ddr_addresses[1] = s.cmdDb.sh0Address;
+    config.ddr_addresses[2] = s.cmdDb.acvAddress;
     config.cnoc_data[0][0] = 0x40000000u;
-    config.cnoc_data[0][1] = 0x00000000u;
-    config.cnoc_data[0][2] = 0x40000000u;
     config.cnoc_data[1][0] = 0x60000001u;
-    config.cnoc_data[1][1] = 0x20000001u;
-    config.cnoc_data[1][2] = 0x60000001u;
-    config.ddr_data[0][0] = 0x40000000u;
-    config.ddr_data[0][1] = 0x40000000u;
-    config.ddr_data[0][2] = 0x40000000u;
+    for (unsigned index = 0; index < 3; ++index) config.ddr_data[0][index] = 0x40000000u;
     config.enable_ifpc = 0;
+
+    /* kgsl_gmu.c only sends the ACD table and feature when the AOP mailbox exists: gmu_aop_mailbox_init sets
+     * ADRENO_ACD_CTRL and gmu_aop_send_acd_state tells the AOP "{class: gpu, res: acd, value: 1}" before the
+     * first boot. This port has no AOP mailbox, so a GMU configured for ACD would run against an AOP that
+     * was never told; leave ACD off until the mailbox is available (KGSL's own behaviour without it). */
+    config.acd_version = 0;
+    config.acd_stride = 0;
+    config.acd_enable_mask = 0;
+    config.acd_count = 0;
+    printf("PICASSO_GPU hfi: acd off (no AOP mailbox)\n");
 
     if (AdrenoHfiStartupValidate(&config) != AdrenoHfiStartupSuccess) {
         printf("PICASSO_GPU hfi: startup configuration refused (gpu levels=%u votes=%u)\n",
@@ -1255,27 +1597,17 @@ extern "C" int native_adreno620_hfi_handshake(void)
     printf("PICASSO_GPU hfi: perf gpu=%u gmu=%u votes=%u bin=%02x gmu-vote=%08x\n",
         config.gpu_count, config.gmu_count, s.votesAvailable, s.speedBin, config.gmu[1].vote);
 
-    /* Cookie: NativeAdrenoKernelTime::now_us/wait_us are the production platform time source and reject a non-null
-     * cookie (tests inject their own); hfiWait/hfiHealthy ignore it. Passing &s here made the very first now_us in
-     * AdrenoHfiStartupRun fail with ClockError before any command was published. */
-    AdrenoHfiStartupServices services = {
-        nullptr, &NativeAdrenoKernelTime::now_us, &hfiWait, &hfiHealthy,
-        2048, 100, 200000, 5000000,
-    };
-    if (AdrenoHfiStartupValidateServices(&services) != AdrenoHfiStartupSuccess) {
-        printf("PICASSO_GPU hfi: startup services refused\n");
-        return -1;
-    }
-    AdrenoHfiStartup startup = {};
-    AdrenoHfiStartupResult result = {};
-    const AdrenoHfiStartupStatus status = AdrenoHfiStartupRun(&startup, &s.hfi, &config,
-        &services, &result);
-    printf("PICASSO_GPU hfi: run status=%d stage=%u transport=%d fw=%u commands=%u polls=%u "
-           "elapsed=%llu skipped=%u\n",
-        status, unsigned(result.stage), int(result.transport_status), result.firmware_error,
-        result.published_commands, result.poll_reads,
-        static_cast<unsigned long long>(result.elapsed_us), s.hfi.skipped);
-    if (status != AdrenoHfiStartupSuccess) {
+    /* Stages through CORE_FW_START, the first GX vote, the GPU_SET OOB and START, in one uninterrupted sequence
+     * (a6xx_gmu_resume's order); no console output between CORE_FW_START and the vote. */
+    const unsigned perfIndex = bin->initial_level < bin->count ?
+        unsigned(bin->count - 1 - bin->initial_level) : unsigned(bin->count - 1);
+    printf("PICASSO_GPU hfi: initial perf index=%u (dt level=%u of %lu)\n",
+        perfIndex, bin->initial_level, static_cast<unsigned long>(bin->count));
+    unsigned lastStage = 0;
+    const AdrenoHfiStatus status = hfiStartupBeforeStart(config, perfIndex, &lastStage);
+    printf("PICASSO_GPU hfi: run status=%d last-stage=%u skipped=%u\n",
+        int(status), lastStage, s.hfi.skipped);
+    if (status != AdrenoHfiSuccess) {
         printf("PICASSO_GPU hfi: first mismatched response header=%08x ret=%08x code=%08x\n",
             s.hfi.skipped_header, s.hfi.skipped_ret, s.hfi.skipped_code);
         return -1;

@@ -514,3 +514,94 @@ The frame *count* is unchanged (the UI is still CPU-render bound with the GPU of
 removes the copy stall from the presentation path, P3 must supply the render path. The
 shadow compare still scans the whole 10.4 MB each swap (~20 ms); if the client ever sends
 partial dirty rects, that pass can be avoided too.
+
+
+## 12. P3 — GX power-on: resolved (wf17–wf38)
+
+**Result.** The GMU cold start, HFI startup and first GX performance vote now complete on hardware:
+
+    vote status=0 fw=0 words=0 skipped=0 perf=1 bw=255
+    oob polls=2 info=80000001 settle=0 status=000000c0->00000000 on
+    hfi: stage=7 id=10 status=0 fw=0 words=0 gx=0
+    hfi: run status=0 last-stage=7 skipped=0
+    PICASSO_GPU end stage=3 step=4 error=0 requested=3 ticks=3 done=1
+
+`GX_HM_GDSC_POWER_OFF` and `GX_HM_CLK_OFF` (bits 6/7 of `GMU_SPTPRAC_PWR_CLK_STATUS`) clear, the
+GPU_SET OOB acked, START acked, and the boot continues into userland with no panic.
+**[verified: out/wf38-runs/run1.log]**
+
+**Root cause (measured).** The GMU votes the DDR/CNOC BCMs while it powers GX. The port sent
+mainline's generic A630 bandwidth table, whose RPMh BCM addresses do not exist on SM7250, so the
+first GX vote timed out inside `GmuPwrGxBwVote` (F2H debug queue id 100, code `0x007300b8`). The
+fix is the A620 table: one bandwidth level (the firmware's "off" level), DDR commands
+MC0/SH0/ACV read from this device's command DB (0x50000/0x50004/0x5007c) and the CNOC command CN0
+(0x50074) instead of the generic `{0x50034, 0x5007c, 0x5004c}`, which contains no CN0. This
+matches the upstream A620 series (Ishu Brar, 2026-10-23): "Without bandwidth levels the GMU falls
+back to the generic A630 table, whose BCM addresses do not exist on SM7250, and the first GX
+performance vote times out."
+
+**Second defect found on the way: the command-DB parse was 144 bytes off.**
+`rsc_hdr.header_offset`/`data_offset` are offsets from the end of `cmd_db_header` (cmd-db.c
+`rsc_to_entry_header`/`rsc_offset`); the port indexed them from the mapping base. The entry walk
+still lined up (24-byte stride), but every aux table was read from the entry/id bytes: the boot
+vote printed `gmu-vote=6d6d0800` (ASCII "mm") and `xo.lvl`/`vrm.soc` were reported missing. After
+the fix: `gfx[8]=0,40,80,c0…`, `mx[7]=0,10,80,c0…`, `cx[8]=0,10,40,80…`, GMU vote
+`0x00400202`, GPU vote for the DT level `0x00400201`, `xo.lvl=0x300a0`, `vrm.soc=0x43400`. The
+PDC is then programmed exactly as vendor `a6xx_load_pdc_ucode` does for a620: sequencer ucode,
+TCS1 `{mx=1, cx=0, xo=0, vrm+4=0}`, TCS3 `{mx=2, cx=2, xo=3, vrm+4=1}`, `PDC_ENABLE=0x80000001`.
+Upstream's A620 series states the same requirement ("the A620 has no PDC setup from AOP, so the
+PDC sequencer is programmed from the driver (xo/mx/cx addresses from cmd-db)"; the VRM command
+goes into both TCS banks).
+
+**What the firmware answered while it was still refusing.** Every failed vote produced
+`dbg id=100 err=007300b8 "GmuPwrGxBwVote"` on the F2H debug queue (queue 2) while the command
+queue advanced to the write index and no response appeared on queue 1. KGSL's decode
+(`kgsl_hfi.h`: `F2H_MSG_ERR` = id 100 carries `{error_code, ASCII}`) is what named the handler.
+
+**Ruled out during the search** (each with a boot; logs under out/wf2x-runs):
+- message order: START (id 10) acked before the vote; vote → OOB → START (vendor `gmu_start` and
+  the quest2-steamos recipe); START → vote → OOB (mainline `a6xx_gmu_resume`). All failed
+  identically, because every pre-wf35 run also sent the corrupt ARC votes above.
+- ACD: the GMU node carries an AOP mailbox, so KGSL sets `ADRENO_ACD_CTRL` and tells the AOP
+  before booting. This port has no mailbox, so ACD is now left off; the vote failed with and
+  without the ACD table/feature.
+- LM feature + `HFI_VALUE_LM_CS0` slope (qfprom 0x45c8 reads 0): accepted, not the blocker.
+- RSCC sleep: `GMU_RSCC_CONTROL_ACK` bit0 = 0 at boot (RSC awake); the wake path exists and is
+  skipped.
+- OOB timing: once the vote succeeds the ACK arrives in 2 polls, so the old 10 ms budget was not
+  the blocker; it is now KGSL's 100 ms anyway.
+- Pre-powering GX from the CPU: mainline's `a6xx_gmu_gxpd_get` uses `gmu_gx_gdsc` whose
+  `power_on` is `gdsc_gx_do_nothing_enable` (verified in gdsc.c), i.e. it does not toggle the
+  GDSC; the GMU owns GX.
+
+**Remaining notes.**
+- PDC ownership on this target: mainline treats the whole A650 family as AOP-owned, vendor a620's
+  core does not; this port programs the PDC from the driver, matching vendor and the upstream A620
+  series. Both the full CPU-PDC path and the earlier enable-only path were tried; the bandwidth
+  table was the discriminator.
+- The AOP QMP mailbox message `{class: gpu, res: acd, value: 1}` is not implemented, so ACD stays
+  disabled.
+- Firmware pair: this port uses the vendor image's `a650_gmu.bin` (+ `a630_sqe.fw`, `a650_sqe.fw`,
+  `a620_zap`), which is also the vendor picasso a620 core's pair; upstream a620 uses
+  `a621_gmu.bin`. The first vote comes up on the vendor firmware.
+- The OOB request is left asserted after `gxPowerOn` returns; the next step (CP/SQE, `hw_init`)
+  should clear it with `HOST2GMU_INTR_SET` bit 31 once the GPU registers have been touched.
+
+## 13. Boot time: the UEFI menu timeout is 3 s of the first-console time
+
+Method: `/tmp/measure-boot.sh` starts a libusb reader on 1209:0001 before issuing `fastboot boot`
+and prints the host time to the first CDC console byte (`Darwin Kernel Version ...`). Each image
+was measured twice.
+
+- baseline (`timeout = 3`, out/wf28-20261102): 22.637 s, 22.581 s → **22.61 s** mean, 0.06 s spread
+- `timeout = 0`, `fallback_timeout = 1` (out/wf16-20261102): 19.650 s, 19.682 s → **19.67 s** mean
+
+The 2.94 s (13.0 %) difference is the UEFI menu's input wait. Neither image changes anything else
+about the boot (same kernel, same args, `sheng-gpu=0`). The default payload TOML now uses
+`timeout = 0` with `fallback_timeout = 1` so an unattended boot skips the menu while a keypress
+still opens it.
+
+Other candidates not yet measured: `picasso_usb_control_ms=15000` (host enumeration wait),
+`native-ufs-start-delay=5`, `offline-hid-start=480` and `sheng-touch-start=60` only gate the
+probe timing, not the console byte, so they do not affect this metric. The first console byte is
+printed by the XNU kernel; earlier time is UEFI + payload load.
