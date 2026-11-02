@@ -75,9 +75,10 @@ def verify_setup_preferences(target, spec):
     if '--statusbar-provider' in arguments:
         require(arguments.count('--statusbar-provider') == 1, 'Duplicate Setup status bar provider')
         index = arguments.index('--statusbar-provider') + 1
-        require(index < len(arguments) and arguments[index] == '_UIStatusBarVisualProvider_LegacyPhone',
+        require(index < len(arguments) and arguments[index] == '_UIStatusBarVisualProvider_Pad_ForcedNoCell',
                 'Invalid Setup status bar provider')
-        expected['com.apple.UIKit'] = {'UIStatusBarVisualProviderClassName': arguments[index]}
+        expected['com.apple.UIKit'] = {'UIStatusBarVisualProviderClassName': arguments[index],
+                                     'StatusBarHidesDate': True}
     if '--no-auto-dim' in arguments:
         expected['com.apple.springboard'].update(SBDisableAutoDim=True,
                                                 SBDontDimOrLockOnAC=True, SBDisableIdleSleep=True)

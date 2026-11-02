@@ -63,7 +63,7 @@ def main():
     (work / 'ram-data/data.dbrdisk').write_bytes(base_blob)
     spec = dict(skip_setup_tool='scripts/picasso-seed-skip-setup.py',
                 skip_setup_args=['--no-auto-dim', '--inject-lib', 'out/picasso/libpicasso-sb.dylib',
-                                 '--statusbar-provider', '_UIStatusBarVisualProvider_LegacyPhone'])
+                                 '--statusbar-provider', '_UIStatusBarVisualProvider_Pad_ForcedNoCell'])
     path = work / 'payload' / ('data-skip-setup-' + base['packed_sha256'][:12] + '-'
                               + hashlib.sha256(' '.join(spec['skip_setup_args']).encode()).hexdigest()[:8] + '.dbr')
     path.write_bytes(blob)
@@ -151,7 +151,8 @@ def main():
         tool.merge_pref(seed_root, 'com.apple.migration', {'LastSystemVersion': check.firmware.BUILD})
         tool.merge_pref(seed_root, 'com.apple.springboard', {'SBDisableAutoDim': True})
         assert plistlib.loads(ui_path.read_bytes()) == {
-            'ExistingPreference': 42, 'UIStatusBarVisualProviderClassName': '_UIStatusBarVisualProvider_LegacyPhone'}
+            'ExistingPreference': 42, 'UIStatusBarVisualProviderClassName': '_UIStatusBarVisualProvider_Pad_ForcedNoCell',
+            'StatusBarHidesDate': True}
         assert merged.count('com.apple.UIKit') == 1
         assert plistlib.loads((prefs / 'com.apple.springboard.plist').read_bytes()) == {
             'SBDisableAutoDim': True, 'BSUIVibrancyEffectViewDisabled': True}
@@ -163,7 +164,7 @@ def main():
                       ['--statusbar-provider', wrapper.STATUSBAR_PROVIDER, '--statusbar-provider', wrapper.STATUSBAR_PROVIDER]):
         case('reject wrapper provider ' + ' '.join(arguments),
              lambda arguments=arguments: wrapper.consume_statusbar_provider(list(arguments)),
-             'Duplicate' if arguments.count('--statusbar-provider') > 1 else 'reviewed Phone provider')
+             'Duplicate' if arguments.count('--statusbar-provider') > 1 else 'reviewed rectangular provider')
     state = {}
 
     def metadata(path):
@@ -195,7 +196,7 @@ def main():
             'com.apple.springboard': dict(BSUIVibrancyEffectViewDisabled=True, SBDisableAutoDim=True,
                                          SBDontDimOrLockOnAC=True, SBDisableIdleSleep=True),
             'com.apple.UIKit': dict(UIStatusBarVisualProviderClassName=state.get(
-                'provider', '_UIStatusBarVisualProvider_LegacyPhone')),
+                'provider', '_UIStatusBarVisualProvider_Pad_ForcedNoCell'), StatusBarHidesDate=not state.get('show_date')),
         }.items():
             if name == 'com.apple.UIKit' and state.get('missing_ui_domain'):
                 continue
@@ -236,6 +237,7 @@ def main():
         ('build', '21H461', 'Setup preferences differ'),
         ('bad_setup', True, 'Setup preferences differ'),
         ('provider', '_UIStatusBarFallbackVisualProvider', 'Setup preferences differ: com.apple.UIKit'),
+        ('show_date', True, 'Setup preferences differ: com.apple.UIKit'),
         ('missing_provider', True, 'Setup preferences differ: com.apple.UIKit'),
         ('missing_ui_domain', True, 'Missing Setup preference: com.apple.UIKit'),
         ('bad_library', True, 'library differs'),

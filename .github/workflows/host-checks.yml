@@ -41,6 +41,11 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Build the Picasso UIKit status bar library
+        run: |
+          python3 scripts/build-picasso-sb-inject.py \
+            package/picasso-springboard/picasso-sb-probe.m out/picasso/libpicasso-sb.dylib
+
       - name: Prepare the isolated upstream source
         run: |
           TREE=$(python3 ./unixnu --prepare)

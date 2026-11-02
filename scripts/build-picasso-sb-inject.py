@@ -8,9 +8,9 @@ signs it (codesign -s -) so dyld will map it. The kernel inserts it into
 SpringBoard (boot-arg picasso_inject_sb); AMFI accepts the ad-hoc signature only
 because the board also boots amfi_allow_any_signature=1.
 
-SOURCE is the library's single Objective-C source. The default probe
-(package/picasso-springboard/picasso-sb-probe.m) only proves the pipeline; a
-device-specific library is supplied by pointing this at a different source.
+SOURCE is the library's single Objective-C source. The default source supplies
+the Picasso status bar metric. picasso_inject_apps=1 also inserts it into
+application bundle executables, so app and SpringBoard metrics agree.
 """
 import subprocess
 import sys
@@ -29,7 +29,8 @@ def main():
     clang = xcrun('-find', 'clang')
     output.parent.mkdir(parents=True, exist_ok=True)
     compile_cmd = [clang, '-arch', 'arm64', '-isysroot', sdk, '-miphoneos-version-min=16.0',
-                   '-dynamiclib', '-fobjc-arc', '-framework', 'Foundation', '-O2',
+                   '-dynamiclib', '-fobjc-arc', '-framework', 'Foundation',
+                   '-framework', 'UIKit', '-O2',
                    '-o', str(output), str(source)]
     subprocess.run(compile_cmd, check=True)
     # Ad-hoc signature: the bytes AMFI needs present; amfi_allow_any_signature skips validating them.

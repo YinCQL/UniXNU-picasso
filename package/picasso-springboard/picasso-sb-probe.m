@@ -1,31 +1,68 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 //
-// libpicasso-sb.dylib (probe): a do-nothing library the kernel inserts into
-// SpringBoard on this board (boot-arg picasso_inject_sb=PATH, see
-// bsd/kern/kern_exec.c). Its only job is to prove the injection pipeline works
-// end to end: the kernel added DYLD_INSERT_LIBRARIES, AMFI allowed an ad-hoc
-// signed library into the process, and dyld mapped it and ran its constructor.
-//
-// It confirms it ran two ways. SpringBoard is sandboxed, so a /dev/console
-// write may be dropped; the reliable signal is reading the kernel sysctl
-// kern.picasso_inject_ack, whose handler prints the caller's pid to the
-// console (a sysctl read the sandbox allows). No SpringBoard class, method or
-// state is touched here; the device-specific logic that a real injected
-// library would carry is NOT in this file.
+// Picasso's rectangular status bar uses UIKit's native Pad_ForcedNoCell
+// provider (selected in the Data seed), with no carrier and time at the left.
+// Reserve another 14.5 mm at the right for the panel's camera area. Hook only
+// this provider's metric; UIKit still owns item placement and animations.
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
+typedef NSDirectionalEdgeInsets (*PicassoEdgeInsets)(id, SEL);
+static PicassoEdgeInsets original_edge_insets;
+
+static CGFloat picasso_statusbar_offset(CGSize size)
+{
+    // G7A panel: approximately 69.5 x 154.4 mm, 1080 x 2400 pixels.
+    // Vendor DTS reports 695 x 1544 in fields named mm (a tenfold metadata
+    // error); do not use those values as literal millimetres. At 360 x 800
+    // points this moves the battery 75.1 points, about 225 panel pixels.
+    CGFloat millimetres = size.width > size.height ? 154.4 : 69.5;
+    return size.width > 0 && size.height > 0 ? size.width * 14.5 / millimetres : 0;
+}
+
+static NSDirectionalEdgeInsets picasso_edge_insets(id receiver, SEL selector)
+{
+    NSDirectionalEdgeInsets insets = original_edge_insets(receiver, selector);
+    // Pad's native trailing margin is 5 pt; the previous LegacyPhone margin
+    // was 5.5 pt. Keep that origin before applying the requested extra shift.
+    insets.trailing += 0.5 + picasso_statusbar_offset(UIScreen.mainScreen.bounds.size);
+    return insets;
+}
+
+static BOOL picasso_install_statusbar(void)
+{
+    Class provider = objc_getClass("_UIStatusBarVisualProvider_Pad");
+    Method method = class_getClassMethod(provider, @selector(edgeInsets));
+    if (!method || method_getNumberOfArguments(method) != 2) return NO;
+    // 20H392 returns NSDirectionalEdgeInsets in d0-d3, not CGRect or an
+    // instance metric. Refuse an incompatible UIKit rather than guessing ABI.
+    char *return_type = method_copyReturnType(method);
+    BOOL compatible = return_type && !strcmp(return_type, @encode(NSDirectionalEdgeInsets));
+    free(return_type);
+    if (!compatible) return NO;
+    original_edge_insets = (PicassoEdgeInsets)method_getImplementation(method);
+    class_replaceMethod(object_getClass(provider), @selector(edgeInsets),
+                        (IMP)picasso_edge_insets, method_getTypeEncoding(method));
+    return YES;
+}
+
 __attribute__((constructor))
 static void picasso_sb_probe(void)
 {
+    BOOL installed = picasso_install_statusbar();
     int value = 0;
     size_t size = sizeof(value);
-    // The kernel handler prints "PICASSO_SBINJECT library ran ... pid=..." when this is read.
+    // Either logging path can be denied by a process sandbox. A kernel exec
+    // environment message alone does not establish that this constructor ran.
     sysctlbyname("kern.picasso_inject_ack", &value, &size, NULL, 0);
 
-    static const char line[] = "PICASSO_SBINJECT probe library loaded into SpringBoard\n";
+    const char *line = installed ? "PICASSO_SBINJECT statusbar metric installed (14.5 mm)\n"
+                                 : "PICASSO_SBINJECT statusbar metric unavailable\n";
     int fd = open("/dev/console", O_WRONLY);
     if (fd >= 0) {
         (void)write(fd, line, strlen(line));

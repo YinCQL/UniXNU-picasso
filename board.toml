@@ -186,8 +186,8 @@ offline_disabled_jobs = [
 ]
 # Use the selected iOS build for Setup/migration flags and disable automatic dimming.
 skip_setup_tool = "scripts/picasso-seed-skip-setup.py"
-# Native phone status bar layout for the 360-point-wide GOP screen.
-skip_setup_args = ["--no-auto-dim", "--inject-lib", "out/picasso/libpicasso-sb.dylib", "--statusbar-provider", "_UIStatusBarVisualProvider_LegacyPhone"]
+# Native rectangular status bar: time at left, no carrier label or date.
+skip_setup_args = ["--no-auto-dim", "--inject-lib", "out/picasso/libpicasso-sb.dylib", "--statusbar-provider", "_UIStatusBarVisualProvider_Pad_ForcedNoCell"]
 # Fits the kernel, trust caches and packed Data seed within the 95% content limit.
 size_mib = 60
 loader = "firmware"
@@ -206,9 +206,10 @@ kernel_args = [
   "armcpu-spi-ipi=1",
   # Request the top CPU frequency row; hardware limits still apply.
   "armcpu-cpufreq=1",
-  # Inject the ad-hoc signed SpringBoard probe from volatile Data.
+  # Apply the Picasso status bar metric in SpringBoard and main app executables.
   "picasso_inject_sb=/private/var/picasso/libpicasso-sb.dylib",
-  # Permit the probe signature for bring-up; keep cs_enforcement_disable unset.
+  "picasso_inject_apps=1",
+  # Permit the library signature for bring-up; keep cs_enforcement_disable unset.
   "amfi_allow_any_signature=1",
   # Reject framebuffer power-off during bring-up; black frames can still be presented.
   "picasso-fb-reject-off=1",
