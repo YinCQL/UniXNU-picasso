@@ -19,7 +19,7 @@ REPLAY_SOURCES = (
     'bsd/kern/kern_exec.c', 'bsd/vm/vm_unix.c', 'bsd/dev/picasso_usb.c',
     'bsd/kern/kern_exit.c', 'bsd/vfs/vfs_syscalls.c', 'bsd/vfs/vfs_lookup.c',
     'bsd/kern/sys_generic.c', 'bsd/kern/kern_descrip.c',
-    'bsd/kern/kern_mman.c', 'bsd/kern/ubc_subr.c',
+    'bsd/kern/kern_mman.c', 'bsd/kern/ubc_subr.c', 'bsd/sys/ubc_internal.h',
     'osfmk/arm64/sleh.c', 'iokit/Kernel/IOUserClient.cpp',
     'bsd/vfs/vfs_attrlist.c', 'bsd/kern/bsd_init.c', 'osfmk/arm/rtclock.c',
     'osfmk/kern/task.c', 'osfmk/arm/model_dep.c',
@@ -72,12 +72,14 @@ def main():
     export(a.xnu, xnu_rev, xnu)
     late_block = baseline.split('for LATE_PATCH in ', 1)[1].split('; do', 1)[0]
     late = [tree / path for path in re.findall(r'"\$ROOT/([^"\n]+)"', late_block)]
-    # These diagnostics modify functions already touched by the owner and
-    # boot-progress patches. Reverse them first on incremental builds.
+    # User-abort hooks modify launchd diagnostic context, which in turn modifies
+    # owner, signature-cache and boot-progress patches. Undo consumers first.
+    user_abort = tree / 'patches/xnu/zzzzzz-picasso-user-abort.patch'
+    framebuffer = tree / 'patches/xnu/zzzzzz-picasso-ios16-framebuffer-swap.patch'
     diagnostics = tree / 'patches/xnu/zzzzz-picasso-launchd-diagnostics.patch'
     assert diagnostics.is_file(), 'Missing launchd diagnostics patch'
-    assert late[0] == diagnostics, 'Launchd diagnostics must be reversed first'
-    assert late[1] == tree / 'patches/xnu/zzzz-picasso-systemos-union.patch'
+    assert late[:3] == [user_abort, framebuffer, diagnostics], 'Undo dependent diagnostics first'
+    assert late[3] == tree / 'patches/xnu/zzzz-picasso-systemos-union.patch'
     prelink = sorted(a.prelink_patches.resolve().glob('*.patch'))
     if not prelink:
         raise RuntimeError('No prelink patches; refusing an incomplete replay')

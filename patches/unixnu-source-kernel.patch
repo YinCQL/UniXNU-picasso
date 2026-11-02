@@ -1799,12 +1799,14 @@ diff --git a/patches/xnu/offline-owner-cache-carrier.patch b/patches/xnu/offline
 diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
 --- a/scripts/build-xnu-4k-baseline.sh
 +++ b/scripts/build-xnu-4k-baseline.sh
-@@ -35,7 +35,12 @@
+@@ -35,7 +35,14 @@
  # Remove them first so earlier independent patches retain their idempotent checks.
  # The same holds for the boot-time GPU addon mount and the staged system apps copy (zzy), which edit the owner Data mount function
  # inside the systemos patch. Reverse newest first; the loop below re-applies them in name order.
 -for LATE_PATCH in "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \
-+for LATE_PATCH in "$ROOT/patches/xnu/zzzzzz-picasso-ios16-framebuffer-swap.patch" \
++# User-abort hooks overlap launchd diagnostics in sleh.c and kern_exit.c.
++for LATE_PATCH in "$ROOT/patches/xnu/zzzzzz-picasso-user-abort.patch" \
++    "$ROOT/patches/xnu/zzzzzz-picasso-ios16-framebuffer-swap.patch" \
 +    "$ROOT/patches/xnu/zzzzz-picasso-launchd-diagnostics.patch" \
 +    "$ROOT/patches/xnu/zzzz-picasso-systemos-union.patch" \
 +    "$ROOT/patches/xnu/zzz-picasso-usb-console.patch" \
