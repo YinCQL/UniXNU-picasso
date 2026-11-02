@@ -310,9 +310,10 @@ scheduler. **[verified: /tmp/wf8-capture.log]**
 3. **Topology**: add the phys-id E/P classification in `ml_parse_cpu_topology()` (the live DT does
    carry `reg` 0x600/0x700), or rebuild the UEFI FD with a DT that names the clusters. Only then
    re-add `__ARM_AMP__ 1` and verify the topology dump shows `en=6 pn=2`.
-4. **Display path**: replace the full-frame copy with `native_legacy_copy_diff()` (already in
-   `NativeLegacyCopy.h`/`NativeLegacyRequest.h`) or raise the display work loop's QoS so the copy
-   stops being preempted. Note the source mapping is already cacheable (opts=0x1001).
+4. ~~**Display path**: replace the full-frame copy with `native_legacy_copy_diff()` or raise the
+   display work loop's QoS.~~ **DONE in wf15 (§11).** The copy runs on backboardd's user-client
+   thread, not the display work loop, so its QoS is the caller's; the shadow diff removes the
+   device stores for unchanged blocks (21–25 ms vs 135–187 ms).
 
 ## 8. Open questions / risks
 
@@ -482,3 +483,34 @@ Caveats:
 The `sched_amp` variant remains available as a build switch (§10.3/§10.5 history) but is
 not the default: it is not what sheng ships, and `CONFIG_SCHED_EDGE` also gates
 `struct thread`'s edge fields, so switching it changes the ABI (§9.2).
+
+## 11. P2 resolved — the scanout copy only stores dirty blocks (wf15)
+
+The full 10.4 MB copy per swap alternated between ~15 ms and ~130–187 ms (wf14:
+`PICASSO_DISPLAY event=10` a=0x27a2f2–0x371673 ticks, b=0x9e3400 every frame).
+The copy is not bandwidth bound (§4.2); the slowdown is the device stores and the
+scheduling around them.
+
+The client always submits full-frame dirty rectangles, so rectangle-based dirty copying
+would be a no-op. The tree already had the right facility:
+`native_legacy_copy_diff()` (`drivers/NativeMobileDisplay/NativeLegacyRequest.h:147-181`)
+compares 64-byte blocks against a cached shadow (rows packed at `width*4`) and stores only
+the blocks that changed. It had no caller.
+
+`NativeLegacyDisplay.cpp` now keeps that shadow (`copyShadow`, `IOMalloc(width*height*4)`,
+10.4 MB wired): the first real frame (or any frame after a blank/plain-path copy) does a full
+diff fill, later frames store only dirty blocks. Unsupported geometry or an allocation
+failure falls back to `native_legacy_copy_pixels()`; the blank swap invalidates the shadow.
+`event=10`'s `b` field now reports the bytes actually stored, not `length`.
+
+Measured (same kernel/payload/args except this change):
+- wf14 full copy: every frame b=0x9e3400, a=0x27a2f2–0x371673 ticks (135–187 ms).
+- wf15 shadow diff: first frame b=0x9e3400, then e.g. b=0, 0x51a40, 0, 0x2d0c0, 0x4c700,
+  0x44400, all at a=0x62ab–0x7662c ticks (21–25 ms). No 130 ms sample in 13 frames.
+  **[verified: out/wf15-runs/run1.log]**
+- 300 s, one boot, 0 panics; topology and scheduler unchanged (wf14 policy).
+
+The frame *count* is unchanged (the UI is still CPU-render bound with the GPU off): P2
+removes the copy stall from the presentation path, P3 must supply the render path. The
+shadow compare still scans the whole 10.4 MB each swap (~20 ms); if the client ever sends
+partial dirty rects, that pass can be avoided too.

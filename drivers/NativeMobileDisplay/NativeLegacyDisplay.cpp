@@ -46,6 +46,12 @@ extern "C" uint64_t mach_continuous_time(void);
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
+    // Previous frame for native_legacy_copy_diff (rows packed at width*4, same bytes as one GOP frame). The client always
+    // sends a full-frame dirty rect, so the only reusable dirty information is this shadow; IPC-backed dirty rects are a no-op here.
+    void *copyShadow=nullptr;
+    uint64_t copyShadowBytes=0;
+    bool copyShadowValid=false;
+    void releaseCopyShadow() {if(copyShadow)IOFree(copyShadow,copyShadowBytes);copyShadow=nullptr;copyShadowBytes=0;copyShadowValid=false;}
     uint32_t scanBudget=4;
     uint64_t frameCount=0;
     bool primary=false;
@@ -115,9 +121,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         OSSafeReleaseNULL(vsyncTimer);vsyncArmed=false;
     }
 public:
-    void free() override {stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+    void free() override {stopVsync();releaseCopyShadow();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
         stopVsync();
+        releaseCopyShadow();
         transferred=false;for(auto &entry: validated)entry=nullptr;
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
@@ -238,6 +245,7 @@ public:
                 native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
             }
             __asm__ volatile("dsb sy" ::: "memory");
+            copyShadowValid=false;   // the GOP is solid black now; the shadow no longer describes the panel
             transferred=true;
             native_legacy_frame_observed(1,0,0,0,0,0);
             native_legacy_transfer_observed(kIOReturnSuccess,request,blankLength);
@@ -325,13 +333,33 @@ public:
             OSSafeReleaseNULL(alt);if(ctrl)IOFree(ctrl,benchBytes);
         }
         uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
-        if(!native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
-            bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
-            source->getLength(),sourceStride,width,height)) {
-            OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
+        // The client's swap always covers the whole frame, so reuse the existing shadow-diff copy: a static frame stores no
+        // device bytes and a small update stores only the changed 64-byte blocks. Fall back to the plain copy on any
+        // unsupported geometry or an allocation failure, and invalidate the shadow whenever the plain path or a blank ran.
+        uint64_t stored=length;
+        int copied=0;
+        if(!copyShadow || copyShadowBytes<length) {
+            releaseCopyShadow();
+            copyShadow=IOMalloc(length);
+            if(copyShadow)copyShadowBytes=length;
+        }
+        if(copyShadow) {
+            const uint64_t diff=native_legacy_copy_diff(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+                bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
+                source->getLength(),sourceStride,width,height,copyShadow,copyShadowValid?1:0);
+            if(diff!=UINT64_MAX){stored=diff;copyShadowValid=true;copied=1;}
+            else copyShadowValid=false;
+        }
+        if(!copied) {
+            stored=length;
+            if(!native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+                bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
+                source->getLength(),sourceStride,width,height)) {
+                OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
+            }
         }
         __asm__ volatile("dsb sy" ::: "memory");
-        {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,length);}
+        {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
         OSSafeReleaseNULL(source);transferred=true;
         native_legacy_transfer_observed(kIOReturnSuccess,request,length);
         finishTransfer(request);
