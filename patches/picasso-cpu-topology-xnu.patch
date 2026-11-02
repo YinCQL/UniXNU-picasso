@@ -22,7 +22,7 @@
 +	uint64_t capacity_max = 0, capacity_min = ~(uint64_t)0;
 +	{
 +		OpaqueDTEntryIterator capacity_iter;
-+		OpaqueDTEntry capacity_child;
++		DTEntry capacity_child = NULL;
 +		if (SecureDTInitEntryIterator(entry, &capacity_iter) == kSuccess) {
 +			while (kSuccess == SecureDTIterateEntries(&capacity_iter, &capacity_child)) {
 +				uint64_t capacity = ml_readprop(capacity_child, "capacity-dmips-mhz", 0);

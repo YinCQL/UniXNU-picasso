@@ -458,13 +458,14 @@ extern "C" void sheng_cpufreq_probe(void) {
         if (SecureDTLookupEntry(NULL, "/", &entry) == kSuccess &&
             SecureDTGetProperty(entry, "model", &prop, &propSize) == kSuccess)
             printf("PICASSO_CPUFREQ topo dt model %.48s\n", (const char *)prop);
-        for (const char *cpu : {"/cpus/cpu@0", "/cpus/cpu@600"}) {
-            if (SecureDTLookupEntry(NULL, cpu, &entry) == kSuccess &&
+        const char *cpuPaths[2] = {"/cpus/cpu@0", "/cpus/cpu@600"};
+        for (unsigned i = 0; i < 2; ++i) {
+            if (SecureDTLookupEntry(NULL, cpuPaths[i], &entry) == kSuccess &&
                 SecureDTGetProperty(entry, "capacity-dmips-mhz", &prop, &propSize) == kSuccess)
                 printf("PICASSO_CPUFREQ topo dt %s capacity size=%u value=%u\n",
-                       cpu, propSize, propSize == 4 ? *(const uint32_t *)prop : 0);
+                       cpuPaths[i], propSize, propSize == 4 ? *(const uint32_t *)prop : 0);
             else
-                printf("PICASSO_CPUFREQ topo dt %s capacity missing\n", cpu);
+                printf("PICASSO_CPUFREQ topo dt %s capacity missing\n", cpuPaths[i]);
         }
     }
     // Read-only first look: enable, perf-state index, the engine's current frequency, the 0x704 vote (diagnostic) and
