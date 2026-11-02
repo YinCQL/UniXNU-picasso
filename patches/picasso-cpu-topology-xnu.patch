@@ -1,12 +1,13 @@
 --- a/pexpert/pexpert/arm64/board_config.h
 +++ b/pexpert/pexpert/arm64/board_config.h
-@@ -135,7 +135,7 @@
- 
+@@ -135,7 +135,8 @@
+
  #define MAX_L2_CLINE                   6
  #define MAX_CPUS                       8 /* sheng: SM8550 has eight cores */
 -#define MAX_CPU_CLUSTERS               1
 +#define MAX_CPU_CLUSTERS               2 /* sheng: SM7250: six A55 (E) and two A76 (P) cores */
- 
++#define __ARM_AMP__                    1
+
  #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
  #endif  /* ARM64_BOARD_CONFIG_BCM2837 */
 --- a/osfmk/arm64/machine_routines.c
@@ -36,13 +37,19 @@
  	while (kSuccess == SecureDTIterateEntries(&iter, &child)) {
  		boolean_t is_boot_cpu = ml_is_boot_cpu(child);
  		boolean_t cpu_enabled = cpumask_boot_arg & 1;
-@@ -1082,6 +1100,9 @@
+@@ -1082,6 +1100,15 @@
  			cpu->cluster_type = CLUSTER_TYPE_E;
  		} else if (cluster_type == 'P') {
  			cpu->cluster_type = CLUSTER_TYPE_P;
 +		} else if (capacity_max > capacity_min) {
 +			uint64_t capacity = ml_readprop(child, "capacity-dmips-mhz", 0);
 +			cpu->cluster_type = (capacity == capacity_max) ? CLUSTER_TYPE_P : CLUSTER_TYPE_E;
++		} else if (capacity_max == 0) {
++			// This firmware builds the DT itself and carries neither cluster-type nor capacity;
++			// on the SM7250 the two A76 cores are cpu@600 and cpu@700 (A55s are cpu@0..500).
++			uint32_t affinity = cpu->phys_id & MPIDR_AFF1_MASK;
++			cpu->cluster_type = (affinity == 0x600 || affinity == 0x700) ?
++			    CLUSTER_TYPE_P : CLUSTER_TYPE_E;
  		}
  
  		topology_info.cluster_type_num_cpus[cpu->cluster_type]++;

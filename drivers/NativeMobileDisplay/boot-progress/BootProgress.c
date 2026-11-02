@@ -15,6 +15,7 @@ extern kern_return_t host_statistics64(host_t host, host_flavor_t flavor, host_i
 #include <string.h>
 extern void proc_selfname(char *, int);
 extern int proc_selfpid(void);
+extern int printf(const char *, ...);
 #include <machine/machine_routines.h>
 #include <kern/misc_protos.h>
 #include <kern/boot_progress.h>
@@ -1215,6 +1216,22 @@ static void monitor(void *arg, wait_result_t result) {
     __atomic_fetch_add(&thread_count,1,__ATOMIC_RELAXED);
     boot_progress_poll();
     unsigned now=seconds();
+    // sheng_cpufreq_probe() dumps the topology before the secondary CPUs are online (en=1 pn=0). Report the
+    // scheduler's active E/P counts once the whole machine is up, so an AMP build's split is visible in the log.
+    {
+      static unsigned topo_reported;
+      const ml_topology_info_t *topo=ml_get_topology_info();
+      if(!topo_reported && topo) {
+        const unsigned en=ml_get_cpu_number_type(CLUSTER_TYPE_E,true,true);
+        const unsigned pn=ml_get_cpu_number_type(CLUSTER_TYPE_P,true,true);
+        if(en+pn>=topo->num_cpus) {
+          topo_reported=1;
+          printf("PICASSO_CPUFREQ topo online cpus=%u clusters=%u types=%x en=%u pn=%u cl-e=%u cl-p=%u\n",
+                 topo->num_cpus,topo->num_clusters,topo->cluster_types,en,pn,
+                 ml_get_cluster_number_type(CLUSTER_TYPE_E),ml_get_cluster_number_type(CLUSTER_TYPE_P));
+        }
+      }
+    }
     if(nprocs>0 && !named){thread_set_thread_name(current_thread(),"boot_progress");named=1;}
     // Report the warm-reset marker the touch probe left in IMEM on the previous boot. Self-gated to once, and
     // to a time before userland starts flooding the CDC console.
