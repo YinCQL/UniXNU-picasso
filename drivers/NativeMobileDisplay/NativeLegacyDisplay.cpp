@@ -10,6 +10,7 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <kern/clock.h>
+#include <kern/thread.h>
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
 #include <libkern/c++/OSData.h>
@@ -33,6 +34,7 @@ extern "C" bool native_legacy_prepare_scanout(void);
 extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
 extern "C" void native_legacy_swap_geometry_observed(const uint32_t *,const uint32_t *,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
+extern "C" void native_legacy_copy_profile_observed(unsigned sample,uint64_t mapTicks,uint64_t scanTicks,uint64_t copyTicks,uint64_t cpuNs,uint32_t mapOptions);
 extern "C" void native_legacy_retirement_observed(IOService *);
 extern "C" void native_legacy_retirement_failed(IOService *);
 // Display refresh tick (boot-arg sheng-vsync=<Hz>, 0 or absent: off). The original family sends the compositor's vsync message (type 5)
@@ -54,6 +56,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool primary=false;
     bool logicalPM=false;
     bool transferred=false;
+    unsigned copySamples=0;
     // One bounded cached copy of visible pixels, independent of IOSurface lifetime.
     void *copyShadow=nullptr;
     uint64_t copyShadowBytes=0,copyShadowStride=0;
@@ -318,10 +321,15 @@ public:
            !native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
             native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
+        const unsigned sample=++copySamples;
+        const bool profile=sample<=8 || sample%32==0;
+        uint64_t mapStart=0,mapEnd=0,scanEnd=0;
+        if(profile)__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(mapStart));
         IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
         if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
         }
+        if(profile)__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(mapEnd));
         if(!native_legacy_copy_layout(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
             bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
             source->getLength(),sourceStride,width,height)) {
@@ -340,6 +348,8 @@ public:
         if(!native_legacy_prepare_scanout()) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
+        if(profile)__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(scanEnd));
+        const uint64_t cpuStart=profile?thread_get_runtime_self():0;
         uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
         uint64_t stored=copySurface(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
             bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
@@ -348,7 +358,13 @@ public:
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
         }
         __asm__ volatile("dsb sy" ::: "memory");
-        {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
+        {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));
+            uint64_t cpuNs=0;
+            if(profile)absolutetime_to_nanoseconds(thread_get_runtime_self()-cpuStart,&cpuNs);
+            native_legacy_copy_timing_observed(copyEnd-copyStart,stored);
+            if(profile)native_legacy_copy_profile_observed(sample,mapEnd-mapStart,scanEnd-mapEnd,
+                copyEnd-copyStart,cpuNs,(uint32_t)source->getMapOptions());
+        }
         OSSafeReleaseNULL(source);transferred=true;
         if(scanned) {
             bool held=bootLogo.holding;

@@ -132,6 +132,12 @@ extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t byte
         IOLog("PICASSO_DISPLAY copy sample=%u ticks=%llu hz=%llu stored_bytes=%llu\n",sample,ticks,hz,bytes);
     }
 }
+extern "C" void native_legacy_copy_profile_observed(unsigned sample,uint64_t mapTicks,uint64_t scanTicks,uint64_t copyTicks,uint64_t cpuNs,uint32_t mapOptions) {
+    uint64_t hz=0;__asm__ volatile("mrs %0, cntfrq_el0":"=r"(hz));
+    // Map options describe the requested mapping policy, not the resolved PTE cache attributes.
+    IOLog("PICASSO_DISPLAY profile sample=%u hz=%llu map_ticks=%llu scan_ticks=%llu copy_ticks=%llu cpu_ns=%llu map_options=%x\n",
+        sample,hz,mapTicks,scanTicks,copyTicks,cpuNs,mapOptions);
+}
 extern "C" void native_legacy_vsync_observed(unsigned event, unsigned hz) { report(11, event, hz, 0); }
 extern "C" void native_legacy_frame_observed(unsigned kind, uint64_t pixels, uint64_t minx, uint64_t miny, uint64_t maxx, uint64_t maxy) {
     if(kind!=2)picasso_hid_frame_presented();
