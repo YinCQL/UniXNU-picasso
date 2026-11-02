@@ -635,6 +635,12 @@ an a650-family device with the vendor a620 values for PC_DBG_ECO_CNTL bit 9, the
 (0x3ffff), UBWC 3.0/hbb14 (SM7250's DT values) and the a650 GBIF list; the OOB GPU_SET request is
 released only after the no-op fence lands (`native_adreno620_gmu_release_gpu_set`).
 
+**Ring soak.** `sheng-gpu-cp-stress=200` submits 200 no-op fences after the OOB release, 50 ms
+apart. All 200 landed (`stress done count=200`), `GMU_SPTPRAC_PWR_CLK_STATUS` stayed 0 (GX on)
+across the idle gaps, and stage 4 still finished `done=1` with the boot continuing into userland
+(wf48). A production submit path can therefore reuse this ring while the GPU stays powered; a
+long-idle then submit cycle (power collapse) is still untested.
+
 **Not done yet.** ZAP is not loaded (no secure PIL/SCM path), so the CP stays in the mode the boot
 chain left it and no `CP_SET_SECURE_MODE` packet is sent; stage 4 proves the CP runs. The next
 piece is the SMMU/Metal path (stage 5) and then the userland GPU stack.

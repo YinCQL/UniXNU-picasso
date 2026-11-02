@@ -615,6 +615,29 @@ extern "C" int native_adreno620_cp_start(void)
     native_adreno620_gmu_release_gpu_set();
     s.started = true;
     printf("PICASSO_GPU cp: ready fence=%u\n", fence);
+
+    /* Optional ring soak (sheng-gpu-cp-stress=<n>): repeated no-op
+     * submissions after the OOB is released, spaced far enough apart for the
+     * GMU to reach its idle level between them. A production submit path must
+     * keep working across that boundary. */
+    uint32_t stressValue = 0;
+    const unsigned stress = (PE_parse_boot_argn("sheng-gpu-cp-stress",
+        &stressValue, static_cast<int>(sizeof stressValue)) && stressValue)
+        ? stressValue : 0u;
+    for (unsigned index = 0; index < stress; ++index) {
+        uint32_t soak = 0;
+        if (!submitNoop(&soak)) return -1;
+        if (!waitFence(soak, kFenceTimeoutUs, true)) {
+            printf("PICASSO_GPU cp: stress failed at %u/%u gx=%08x\n",
+                index + 1, stress, gmuRead(kGmuGxPwrStatus));
+            return -1;
+        }
+        if ((index % 10) == 0)
+            printf("PICASSO_GPU cp: stress %u/%u fence=%u gx=%08x\n",
+                index + 1, stress, soak, gmuRead(kGmuGxPwrStatus));
+        IODelay(50000);
+    }
+    if (stress) printf("PICASSO_GPU cp: stress done count=%u\n", stress);
     return 0;
 }
 
