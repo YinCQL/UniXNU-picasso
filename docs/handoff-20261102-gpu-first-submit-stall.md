@@ -2,7 +2,7 @@
 
 **Status, 2026-11-02 evening (CST).** Worktree `stage7-native-watchdog`, branch
 `stage12/picasso-cpufreq-big`: `befd700` on top of `801950c` carries the diagnostics described in §7
-and the first version of this document; a docs-only commit on top carries the review corrections.
+and the first version of this document; docs-only commits on top carry the review corrections.
 The Metal plugin now opens the published GPU service, allocates BOs and submits its first command
 buffer, but that submission never completes: the CP stalls with `CP_HW_ERROR` and the IB page it
 names reads as zero at submit time and at stall time through two independent readers. **There is no
@@ -24,7 +24,7 @@ reproduced here so the handoff survives outside the chat.
 >
 > 当前证据：wf70 已用 pid/VM/VM next-handle 三重身份锁定卡死的是 backboardd（pid 56）的第一次提交（h=16，iova 0x100027000，756 B；wire 与 stall 均读零；fence page 经 cacheable alias 和 DRAM 都读到 2，证明读取器正常）；wf70 中同地址后有内容的记录属于 mediaserverd（pid 29）的另一个进程/VM，不是同进程重提。wf71 的诊断内核本身有效（sha256 65e94a034c1eaa2615cca149a95a1804380a8de5eb162b84e3d829aaf14634f3，含 `PICASSO_GPU map`/`stall cpregs`），但镜像漏了 `sheng-gpu-metal=1 sheng-gpu-addon=1`，GPU 服务未发布，wf71 作废。
 >
-> 立即动作：用同一个内核重新打包 payload（只重打 payload/boot image，不重编内核），内核参数必须带 `sheng-gpu-metal=1 sheng-gpu-addon=1`，生成 wf72；打包后必须检查 `out/wf72/picasso/payload/payload.json` 的 `kernel_args` 含这两个参数、`kernel_sha256` 与 `shasum -a 256 out/picasso/kernel/kernel.macho` 一致；然后 CDC 重启到 fastboot、`fastboot boot`、抓串口；读取新的 `PICASSO_GPU map wire:`、`map stall:`、`stall cpregs:`、`stall ids:`、`table switch:` 行，按文档 §6.4 的决策表判断。
+> 立即动作：用同一个内核重新打包 payload（只重打 payload/boot image，不重编内核），内核参数必须带 `sheng-gpu-metal=1 sheng-gpu-addon=1`，生成 wf72；打包后必须检查 `out/wf72/picasso/payload/payload.json` 的 `kernel_args` 含这两个参数、`kernel_sha256` 与 `shasum -a 256 out/picasso/kernel/kernel.macho` 一致；然后重启到 fastboot（若已在 fastboot 则跳过）、`fastboot boot`、抓串口；读取新的 `PICASSO_GPU map wire:`、`map stall:`、`stall cpregs:`、`stall ids:`、`table switch:` 行，按文档 §6.4 的决策表判断。
 >
 > 必须遵守：只用 `fastboot boot`，禁止刷分区；串口 `/dev/cu.usbmodemPICASSO011`，采集前确认没有进程占用；每轮先探测设备状态（`/dev/cu.usbmodem*`、`fastboot devices`），不要沿用旧值；build 需要 `export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` 和 `export UNIXNU_KERNELCACHE=/Users/silenzio/Desktop/development/ios/UniXNU/out/ipsw/21H461/kernelcache.decompressed`；不要 reset/checkout 共享工作树；一次只改一个变量，每个结论必须带证据（日志行/寄存器/测量）；里程碑 commit 并更新 PR #13；多看官方实现（mainline msm/a6xx、Turnip、XNU IOKit），不要新造轮子；用 subagent 做广度调查以节省上下文；继续工作，直到目标完成。
 
@@ -260,9 +260,9 @@ Expected addon sha `0dbe0ef2c4e765b9d5f25dcf3eb197ef7b3141e97a5898f8f0e10e0f26cc
 
 ### 6.3 Reboot to fastboot, boot, capture
 
-Probe the device state first (`/dev/cu.usbmodem*`, `fastboot devices`, `lsof`); when this was
-written it was booted with the CDC console alive. The capture tool and the CDC command tool must
-not run at the same time as another reader of the console.
+Probe the device state first (`/dev/cu.usbmodem*`, `fastboot devices`, `lsof`). If it is already in
+fastboot, skip the reboot step; if it is running, reboot to fastboot first. The capture tool and
+the CDC command tool must not run at the same time as another reader of the console.
 
 ```sh
 cd /Users/silenzio/Desktop/development/ios/worktrees/stage7-native-watchdog
