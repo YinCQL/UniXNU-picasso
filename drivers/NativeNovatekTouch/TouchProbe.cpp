@@ -529,8 +529,9 @@ bool publish(const struct nvt_contact *out, int n) {
 
 // Decode the panel's ten 6-byte records (vendor nvt_ts_work_func) into contacts in the publication convention
 // (0.1 panel pixels). An idle panel simply has no record with a valid finger id.
-void parseReport(const uint8_t *report, struct nvt_contact *out, int &n) {
+bool parseReport(const uint8_t *report, struct nvt_contact *out, int &n) {
     n = 0;
+    unsigned ids = 0;
     for (unsigned i = 0; i < NVT_REPORT_POINTS; ++i) {
         const unsigned pos = 6 * i;
         const unsigned id = report[pos] >> 3;
@@ -538,14 +539,44 @@ void parseReport(const uint8_t *report, struct nvt_contact *out, int &n) {
         if (!id || id > NVT_REPORT_POINTS || (state != 1 && state != 2)) continue;
         const int x = (report[pos + 1] << 4) | (report[pos + 3] >> 4);
         const int y = (report[pos + 2] << 4) | (report[pos + 3] & 0x0f);
-        if (x > TB_PANEL_WIDTH_PX || y > TB_PANEL_HEIGHT_PX) continue;
+        if (x > TB_PANEL_WIDTH_PX || y > TB_PANEL_HEIGHT_PX || (ids & (1u << id))) return false;
+        ids |= 1u << id;
         struct nvt_contact &c = out[n++];
-        bzero(&c, sizeof(c));
+        memset(&c, 0, sizeof(c));
         c.slot = static_cast<int>(i);
         c.tracking_id = static_cast<int>(id);
         c.x = x * 10;
         c.y = y * 10;
     }
+    return true;
+}
+
+bool sameFingerSet(const struct nvt_contact *a, int na, const struct nvt_contact *b, int nb) {
+    if (na != nb) return false;
+    unsigned am = 0, bm = 0;
+    for (int i = 0; i < na; ++i) {
+        am |= 1u << a[i].tracking_id;
+        bm |= 1u << b[i].tracking_id;
+    }
+    return am == bm;
+}
+
+// Confirm finger membership across two reads. Coordinates may advance while
+// the finger moves; use the newer sample instead of discarding normal motion.
+// Invalid or inconsistent membership leaves the last published contact intact.
+int sampleContacts(struct nvt_chip *chip, const struct nvt_contact *last, int lastN,
+    struct nvt_contact *out, int &n) {
+    uint8_t report[NVT_REPORT_LEN];
+    if (nvt_read_report(chip, report)) return NVT_ERR_BUS;
+    if (!parseReport(report, out, n)) return 0;
+    if (n == lastN && !memcmp(out, last, sizeof(out[0]) * static_cast<size_t>(n))) return 0;
+    uint8_t again[NVT_REPORT_LEN];
+    struct nvt_contact newer[NVT_REPORT_POINTS];
+    int newerN = 0;
+    if (nvt_read_report(chip, again)) return NVT_ERR_BUS;
+    if (!parseReport(again, newer, newerN) || !sameFingerSet(out, n, newer, newerN)) return 0;
+    memcpy(out, newer, sizeof(out[0]) * static_cast<size_t>(n));
+    return n != lastN || memcmp(out, last, sizeof(out[0]) * static_cast<size_t>(n)) != 0;
 }
 
 void frameLoop(Session &s) {
@@ -570,25 +601,12 @@ void frameLoop(Session &s) {
             else thread_block(THREAD_CONTINUE_NULL);
             seen = gIrqEvents;
         }
-        // The panel's report format (vendor nvt_ts_work_func): ten 6-byte records at 1 + 6*i.
-        uint8_t report[NVT_REPORT_LEN];
-        if (nvt_read_report(&s.chip, report)) { fail(50, NVT_ERR_BUS); return; }
-        ++native_novatek_touch_valid;
         struct nvt_contact out[NVT_REPORT_POINTS];
         int n = 0;
-        parseReport(report, out, n);
-        if (n != lastN || memcmp(out, last, sizeof(out[0]) * static_cast<size_t>(n)) != 0) {
-            // A sample that disagrees with a second read was taken while the firmware rewrote the buffer. Drop it;
-            // publishing it would show up as a phantom press or lift, and UIKit work is expensive on this port.
-            uint8_t again[NVT_REPORT_LEN];
-            struct nvt_contact out2[NVT_REPORT_POINTS];
-            int n2 = 0;
-            if (nvt_read_report(&s.chip, again)) { fail(50, NVT_ERR_BUS); return; }
-            parseReport(again, out2, n2);
-            if (n2 != n || memcmp(out, out2, sizeof(out[0]) * static_cast<size_t>(n)) != 0) {
-                continue;   // torn: the next wake reads a settled report
-            }
-            if (!publish(out, n)) continue;
+        int sample = sampleContacts(&s.chip, last, lastN, out, n);
+        if (sample < 0) { fail(50, sample); return; }
+        ++native_novatek_touch_valid;
+        if (sample && publish(out, n)) {
             memcpy(last, out, sizeof(out[0]) * static_cast<size_t>(n));
             lastN = n;
             ++native_novatek_touch_frames;

@@ -41,11 +41,15 @@ def main():
         'static void notifyPublished(', 'static void publishContact('))
     bodies += '\n' + extract(probe, 'static void notifyThunk(') + '\n' + extract(probe, 'bool publish(')
     (out / 'producer-bodies.h').write_text(bodies)
+    report_bodies = '\n'.join(extract(probe, marker) for marker in (
+        'bool parseReport(', 'bool sameFingerSet(', 'int sampleContacts('))
+    (out / 'report-bodies.h').write_text(report_bodies)
     runs = []
     for asan in (False, True):
         for label, language, files in (
             ('protocol', 'c', [source / 'Test/main.c', source / 'NvtProtocol.c', source / 'NvtTouchCore.c']),
             ('handoff', 'c++', [ROOT / 'scripts/tests/picasso-touch-handoff-host.cpp']),
+            ('report', 'c++', [ROOT / 'scripts/tests/picasso-touch-report-host.cpp']),
         ):
             name = label + ('-asan' if asan else '')
             exe = out / (name + ('.exe' if os.name == 'nt' else ''))
@@ -71,6 +75,7 @@ def main():
                 raise RuntimeError(result.stdout + result.stderr)
             runs.append(dict(name=name, passed=True, command=command, output=result.stdout.strip()))
     result = dict(scope=__doc__, runs=runs, passed=True, hardware_tested=False,
+                  report_bodies_sha256=hashlib.sha256(report_bodies.encode()).hexdigest(),
                   producer_bodies_sha256=hashlib.sha256(bodies.encode()).hexdigest())
     (out / 'results.json').write_text(json.dumps(result, indent=2) + '\n')
     print('PASS: touch protocol and production producer handoff, normal and ASan')
