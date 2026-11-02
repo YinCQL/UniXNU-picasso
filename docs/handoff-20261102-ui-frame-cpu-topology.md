@@ -390,3 +390,70 @@ Logs: `out/wf9-runs/run{1,2,3}.log`, `out/wf9-runs/harness.log`; each round ends
 active `PICASSO_SYNC`/`PICASSO_CPUFREQ` sample, not a panic. The diagnostic IRQ probe
 (`boot-progress=2`) stayed enabled throughout, i.e. the previously crashing path ran for
 900 s of booted userland without a fault.
+
+## 10. P1 progress — E/P topology, AMP, and a latent GIC IPI bug (wf10–wf12)
+
+### 10.1 The E/P classification works
+
+`ml_parse_cpu_topology()` now falls back to the DT `reg` when neither `cluster-type` nor
+`capacity-dmips-mhz` exists (`capacity_max == 0` branch in
+`patches/picasso-cpu-topology-xnu.patch`): `phys 0x600/0x700` are P, `0x0..0x500` are E.
+With `__ARM_AMP__ 1` restored, the live dump reads
+`topo cpus=8 clusters=2 types=6 en=1 pn=0` at probe time and the late print added in
+`BootProgress.c` (monitor loop, once `en+pn == num_cpus`) reads
+`topo online cpus=8 clusters=2 types=6 en=6 pn=2 cl-e=1 cl-p=1`.
+**[verified: out/wf11-runs/run1.log lines 84-92 and 804, out/wf12-runs/run1.log]**
+
+### 10.2 Clutch cannot be used with two psets
+
+With the classification but without `__ARM_AMP__` (wf10), the P CPUs create a second
+`PSET_SMP` in `pset_node0`. `sched_steal_thread_enabled()` is
+`bit_count(pset->node->pset_map) > 1`, now true, and `sched_clutch_steal_thread()` returns
+`THREAD_NULL` **without dropping the pset lock** while `thread_select()`'s caller contract
+says it returns unlocked. The subsequent `pset_lock(pset)` is recursive on pset0
+(`0xfffffff007d69a00 = pset0+0x100`) and panics in `lck_ticket_contended`.
+**[verified: out/wf10-runs/run1.log; sched_clutch.c:3069, sched_prim.c:723,2884-2892]**
+So the intermediate "classification under clutch" build is not viable; AMP (edge) is the
+path, which is what the final build does.
+
+### 10.3 Edge leaves the P pset unused
+
+With AMP the kernel selects `sched_edge_dispatch` (`nm sched_prim.o`: `U _sched_edge_dispatch`),
+but nothing ever places a thread on cluster 1:
+`sched_clutch_bucket_group_init()` seeds every bucket's `scbg_preferred_cluster` with
+`pset0.pset_cluster_id` (E, the boot cluster), the edge migration matrix forbids E→P
+(`migration_allowed = 0, steal_allowed = 0`), and this port has no CLPC/perfcontrol caller of
+`sched_edge_tg_preferred_cluster_change()`. Also `sched_edge_cpu_init_completed()` is only
+called from `AppleARMSMP.cpp` under `USE_APPLEARMSMP`, which BCM2837 does not define, so
+`native_psets`/`foreign_psets`/`sched_edges` stay zeroed.
+**[verified: source lines; out/wf11-runs/run1.log and out/wf12-runs/run1.log
+`gov d0 busy≈98 d1/d2 busy=0`]**
+
+### 10.4 The wf11 panic was a GIC SPI-IPI routing bug (fixed in wf12)
+
+wf11 ran the AMP/E-P topology and, after ~2.5 min in userland, `backboardd` panicked in
+`task_restartable_ranges_synchronize`: `wait_while_equals32[thread+...]` stuck at
+`0x00010000` (`trr_ipi_ack_pending`) for 125 ms. The AST IPI was never acknowledged because
+`ArmCpu::spiIpiConfigure()` wrote each core's `GICD_IROUTER` at `0x6000 + 8*INTID`; GICv3
+places SPI routers at `0x6000 + 8*(INTID-32)`, so the writes went to `INTID+32` (outside the
+implemented range) and INTIDs 1008..1015 kept their reset route (affinity 0, the boot CPU).
+The affinity word was also encoded in MPIDR/DT layout instead of the IROUTER's
+Aff0[39:32]/Aff1[47:40]/Aff2[55:48]/Aff3[63:56]. Consequently non-boot cores stayed
+`SIGPdisabled`; `cpu_signal_internal()` refuses to signal them and `cause_ast_check()` ignores
+the failure, so the pending bit never clears. `armcpu_spi_attach()` had the same off-by-32.
+**[verified: drivers/ArmCpu/ArmCpu.cpp, panic out/wf11-runs/run1.log:2652]**
+
+Fix: `gicdRouterOffset(intid)` and `gicdRouteFromAffinity(aff)` helpers used by both
+`spiIpiConfigure()` and `armcpu_spi_attach()`. wf12 is otherwise the wf11 kernel/payload:
+1 boot, 300 s, **0 panics**, topology still `en=6 pn=2`. **[verified: out/wf12-runs/run1.log]**
+
+### 10.5 Next step: make AMP actually use P
+
+Choosing the classic `sched_amp_dispatch` (define `CONFIG_SCHED_CLUTCH 1` +
+`CONFIG_SCHED_EDGE_OPT_OUT 1` in the BCM2837 block so `sched_prim.h` picks
+`sched_amp_dispatch`) is the smallest decisive experiment: `sched_amp_choose_processor()`
+explicitly spills to `pcore_set`, whereas edge needs the CLPC wiring above. If amp places
+work on cluster 1, the acceptance metric is the governor's `d1/d2 busy` rising and `d0`
+falling; if not, wire `scbg_preferred_cluster`/`cpu_init_completed` into edge instead.
+Do not forget the §9.2 two-pass build rule whenever `__ARM_AMP__` (and therefore the
+`struct thread` layout) changes.

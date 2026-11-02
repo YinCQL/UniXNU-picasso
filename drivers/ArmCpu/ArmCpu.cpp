@@ -118,6 +118,22 @@ static void write32 (uintptr_t base, unsigned offset, uint32_t value)
   *reinterpret_cast<volatile uint32_t *>(base + offset) = value;
 }
 
+// GICD_IROUTER<n> for an SPI n: 0x6000 + 8 * (n - 32). Writing 0x6000 + 8 * n programs the router
+// of interrupt n + 32 instead, which left INTIDs 1008..1015 at their reset route (affinity 0, the boot
+// CPU): every SPI IPI landed on CPU0, secondaries stayed SIGPdisabled and cross-core ASTs were dropped.
+static uint64_t gicdRouterOffset (uint32_t intid)
+{
+  return 0x6000 + 8ULL * (intid - 32);
+}
+
+// GICD_IROUTER holds Aff0[39:32] Aff1[47:40] Aff2[55:48] Aff3[63:56]; `aff` uses the MPIDR/DT-reg
+// layout (Aff0[7:0] Aff1[15:8] Aff2[23:16] Aff3[39:32]), so it must be unpacked, not masked.
+static uint64_t gicdRouteFromAffinity (uint64_t aff)
+{
+  return ((aff & 0xffULL) << 32) | (((aff >> 8) & 0xffULL) << 40) |
+         (((aff >> 16) & 0xffULL) << 48) | (((aff >> 32) & 0xffULL) << 56);
+}
+
 // Distributor side of the software IPI of logical core `core`: group 1, edge-triggered, priority 0x80, routed to affinity `aff`, enabled.
 static void spiIpiConfigure (uintptr_t dist, uint32_t core, uint64_t aff)
 {
@@ -125,7 +141,7 @@ static void spiIpiConfigure (uintptr_t dist, uint32_t core, uint64_t aff)
   write32 (dist, 0x80 + (id / 32) * 4, read32 (dist, 0x80 + (id / 32) * 4) | (1U << (id % 32)));
   write32 (dist, 0xc00 + (id / 16) * 4, read32 (dist, 0xc00 + (id / 16) * 4) | (2U << ((id % 16) * 2)));
   write32 (dist, 0x400 + (id / 4) * 4, 0x80808080);
-  *reinterpret_cast<volatile uint64_t *>(dist + 0x6000 + 8ULL * id) = aff & 0xff00ffffffULL;
+  *reinterpret_cast<volatile uint64_t *>(dist + gicdRouterOffset (id)) = gicdRouteFromAffinity (aff);
   __asm__ volatile ("dsb sy" ::: "memory");
   write32 (dist, 0x100 + (id / 32) * 4, 1U << (id % 32));
   __asm__ volatile ("dsb sy" ::: "memory");
@@ -836,7 +852,7 @@ extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler
   *reinterpret_cast<volatile uint8_t *> (gDist + 0x400 + intid) = 0xa0;
   const unsigned cfg = 0xc00 + (intid / 16) * 4, shift = (intid % 16) * 2 + 1;
   write32 (gDist, cfg, (read32 (gDist, cfg) & ~(1U << shift)) | ((edge ? 1U : 0U) << shift));
-  *reinterpret_cast<volatile uint64_t *> (gDist + 0x6000 + 8 * intid) = gBootAffinity;
+  *reinterpret_cast<volatile uint64_t *> (gDist + gicdRouterOffset (intid)) = gicdRouteFromAffinity (gBootAffinity);
   gSpi[used] = {intid, handler, context, 0};
   __atomic_store_n (&gSpiUsed, used + 1, __ATOMIC_RELEASE);
   __asm__ volatile ("dsb sy" ::: "memory");
@@ -846,7 +862,7 @@ extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler
                 (((read32 (gDist, cfg) >> shift) & 1U) << 2) |
                 (static_cast<uint32_t> (*reinterpret_cast<volatile uint8_t *> (gDist + 0x400 + intid)) << 8);
   }
-  if (router != nullptr) { *router = *reinterpret_cast<volatile uint64_t *> (gDist + 0x6000 + 8 * intid); }
+  if (router != nullptr) { *router = *reinterpret_cast<volatile uint64_t *> (gDist + gicdRouterOffset (intid)); }
   return kIOReturnSuccess;
 }
 
