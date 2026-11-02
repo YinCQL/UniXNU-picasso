@@ -44,12 +44,21 @@ def main():
     report_bodies = '\n'.join(extract(probe, marker) for marker in (
         'bool parseReport(', 'bool sameFingerSet(', 'int sampleContacts('))
     (out / 'report-bodies.h').write_text(report_bodies)
+    device = (ROOT / 'drivers/NativeHidInput/NativeHidInput.cpp').read_text()
+    fields = device.split('    uint32_t lastSeq=0;', 1)[1].split('    static unsigned transformCoordinate(', 1)[0]
+    delivery = '\n'.join(extract(device, marker) for marker in (
+        'static unsigned transformCoordinate(', 'void touchSend(', 'static void tick('))
+    (out / 'delivery-bodies.h').write_text('uint32_t lastSeq=0;' + fields + delivery.replace(
+        '__asm__ volatile("dmb ish":::"memory");', '__atomic_thread_fence(__ATOMIC_ACQUIRE);'))
+    observer = extract(hid, 'extern "C" void native_hid_input_observed(')
+    (out / 'observer-bodies.h').write_text(observer)
     runs = []
     for asan in (False, True):
         for label, language, files in (
             ('protocol', 'c', [source / 'Test/main.c', source / 'NvtProtocol.c', source / 'NvtTouchCore.c']),
             ('handoff', 'c++', [ROOT / 'scripts/tests/picasso-touch-handoff-host.cpp']),
             ('report', 'c++', [ROOT / 'scripts/tests/picasso-touch-report-host.cpp']),
+            ('delivery', 'c++', [ROOT / 'scripts/tests/picasso-touch-delivery-host.cpp']),
         ):
             name = label + ('-asan' if asan else '')
             exe = out / (name + ('.exe' if os.name == 'nt' else ''))
@@ -76,6 +85,8 @@ def main():
             runs.append(dict(name=name, passed=True, command=command, output=result.stdout.strip()))
     result = dict(scope=__doc__, runs=runs, passed=True, hardware_tested=False,
                   report_bodies_sha256=hashlib.sha256(report_bodies.encode()).hexdigest(),
+                  delivery_bodies_sha256=hashlib.sha256((fields + delivery).encode()).hexdigest(),
+                  observer_bodies_sha256=hashlib.sha256(observer.encode()).hexdigest(),
                   producer_bodies_sha256=hashlib.sha256(bodies.encode()).hexdigest())
     (out / 'results.json').write_text(json.dumps(result, indent=2) + '\n')
     print('PASS: touch protocol and production producer handoff, normal and ASan')

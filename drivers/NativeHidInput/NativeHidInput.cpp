@@ -258,6 +258,7 @@ class NativeHidInput : public IOHIDDevice {
 #endif
     }
     uint32_t lastSeq=0;
+    bool touchRetry=false;
     // Fingers sent as down in the previous report; a vanished identifier gets one explicit tip-up report.
     int prevIds[TOUCH_FINGERS]={-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
     int prevX[TOUCH_FINGERS]={},prevY[TOUCH_FINGERS]={};
@@ -287,7 +288,6 @@ class NativeHidInput : public IOHIDDevice {
         for(unsigned i=0;i<count;++i){ids[i]=native_touch_ids[i];xs[i]=native_touch_xs[i];ys[i]=native_touch_ys[i];}
         __asm__ volatile("dmb ish":::"memory");
         if(native_touch_seq!=before)return;      // torn read: retry on the next tick
-        self->lastSeq=before;
         // Sizes follow the axis maxima of the touch core: 30480 long, 20320 short, mapped to the same 0..32767 range.
         unsigned char report[1+TOUCH_FINGERS*6+1]={3};
         unsigned slot=0;
@@ -316,17 +316,22 @@ class NativeHidInput : public IOHIDDevice {
             f[4]=(unsigned char)self->prevY[j];f[5]=(unsigned char)(self->prevY[j]>>8);
             ++slot;edge::native_touch_hid_multi[2]=edge::native_touch_hid_multi[2]+1;
         }
-        for(unsigned j=0;j<TOUCH_FINGERS;++j) {
-            self->prevIds[j]=j<downCount?nextIds[j]:-1;
-            if(j<downCount){self->prevX[j]=nextX[j];self->prevY[j]=nextY[j];}
-        }
-        if(!slot)return;
+        if(!slot){self->lastSeq=before;self->touchRetry=false;return;}
         report[1+TOUCH_FINGERS*6]=(unsigned char)slot;
         IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
         IOReturn result=buffer?self->submitReport(buffer):kIOReturnNoMemory;
         OSSafeReleaseNULL(buffer);
         native_hid_input_observed(6,result);
         native_touch_hid_reports=native_touch_hid_reports+1;
+        // Commit only reports accepted by the original family. A failed lift
+        // must retain the previous fingers so the next attempt still releases them.
+        self->touchRetry=result!=kIOReturnSuccess;
+        if(self->touchRetry)return;
+        self->lastSeq=before;
+        for(unsigned j=0;j<TOUCH_FINGERS;++j) {
+            self->prevIds[j]=j<downCount?nextIds[j]:-1;
+            if(j<downCount){self->prevX[j]=nextX[j];self->prevY[j]=nextY[j];}
+        }
     }
     // The button driver's thread calls buttonsNotify on every change of the pressed set.
     static void buttonsNotify(void *context,uint32_t mask) {
@@ -368,6 +373,9 @@ class NativeHidInput : public IOHIDDevice {
     }
     static void tick(OSObject *owner,IOTimerEventSource *source) {
         NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return;
+        // Reuse the existing timer for one retry per tick, using the newest
+        // snapshot. Normal touch reports remain notification-driven.
+        if(self->touchRetry)self->touchSend();
         native_hid_live_checkpoint(self);
         if(self->touchOnly){source->setTimeoutMS(1000);return;}
         if(!self->down && !hasEventDriver(self,4)) {
