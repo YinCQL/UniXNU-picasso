@@ -447,28 +447,38 @@ Fix: `gicdRouterOffset(intid)` and `gicdRouteFromAffinity(aff)` helpers used by 
 `spiIpiConfigure()` and `armcpu_spi_attach()`. wf12 is otherwise the wf11 kernel/payload:
 1 boot, 300 s, **0 panics**, topology still `en=6 pn=2`. **[verified: out/wf12-runs/run1.log]**
 
-### 10.5 Classic `sched_amp` uses both clusters (wf13, accepted)
+### 10.5 Edge with the sheng (SM8550) bucket policy uses both clusters (wf14, accepted)
 
-Choosing the classic `sched_amp_dispatch` instead of edge (define `CONFIG_SCHED_CLUTCH 1`
-and `CONFIG_SCHED_EDGE_OPT_OUT 1` in the BCM2837 block so `sched_prim.h` picks
-`sched_amp_dispatch`) is the smallest wiring change: `sched_amp_pset_init()` records
-`ecore_set`/`pcore_set` at pset creation and `sched_amp_choose_processor()`/
-`sched_amp_steal_thread()` spill to the P set, with no CLPC dependency. **Note that
-`CONFIG_SCHED_EDGE` also gates the edge fields in `struct thread`
-(`kern/thread.h:400-405`), so switching it off moves `machine.CpuDatap` back to 0x1d0 and
-the §9.2 two-pass/archive rule applies again.**
+The classic `sched_amp` detour worked (wf13: P busy 33–61 %) but is not the project's
+precedent. The sibling sheng port's `patches/xnu/zzyf-sheng-amp.patch` keeps edge and adds
+the missing policy, so this port now does the same (same hunk logic, adapted to the tree):
+- `sched_edge_default_preferred_cluster(bucket)`: fixed-priority, foreground and
+  user-initiated buckets (`bucket < TH_BUCKET_SHARE_UT`) start on the first P cluster;
+  utility/background buckets start on the boot (E) cluster.
+- `sched_edge_ui_bucket_stays_on_p()`: P-preferred UI buckets do not migrate or get stolen
+  to E.
+- `sched_edge_clutch_bucket_group_preferred_cluster()` falls back to `pset0` until the P
+  pset exists (cores register asynchronously).
+- The E→P edge allows `sce_steal_allowed = 1`, so an idle P core can take E work; there is
+  no performance controller on this port.
 
-wf13 (same payload, E/P classification + AMP, amp scheduler): one boot, 300 s, **0 panics**,
-`en=6 pn=2`. Placement is now real:
-- Governor (mode 4): `d1 busy≈33-45%`, `d2 busy≈53-61%` (edge left both at 0);
-  `d0` still reads ≈99 because that field is the busiest *single* CPU over a short window,
-  not a cluster average.
-- Per-CPU 10 s averages from a measurement-only boot (`sheng-cpufreq=1`, usage thread):
-  `c0..c5` (A55) 20–70 %, `c6/c7` (A76) 50–78 %, i.e. the load is spread across both
-  clusters. **[verified: out/wf13-runs/run1.log, out/wf13-cpuusage-run/run1.log]**
-- UI frame production did not improve (4–5 full-frame copies per 300 s, same as wf12):
-  P1 fixes *where* the CPU work runs, not the absence of a GPU render path (§7.2/§7.3).
+`__ARM_AMP__`/`MAX_CPU_CLUSTERS=2` stay as before. wf14 (same payload, classification + AMP
++ this policy, edge): one boot, 300 s, **0 panics**, early topology dump
+`cpus=8 clusters=2 types=6 en=1 pn=0` with cpu0–5 type E / cpu6–7 type P. The governor now
+shows `d1 busy=100 d2 busy=100` (edge alone: 0), i.e. the A76s carry work.
+**[verified: out/wf14-runs/run1.log]**
 
-If edge is revisited later, the two missing wires are those in §10.3:
-`sched_edge_cpu_init_completed()` after the last CPU is registered, and a P preference in
-`scbg_preferred_cluster` (a CLPC replacement) instead of `pset0`.
+Caveats:
+- `d0` still reads ≈100. That field is the busiest *single* CPU in a short window, and the
+  boot-progress diagnostics plus background work keep one A55 hot; it is not a cluster
+  average. A measurement-only boot (wf13, `sheng-cpufreq=1`) showed the per-CPU 10 s
+  averages: A55 20–70 %, A76 50–78 %. **[verified: out/wf13-cpuusage-run/run1.log]**
+- The once-only `topo online` print added in §10.1 did not appear in wf14 (it did in
+  wf12/wf13); the monitor thread appears to freeze/starve before it fires. The early dump
+  plus the governor data still prove the split.
+- UI frame production is unchanged (5 full-frame copies per 300 s): P1 moves *where* the
+  CPU work runs; the missing GPU render path is P3 (§7.2/§7.3).
+
+The `sched_amp` variant remains available as a build switch (§10.3/§10.5 history) but is
+not the default: it is not what sheng ships, and `CONFIG_SCHED_EDGE` also gates
+`struct thread`'s edge fields, so switching it changes the ABI (§9.2).
