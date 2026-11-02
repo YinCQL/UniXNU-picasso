@@ -123,7 +123,15 @@ extern "C" void native_legacy_swap_geometry_observed(const uint32_t *a, const ui
     if (takeReport(&count)) IOLog("PICASSO_DISPLAY geometry rect0=%u,%u,%u,%u rect1=%u,%u,%u,%u options=%x,%x,%x size=%ux%u\n",
         a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], o0, o1, o2, w, h);
 }
-extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t bytes) { report(10, ticks, bytes, 0); }
+extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t bytes) {
+    report(10, ticks, bytes, 0);
+    static unsigned count;
+    unsigned sample=__atomic_add_fetch(&count,1,__ATOMIC_RELAXED);
+    if(sample<=4 || sample%64==0) {
+        uint64_t hz=0;__asm__ volatile("mrs %0, cntfrq_el0":"=r"(hz));
+        IOLog("PICASSO_DISPLAY copy sample=%u ticks=%llu hz=%llu stored_bytes=%llu\n",sample,ticks,hz,bytes);
+    }
+}
 extern "C" void native_legacy_vsync_observed(unsigned event, unsigned hz) { report(11, event, hz, 0); }
 extern "C" void native_legacy_frame_observed(unsigned kind, uint64_t pixels, uint64_t minx, uint64_t miny, uint64_t maxx, uint64_t maxy) {
     if(kind!=2)picasso_hid_frame_presented();

@@ -2,12 +2,17 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <initializer_list>
 #ifdef _MSC_VER
 #define __builtin_memcpy memcpy
 #endif
 #include "NativeLegacyRequest.h"
 #include "PicassoGop.h"
+static bool allocationFails;
+static unsigned allocations,frees;
+static void *IOMalloc(uint64_t bytes) {++allocations;return allocationFails?nullptr:malloc(static_cast<size_t>(bytes));}
+static void IOFree(void *pointer,uint64_t) {++frees;free(pointer);}
 #include "PicassoQueueExtracted.h"
 
 struct Video {
@@ -75,6 +80,58 @@ static void pixels() {
 }
 
 static void setptr(unsigned char *base, unsigned offset, const void *value) { memcpy(base + offset, &value, 8); }
+static void differentialCopies() {
+    alignas(8) unsigned char src[320],dst[352],alternate[352];
+    for(unsigned i=0;i<sizeof(src);++i)src[i]=static_cast<unsigned char>(i);
+    memset(dst,0xaa,sizeof(dst));memset(alternate,0xbb,sizeof(alternate));
+    CopyFixture copy;
+    assert(copy.copySurface(dst,sizeof(dst),176,src,sizeof(src),160,34,2)==272);
+    assert(copy.copySurface(dst,sizeof(dst),176,src,sizeof(src),160,34,2)==0);
+    src[0]^=1;src[160+135]^=1;
+    assert(copy.copySurface(dst,sizeof(dst),176,src,sizeof(src),160,34,2)==72);
+    for(unsigned row=0;row<2;++row) {
+        assert(!memcmp(dst+row*176,src+row*160,136));
+        for(unsigned i=136;i<176;++i)assert(dst[row*176+i]==0xaa);
+    }
+    // A cleared scanout cannot use the previous shadow, even if the next surface is identical.
+    assert(native_legacy_fill_pixels(dst,sizeof(dst),176,34,2,0xff000000));
+    copy.copyShadowValid=false;
+    assert(copy.copySurface(dst,sizeof(dst),176,src,sizeof(src),160,34,2)==272);
+    // Changing mapping or dimensions forces a full initialization of the new shadow.
+    assert(copy.copySurface(alternate,sizeof(alternate),176,src,sizeof(src),160,34,2)==272);
+    assert(!memcmp(alternate,src,136));
+    assert(copy.copySurface(alternate,sizeof(alternate),176,src,sizeof(src),160,32,2)==256);
+    assert(copy.copySurface(alternate,1,176,src,sizeof(src),160,32,2)==UINT64_MAX);
+    copy.resetCopyShadow();copy.resetCopyShadow();
+    assert(allocations==frees);
+    // Allocation failure is tried once and preserves correct full-copy behavior.
+    allocationFails=true;unsigned tried=allocations;
+    assert(copy.copySurface(dst,sizeof(dst),176,src,sizeof(src),160,34,2)==272);
+    src[7]^=1;
+    assert(copy.copySurface(dst,sizeof(dst),176,src,sizeof(src),160,34,2)==272);
+    assert(allocations==tried+1 && !memcmp(dst,src,136));
+    copy.resetCopyShadow();allocationFails=false;
+    // Odd widths retain the aligned 32-bit fallback and never allocate a shadow.
+    tried=allocations;
+    assert(copy.copySurface(dst,sizeof(dst),176,src,sizeof(src),160,33,2)==264);
+    assert(allocations==tried);copy.resetCopyShadow();
+    // Unaligned normal-memory sources still use the differential path.
+    assert(copy.copySurface(dst,sizeof(dst),176,src+1,sizeof(src)-1,144,32,2)==256);
+    assert(copy.copySurface(dst,sizeof(dst),176,src+1,sizeof(src)-1,144,32,2)==0);
+    copy.resetCopyShadow();
+    // Device alignment and the 16 MiB cap keep the bounded full-copy fallback.
+    tried=allocations;
+    assert(copy.copySurface(dst+4,sizeof(dst)-4,168,src,sizeof(src),160,32,2)==256);
+    assert(allocations==tried);copy.resetCopyShadow();
+    constexpr uint64_t largeBytes=2048ULL*2049*4;
+    void *largeSource=calloc(1,static_cast<size_t>(largeBytes));
+    void *largeDestination=malloc(static_cast<size_t>(largeBytes));
+    assert(largeSource && largeDestination);
+    assert(copy.copySurface(largeDestination,largeBytes,8192,largeSource,largeBytes,8192,2048,2049)==largeBytes);
+    assert(allocations==tried && !copy.copyShadow);
+    copy.resetCopyShadow();free(largeSource);free(largeDestination);
+    puts("PASS: differential copy bytes, unchanged frames, tails/padding, blank invalidation, mapping/geometry reset, allocation failure and ownership");
+}
 static const void *getptr(unsigned char *base, unsigned offset) { const void *p; memcpy(&p, base + offset, 8); return p; }
 static void queue() {
     QueueFixture q = {};
@@ -131,6 +188,6 @@ static void bootLogo() {
 }
 
 int main() {
-    video(); pixels(); queue(); bootLogo();
+    video(); pixels(); queue(); bootLogo(); differentialCopies();
     puts("PASS: GOP handoff, linear format, bounded pixel copies, blank frames and original queue ownership");
 }

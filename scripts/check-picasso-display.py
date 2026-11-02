@@ -57,6 +57,10 @@ def main():
         ('bool isValidated(', 'void removeValidated(', 'bool addValidated('))
     with (out / 'PicassoQueueExtracted.h').open('a') as stream:
         stream.write('struct ValidationFixture {\nconst OriginalLegacySwapRequest *validated[8]={};\n' + validation + '\n};\n')
+        shadow_fields = driver.split('    void *copyShadow=nullptr;', 1)[1].split('    void resetCopyShadow()', 1)[0]
+        shadow_methods = '\n'.join(extract(driver, marker) for marker in
+                                   ('void resetCopyShadow(', 'uint64_t copySurface('))
+        stream.write('struct CopyFixture {\nvoid *copyShadow=nullptr;' + shadow_fields + shadow_methods + '\n};\n')
     report = dict(scope='MSVC host tests of production helpers; original ABI static audit; no Apple SDK or phone execution',
                   original_sha256=hashlib.sha256(original).hexdigest(), virtual_slots=len(slots), aliases=aliases, runs=[])
     host = load(ROOT / 'scripts/check-picasso-user-fault.py')
@@ -84,7 +88,11 @@ def main():
     arm.write_text('#include "NativeLegacyRequest.h"\nextern "C" int present(volatile void *dst, uint64_t db, uint64_t ds,'
         'const void *src,uint64_t sb,uint64_t ss,uint32_t w,uint32_t h) {\n'
         'int ok=native_legacy_copy_pixels(dst,db,ds,src,sb,ss,w,h);\n'
-        'if(ok)__asm__ volatile("dsb sy" ::: "memory");return ok;}\n')
+        'if(ok)__asm__ volatile("dsb sy" ::: "memory");return ok;}\n'
+        'extern "C" uint64_t present_diff(volatile void *dst,uint64_t db,uint64_t ds,'
+        'const void *src,uint64_t sb,uint64_t ss,uint32_t w,uint32_t h,void *shadow,int valid) {\n'
+        'uint64_t stored=native_legacy_copy_diff(dst,db,ds,src,sb,ss,w,h,shadow,valid);\n'
+        'if(stored!=UINT64_MAX)__asm__ volatile("dsb sy" ::: "memory");return stored;}\n')
     command = ['C:/Program Files/LLVM/bin/clang++.exe', '--target=arm64-apple-ios17.0', '-std=c++17',
         '-ffreestanding', '-fno-builtin', '-mgeneral-regs-only', '-O2', '-Wall', '-Wextra', '-Werror',
         '-I', str(source_dir), '-c', str(arm), '-o', str(out / 'pixels.o')]

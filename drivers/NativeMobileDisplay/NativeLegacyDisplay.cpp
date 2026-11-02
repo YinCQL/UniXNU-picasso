@@ -54,6 +54,45 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool primary=false;
     bool logicalPM=false;
     bool transferred=false;
+    // One bounded cached copy of visible pixels, independent of IOSurface lifetime.
+    void *copyShadow=nullptr;
+    uint64_t copyShadowBytes=0,copyShadowStride=0;
+    uintptr_t copyShadowDestination=0;
+    uint32_t copyShadowWidth=0,copyShadowHeight=0;
+    bool copyShadowValid=false,copyShadowTried=false;
+    void resetCopyShadow() {
+        if(copyShadow)IOFree(copyShadow,copyShadowBytes);
+        copyShadow=nullptr;copyShadowBytes=copyShadowStride=0;
+        copyShadowDestination=0;copyShadowWidth=copyShadowHeight=0;
+        copyShadowValid=copyShadowTried=false;
+    }
+    uint64_t copySurface(volatile void *destination,uint64_t destinationBytes,uint64_t destinationStride,
+        const void *source,uint64_t sourceBytes,uint64_t sourceStride,uint32_t width,uint32_t height) {
+        if(!native_legacy_copy_layout(destination,destinationBytes,destinationStride,
+            source,sourceBytes,sourceStride,width,height))return UINT64_MAX;
+        if(copyShadowDestination!=(uintptr_t)destination || copyShadowStride!=destinationStride ||
+            copyShadowWidth!=width || copyShadowHeight!=height) {
+            resetCopyShadow();copyShadowDestination=(uintptr_t)destination;copyShadowStride=destinationStride;
+            copyShadowWidth=width;copyShadowHeight=height;
+        }
+        uint64_t length=(uint64_t)width*height*4;
+        if(!copyShadowTried) {
+            copyShadowTried=true;
+            // 1080x2400 uses 10,368,000 bytes. Never grow this with RAM pressure
+            // or retry a failed allocation on every frame.
+            if(length<=16ULL*1024*1024 && !(width&1) && !((uintptr_t)destination&7) && !(destinationStride&7)) {
+                copyShadow=IOMalloc(length);if(copyShadow)copyShadowBytes=length;
+            }
+        }
+        uint64_t stored=native_legacy_copy_diff(destination,destinationBytes,destinationStride,
+            source,sourceBytes,sourceStride,width,height,copyShadow,copyShadowValid);
+        if(stored==UINT64_MAX) {
+            copyShadowValid=false;
+            return native_legacy_copy_pixels(destination,destinationBytes,destinationStride,
+                source,sourceBytes,sourceStride,width,height)?length:UINT64_MAX;
+        }
+        copyShadowValid=true;return stored;
+    }
     // Preserve every accepted request until the original family retires it.
     // A full table rejects the new request without evicting a live entry.
     const OriginalLegacySwapRequest *validated[8]={};
@@ -118,9 +157,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         OSSafeReleaseNULL(vsyncTimer);vsyncArmed=false;
     }
 public:
-    void free() override {stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+    void free() override {stopVsync();resetCopyShadow();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
         stopVsync();
+        resetCopyShadow();
         transferred=false;for(auto &entry: validated)entry=nullptr;
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
@@ -251,6 +291,7 @@ public:
                 finishTransfer(request);
                 return;
             }
+            copyShadowValid=false;
             if(!native_legacy_fill_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                 bootMapping->getLength(),blank.v_rowBytes,bw,bh,0xff000000U)) {
                 native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
@@ -300,13 +341,14 @@ public:
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
         uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
-        if(!native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+        uint64_t stored=copySurface(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
             bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
-            source->getLength(),sourceStride,width,height)) {
+            source->getLength(),sourceStride,width,height);
+        if(stored==UINT64_MAX) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
         }
         __asm__ volatile("dsb sy" ::: "memory");
-        {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,length);}
+        {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
         OSSafeReleaseNULL(source);transferred=true;
         if(scanned) {
             bool held=bootLogo.holding;
@@ -445,7 +487,7 @@ public:
             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
             valid=width==video.v_width && height==video.v_height;
             if(valid) {
-                OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=true; // Text/graphics is console policy, not display identity.
+                resetCopyShadow();OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=true; // Text/graphics is console policy, not display identity.
                 valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
             }
         }
