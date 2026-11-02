@@ -654,6 +654,30 @@ hw_init and submits one `CP_INDIRECT_BUFFER` through the production class:
 The boot continues into userland (wf49). This is the submission path the Metal side will use; the
 next step is to attach `NativeAdrenoSubmit` and publish the service on top of it.
 
+**Service publication.** `sheng-gpu-publish=1` attaches `NativeAdrenoSubmit` to the adopted ring and
+the GPU context VM, fills `NativeAdrenoAbiDeviceInfo` with this chip's values (chip id 0x06020001,
+hbb 14, UBWC 3.0, `va_size = 2^ias - 0x100000000` with ias 48) and calls `native_adreno_publish()`:
+
+    PICASSO_GPU cp: publish status=00000000 service=0xfffffff5a80ca9c0 va_size=ffff00000000
+    PICASSO_GPU cp: published
+    PICASSO_GPU end stage=4 step=4 error=0 requested=4 ticks=4 done=1
+
+The boot continues with `panic=0` (wf50). No accelerator is registered and the Metal plugin is not
+in this image, so no client can submit; this proves the per-process VM/table-switch and userclient
+plumbing on A620. The A740 `NativeAdrenoService::start` path is **not** the way forward: its a6xx
+branch is an unreachable skeleton (it never builds a GPU context, its SQE copy keeps the 4-byte
+header, ring/SQE IOVAs stay zero, and its cold start is the generated A740 one). The live owner
+stays this probe/board code; the accelerator (`AGXAccelerator`, `IOAcceleratorES`) is registered
+programmatically after IOGPUFamily loads, and the Metal plugin bundle itself arrives through the
+boot addon mount.
+
+**Next milestones** (ranked, from the service-path survey): (1) register the accelerator with
+`MetalPluginName`/`MetalPluginClassName`/`NativeSandboxGrantProcess` (the wiring exists in the
+sheng reference, not in this worktree); (2) give `NativeAdrenoSubmit` an A620 plain-submission
+profile (the current one always emits A7XX thread-control framing) and open one user client; (3)
+enable the Metal plugin end-to-end with the addon mount and sandbox patches. Only the secure
+content/CP aperture paths are fundamentally blocked on zap/PIL.
+
 **Not done yet.** ZAP is not loaded (no secure PIL/SCM path), so the CP stays in the mode the boot
 chain left it and no `CP_SET_SECURE_MODE` packet is sent; stage 4 proves the CP runs. The next
 piece is the SMMU/Metal path (stage 5) and then the userland GPU stack.

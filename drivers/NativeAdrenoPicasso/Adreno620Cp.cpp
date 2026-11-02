@@ -24,11 +24,14 @@
  * Nothing here frees or remaps a buffer the GPU may still read. */
 #include "Adreno620Probe.h"
 #include "Adreno620ProbeCore.h"
+#include "NativeAdrenoABI.h"
 #include "NativeAdrenoA620HwInit.h"
 #include "NativeAdrenoGpuContext.h"
 #include "NativeAdrenoKernelTime.h"
 #include "NativeAdrenoMemory.h"
 #include "NativeAdrenoRing.h"
+#include "NativeAdrenoSubmit.h"
+#include "NativeAdrenoTimer.h"
 #include "AdrenoPM4.h"
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
@@ -36,6 +39,12 @@
 #include <pexpert/pexpert.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/* NativeAdrenoPublish.cpp has no header: these are its exported entry points. */
+extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *,
+    NativeAdrenoRing *, const NativeAdrenoRingClock *, const NativeAdrenoTimer *,
+    const NativeAdrenoAbiDeviceInfo *, uint32_t, uint32_t);
+extern "C" IOService *native_adreno_published_service(void);
 
 namespace {
 
@@ -558,38 +567,58 @@ uint64_t ringNowUs(void *)
     return NativeAdrenoKernelTime::now_us(nullptr, &microseconds) ? 0 : microseconds;
 }
 
-/* Take the live ring into the production ring class with the A6xx fence
- * profile and submit one CP_INDIRECT_BUFFER through it. This is the first
- * submission through the same code the Metal path will use. */
-bool ringSmoke()
+/* The live ring as the production class sees it: adopted once, with the A6xx
+ * fence profile. Returns null when the board buffers are gone or the adopt
+ * was refused. */
+NativeAdrenoRing *ringObject()
 {
-    CpState &s = *gState;
-    if (!s.ring.base || !s.memptrs.base) return false;
     static NativeAdrenoRing ring;
-    static NativeAdrenoRingClock clock;
+    static bool ready = false, failed = false;
+    if (ready) return &ring;
+    if (failed) return nullptr;
+    CpState &s = *gState;
+    if (!s.ring.base || !s.memptrs.base) {
+        failed = true;
+        return nullptr;
+    }
     const NativeAdrenoRingIo io = {nullptr, ringWrite, ringRead, ringBarrier,
         nullptr, ringFenceStatus};
     const NativeAdrenoRingCache cache = {nullptr, ringPublish, ringAcquire};
-    clock = {nullptr, ringNowUs, nullptr};
-
     const IOReturn adopted = ring.adopt(&io, &cache,
         const_cast<uint8_t *>(s.ring.base), size_t(s.ring.bytes), GpuRingIova,
         const_cast<uint8_t *>(s.memptrs.base), size_t(s.memptrs.bytes), GpuMemptrsIova,
         s.next, s.sequence);
     if (adopted) {
         printf("PICASSO_GPU cp: ring adopt failed %08x\n", unsigned(adopted));
-        return false;
+        failed = true;
+        return nullptr;
     }
     ring.setA6xxFence(true);
+    ready = true;
+    return &ring;
+}
+
+/* Take the live ring into the production ring class with the A6xx fence
+ * profile and submit one CP_INDIRECT_BUFFER through it. This is the first
+ * submission through the same code the Metal path will use. */
+bool ringSmoke()
+{
+    CpState &s = *gState;
+    NativeAdrenoRing *ring = ringObject();
+    if (!ring) return false;
+    NativeAdrenoRingClock clock;
+    clock.cookie = nullptr;
+    clock.now_us = ringNowUs;
+    clock.idle = nullptr;
 
     uint32_t words[4] = {};
     const uint32_t ib[3] = {uint32_t(GpuScratchIova), uint32_t(GpuScratchIova >> 32), 1};
     if (!packet(words, 4, 0, kCpIndirectBufferOpcode, ib, 3)) return false;
     uint32_t fence = 0;
-    const IOReturn committed = ring.submit(words, 4, &fence);
+    const IOReturn committed = ring->submit(words, 4, &fence);
     uint32_t observed = 0;
     const NativeAdrenoRingFence waited = committed ? NativeAdrenoRingFencePoisoned :
-        ring.wait(fence, &clock, kFenceTimeoutUs, &observed);
+        ring->wait(fence, &clock, kFenceTimeoutUs, &observed);
     printf("PICASSO_GPU cp: ring smoke submit=%08x fence=%u observed=%u result=%d\n",
         unsigned(committed), fence, observed, int(waited));
     if (committed || waited != NativeAdrenoRingFenceComplete) return false;
@@ -599,6 +628,49 @@ bool ringSmoke()
     s.next = (s.next + kIbSubmitDwords) & (kRingDwords - 1);
     s.sequence = fence;
     return true;
+}
+
+/* Publish the live GPU context through the production service: the same VM,
+ * ring and submit object the A740 board hands over, with this chip's device
+ * information. No user client can submit yet (the Metal plugin is not part of
+ * this image), so the published ring stays idle. */
+bool publishGpu()
+{
+    NativeAdrenoRing *ring = ringObject();
+    NativeAdrenoVm *vm = NativeAdrenoGpuContextVm();
+    const uint32_t ias = NativeAdrenoGpuContextInputBits();
+    if (!ring || !vm || ias < 33 || ias > 48) {
+        printf("PICASSO_GPU cp: publish refused ring=%p vm=%p ias=%u\n", ring, vm, ias);
+        return false;
+    }
+    static NativeAdrenoSubmit submit;
+    const IOReturn attached = submit.attach(vm, ring);
+    if (attached) {
+        printf("PICASSO_GPU cp: submit attach failed %08x\n", unsigned(attached));
+        return false;
+    }
+    static NativeAdrenoAbiDeviceInfo info;
+    info = {};
+    info.chip_id = 0x06020001u;               /* the ADT's qcom,chipid for this GPU */
+    info.gmem_bytes = 512u * 1024u;
+    info.gmem_base = 0;
+    info.uche_trap_base = 0x1fffffffff000ull;
+    info.va_start = GpuClientVaStart;
+    info.va_size = (uint64_t(1) << ias) - GpuClientVaStart;
+    info.highest_bank_bit = 14;               /* SM7250: UBWC 3.0, hbb 14 */
+    info.ubwc_swizzle = 0x6;                  /* levels 2 and 3 (qcom_ubwc_swizzle) */
+    info.macrotile_mode = 0;
+    info.ubwc_version = 3;
+    NativeAdrenoRingClock clock;
+    clock.cookie = nullptr;
+    clock.now_us = ringNowUs;
+    clock.idle = nullptr;
+    const IOReturn published = native_adreno_publish(vm, &submit, ring, &clock,
+        nullptr, &info, ias, 40);
+    printf("PICASSO_GPU cp: publish status=%08x service=%p va_size=%llx\n",
+        unsigned(published), native_adreno_published_service(),
+        static_cast<unsigned long long>(info.va_size));
+    return published == kIOReturnSuccess;
 }
 
 bool acquireBuffers()
@@ -745,6 +817,16 @@ extern "C" int native_adreno620_cp_start(void)
             return -1;
         }
         printf("PICASSO_GPU cp: ring smoke ok next=%u seqno=%u\n", s.next, s.sequence);
+    }
+
+    uint32_t publishValue = 0;
+    if (PE_parse_boot_argn("sheng-gpu-publish", &publishValue,
+        static_cast<int>(sizeof publishValue)) && publishValue) {
+        if (!publishGpu()) {
+            printf("PICASSO_GPU cp: publish failed\n");
+            return -1;
+        }
+        printf("PICASSO_GPU cp: published\n");
     }
     return 0;
 }
