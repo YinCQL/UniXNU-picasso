@@ -580,6 +580,14 @@ extern "C" void native_adreno_set_firmware(const native_adreno620_firmware *firm
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
+extern "C" int native_adreno620_sqe_firmware(const uint8_t **bytes, size_t *length)
+{
+    if (!bytes || !length || !gFirmwareSqe || !gFirmwareSqeBytes) return -1;
+    *bytes = gFirmwareSqe;
+    *length = gFirmwareSqeBytes;
+    return 0;
+}
+
 extern "C" void native_adreno_probe(void)
 {
     uint32_t stage = 0;

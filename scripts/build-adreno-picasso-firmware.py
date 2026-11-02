@@ -22,8 +22,10 @@ FW_DIR = Path(os.environ.get('ADRENO620_FW_DIR') or '/tmp/picasso-gpu-fw')
 
 FILES = {
     'gmu': 'a650_gmu.bin',
-    'sqe': 'a630_sqe.fw',
-    'sqe_alt': 'a650_sqe.fw',
+    # The vendor a620 core entry (adreno_gpu_core_a620) and mainline's a620
+    # series both pair this GPU with a650_sqe.fw: a620 is an A650 derivative.
+    'sqe': 'a650_sqe.fw',
+    'sqe_alt': 'a630_sqe.fw',
     'zap_mdt': 'a620_zap.mdt',
     'zap_b00': 'a620_zap.b00',
     'zap_b01': 'a620_zap.b01',

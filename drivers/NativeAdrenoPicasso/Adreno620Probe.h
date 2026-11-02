@@ -32,6 +32,14 @@ struct native_adreno620_firmware {
 
 void native_adreno_set_firmware(const struct native_adreno620_firmware *firmware);
 
+/* The SQE image the probe validated (the vendor file bytes, including its 4-byte header), for the CP hook.
+ * Returns -1 when no firmware was staged. */
+int native_adreno620_sqe_firmware(const uint8_t **bytes, size_t *length);
+
+/* Releases the GMU GPU_SET out-of-band request (HOST2GMU_INTR_SET bit 31) once the CP is running, the last
+ * step of mainline hw_init after the CP ring has been initialized. No-op before the GMU has been booted. */
+void native_adreno620_gmu_release_gpu_set(void);
+
 /* Strong entry point; safe to call once from the boot monitor. Without
  * sheng-gpu=<1..5> it returns without doing anything. */
 void native_adreno_probe(void);

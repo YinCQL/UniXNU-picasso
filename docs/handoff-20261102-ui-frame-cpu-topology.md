@@ -587,6 +587,58 @@ queue advanced to the write index and no response appeared on queue 1. KGSL's de
 - The OOB request is left asserted after `gxPowerOn` returns; the next step (CP/SQE, `hw_init`)
   should clear it with `HOST2GMU_INTR_SET` bit 31 once the GPU registers have been touched.
 
+### 12.1 Stage 4 — CP/SQE bring-up: resolved (wf39–wf47)
+
+**Result.** `sheng-gpu=4` now runs mainline's A650-family `hw_init`, uploads the SQE microcode,
+starts the CP, submits `CP_ME_INIT`, submits a no-op IB and waits for its `CACHE_FLUSH_TS` fence:
+
+    PICASSO_GPU cp: sqe payload=31456 first=016dd087
+    PICASSO_GPU cp: sqe started cntl=00000001 status=00c00015 int=00000000 fault=00000000
+    PICASSO_GPU cp: me_init submitted wptr=9 shadow=0 rptr=0
+    PICASSO_GPU cp: me_init idle
+    PICASSO_GPU cp: noop ib submitted wptr=18 fence=1
+    PICASSO_GPU gx: oob released
+    PICASSO_GPU cp: ready fence=1
+    PICASSO_GPU end stage=4 step=4 error=0 requested=4 ticks=4 done=1
+
+The probe's own `cp_submit`/`cp_wait` then return a second fence (`fence=2 wait returned 0`), and the
+boot continues into userland (PID1 scans, `panic=0`). **[verified: out/wf47-runs/run1.log]**
+
+**Root cause: the GPU context did not route `gfx3d_user`'s secure aliases.** The device-tree
+`iommus = <&adreno_smmu 0 0x401>` expands sid 0 / mask 0x401 to the exact SIDs 0, 1, 0x400 and
+0x401; the port attached only the first two ("the non-secure GPU traffic uses 0 and 1"), leaving the
+secure aliases unrouted. The CP runs in secure mode until the zap shader switches it out
+(`CP_SET_SECURE_MODE`), so releasing `CP_SQE_HALT` with those aliases faulting wedged the GPU block
+and the SoC watchdog reset the device every time, with the console dying at the SQE start.
+
+**How it was isolated** (each a boot; `sheng-gpu-cp-limit=<1..7>` stops after a phase):
+| limit | stops after | outcome |
+|---|---|---|
+| 2 | `hw_init` | survives, userland continues (wf41) |
+| 4 | ring programming | survives (wf42) |
+| 5 | CP register readback | survives (wf43) |
+| 6 | `CP_SQE_CNTL=1` | **reset** with a630 SQE (wf39/wf44) and with a650 SQE (wf45) |
+| 7 (default) | full stage | succeeds once the secure aliases are routed (wf47) |
+
+**Second fix: the SQE firmware pairing.** The embedded firmware unit staged `a630_sqe.fw` as the
+primary SQE. Vendor's `adreno_gpu_core_a620` and upstream's a620 series both pair this GPU with
+`a650_sqe.fw` (a620 is an A650 derivative, same as the GMU's `a650_gmu.bin`); the generator now
+embeds a650 as primary and a630 as the alternate. The vendor image's `a650_sqe.fw` is version
+0x087, below mainline's 0x095 floor, so the probe reports that and continues only with
+`sheng-gpu-allow-old-sqe=1`.
+
+**Also in this change.** The GPU-context class gained a streams variant
+(`NativeAdrenoGpuContextBringupStreams`, up to 8 exact streams) so the four SIDs attach in one
+transaction; the integration quiesces slots 1–4 first and attaches 0/1/0x400/0x401 to bank 0/ASID 1
+(`route=0/4` verified by the kit). The CP hook (`Adreno620Cp.cpp`) follows mainline `hw_init` for
+an a650-family device with the vendor a620 values for PC_DBG_ECO_CNTL bit 9, the hang-detect span
+(0x3ffff), UBWC 3.0/hbb14 (SM7250's DT values) and the a650 GBIF list; the OOB GPU_SET request is
+released only after the no-op fence lands (`native_adreno620_gmu_release_gpu_set`).
+
+**Not done yet.** ZAP is not loaded (no secure PIL/SCM path), so the CP stays in the mode the boot
+chain left it and no `CP_SET_SECURE_MODE` packet is sent; stage 4 proves the CP runs. The next
+piece is the SMMU/Metal path (stage 5) and then the userland GPU stack.
+
 ## 13. Boot time: the UEFI menu timeout is 3 s of the first-console time
 
 Method: `/tmp/measure-boot.sh` starts a libusb reader on 1209:0001 before issuing `fastboot boot`

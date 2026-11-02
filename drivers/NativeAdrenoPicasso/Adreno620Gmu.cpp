@@ -1427,6 +1427,16 @@ int gxPowerOn(unsigned perfIndex)
 
 } // namespace
 
+extern "C" void native_adreno620_gmu_release_gpu_set(void)
+{
+    if (!gState) return;
+    /* a6xx_gmu_clear_oob(GMU_OOB_GPU_SET) for a non-legacy GMU: writing the
+     * clear_new bit (31) into HOST2GMU_INTR_SET releases the request. */
+    coreWrite(kGmuHost2GmuIntrSet, 1u << 31);
+    barrier();
+    printf("PICASSO_GPU gx: oob released\n");
+}
+
 extern "C" int native_adreno620_gmu_boot(const uint8_t *gmu, size_t gmuBytes,
     const uint8_t *sqe, size_t sqeBytes)
 {

@@ -5,10 +5,10 @@
  *
  * smmu_attach uses the qualified A740 context machinery unchanged: NativeAdrenoGmuContextBringup builds the GMU's own
  * context (bank, ASID, SMR slot and stream are the board plan's: bank 3 / ASID 4 / slot 0 / SID 5) and
- * NativeAdrenoGpuContextBringup builds the GPU context (bank 0 / ASID 1) with the first two exact SIDs of gfx3d_user.
- * The masked SIDs 0x400/0x401 are the secure aliases of the same streams; the non-secure GPU traffic uses 0 and 1, and
- * the kit attaches exact SIDs only, so the first bring-up leaves the secure aliases unrouted. The SMMU global state is
- * XBL-owned (SCR0 0x00210406, which the stream kit verifies and never rewrites).
+ * NativeAdrenoGpuContextBringupStreams builds the GPU context (bank 0 / ASID 1) with all four exact SIDs of gfx3d_user
+ * (0, 1 and the secure aliases 0x400/0x401 of the same stream mask). The CP runs in secure mode until the zap shader
+ * switches it out, so those aliases must be routed to the same bank, as the device tree's <&adreno_smmu 0 0x401> does.
+ * The SMMU global state is XBL-owned (SCR0 0x00210406, which the stream kit verifies and never rewrites).
  *
  * Both bring-ups allocate and map before any traffic exists (GX is still off in stage 2), so enabling the banks cannot
  * fault a running master. Each context object lives forever and can be brought up once per boot. */
@@ -32,7 +32,7 @@ extern "C" int native_adreno620_smmu_attach(const adreno620::ProbeSmmuPlan *plan
         if (bank.name && strcmp(bank.name, "gmu_kernel") == 0) gmu = &bank;
         else if (bank.name && strcmp(bank.name, "gfx3d_user") == 0) gpu = &bank;
     }
-    if (!gmu || !gpu || !gmu->sid_count || gpu->sid_count < 2) {
+    if (!gmu || !gpu || !gmu->sid_count || gpu->sid_count < 4) {
         printf("PICASSO_GPU smmu: plan lacks the GMU/GPU bring-up banks (gmu=%u gpu=%u)\n",
                gmu ? gmu->sid_count : 0u, gpu ? gpu->sid_count : 0u);
         return -1;
@@ -87,22 +87,29 @@ extern "C" int native_adreno620_smmu_attach(const adreno620::ProbeSmmuPlan *plan
            gmuReport.sctlr, gmuReport.cbar, gmuReport.smr, gmuReport.s2cr);
     if (status) return -1;
 
-    if (!quiesce(1) || !quiesce(2)) {
-        printf("PICASSO_GPU smmu: GPU stream slots did not reach FAULT\n");
-        return -1;
+    for (unsigned slot = 1; slot <= 4; ++slot) {
+        if (!quiesce(slot)) {
+            printf("PICASSO_GPU smmu: GPU stream slot %u did not reach FAULT\n", slot);
+            return -1;
+        }
     }
-    const uint32_t gpuSid0 = gpu->sids[0], gpuSid1 = gpu->sids[1];
-    status = NativeAdrenoGpuContextBringup(smmu, 0x10000, gpu->bank, gpu->asid,
-        1, gpuSid0, 2, gpuSid1, nullptr, &gpuReport);
-    printf("PICASSO_GPU smmu: gpu bank=%u asid=%u slots=1,2 sids=%u,%u status=%08x step=%u program=%u/%u "
-           "route=%u/%u reads=%u id1=%08x id2=%08x oas=%u aero=%u sctlr=%08x cbar=%08x smr=%08x s2cr=%08x\n",
-           gpu->bank, gpu->asid, gpuSid0, gpuSid1, (unsigned)status, gpuReport.step,
-           gpuReport.program_status, gpuReport.program_enabled,
+    /* gfx3d_user's iommus mask is 0x401, so its exact SIDs are 0, 1 and the
+     * secure aliases 0x400/0x401 that the CP uses before the zap shader makes
+     * it non-secure. Attach all four to the one GPU context. */
+    const unsigned gpuSlots[4] = {1, 2, 3, 4};
+    const uint16_t gpuSids[4] = {gpu->sids[0], gpu->sids[1], gpu->sids[2], gpu->sids[3]};
+    status = NativeAdrenoGpuContextBringupStreams(smmu, 0x10000, gpu->bank, gpu->asid,
+        gpuSlots, gpuSids, 4, nullptr, &gpuReport);
+    printf("PICASSO_GPU smmu: gpu bank=%u asid=%u slots=1,2,3,4 sids=%u,%u,%u,%u status=%08x step=%u "
+           "program=%u/%u route=%u/%u reads=%u id1=%08x id2=%08x oas=%u aero=%u sctlr=%08x cbar=%08x "
+           "smr=%08x s2cr=%08x\n",
+           gpu->bank, gpu->asid, gpuSids[0], gpuSids[1], gpuSids[2], gpuSids[3], (unsigned)status,
+           gpuReport.step, gpuReport.program_status, gpuReport.program_enabled,
            gpuReport.route_status, gpuReport.routes_verified, gpuReport.spans,
            gpuReport.id1, gpuReport.id2, gpuReport.output_bits, gpuReport.program_readback_valid,
            gpuReport.sctlr, gpuReport.cbar, gpuReport.smr, gpuReport.s2cr);
     if (status) return -1;
 
-    printf("PICASSO_GPU smmu: both contexts ready (secure SIDs 0x400/0x401 left unrouted)\n");
+    printf("PICASSO_GPU smmu: both contexts ready (gfx3d_user secure aliases routed)\n");
     return 0;
 }

@@ -288,10 +288,11 @@ def build_adreno_picasso(record: dict):
     extra_flags = ['-I', str(ROOT / 'drivers/NativeAdrenoPicasso'),
                    '-I', str(ROOT / 'drivers/NativeAdreno'),
                    '-I', str(ROOT / 'kits/ArmSmmu4K'),
-                   '-I', str(ROOT / 'kits/AdrenoFirmware')]
+                   '-I', str(ROOT / 'kits/AdrenoFirmware'),
+                   '-I', str(ROOT / 'kits/AdrenoPM4')]
     cpp_sources = [ROOT / 'drivers/NativeAdrenoPicasso' / name for name in
                    ('Adreno620Board.cpp', 'Adreno620ProbeCore.cpp', 'Adreno620Probe.cpp', 'Adreno620Hooks.cpp',
-                    'Adreno620Integration.cpp', 'Adreno620Gmu.cpp')]
+                    'Adreno620Integration.cpp', 'Adreno620Gmu.cpp', 'Adreno620Cp.cpp')]
     c_sources = [ROOT / 'drivers/NativeAdrenoPicasso' / 'Adreno620Firmware.c']
     embedded = out / 'adreno620_embedded_firmware.c'
     if embedded.is_file():
