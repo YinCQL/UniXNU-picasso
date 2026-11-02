@@ -17,10 +17,12 @@ enum : uint32_t {
     RingRptr = 0x0806,
     RingWptr = 0x0807,
     RingScratch = 0x0885,     /* CP_SCRATCH(2) for A6XX..A7XX */
-    RingFenceOpcode = 0x46,   /* CP_EVENT_WRITE7 on A7XX */
-    RingFenceEvent = 0x31,    /* CACHE_CLEAN */
+    RingFenceOpcode = 0x46,   /* CP_EVENT_WRITE7 on A7XX, CP_EVENT_WRITE on A6XX */
+    RingFenceEvent = 0x31,    /* CACHE_CLEAN (A7XX only) */
+    RingA6xxCacheFlushTs = 0x04,   /* CACHE_FLUSH_TS event type (a6xx_gpu.c a6xx_emit_fence) */
     RingFenceEnable = 1u << 27,
     RingFenceIrq = 1u << 31,
+    RingA6xxFenceWords = 5,   /* TYPE7 header + event, address lo/hi, seqno */
     RingBlockBytes = 32,
     /* A7XX framing, as a7xx_submit() in the pinned a6xx_gpu.c emits it: CP_THREAD_CONTROL (0x17; THREAD bits 0..1,
      * BR 1, BV 2, BOTH 3; SYNC_THREADS bit 31), CP_SET_MARKER (0x65; 0x101 IFPC disable, 0x100 enable), CCU_INVALIDATE_DEPTH
@@ -131,7 +133,7 @@ IOReturn NativeAdrenoRing::readRptr(uint32_t *value)
     uint32_t rptr=0;
     /* A secondary ring has no CP_RB_RPTR of its own: the CP keeps its read pointer in the ring's record, whose rptr shadow the CP
      * writes to msm_rbmemptrs.rptr (the fence page's first word, the address the record names) whenever it switches away. */
-    if(secondary_) {
+    if(secondary_ || shadow_rptr_) {
         if(cache_.acquire(cache_.cookie,fence_,fence_bytes_))return poison();
         rptr=fence_[0];
     } else if(io_.read32(io_.cookie,RingRptr,&rptr))return poison();
@@ -245,15 +247,24 @@ IOReturn NativeAdrenoRing::emitFence(uint32_t at,uint32_t seqno,uint32_t *end)
 {
     const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
     uint32_t words[RingFenceWords]={0};
-    if(AdrenoPM4Type4(RingScratch,1,&words[0])!=AdrenoPM4Success ||
-        AdrenoPM4Type7(RingFenceOpcode,4,&words[2])!=AdrenoPM4Success)return poison();
-    words[1]=seqno;
-    words[3]=RingFenceEvent|RingFenceEnable|RingFenceIrq;
-    /* The timestamp goes to +4 (msm_rbmemptrs.fence), where wait() reads it; +0 is the CP's RPTR shadow. */
     const uint64_t at4=fence_iova_+4;
-    words[4]=(uint32_t)at4;words[5]=(uint32_t)(at4>>32);words[6]=seqno;
-    for(uint32_t i=0;i<RingFenceWords;++i)ring_[(at+i)&mask]=words[i];
-    *end=(at+RingFenceWords)&mask;return kIOReturnSuccess;
+    uint32_t count=RingFenceWords;
+    if(a6xx_) {
+        /* a6xx: CP_EVENT_WRITE with CACHE_FLUSH_TS | IRQ; no CP_SCRATCH and
+         * no A7XX event bits (a6xx_emit_fence). */
+        if(AdrenoPM4Type7(RingFenceOpcode,4,&words[0])!=AdrenoPM4Success)return poison();
+        words[1]=RingA6xxCacheFlushTs|RingFenceIrq;
+        words[2]=(uint32_t)at4;words[3]=(uint32_t)(at4>>32);words[4]=seqno;
+        count=RingA6xxFenceWords;
+    } else {
+        if(AdrenoPM4Type4(RingScratch,1,&words[0])!=AdrenoPM4Success ||
+            AdrenoPM4Type7(RingFenceOpcode,4,&words[2])!=AdrenoPM4Success)return poison();
+        words[1]=seqno;
+        words[3]=RingFenceEvent|RingFenceEnable|RingFenceIrq;
+        words[4]=(uint32_t)at4;words[5]=(uint32_t)(at4>>32);words[6]=seqno;
+    }
+    for(uint32_t i=0;i<count;++i)ring_[(at+i)&mask]=words[i];
+    *end=(at+count)&mask;return kIOReturnSuccess;
 }
 /* The fence of a framed submission: CP_SCRATCH(2), the BV thread's timestamp, a BR wait for it (so BR cannot report the
  * submission while BV still works on it), then the ring timestamp with an interrupt, both threads and IFPC back on. */
@@ -312,6 +323,27 @@ IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *io,const NativeAdren
     IOReturn status=program();
     if(status)return status;
     seqno_=0;completed_=0;submissions_=0;
+    attached_=true;return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoRing::adopt(const NativeAdrenoRingIo *io,const NativeAdrenoRingCache *cache,
+    void *ring,size_t ring_bytes,uint64_t ring_iova,void *fence,size_t fence_bytes,uint64_t fence_iova,
+    uint32_t wptr,uint32_t seqno)
+{
+    if(attached_ || poisoned_ || ring_ || fence_)return kIOReturnBusy;
+    if(!io || !io->write32 || !io->read32 || !io->barrier || !cache ||
+        !cache->publish || !cache->acquire || !ring || !fence ||
+        ring_bytes<8192 || ring_bytes>(1u<<20) || (ring_bytes&(ring_bytes-1)) ||
+        ((ring_iova|ring_bytes)&(ring_bytes-1)) || (ring_iova&4095) ||
+        fence_bytes<64 || (fence_iova&7) || fence_bytes>=(1u<<24) ||
+        wptr>=ring_bytes/4)return kIOReturnBadArgument;
+    io_=*io;cache_=*cache;ring_=static_cast<volatile uint32_t *>(ring);
+    ring_bytes_=ring_bytes;ring_iova_=ring_iova;
+    fence_=static_cast<volatile uint32_t *>(fence);fence_bytes_=fence_bytes;fence_iova_=fence_iova;
+    control_=(uint32_t)(ilog2(ring_bytes_/8)&0x3f)|(ilog2(RingBlockBytes/8)<<8);
+    /* The CP is idle at wptr: both pointers start there and the fence keeps
+     * its live value, so the next submission's number follows the board's. */
+    next_=wptr;rptr_shadow_=wptr;seqno_=seqno;completed_=seqno;submissions_=0;
+    shadow_rptr_=true;   /* the CP maintains msm_rbmemptrs.rptr under HW_APRIV */
     attached_=true;return kIOReturnSuccess;
 }
 /* A second ring of the same GPU: the CP has one ring register set, so this one programs none of it. Its base, read-pointer shadow
@@ -507,12 +539,14 @@ IOReturn NativeAdrenoRing::submit(const uint32_t *words,size_t word_count,uint32
 IOReturn NativeAdrenoRing::submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence)
 {
     if(!fence)return kIOReturnBadArgument;
+    if(a6xx_)return kIOReturnUnsupported;   /* thread control and CACHE_CLEAN are A7XX-only */
     return submitWords(words,word_count,seqno_+1,true,current_,fence);
 }
 IOReturn NativeAdrenoRing::submitFramed(const uint32_t *words,size_t word_count,uint32_t number,uint32_t *issued)
 {
     if(!issued)return kIOReturnBadArgument;*issued=0;
     if(!number || (int32_t)(number-seqno_)<=0)return kIOReturnBadArgument;
+    if(a6xx_)return kIOReturnUnsupported;
     return submitWords(words,word_count,number,true,current_,issued);
 }
 IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,uint32_t number,bool framed,bool give_wptr,uint32_t *fence)
@@ -524,7 +558,8 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
     const bool reset=framed && reset_pending_,table=reset && table_pending_;
     /* A plain (kernel) submission cannot carry the switch: a pending table waits for the next framed one. */
     const uint32_t extra=framed?RingPrologueWords+(reset?RingResetWords:0)+(table?RingTableWords:0)+RingFramedFenceWords+
-        (stamps_?2*RingStampWords:0)+(preempt_?RingPseudoWords+RingYieldWords:0):RingFenceWords;
+        (stamps_?2*RingStampWords:0)+(preempt_?RingPseudoWords+RingYieldWords:0):
+        (a6xx_?RingA6xxFenceWords:RingFenceWords);
     if(word_count>size_words-extra-8)return kIOReturnNoResources;
     uint32_t rptr=0;IOReturn status=readRptr(&rptr);
     if(status)return status;

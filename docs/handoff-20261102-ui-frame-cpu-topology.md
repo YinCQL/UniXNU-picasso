@@ -641,6 +641,19 @@ across the idle gaps, and stage 4 still finished `done=1` with the boot continui
 (wf48). A production submit path can therefore reuse this ring while the GPU stays powered; a
 long-idle then submit cycle (power collapse) is still untested.
 
+**Production ring adoption.** `NativeAdrenoRing` now has `adopt()` (take over a board-programmed
+ring without register writes, no fence-page clear, HW_APRIV shadow as the read pointer) and an A6xx
+fence profile (`CP_EVENT_WRITE` with the CACHE_FLUSH_TS event | IRQ; framed A7XX thread-control
+submissions are refused). With `sheng-gpu-ring-smoke=1` the CP stage adopts the live ring after
+hw_init and submits one `CP_INDIRECT_BUFFER` through the production class:
+
+    PICASSO_GPU cp: ring smoke submit=00000000 fence=2 observed=2 result=0
+    PICASSO_GPU cp: ring smoke ok next=27 seqno=2
+    PICASSO_GPU end stage=4 step=4 error=0 requested=4 ticks=4 done=1
+
+The boot continues into userland (wf49). This is the submission path the Metal side will use; the
+next step is to attach `NativeAdrenoSubmit` and publish the service on top of it.
+
 **Not done yet.** ZAP is not loaded (no secure PIL/SCM path), so the CP stays in the mode the boot
 chain left it and no `CP_SET_SECURE_MODE` packet is sent; stage 4 proves the CP runs. The next
 piece is the SMMU/Metal path (stage 5) and then the userland GPU stack.

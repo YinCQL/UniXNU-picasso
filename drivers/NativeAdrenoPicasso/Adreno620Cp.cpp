@@ -26,7 +26,9 @@
 #include "Adreno620ProbeCore.h"
 #include "NativeAdrenoA620HwInit.h"
 #include "NativeAdrenoGpuContext.h"
+#include "NativeAdrenoKernelTime.h"
 #include "NativeAdrenoMemory.h"
+#include "NativeAdrenoRing.h"
 #include "AdrenoPM4.h"
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
@@ -77,6 +79,7 @@ constexpr uint32_t kGmuCgcDelayCntl = 0x23B0A;
 constexpr uint32_t kGmuCgcHystCntl = 0x23B0B;
 constexpr uint32_t kGmuCxBusyMask = 0x23B0E;
 constexpr uint32_t kGmuAhbFenceStatus = 0x23B13;
+constexpr uint32_t kGmuAhbFenceStatusClr = 0x23B14;
 constexpr uint32_t kGmuGxPwrStatus = 0x1F8D0;
 constexpr uint32_t kGmuPowerCounterSelect0 = 0x1F841;
 constexpr uint32_t kGmuPowerCounterEnable = 0x1F840;
@@ -505,6 +508,99 @@ bool waitFence(uint32_t fence, unsigned timeoutUs, bool verbose)
     }
 }
 
+/* Ring callbacks for the production NativeAdrenoRing: the same GPU window and
+ * GMU fence status the boot stage uses. The cache callbacks are no-ops because
+ * every CPU access to the ring and memptrs goes through the uncached aliases
+ * mapped above (no cache line of them can exist). */
+int ringWrite(void *, uint32_t reg, uint32_t value)
+{
+    gpuWrite(reg, value);
+    return 0;
+}
+
+int ringRead(void *, uint32_t reg, uint32_t *value)
+{
+    if (!value) return 1;
+    *value = gpuRead(reg);
+    return 0;
+}
+
+int ringBarrier(void *)
+{
+    barrier();
+    return 0;
+}
+
+int ringFenceStatus(void *, int clear, uint32_t *status)
+{
+    if (clear) {
+        gmuWrite(kGmuAhbFenceStatusClr, 0x7u);
+        return 0;
+    }
+    if (!status) return 1;
+    *status = gmuRead(kGmuAhbFenceStatus);
+    return 0;
+}
+
+int ringPublish(void *, const volatile uint32_t *, size_t)
+{
+    return 0;
+}
+
+int ringAcquire(void *, volatile uint32_t *, size_t)
+{
+    return 0;
+}
+
+uint64_t ringNowUs(void *)
+{
+    uint64_t microseconds = 0;
+    return NativeAdrenoKernelTime::now_us(nullptr, &microseconds) ? 0 : microseconds;
+}
+
+/* Take the live ring into the production ring class with the A6xx fence
+ * profile and submit one CP_INDIRECT_BUFFER through it. This is the first
+ * submission through the same code the Metal path will use. */
+bool ringSmoke()
+{
+    CpState &s = *gState;
+    if (!s.ring.base || !s.memptrs.base) return false;
+    static NativeAdrenoRing ring;
+    static NativeAdrenoRingClock clock;
+    const NativeAdrenoRingIo io = {nullptr, ringWrite, ringRead, ringBarrier,
+        nullptr, ringFenceStatus};
+    const NativeAdrenoRingCache cache = {nullptr, ringPublish, ringAcquire};
+    clock = {nullptr, ringNowUs, nullptr};
+
+    const IOReturn adopted = ring.adopt(&io, &cache,
+        const_cast<uint8_t *>(s.ring.base), size_t(s.ring.bytes), GpuRingIova,
+        const_cast<uint8_t *>(s.memptrs.base), size_t(s.memptrs.bytes), GpuMemptrsIova,
+        s.next, s.sequence);
+    if (adopted) {
+        printf("PICASSO_GPU cp: ring adopt failed %08x\n", unsigned(adopted));
+        return false;
+    }
+    ring.setA6xxFence(true);
+
+    uint32_t words[4] = {};
+    const uint32_t ib[3] = {uint32_t(GpuScratchIova), uint32_t(GpuScratchIova >> 32), 1};
+    if (!packet(words, 4, 0, kCpIndirectBufferOpcode, ib, 3)) return false;
+    uint32_t fence = 0;
+    const IOReturn committed = ring.submit(words, 4, &fence);
+    uint32_t observed = 0;
+    const NativeAdrenoRingFence waited = committed ? NativeAdrenoRingFencePoisoned :
+        ring.wait(fence, &clock, kFenceTimeoutUs, &observed);
+    printf("PICASSO_GPU cp: ring smoke submit=%08x fence=%u observed=%u result=%d\n",
+        unsigned(committed), fence, observed, int(waited));
+    if (committed || waited != NativeAdrenoRingFenceComplete) return false;
+
+    /* Keep the boot-stage ring cursor in step with the class: the submission
+     * above wrote exactly kIbSubmitDwords words (IB + A6xx fence). */
+    s.next = (s.next + kIbSubmitDwords) & (kRingDwords - 1);
+    s.sequence = fence;
+    return true;
+}
+
 bool acquireBuffers()
 {
     CpState &s = *gState;
@@ -638,6 +734,18 @@ extern "C" int native_adreno620_cp_start(void)
         IODelay(50000);
     }
     if (stress) printf("PICASSO_GPU cp: stress done count=%u\n", stress);
+
+    /* First submission through the production NativeAdrenoRing with the A6xx
+     * fence profile (sheng-gpu-ring-smoke=1). */
+    uint32_t smokeValue = 0;
+    if (PE_parse_boot_argn("sheng-gpu-ring-smoke", &smokeValue,
+        static_cast<int>(sizeof smokeValue)) && smokeValue) {
+        if (!ringSmoke()) {
+            printf("PICASSO_GPU cp: ring smoke failed\n");
+            return -1;
+        }
+        printf("PICASSO_GPU cp: ring smoke ok next=%u seqno=%u\n", s.next, s.sequence);
+    }
     return 0;
 }
 
