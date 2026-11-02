@@ -827,6 +827,31 @@ no client submission occurred. Repack the same kernel with those arguments as wf
 `docs/handoff-20261102-gpu-first-submit-stall.md`. **[verified: out/wf71-runs/run1.log;
 out/wf71/picasso/payload/payload.json]**
 
+**wf72 result — the zero page is executed, the CP names CP_OPCODE_ERROR, no mapping overlap.** The
+same kernel packed with `sheng-gpu-metal=1 sheng-gpu-addon=1` publishes the service and reproduces
+the stall: backboardd (pid 56, VM `0xfffffff345e29928`) submits 756 B at `0x100027000`; the wire
+read, the stall `bufinfo` and both readers see zeros, while the CP has consumed the whole ring
+(`RPTR`=`WPTR`=0x24, `CP_IB1_REM_SIZE`=0) and raised `CP_INTERRUPT_STATUS` bit 0
+(`CP_OPCODE_ERROR`), so the zero words are executed as type-0 packets and fault the SQE; the fence
+never runs. The wf71 mapping dump shows all mappings disjoint — the wf70 `handle=10` was hex
+(handle 16), not an overlap. mediaserverd (pid 29, a different VM) submits the same 756 B shape and
+its DRAM holds the genuine `tu_init_hw` prologue (`70460001 31 40bb0801 fffff 70268000 …`), so the
+recording path is sound. Two diagnostic defects surfaced: `sampleWord`'s `cached=` field is a
+failed read (not a measurement) for system BOs outside the physical aperture, and `dramRead32`
+mapped pages without `kIOMapInhibitCache`, i.e. cacheable. wf73 fixes the reader and adds a bounded
+full-buffer/whole-VM signature scan. **[verified: out/wf72-runs/run1.log]**
+
+**wf73 result — root cause: the BO's zero fill is written back over the client's stream.** With a
+truly uncached reader (`kIOMapInhibitCache`) and a bounded scan, backboardd's submitted BO holds
+the real `tu_init_hw` prologue at submit time (`scan wire: h=16 scanned=16384 nz=889 first=0:70460001`).
+At the 50 ms stall snapshot the first 704 bytes (11 cache lines) are zero and only 12 nonzero words
+remain, starting at 0x2c0 (`scan stall: nz=12 first=2c0:70460001`). The system BO is zero-filled by
+the VM through cacheable mappings; for write-combined BOs `allocateSystem`/`prepareSystem` skipped
+the clean, so the dirty zero lines stayed in the CPU cache while the client's non-cacheable stores
+went to DRAM. Their later eviction wrote zeros back over the command stream, and the CP fetched a
+zero first packet (`CP_OPCODE_ERROR`). Fix (wf74): clean the zero fill at allocation for every
+system BO, write-combined included. **[verified: out/wf73-runs/run1.log]**
+
 **One operational trap.** `unixnu build kernel` runs the archive stages before the XNU pass, and
 those archives read `out/picasso/tree/build/xnu/ios-obj/.../link.filelist` (written by the previous
 XNU pass) to survey kernel symbols. Interrupting a build leaves the XNU object tree pruned while

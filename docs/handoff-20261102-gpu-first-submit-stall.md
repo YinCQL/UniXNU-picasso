@@ -6,10 +6,12 @@ and the first version of this document; docs-only commits on top carry the revie
 The Metal plugin now opens the published GPU service, allocates BOs and submits its first command
 buffer, but that submission never completes: the CP stalls with `CP_HW_ERROR` and the IB page it
 names reads as zero at submit time and at stall time through two independent readers. **There is no
-fix yet.** The diagnostic kernel built for the next measurement is correct, but it was packed into
-an image without the GPU boot arguments, so the run (wf71) never published the service and
-produced no submission evidence. The immediate next step is to repack the same kernel correctly
-(wf72) and run it.
+fix yet.** wf72 ran the diagnostic kernel packed correctly (§3.1): it confirms the zero page, names
+the CP's error (`CP_INTERRUPT_STATUS` = 1, `CP_OPCODE_ERROR`), and rules out the suspected mapping
+overlap (the `handle=10` in the stall line is hexadecimal, i.e. handle 16). It also exposes a
+diagnostic-reader defect: the "uncached" DRAM reader used for every IB read mapped its page with
+the default (cacheable) attribute. wf73 (same evidence, a truly uncached reader plus a full-buffer
+and whole-VM signature scan) is the current run.
 
 The running project handoff is `docs/handoff-20261102-ui-frame-cpu-topology.md`; its §12.3 records
 the wf54–wf71 result and must be kept current. This document is the focused continuation of that
@@ -159,6 +161,112 @@ Two consequences for the next agent:
 2. The `STALL` readers may be reading the wrong mapping (handle 10) if two mappings overlap; the
    wire-time zero could be a reader artifact rather than the client's BO content. The dump is the
    discriminator.
+
+### 3.2 wf72 result — the CP executes the zero page and reports an opcode error
+
+Run `out/wf72-runs/run1.log` (kernel `65e94a03…`, args include both GPU flags). Timeline:
+
+```
+2435  wire: pid=56 vm=0xfffffff345e29928 next=17 h=16 iova=100027000 bytes=756 sample=0/0/0 bo= 0 0 0 0 0 0 0 0
+2447  map wire: slot=11 h=12 iova=100000000 bytes=20480 sys=1 wc=1 words=0 204cc003 3f800000 204cc004
+2448  map wire: slot=12 h=13 iova=100005000 bytes=131072 sys=1 wc=1 words=40a00201 fcfc 0 0
+2451  map wire: slot=15 h=16 iova=100027000 bytes=16384 sys=1 wc=1 words=0 0 0 0
+2452  table switch: vm=0xfffffff345e29928 ttbr0=100000d5ccc000
+2453  tunnel: call=5 status=0
+2494  stall: fence=3 pending=2039547 us cpFence=2 rptr=27 wptr=36
+2495  stall cp: 800005 0 0 0 900200 0 8000430e 0 24 24 27000 1 0 0 0 0 deafbead...
+2496  stall smmu: 400 1338f508 13c43 70903 job=11
+2497  stall cpregs: cpint=1 hwfault=0 protect=0 sqe=aa
+2498  stall job: count=1 words=4: 70bf8003 27000 1 bd
+2501  stall fencepage: read=0 cached=2 dram=2 handle=10
+2503  stall bufinfo: describe=0 iova=100027000 bytes=16384 perm=1 read=0: 0 0 0 0 0 0 0 0
+2520  map stall: slot=15 h=16 iova=100027000 bytes=16384 words=0 0 0 0
+2461  wire: pid=29 vm=0xfffffff345e29d28 next=17 h=16 iova=100027000 bytes=756
+      sample=0/0/70460001 bo= 70460001 31 40bb0801 fffff 70268000 48980401 1f 40980501
+```
+
+Reading it:
+
+- **The CP consumed the whole submission and then reported an opcode error.** `CP_RB_RPTR` =
+  `CP_RB_WPTR` = 0x24 (36 dwords), `CP_IB1_REM_SIZE` (0x092a) = 0, so the IB is finished, not
+  blocked mid-fetch; `CP_INTERRUPT_STATUS` = 1 is `CP_OPCODE_ERROR` (bit 0 of `A6XX_CP_INT`,
+  a6xx.xml). A zero page therefore is **not** a harmless no-op on this part/ucode: all-zero words
+  decode as type-0 register writes (register 0, one dword), and the SQE faults on them. The fence
+  packet after the IB never runs, which is why `cpFence` stays at the board probe's 2.
+- **There is no mapping overlap.** `stall fencepage ... handle=10` is printed with `%llx`: handle
+  0x10, i.e. 16. The wf72 `map wire` dump lists handle 10 at `0x30000000/32768` (the internal
+  ring1 buffer) and handle 16 at `0x100027000/16384` alone; slots 0..15 are disjoint. H2 as
+  written in wf70 is a printf-radix misreading, not a table bug.
+- **`cached=0` in `sampleWord` is not a measurement on client BOs.** `cachedRead32` returns -1 when
+  the physical address is outside `[gPhysBase, gPhysBase+gPhysSize)`; for these system pages it
+  does, and `sampleWord` leaves `cached` at its zero initializer. Only the DRAM field is evidence
+  for a system BO. (The fence page is a kernel BO inside the aperture, so its `cached=2` is real.)
+- **The "uncached" DRAM reader was cacheable.** `dramRead32` mapped its page with
+  `kIOMapAnywhere|kIOMapReadOnly`; without `kIOMapInhibitCache` that is a default (cacheable)
+  mapping, so a zero read also populates a clean zero line that later "confirms" the zero even
+  after DRAM changes. wf73 fixes the reader and adds a full-buffer and whole-VM scan through it.
+- **The same client code works in mediaserverd.** pid 29's first submission is a real `tu_init_hw`
+  prologue (`70460001` = `CP_EVENT_WRITE` cache-invalidate, `40bb0801 fffff` = `SP_UPDATE_CNTL`,
+  `70268000` = `CP_WAIT_FOR_IDLE`) in DRAM at submit time. Whatever loses backboardd's copy is
+  specific to that submission, not to the recording path or the ABI.
+
+### 3.3 wf73 result — the stream is in DRAM at submit and a write-back zeros it
+
+Run `out/wf73-runs/run1.log` (kernel `2a8a1257…`, both GPU flags). wf73 changes two diagnostics
+only: `dramRead32` now maps with `kIOMapInhibitCache` (it previously used the default, cacheable
+attribute), and a bounded scan reads the submitted BO and every mapping through that reader.
+
+```
+2316  wire: pid=56 vm=0xfffffff188ee7128 next=17 h=16 iova=100027000 bytes=756
+      sample=0/0/70460001 bo= 70460001 31 40bb0801 fffff 70268000 ...
+2333  scan wire: h=16 scanned=16384 nz=889 first=0:70460001 needle=70460001 at=0
+2334  scan vm: needle=70460001 hits=1 h=16 off=2c0 word=70460001
+2336  tunnel: call=5 status=0
+2349  stall: fence=3 pending=50000 us cpFence=2 rptr=27 wptr=36
+2376  scan stall: h=16 scanned=16384 nz=12 first=2c0:70460001 needle at=2c0
+2385  stall: fence=3 pending=1000018 us cpFence=2 rptr=27 wptr=36
+2412  scan stall: h=16 scanned=16384 nz=12 first=2c0:70460001 needle at=2c0
+```
+
+Reading it:
+
+- **The client's stream is in the BO at submit time.** Through the truly uncached reader the
+  submitted BO has 889 nonzero dwords and the `tu_init_hw` prologue at offset 0. The earlier
+  "zero IB" was the cacheable diagnostic reader returning a stale zero line.
+- **Between the submit and the 50 ms snapshot the first 704 bytes (11 cache lines) are overwritten
+  with zeros.** The scan then finds only 12 nonzero words, the first at 0x2c0; the two later
+  snapshots agree. 704 is 11×64 and the stream is 756 B, so the tail of the stream (0x2c0..0x2f3)
+  survives. That is a cache-line write-back of the BO's zero fill: system BOs are zero-filled by
+  the VM through cacheable mappings, and for **write-combined** BOs `allocateSystem`/`prepareSystem`
+  deliberately skipped the clean ("no CPU mapping should cache these pages"), assuming the zero
+  fill shared the BO's mapping attribute. It does not: the dirty zero lines stay in the CPU cache,
+  the client's WC stores go around them to DRAM, and their later eviction writes zeros back over
+  the command stream. The CP fetches the zeroed first packet, decodes type-0, and raises
+  `CP_OPCODE_ERROR`; the fence never runs. Mediaserverd's BO escaped because its dirty lines were
+  evicted before its client wrote.
+- **The fix (wf74):** clean the zero fill at allocation for every system BO, write-combined
+  included (`prepareSystem` and `allocateSystem` no longer test `!write_combined`). One-time pass,
+  before the BO is exposed or mapped by the client.
+
+**wf74 result — the fix works.** Kernel `3081b7b6…` with the allocation clean. Run
+`out/wf74-runs/run2.log`:
+
+```
+2377  wire: pid=56 vm=0xfffffff1e2308928 next=17 h=16 iova=100027000 bytes=756
+      sample=0/70460001/70460001 bo= 70460001 31 40bb0801 fffff 70268000 ...
+2378  scan wire: h=16 scanned=16384 nz=137 first=0:70460001 needle=70460001 at=0
+2381  tunnel: call=5 status=0
+2382  tunnel: call=6 status=0
+2383  tunnel: call=8 status=0
+2384  tunnel: call=6 status=0
+```
+
+The first submission is accepted and its fence is observed (`call=6 status=0`); the BO still holds
+the prologue at offset 0 at wire time (the 137 nonzero dwords are the stream itself — the 889 of
+wf73 included stale lines that the zero-fill clean removed), no stall or hang follows, and both
+backboardd and mediaserverd continue with further submissions and BO allocations (calls 2/3/13).
+The first-submission stall is fixed; the next stage is Metal device creation and sustained frames.
+**[verified: out/wf74-runs/run2.log]**
 
 ## 4. Ruled out so far
 
