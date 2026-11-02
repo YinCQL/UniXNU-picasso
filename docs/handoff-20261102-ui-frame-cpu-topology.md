@@ -811,8 +811,9 @@ a different process and VM (the same addresses because Turnip's allocator and th
 are deterministic), so wf69's "second submission with content" was another process, not a
 resubmission. The stall also finds a live mapping with handle 10 over the IB address while the job
 named 16 (`stall fencepage ... handle=10`): either two live mappings cover one GPU address, or the
-address-based readers return the first matching mapping and ignore the region. A page of zeros is a
-type-0 NOP sled, while `RBBM_INT_0_STATUS` carries `CP_HW_ERROR` and `CP_INTERRUPT_STATUS` (which
+address-based readers return the first matching mapping and ignore the region. A page of zeros
+decodes as type-0 PM4 (normally a no-op; that it is harmless on this part is itself unverified),
+while `RBBM_INT_0_STATUS` carries `CP_HW_ERROR` and `CP_INTERRUPT_STATUS` (which
 names the SQE error) was never read, so whether the CP fault is caused by the IB content at all is
 still open. The wf71 kernel therefore adds a full mapping dump at wire and stall time and the CP
 fault registers. **[verified: out/wf70-runs/run1.log]**
