@@ -447,13 +447,28 @@ Fix: `gicdRouterOffset(intid)` and `gicdRouteFromAffinity(aff)` helpers used by 
 `spiIpiConfigure()` and `armcpu_spi_attach()`. wf12 is otherwise the wf11 kernel/payload:
 1 boot, 300 s, **0 panics**, topology still `en=6 pn=2`. **[verified: out/wf12-runs/run1.log]**
 
-### 10.5 Next step: make AMP actually use P
+### 10.5 Classic `sched_amp` uses both clusters (wf13, accepted)
 
-Choosing the classic `sched_amp_dispatch` (define `CONFIG_SCHED_CLUTCH 1` +
-`CONFIG_SCHED_EDGE_OPT_OUT 1` in the BCM2837 block so `sched_prim.h` picks
-`sched_amp_dispatch`) is the smallest decisive experiment: `sched_amp_choose_processor()`
-explicitly spills to `pcore_set`, whereas edge needs the CLPC wiring above. If amp places
-work on cluster 1, the acceptance metric is the governor's `d1/d2 busy` rising and `d0`
-falling; if not, wire `scbg_preferred_cluster`/`cpu_init_completed` into edge instead.
-Do not forget the §9.2 two-pass build rule whenever `__ARM_AMP__` (and therefore the
-`struct thread` layout) changes.
+Choosing the classic `sched_amp_dispatch` instead of edge (define `CONFIG_SCHED_CLUTCH 1`
+and `CONFIG_SCHED_EDGE_OPT_OUT 1` in the BCM2837 block so `sched_prim.h` picks
+`sched_amp_dispatch`) is the smallest wiring change: `sched_amp_pset_init()` records
+`ecore_set`/`pcore_set` at pset creation and `sched_amp_choose_processor()`/
+`sched_amp_steal_thread()` spill to the P set, with no CLPC dependency. **Note that
+`CONFIG_SCHED_EDGE` also gates the edge fields in `struct thread`
+(`kern/thread.h:400-405`), so switching it off moves `machine.CpuDatap` back to 0x1d0 and
+the §9.2 two-pass/archive rule applies again.**
+
+wf13 (same payload, E/P classification + AMP, amp scheduler): one boot, 300 s, **0 panics**,
+`en=6 pn=2`. Placement is now real:
+- Governor (mode 4): `d1 busy≈33-45%`, `d2 busy≈53-61%` (edge left both at 0);
+  `d0` still reads ≈99 because that field is the busiest *single* CPU over a short window,
+  not a cluster average.
+- Per-CPU 10 s averages from a measurement-only boot (`sheng-cpufreq=1`, usage thread):
+  `c0..c5` (A55) 20–70 %, `c6/c7` (A76) 50–78 %, i.e. the load is spread across both
+  clusters. **[verified: out/wf13-runs/run1.log, out/wf13-cpuusage-run/run1.log]**
+- UI frame production did not improve (4–5 full-frame copies per 300 s, same as wf12):
+  P1 fixes *where* the CPU work runs, not the absence of a GPU render path (§7.2/§7.3).
+
+If edge is revisited later, the two missing wires are those in §10.3:
+`sched_edge_cpu_init_completed()` after the last CPU is registered, and a P preference in
+`scbg_preferred_cluster` (a CLPC replacement) instead of `pset0`.
