@@ -850,3 +850,21 @@ Client side (read-only reference copies):
   pattern or zeros). Plugin CDHash `289b3036b5cdce84414a19db5f5a19f17a09831b`, trust
   `a9d1b5456d37770bb27212d736636012e717440afae3d486acdc91dd7b2066af`; image
   `out/wf90/picasso/boot/wf90.img`, log `out/wf90-runs/run1.log`.
+- **wf90 result: Turnip's GPU work leaves the memory untouched.** `T s0 r0 v512 c0 g0/4096` and
+  `S fdeadbeef deadbeef deadbeef kdeadbeef deadbeef deadbeef r5a5a…`: the fill buffer samples are
+  still the CPU's `0xdeadbeef`, the compute buffer still `0xdeadbeef`, and the render read-back
+  buffer still the CPU's `0x5a5a5a5a`. So no blit, no dispatch and no copy ran — `v512` was only
+  the untouched half of the fill buffer. Every fence retired anyway. The watchdog `W 6200` sample
+  symbolized (`atos`) to `tu_CreateGraphicsPipelines` → `tu6_emit_viewport` in the Turnip dylib —
+  the 15 s block is pipeline creation in the compiler, not a GPU wait.
+- **wf91: did the CP execute anything inside Turnip's command buffer?** `fillTest` now creates a
+  `VK_QUERY_TYPE_TIMESTAMP` pool, records `vkCmdResetQueryPool` + `vkCmdWriteTimestamp`
+  (`VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT`) into the same command buffer, and reads the result with
+  `VK_QUERY_RESULT_WITH_AVAILABILITY_BIT` (no wait). Turnip implements the timestamp as
+  `CP_REG_TO_MEM(CP_ALWAYS_ON_COUNTER)` + `CP_MEM_WRITE` — both CP-level and both inside the IB —
+  while the kernel's fence is outside the IB. `turnipPhase()` streams `Q t<value> a<availability>
+  r<VkResult>` as its own line (the `S` line was truncated at the stream's 63-character limit).
+  Non-zero `t` means the IB ran and the pipeline stages are the problem; zero means the CP skipped
+  the client's IB. Plugin CDHash `0d2e7bfb013c0e2ac6d85dffb49ef689a8b30d06`, trust
+  `693690d75959f1fc08f3e3f6a89cb417b310c32bc44a3bc6dd1bcff3dddac08f`; image
+  `out/wf91/picasso/boot/wf91.img`, log `out/wf91-runs/run1.log`.
