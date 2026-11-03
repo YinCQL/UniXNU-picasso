@@ -1444,3 +1444,17 @@ Client side (read-only reference copies):
   `vsyncKicked` keeps the tick active from the first kick on instead of depending on the
   guessed +5592 head. Expected signature: `vsync_ticks` grows and the compositor submits more
   than its initial three frames.
+- **wf132: the lock screen comes up.** With the swap-queue kick driving `vsyncKicked`, the tick
+  arms on the compositor's first kick (`kicked=1 armed=1`), the display-state report starts
+  firing from the vsync path every 600 ticks, and the compositor stops idling: `submit=22
+  accept=22 reject=0 transfer=22 retire=22 copies=22` by ~1020 s, with the bootlogo replaced by
+  the lock screen on the panel. That is the first user-visible UI on this port with the
+  TZ-authenticated, non-secure GPU driver, and it is a direct consequence of the vsync
+  stand-in actually running (wf131 measured `wanted=0` on every kick and exactly three swaps).
+  The plugin's text stream confirms the renderer: `Y turnip`, `M … device: ShaderCache(…)`, and
+  the display path stays clean (no `stall:`/`hang:`, `transfer_fail=0`, `reject=0`).
+- **wf133: is the lock screen GPU work?** The +180 s counter still read `submissions=6` because
+  the UI starts minutes later, so `addonReport` now keeps printing the submit counter every
+  30 s (`PICASSO_GPU submits live <n>`). Its growth (or not) decides whether the compositor's
+  per-frame path is our GPU or a CPU/display-copy path. Image
+  `out/wf132/picasso/boot/wf132.img`; log `out/wf132-runs/run1.log`.

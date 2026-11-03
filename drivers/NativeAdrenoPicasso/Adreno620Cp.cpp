@@ -1880,6 +1880,17 @@ void addonReport(void *, wait_result_t)
     printf("PICASSO_GPU metal final: opens=%u foreign=%u report=%s report2=%s\n",
         native_adreno_metal_opens(), native_adreno_metal_foreign_opens(),
         native_adreno_metal_report(), native_adreno_metal_report2());
+    /* wf133: the UI comes up minutes after the third sample (wf132 saw the lock screen with the
+     * +180 s counter still at the five setup submissions), so keep reporting: whether the
+     * compositor's later frames are GPU work shows up here as the counter growing. */
+    for (unsigned round = 1;; ++round) {
+        IOSleep(30000);
+        printf("PICASSO_GPU submits live %u: submissions=%u ibs=%u max=%u many=%u "
+               "opens=%u report=%s\n", round,
+            native_adreno_submit_ibs[0], native_adreno_submit_ibs[1],
+            native_adreno_submit_ibs[2], native_adreno_submit_ibs[3],
+            native_adreno_metal_opens(), native_adreno_metal_report());
+    }
 }
 
 /* One entry of the production user-client dispatch, with the record sizes the
