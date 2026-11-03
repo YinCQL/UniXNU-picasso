@@ -59,7 +59,8 @@ def check(tree, work, kernelcache, output):
     builder.require(set(build['members']) == {'NativeLegacyDisplay.late.o', 'PicassoDisplay.o',
         'NativeKeyStoreEvents.late.o', 'PicassoKeyStore.o', 'PicassoAccelerator.late.o',
         'original-bindings.o', 'NativeHidInput.late.o', 'PicassoHidInput.o',
-        'hid-original-bindings.o'}, 'Wrong display/state/input archive members')
+        'hid-original-bindings.o', 'NativeGOPPresenter.late.o', 'NativeGOPGlue.o',
+        'PicassoPr13.o'}, 'Wrong display/state/input archive members')
     kernel = work / 'kernel/kernel.macho'
     plan = json.loads(kernel.with_suffix('.json').read_text())
     report = builder.verify_kernel(aes, native, original, kernel.read_bytes(), plan, audit)
@@ -69,7 +70,11 @@ def check(tree, work, kernelcache, output):
                                directory, kernel.read_bytes(), plan)
     config = (work / '.config').read_text()
     builder.require(config.splitlines().count('CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y') == 1, 'Display disabled in actual config')
-    builder.require('CONFIG_XNU_NATIVE_ADRENO=y' not in config, 'Unexpected GPU configuration')
+    builder.require(config.splitlines().count('CONFIG_XNU_NATIVE_ADRENO=y') == 1, 'GPU disabled in actual config')
+    initializer = '__GLOBAL__sub_I_NativeGOPPresenter.cpp'
+    builder.require(platform.initializer_state(directory / 'NativeGOPPresenter.o', native, initializer, True) ==
+                    platform.initializer_state(directory / 'NativeGOPPresenter.late.o', native, initializer, False),
+                    'Late conversion changed GOP presenter instructions')
     report.update(scope='Actual SDK build and final linked dispatch; runtime not qualified',
                   archive_sha256=build['archive_sha256'], build_profile=profile)
     output.write_text(json.dumps(report, indent=2) + '\n')

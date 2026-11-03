@@ -13,6 +13,9 @@
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSSymbol.h>
 #include <kern/clock.h>
+#include <kern/task.h>
+#include <kern/thread.h>
+#include <IOKit/IOMemoryDescriptor.h>
 #include <kern/thread_call.h>
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
@@ -26,6 +29,9 @@ IOService *picasso_accelerator_allocate(void);
 bool picasso_power_source_publish(void);
 void picasso_keystore_probe(void);
 void picasso_hid_start_later(void);
+void picasso_pr13_start(void);
+void native_gop_presenter_static_init(void) __asm__("__GLOBAL__sub_I_NativeGOPPresenter.cpp");
+bool native_gop_glue_start(IOService *nub);
 void picasso_hid_frame_presented(void);
 void picasso_hid_content_presented(void);
 IOService *native_legacy_display_allocate(void);
@@ -191,6 +197,49 @@ static bool matchDisplayScale(IORegistryEntry *entry, uint32_t &scale, bool &add
     return scale == 2 || scale == 3;
 }
 
+/* wf129: a coarse read-back of the scanout surface, so "the UI is up" can be
+ * judged from the serial log alone. A 12x24 luminance grid, one hex digit per
+ * cell, is sampled every sheng-display-grid seconds; read-only, and inactive
+ * unless that boot argument is present. */
+static uint64_t gridPhysical, gridBytes, gridPeriodMs;
+static uint32_t gridWidth, gridHeight, gridStride;
+
+static void gridSampleThread(void *, wait_result_t)
+{
+    IOMemoryDescriptor *descriptor = IOMemoryDescriptor::withPhysicalAddress(
+        gridPhysical, gridBytes, kIODirectionIn);
+    if (!descriptor) { printf("PICASSO_GRID: descriptor failed\n"); return; }
+    IOMemoryMap *map = descriptor->createMappingInTask(kernel_task, 0,
+        kIOMapAnywhere | kIOMapInhibitCache);
+    descriptor->release();
+    if (!map) { printf("PICASSO_GRID: mapping failed\n"); return; }
+    volatile const uint8_t *fb = reinterpret_cast<volatile const uint8_t *>(
+        static_cast<uintptr_t>(map->getAddress()));
+    for (unsigned sample = 1;; ++sample) {
+        IOSleep(static_cast<unsigned>(gridPeriodMs));
+        printf("PICASSO_GRID frame=%u\n", sample);
+        /* wf131: the state line carries submissions/accepted/transfers/copies/vsync_ticks, so
+         * the grid run also shows whether the display service is being fed frames at all. */
+
+        for (uint32_t row = 0; row < 24; ++row) {
+            char text[13];
+            for (uint32_t col = 0; col < 12; ++col) {
+                const uint32_t x = (col * gridWidth + gridWidth / 2) / 12;
+                const uint32_t y = (row * gridHeight + gridHeight / 2) / 24;
+                const volatile uint32_t *pixel =
+                    reinterpret_cast<volatile const uint32_t *>(
+                        fb + uint64_t(y) * gridStride + uint64_t(x) * 4);
+                const uint32_t value = *pixel;
+                const uint32_t luma = ((value & 0xff) * 11 +
+                    ((value >> 8) & 0xff) * 59 + ((value >> 16) & 0xff) * 30) / 100;
+                text[col] = "0123456789abcdef"[luma >> 4];
+            }
+            text[12] = 0;
+            printf("PICASSO_GRID %02u %s\n", row, text);
+        }
+    }
+}
+
 extern "C" bool native_legacy_gop_mapping_observed(IOService *, IOMemoryMap *map, uint32_t width, uint32_t height) {
     PE_Video video = {};
     if (PE_current_console(&video) || map->getPhysicalAddress() != video.v_baseAddr ||
@@ -206,6 +255,21 @@ extern "C" bool native_legacy_gop_mapping_observed(IOService *, IOMemoryMap *map
     IOLog("PICASSO_DISPLAY mapped ok=%u base=%llx bytes=%llx width=%u height=%u stride=%lu depth=%lu console=%lu scale=%u scale_ok=%u rotation_ok=%u\n",
         (unsigned)ok, map->getPhysicalAddress(), map->getLength(), width, height,
         video.v_rowBytes, video.v_depth, video.v_display, scale, (unsigned)scaleOK, (unsigned)rotationOK);
+    gridPhysical = map->getPhysicalAddress();
+    gridBytes = map->getLength();
+    gridWidth = width;
+    gridHeight = height;
+    gridStride = video.v_rowBytes;
+    uint32_t gridSeconds = 0;
+    if (PE_parse_boot_argn("sheng-display-grid", &gridSeconds,
+            static_cast<int>(sizeof gridSeconds)) && gridSeconds) {
+        gridPeriodMs = gridSeconds > 3600u ? 3600000u : uint64_t(gridSeconds) * 1000u;
+        thread_t thread = nullptr;
+        if (kernel_thread_start(gridSampleThread, nullptr, &thread) == KERN_SUCCESS)
+            thread_deallocate(thread);
+        else
+            printf("PICASSO_GRID: thread failed\n");
+    }
     return ok;
 }
 
@@ -215,6 +279,7 @@ extern "C" void native_legacy_display_probe(void) {
     void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if (!handle) { report(0, 1, kIOReturnNoMemory, 0); return; }
     native_legacy_display_static_init();
+    native_gop_presenter_static_init();
     OSReturn status = OSMetaClass::postModLoad(handle);
     report(0, 1, status, 0);
     if (status) return;
@@ -266,20 +331,25 @@ static void publishDisplayModes(IOService *display, uint32_t width, uint32_t hei
 static void publishAcceleratorStub(void) {
     unsigned requested = 1;
     PE_parse_boot_argn("picasso-accel-stub", &requested, sizeof(requested));
-    if (requested != 1) { IOLog("PICASSO_ACCEL disabled by boot-arg\n"); return; }
+    unsigned metal = 0;
+    PE_parse_boot_argn("sheng-gpu-metal", &metal, sizeof(metal));
+    if (metal == 1) requested = 0;
+    // Both the PR13 accelerator and the CPU fallback derive from this original
+    // class. Register neither a replacement class nor a duplicate metaclass.
+    kern_return_t loaded = OSKextLoadKextWithIdentifier("com.apple.iokit.IOGPUFamily");
     const OSSymbol *name = OSSymbol::withCString("IOAcceleratorES");
-    bool absent = name && !OSMetaClass::getMetaClassWithName(name);
+    bool present = name && OSMetaClass::getMetaClassWithName(name);
     OSSafeReleaseNULL(name);
     IOService *provider = IOService::getResourceService();
-    if (!absent || !provider) {
-        IOLog("PICASSO_ACCEL publish refused class_absent=%u provider=%u\n", absent, provider != nullptr); return;
+    if (loaded || !present || !provider) {
+        IOLog("PICASSO_ACCEL publish refused load=%x class_present=%u provider=%u\n", loaded, present, provider != nullptr); return;
     }
     void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if (!handle) { IOLog("PICASSO_ACCEL preModLoad failed\n"); return; }
     picasso_accelerator_static_init();
     OSReturn status = OSMetaClass::postModLoad(handle);
     if (status) { IOLog("PICASSO_ACCEL metaclass result=%x\n", status); return; }
-    IOService *accel = picasso_accelerator_allocate();
+    IOService *accel = requested == 1 ? picasso_accelerator_allocate() : nullptr;
     bool initialized = accel && accel->init();
     bool attached = initialized && accel->attach(provider);
     bool started = attached && accel->start(provider);
@@ -324,6 +394,7 @@ extern "C" void native_legacy_display_late_probe(void) {
         nub->setDeviceMemory(ranges); nub->setName("NativeGOPFramebuffer");
         nubAttached = nub->attach(parent);
         if (nubAttached) nubStarted = nub->start(parent);
+        if (nubStarted) native_gop_glue_start(nub);
         if (nubStarted && nub->setProperty("device_type", typeData)) {
             nub->setName("gop-display", gIODTPlane);
             dtAttached = nub->attachToParent(treeParent, gIODTPlane);
@@ -340,6 +411,7 @@ extern "C" void native_legacy_display_late_probe(void) {
         publishDisplayModes(display, (uint32_t)video.v_width, (uint32_t)video.v_height);
         publishAcceleratorStub();
         picasso_hid_start_later();
+        picasso_pr13_start();
     }
     else {
         if (attached) display->detach(nub);

@@ -45,6 +45,10 @@ archives = [
   "build-corecrypto-14.py --namespace",
   "build-arm-driver.py ArmDTPlatform",
   "build-arm-driver.py ArmCpu",
+  "build-arm-driver.py NativeAdreno",
+  "build-arm-driver.py AdrenoPicasso",
+  "build-picasso-cpufreq.py",
+  "build-arm-driver.py NativeWlan",
   # AppleImage4 waits for this real software-key IOAESAccelerator provider.
   "build-picasso-aes.py",
   # UFS physical windows are defined in the board driver.
@@ -212,7 +216,7 @@ skip_setup_args = ["--no-auto-dim", "--inject-lib", "out/picasso/libpicasso-sb.d
 size_mib = 60
 loader = "firmware"
 title = "Boot"
-dram_size = "0x80000000"
+dram_size = "0x180000000"
 # Keep kprintf enabled; the console is carried by USB CDC.
 # Enable eight cores with PSCI, routed SPI IPIs and the initial self-IPI.
 kernel_args = [
@@ -226,6 +230,7 @@ kernel_args = [
   "armcpu-spi-ipi=1",
   # Request the top CPU frequency row; hardware limits still apply.
   "armcpu-cpufreq=1",
+  "sheng-cpufreq=4",
   # Apply the Picasso status bar metric in SpringBoard and main app executables.
   "picasso_inject_sb=/private/var/picasso/libpicasso-sb.dylib",
   "picasso_inject_apps=1",
@@ -267,6 +272,8 @@ kernel_args = [
   "offline-legacy-validate=1",
   "offline-legacy-transfer=1",
   "offline-legacy-cpu-present=1",
+  # Offer frames to the GPU client; keep the CPU path when no client accepts.
+  "sheng-fb-gpu=1",
   # State queries only for unprotected RAM Data; no keybag/key operations.
   "picasso-aks-state=1",
   # Software refresh notifications only; panel timing remains firmware-owned.
@@ -296,8 +303,8 @@ packed_data_ramdisk = true
 iphone_identity = true
 # Select the authenticated OS volume by UUID; verify its signed image independently.
 root_match_volume_uuid = "DADD93F8-DBBF-4B17-A1DF-0F11E64172F7"
-# Reserve 768 MiB of contiguous conventional memory for XNU and volatile Data.
-# Firmware must allocate the whole range; this is separate from FAT and dram_size.
-owned_memory_size = "0x30000000"
+# Request the 5 GiB contiguous run published by the PR13 firmware.
+# DarwinBoot clamps it to the largest free run; packed Data stays sparse.
+owned_memory_size = "0x140000000"
 cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
 unique_chip_id = "required"

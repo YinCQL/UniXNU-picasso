@@ -243,16 +243,19 @@ def main():
     objects = []
     sources = [source_dir / 'NativeLegacyDisplay.cpp', ROOT / 'kits/picasso/PicassoDisplay.cpp',
                ROOT / 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp', ROOT / 'kits/picasso/PicassoKeyStore.cpp',
-               ROOT / 'kits/picasso/PicassoAccelerator.cpp']
+               ROOT / 'kits/picasso/PicassoAccelerator.cpp',
+               source_dir / 'NativeGOPPresenter.cpp', source_dir / 'NativeGOPGlue.cpp',
+               ROOT / 'kits/picasso/PicassoPr13.cpp']
     audit = None
     for source in sources:
         obj = out / (source.stem + '.o')
-        command = platform.compile_command(record, source, obj, ROOT) + ['-I', str(out), '-I', str(source_dir), '-mgeneral-regs-only']
+        command = platform.compile_command(record, source, obj, ROOT) + ['-I', str(out), '-I', str(source_dir),
+            '-I', str(ROOT / 'drivers/NativeAdreno'), '-mgeneral-regs-only']
         platform.run(command, obj.with_suffix('.compile.log'), record['directory'])
         if source.stem == 'NativeLegacyDisplay':
             audit = audit_object(platform, native, obj, slots, aliases, names)
             platform.write_json(out / 'object-audit.json', audit)
-        if source.stem in ('NativeLegacyDisplay', 'NativeKeyStoreEvents', 'PicassoAccelerator'):
+        if source.stem in ('NativeLegacyDisplay', 'NativeKeyStoreEvents', 'PicassoAccelerator', 'NativeGOPPresenter'):
             late = out / (source.stem + '.late.o')
             objcopy = shutil.which('llvm-objcopy')
             require(objcopy, 'llvm-objcopy required')
@@ -273,13 +276,14 @@ def main():
     objects += hid_objects
     sources += hid_sources
     sources += [ROOT / 'drivers/NativeNovatekTouch/TouchPublish.h']
+    sources += [ROOT / 'drivers/NativeAdreno/OriginalAcceleratorABI.h']
     pending = Path(tempfile.mkdtemp(prefix='qualified-display-', dir=out)) / 'libNativeLegacyDisplay.late.a'
     platform.run(['xcrun', 'ar', 'rcs', pending, *objects], out / 'archive.log')
     members = platform.check_archive_members(platform.run(['xcrun', 'ar', 't', pending], out / 'members.log').splitlines(), objects)
     archive = out / pending.name
     platform.save_old_archive(archive)
     pending.rename(archive)
-    sources += [source_dir / n for n in ('PicassoGop.h', 'NativeLegacyRequest.h', 'NativeLegacyBootLogo.h', 'OriginalLegacyFramebufferBase.h.in')]
+    sources += [source_dir / n for n in ('PicassoGop.h', 'NativeLegacyRequest.h', 'NativeLegacyBootLogo.h', 'OriginalLegacyFramebufferBase.h.in', 'NativeGOPWire.h')]
     sources += [ROOT / 'scripts/build-picasso-display.py', ROOT / 'scripts/build-picasso-pmgr.py',
                 ROOT / 'scripts/picasso_target.py']
     platform.write_json(out / 'build-report.json', dict(complete=True, archive_sha256=sha(archive.read_bytes()),

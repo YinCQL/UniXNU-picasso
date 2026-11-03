@@ -53,10 +53,10 @@ jobs:
       - name: Verify firmware volume and DTB are present
         run: |
           test -s uefi/SILICIUM_UEFI.fd || { echo "uefi/SILICIUM_UEFI.fd missing"; exit 1; }
-          test -s uefi/mu-silicium/Resources/DTBs/picasso.dtb || { echo "picasso.dtb missing"; exit 1; }
+          test -s uefi/mu-silicium/Resources/DTBs/picasso-topology.dtb || { echo "picasso-topology.dtb missing"; exit 1; }
           test -s uefi/mu-silicium/BootShim/BootShim.S || { echo "BootShim.S missing"; exit 1; }
           test -s uefi/mu-silicium/Resources/Scripts/mkbootimg.py || { echo "mkbootimg.py missing"; exit 1; }
-          ls -l uefi/SILICIUM_UEFI.fd uefi/mu-silicium/Resources/DTBs/picasso.dtb
+          ls -l uefi/SILICIUM_UEFI.fd uefi/mu-silicium/Resources/DTBs/picasso-topology.dtb
 
       - name: Prepare the isolated upstream source
         run: |
@@ -253,7 +253,7 @@ jobs:
           python3 ./unixnu bootimg \
             --uefi "$GITHUB_WORKSPACE/device/uefi/mu-silicium" \
             --fd "$GITHUB_WORKSPACE/device/uefi/SILICIUM_UEFI.fd" \
-            --dtb "$GITHUB_WORKSPACE/device/uefi/mu-silicium/Resources/DTBs/picasso.dtb" \
+            --dtb "$GITHUB_WORKSPACE/device/uefi/mu-silicium/Resources/DTBs/picasso-topology.dtb" \
             --ramdisk "$GITHUB_WORKSPACE/device/out/picasso/payload/payload.img" \
             -o "$GITHUB_WORKSPACE/device/out/picasso/boot/boot.img" \
             2>&1 | tee out/picasso/logs/bootimg.log

@@ -2,7 +2,7 @@
 #
 # Reaches the XNU video/serial console and reports the genuine missing-driver panic.
 # Native UFS, software AES, volatile Data and CPU/GOP display are selected.
-# Adreno and persistent Data remain unimplemented.
+# PR13 GPU/CPU/WLAN probes are linked; persistent Data remains disabled.
 
 CONFIG_XNU_BUILD_ARCHIVES=y
 CONFIG_XNU_SOURCE_CORECRYPTO14=y
@@ -32,7 +32,10 @@ CONFIG_XNU_NATIVE_RAM_BLOCK=y
 # CONFIG_XNU_NATIVE_MOBILE_DISPLAY is not set
 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
 CONFIG_XNU_NOVATEK_TOUCH=y
-# CONFIG_XNU_NATIVE_ADRENO is not set
+CONFIG_XNU_NATIVE_ADRENO=y
+CONFIG_XNU_ADRENO620_PROBE=y
+CONFIG_XNU_PICASSO_CPUFREQ=y
+CONFIG_XNU_PICASSO_WLAN=y
 # CONFIG_XNU_ARMVIRT_PLATFORM is not set
 # CONFIG_XNU_ZONE_PGZ_ALIGNMENT_PROBE is not set
 # CONFIG_XNU_VERIFIED_ROOT_PROBE is not set

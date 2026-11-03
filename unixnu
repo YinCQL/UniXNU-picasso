@@ -19,7 +19,10 @@ def prepare(device=DEVICE, source=None):
         raise ValueError('upstream.rev must contain a full Git commit ID')
     patch = device / 'patches/unixnu-source-kernel.patch'
     usb_patch = device / 'patches/picasso-usb-console-xnu.patch'
-    fingerprint = hashlib.sha256(patch.read_bytes() + b'\0' + usb_patch.read_bytes()).hexdigest()
+    overlays = [device / 'patches/picasso-cpu-idle-xnu.patch',
+                device / 'patches/picasso-cpu-topology-xnu.patch']
+    fingerprint = hashlib.sha256(b'\0'.join(
+        p.read_bytes() for p in [patch, usb_patch, *overlays])).hexdigest()
     cache = device / '.cache'
     target = cache / f'upstream-{revision[:12]}-{fingerprint[:12]}'
     if target.is_dir():
@@ -54,6 +57,9 @@ def prepare(device=DEVICE, source=None):
         if not embedded_usb_patch.is_file():
             raise FileNotFoundError(f'{embedded_usb_patch} missing from source patch')
         embedded_usb_patch.write_bytes(usb_patch.read_bytes())
+        for name, overlay in zip(('zzzzzzzzzzzzzzzzzzzzzzzz-picasso-cpu-idle.patch',
+                                  'zzzzzzzzzzzzzzzzzzzzzzzzz-picasso-cpu-topology.patch'), overlays):
+            (tree / 'patches/xnu' / name).write_bytes(overlay.read_bytes())
         tree.rename(target)
     return target
 

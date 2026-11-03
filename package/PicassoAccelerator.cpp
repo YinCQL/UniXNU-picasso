@@ -3,7 +3,7 @@
 //
 // backboardd matches IOAcceleratorES before CoreAnimation composes a frame;
 // with no such service the UI never draws, even though the GOP framebuffer
-// works. Picasso has no Adreno backend yet, so this stub owns the name: it
+// works. The CPU fallback derives from the original IOAcceleratorES: it
 // answers every user-client call with success and zeroed outputs and
 // advertises no MetalPluginName, which leaves CoreAnimation on its software
 // path. The same approach brought mondrian to the iOS main UI.
@@ -19,6 +19,7 @@
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSSymbol.h>
 #include <sys/proc.h>
+#include "OriginalAcceleratorABI.h"
 
 class PicassoAcceleratorUserClient : public IOUserClient {
     OSDeclareDefaultStructors(PicassoAcceleratorUserClient);
@@ -50,15 +51,15 @@ IOReturn PicassoAcceleratorUserClient::externalMethod(uint32_t selector, IOExter
     return kIOReturnSuccess;
 }
 
-class IOAcceleratorES : public IOService {
-    OSDeclareDefaultStructors(IOAcceleratorES);
+class PicassoCpuAccelerator : public IOAcceleratorES {
+    OSDeclareDefaultStructors(PicassoCpuAccelerator);
 public:
     bool start(IOService *provider) override;
 };
 
-OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+OSDefineMetaClassAndStructors(PicassoCpuAccelerator, IOAcceleratorES);
 
-bool IOAcceleratorES::start(IOService *provider) {
+bool PicassoCpuAccelerator::start(IOService *provider) {
     if (!IOService::start(provider)) return false;
     setProperty(kIOUserClientClassKey, "PicassoAcceleratorUserClient");
     setProperty("IOAcceleratorStub", kOSBooleanTrue);
@@ -67,7 +68,7 @@ bool IOAcceleratorES::start(IOService *provider) {
 }
 
 extern "C" IOService *picasso_accelerator_allocate(void) {
-    return OSTypeAlloc(IOAcceleratorES);
+    return OSTypeAlloc(PicassoCpuAccelerator);
 }
 
 // A fixed IOPMPowerSource: a full battery on a USB-C charger. powerd finds

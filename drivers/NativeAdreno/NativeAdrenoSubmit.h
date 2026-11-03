@@ -1,0 +1,240 @@
+/* SPDX-License-Identifier: MIT */
+#ifndef NATIVE_ADRENO_SUBMIT_H
+#define NATIVE_ADRENO_SUBMIT_H
+#include "NativeAdrenoPreempt.h"
+#include "NativeAdrenoRing.h"
+#include "NativeAdrenoVm.h"
+
+/* IBs of one submission: a whole frame, so the ring prologue (cache flush, idle wait, thread switch) runs once per frame. */
+enum : size_t {NativeAdrenoSubmitMaxBuffers=128};
+struct NativeAdrenoSubmitBuffer {
+    uint64_t handle;
+    uint64_t iova;
+    size_t bytes;      /* Complete indirect-buffer range in bytes. */
+};
+/* Coherence samples (int-070): [0] submissions sampled; [1..3] the last one's first IB word through the kernel's cacheable alias,
+ * through DRAM before and through DRAM after the CPU cache maintenance of every mapped BO (~0 when unreadable); [4] samples whose
+ * three values differ and [5..7] the first such sample. */
+extern "C" volatile uint32_t native_adreno_coherence[8];
+/* The write-combine audit (int-100), see NativeAdrenoSubmit.cpp, and the submission (1-based) that ended the trust; 0 = never. */
+extern "C" volatile uint32_t native_adreno_wc_audit[6];
+extern "C" volatile uint32_t native_adreno_wc_distrusted;
+/* A GPU restart after a hang (NativeAdrenoSubmit::recover): the board resets the GPU and brings the CP up again on the same ring (a6xx_recover
+ * and hw_init), calling NativeAdrenoRing::restart(completed) between the reset and its CP init. Nonzero: the GPU could not be restarted. */
+typedef IOReturn (*NativeAdrenoRestart)(void *cookie,NativeAdrenoRing *ring,uint32_t completed);
+struct NativeAdrenoRecovery {
+    uint32_t fence;            /* the fence the GPU hung on */
+    uint32_t replayed;         /* submissions given to the ring again after the restart */
+    NativeAdrenoVm *guilty;    /* the VM of the hung submission, null when no job held that fence */
+    IOReturn status;
+};
+/* Each client's queues are one range of the shared queue space: client n owns [n << 32, (n + 1) << 32). */
+enum : uint64_t {NativeAdrenoQueueRange=UINT64_C(1)<<32};
+struct NativeAdrenoSubmitStats {
+    uint32_t submissions,completed,timeouts,poisoned_jobs,hangs,restarts;
+    size_t references_held,references_retired,peak_jobs;
+};
+/* Kernel-side execbuf: turns validated indirect buffers into one ring
+ * submission and owns a device reference per distinct buffer until the
+ * timestamp fence is actually observed. This is not a userspace ABI and not a
+ * scheduler: as many jobs are outstanding as the ring has room for (a full
+ * ring answers kIOReturnBusy, as msm waits for ring space), callers serialize
+ * every method, and the ring/VM must already be attached to the same live context.
+ * Buffers may be sub-ranges of a live VM mapping but never a different IOVA,
+ * unmapped handle, table pool or a range that includes unreadable bytes.
+ * A failed ring commit that poisons the ring keeps every reference and the
+ * submit object unusable; only an independent reset may reclaim them. */
+class NativeAdrenoSubmit final {
+public:
+    /* Everything the switch needs beyond the rings: the GPU's register window for the trigger registers, the GPU addresses of
+     * each ring's preemption record and SMMU info page, and the CPU mappings of those pages (the board's buffers), which are
+     * rewritten before each switch: the incoming ring's record carries the write pointer the CP resumes at. */
+    struct PreemptSetup {
+        NativeAdrenoPreemptIo io{};
+        NativeAdrenoPreemptRings pages{};
+        uint64_t (*now)(void *)=nullptr;
+        void *clock=nullptr;
+        unsigned mode=1;   /* 1: only the low and disabled queues (priority 2, 3) take the second ring; 2: the normal ones (1) too */
+    };
+private:
+    struct Job {
+        uint32_t fence=0;
+        size_t count=0;
+        uint64_t handles[NativeAdrenoSubmitMaxBuffers]{};
+        uint64_t queue=0;
+        bool active=false;
+        uint64_t vm_next=0;   /* NativeAdrenoVm::nextHandle() at submission: a mapping with a handle from it on came later */
+        NativeAdrenoVm *vm=nullptr;   /* the GPU address space (process page table) the job's buffers belong to */
+        uint32_t context=0;           /* the ring context it ran in (NativeAdrenoRing::useContext) */
+        uint64_t submit_us=0;         /* the clock when the write pointer moved (0: no clock), and the GPU level then (native_gpu_dcvs) */
+        uint32_t level=0;
+        int32_t owner=0;              /* the process that submitted it (nextOwner) */
+        size_t word_count=0;          /* its ring words (the IB packets), kept to replay it after a GPU restart */
+        uint32_t words[NativeAdrenoSubmitMaxBuffers*4]{};
+        uint8_t ring=0;               /* the ring it went to (0 high, 1 low: NativeAdrenoSubmit's two rings) */
+        int8_t priority=-1;           /* the Metal GPU priority its queue gave (-1: none) and the submitting task's GPU role (task_get_gpu_role) */
+        uint8_t role=0;
+        uint8_t loaded=0,flight=0;    /* the ring the CP ran when it was submitted, and whether a switch was in flight then */
+        uint8_t replays=0;            /* how many GPU restarts replayed it */
+        uint64_t replay_us=0;         /* when it was last given to the ring again (0: never) */
+    };
+    /* The jobs, grown on demand; a job never moves. Iterates as Job &. */
+    struct JobList {
+        Job **items=nullptr;size_t count=0;
+        struct It {Job **at;Job &operator*() const {return **at;}It &operator++() {++at;return *this;}bool operator!=(const It &o) const {return at!=o.at;}};
+        It begin() const {return {items};}
+        It end() const {return {items+count};}
+    } jobs_;
+    /* msm hangcheck state: the fence seen at the last check, the progress retries spent on it and the CP state then (a6xx_progress). */
+    uint32_t hang_fence_=0,progress_retries_=0,last_cp_[6]{};
+    bool madeProgress();
+    NativeAdrenoVm *vm_=nullptr;   /* the default VM: the kernel's table, installed at bring-up */
+    /* Page table switching between processes: mode 0 none (one table for everything), 1 the CPU writes TTBR0 while the GPU is idle,
+     * 2 the CP switches in the ring (CP_SMMU_TABLE_UPDATE). table_vm_ is the VM whose table the GPU runs after the queued work. */
+    unsigned table_mode_=0;
+    NativeAdrenoVm *table_vm_=nullptr;
+    void *table_cookie_=nullptr;
+    IOReturn (*write_table_)(void *,uint64_t ttbr0)=nullptr;
+    IOReturn useVm(NativeAdrenoVm *,const NativeAdrenoRingClock *);
+    NativeAdrenoRing *ring_=nullptr;
+    /* Two rings and the CP's context switch between them (NativeAdrenoPreempt): ring 0 serves every queue but the low and
+     * background ones, which go to ring 1. A submission to the ring the CP does not run is queued behind, and the switch is
+     * triggered as soon as its buffers do not overlap the running ring's. Off unless the board turns it on (sheng-gpu-preempt=1). */
+    NativeAdrenoRing *rings_[2]={nullptr,nullptr};
+    unsigned ring_count_=0;
+    NativeAdrenoPreempt preempt_{};
+    bool preempt_on_=false;
+    /* Which ring issued each fence (the two rings share one numbering): fence & (FenceMap-1) -> ring, tag -> its fence. */
+    enum : uint32_t {FenceMap=8192};
+    uint32_t *fence_tag_=nullptr;
+    uint8_t *fence_ring_=nullptr;
+    uint32_t fence_issued_=0;
+    PreemptSetup preempt_setup_{};
+    int32_t next_priority_=-1;    /* the Metal GPU priority of the next submission (-1: not given, the middle ring) */
+    int32_t next_role_=0;         /* the GPU role of the task submitting next (only logged) */
+    bool last_stranded_=false;
+    uint32_t recovery_info_[4]={};   /* the last recovery: the hung job's ring (9: none), each ring's newest fence, the ring the CP ran */
+    /* A switch that cannot be made (the trigger refused, or the CP did not finish one in time) leaves the second ring's jobs without a
+     * CP to run them. The ring is then given up for good (preempt_dead_, with the reason) and the GPU restart replays what it holds on
+     * the first ring (stranded_: recover() starts from the oldest job that never ran). */
+    enum : uint32_t {PreemptSwitchTimeoutUs=30000,PreemptStrandedUs=2000000,PreemptAgingUs=250000};   /* a switch not done in 30 ms; a ring-1 job unreached for 2 s */
+    bool preempt_dead_=false,stranded_=false;
+    uint32_t dead_reason_=0,rescues_=0;
+    void markPreemptDead(uint32_t reason) {if(!preempt_dead_) {preempt_dead_=true;dead_reason_=reason;}}
+    NativeAdrenoRing *ringOfFence(uint32_t fence) const;
+    unsigned ringForPriority() const;
+    bool ringDisjoint(unsigned ring,const uint64_t *handles,size_t count) const;
+    /* The oldest job on `index` that the ring's CP has not finished (its fence beyond what that ring last wrote); null when none. */
+    const Job *pendingOn(unsigned index);
+    void noteFence(uint32_t fence,uint8_t ring);
+    /* The ring a job ran on (the first ring when there is one only). Everything that reads or writes that ring's registers goes
+     * through it. */
+    NativeAdrenoRing *ring(unsigned index=0) {return index<ring_count_?rings_[index]:ring_;}
+    void driveSwitch(const NativeAdrenoRingClock *clock);
+    NativeAdrenoSubmitStats stats_{};
+    void noteStall(uint32_t observed,const NativeAdrenoRingClock *clock);   /* the CP's state for a fence that stopped advancing (native_adreno_stall) */
+    bool attached_=false,poisoned_=false;
+    /* The A6xx plain profile (setA6xxPlain): no thread-control framing, no preemption. */
+    bool a6xx_=false;
+    uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */
+    /* submit()'s distinct buffers and ring words: too large for the kernel stack at 128 IBs (callers serialize every method) */
+    uint64_t scratch_handles_[NativeAdrenoSubmitMaxBuffers]{};
+    uint32_t scratch_words_[NativeAdrenoSubmitMaxBuffers*4]{};
+    Job *find(uint32_t fence);
+    Job *free();
+    IOReturn release(Job &);
+    IOReturn poison();
+    int32_t next_owner_=0;
+    /* The clock of the last submission, for the time a job is seen retired (release has no clock of its own). */
+    uint64_t (*clock_now_)(void *)=nullptr;void *clock_cookie_=nullptr;
+public:
+    /* The process the next submission comes from, for the timeline (the user client sets it before each submit). */
+    void nextOwner(int32_t pid) {next_owner_=pid;}
+    /* The Metal GPU priority of the next submission's queue (MTLGPUPriority: 0 high, 1 normal, 2 low, 3 disabled, 4 normal-high,
+     * 5 real-time; -1 not given). Only low and disabled (2, 3) go to ring 1; the rest, the unspecified included, stay on ring 0. */
+    void nextPriority(int32_t priority) {next_priority_=priority>=0 && priority<=5?priority:-1;}
+    void nextRole(int32_t role) {next_role_=role;}
+    bool lastRecoveryStranded() const {return last_stranded_;}
+    uint32_t recoveryInfo(unsigned i) const {return i<4?recovery_info_[i]:0;}
+    uint32_t deadReason() const {return preempt_dead_?dead_reason_:0;}
+    /* The second ring and the switch between them. Both rings must be attached, their records and SMMU info pages mapped; the
+     * caller keeps those buffers alive. `on` false keeps the second ring out of use (the first ring alone, as before). The rings
+     * must have been given their own preemption state (NativeAdrenoRing::setPreempt). */
+    IOReturn setPreemption(NativeAdrenoRing *high,NativeAdrenoRing *low,const PreemptSetup &setup,bool on);
+    bool preemption() const {return preempt_on_ && ring_count_>1;}
+    NativeAdrenoPreemptStats preemptStats() const {return preempt_.stats();}
+    /* The interrupt's side of a switch: the ring the CP moved to is the one whose write pointer is given again. Returns whether a
+     * switch completed. Called from the GPU interrupt (native_adreno_preempt_irq). */
+    bool preemptIrq();
+    /* The switch counters, the ring the CP runs, whether a switch is in flight and the control register as the hardware holds it. */
+    /* A word of ring `index`'s preemption record as the CPU sees it now (the CP saves the read pointer, info and errno there). */
+    uint32_t recordWord(unsigned index,uint32_t byte_offset) const
+    {
+        return index<NativeAdrenoPreemptRingCount?NativeAdrenoPreempt::recordWord(preempt_setup_.pages.record_cpu[index],byte_offset):0;
+    }
+    bool preemptStats(NativeAdrenoPreemptStats *stats,uint32_t *loaded,bool *in_flight,uint32_t *cntl,uint32_t *dead=nullptr,uint32_t *rescues=nullptr) const
+    {
+        if(!preemption())return false;
+        if(dead)*dead=preempt_dead_?dead_reason_:0;
+        if(rescues)*rescues=rescues_;
+        *stats=preempt_.stats();*loaded=preempt_.loaded();*in_flight=preempt_.inFlight();*cntl=preempt_.readCntl();
+        return true;
+    }
+    NativeAdrenoSubmit()=default;
+    ~NativeAdrenoSubmit()=default;
+    NativeAdrenoSubmit(const NativeAdrenoSubmit &)=delete;
+    NativeAdrenoSubmit &operator=(const NativeAdrenoSubmit &)=delete;
+    IOReturn attach(NativeAdrenoVm *,NativeAdrenoRing *);
+    /* A6xx (a620) submission profile: a submission is the caller's ring words
+     * alone, followed by the ring's plain CP_EVENT_WRITE timestamp fence. The
+     * A7XX thread-control framing and the two-ring preemption are not used.
+     * Set before the first submission. */
+    void setA6xxPlain(bool on) {a6xx_=on;}
+    bool a6xxPlain() const {return a6xx_;}
+    /* Refuses while jobs are outstanding or poisoned; the caller must have
+     * stopped the GPU and observed every fence before calling this. */
+    IOReturn detach();
+    /* queue is bookkeeping for one shared ring; it never reorders or isolates
+     * submissions and is validated by the caller's open queue set. */
+    IOReturn submit(const NativeAdrenoSubmitBuffer *,size_t,uint64_t queue,
+        uint32_t *fence);
+    /* The same for the buffers of one process's VM (null: the default VM); with table switching on, the GPU runs the job on that
+     * VM's table. The clock is for the CPU switch's wait for the GPU to go idle. */
+    IOReturn submit(NativeAdrenoVm *,const NativeAdrenoSubmitBuffer *,size_t,uint64_t queue,uint32_t *fence,
+        const NativeAdrenoRingClock *);
+    /* Turns on table switching (mode 1 or 2, see table_mode_); write installs a TTBR0 from the CPU (used by mode 1 and to leave a
+     * table that is about to be freed). Only with no job outstanding. */
+    IOReturn setTableSwitching(unsigned mode,IOReturn (*write)(void *,uint64_t),void *cookie);
+    unsigned tableMode() const {return table_mode_;}
+    /* Before a VM is freed: waits for every job, and when the GPU's table is that VM's, installs the default table from the CPU. */
+    IOReturn forgetVm(NativeAdrenoVm *,const NativeAdrenoRingClock *,uint32_t timeout_us);
+    NativeAdrenoVm *defaultVm() const {return vm_;}
+    bool queueOutstanding(uint64_t queue) const;
+    /* Queues [first, first+count): whether any of their jobs is outstanding, and a wait for every one of them (oldest first) that
+     * leaves other queues' jobs alone. Each client of the shared ring owns one such range. */
+    bool rangeOutstanding(uint64_t first,uint64_t count) const;
+    IOReturn waitRange(uint64_t first,uint64_t count,const NativeAdrenoRingClock *,uint32_t timeout_us);
+    /* Retires (without waiting) every job whose fence the CP has already passed, so completed work never pins buffers or
+     * job slots just because nobody called wait(). */
+    IOReturn retireCompleted();
+    /* Waits for every outstanding job in submission order and retires its references. */
+    IOReturn waitAll(const NativeAdrenoRingClock *,uint32_t timeout_us);
+    /* Polls the CP timestamp; on completion retires every buffer reference. A fence whose job was already retired (by
+     * wait or retireCompleted) is checked against the ring and succeeds once the CP has passed it. */
+    IOReturn wait(uint32_t fence,const NativeAdrenoRingClock *,uint32_t timeout_us);
+    /* Wait for an earlier fence without touching job references; a timeout
+     * leaves every job and reference exactly as they were. */
+    IOReturn observeFence(uint32_t fence,const NativeAdrenoRingClock *,uint32_t timeout_us);
+    /* msm's hangcheck_handler, for the caller to run every DRM_MSM_HANGCHECK_DEFAULT_PERIOD (500 ms): *hung when the ring fence did not move
+     * since the last check while work is pending and the CP made no progress either (a6xx_progress: IB1/IB2 base and remaining words, at
+     * most DRM_MSM_HANGCHECK_PROGRESS_RETRIES (3) checks in a row on one fence). */
+    IOReturn hangCheck(bool *hung);
+    /* msm's recover_worker: the job on the hung fence is the guilty one (its VM is marked, NativeAdrenoVm::noteHang), the ring fence
+     * moves past it, restart resets the GPU, the guilty job is retired, then every later job is submitted again with its own fence
+     * (a job of an unusable VM without its buffers). Callers serialize this with every other method. A failed restart poisons. */
+    IOReturn recover(NativeAdrenoRestart restart,void *cookie,const NativeAdrenoRingClock *,NativeAdrenoRecovery *);
+    bool poisoned() const {return poisoned_;}
+    size_t outstanding() const;
+    NativeAdrenoSubmitStats stats() const {return stats_;}
+};
+#endif
