@@ -255,7 +255,10 @@ const FirmwareFile &zapElf();
  * the already-listed a630/a650 names, which is the downstream pattern for
  * A620 = a630_sqe.fw + a650_gmu.bin. The a650_sqe.fw alternative is exposed
  * because the pinned mainline catalog uses it for the A650 family; see
- * README.md and choose at integration time, never silently. */
+ * README.md and choose at integration time, never silently.
+ * The pinned alternative is linux-firmware's a650_sqe.fw (version 0x112,
+ * 31964 bytes), whose version clears mainline's 0x095 floor; the vendor image's
+ * 0x087 file (31460 bytes) is kept out of tree as a650_sqe_vendor_0x87.fw. */
 const FirmwareFile &sqe();
 const FirmwareFile *sqeAlternate();
 const FirmwareFile &gmu();

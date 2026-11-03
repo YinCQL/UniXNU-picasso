@@ -698,7 +698,7 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
         }
         if(job) {
             printf("PICASSO_GPU stall job: count=%u words=%u:", job->count, job->word_count);
-            for(uint32_t i=0;i<job->word_count && i<12;++i)printf(" %x", job->words[i]);
+            for(uint32_t i=0;i<job->word_count && i<32;++i)printf(" %x", job->words[i]);
             printf("\nPICASSO_GPU stall ib:");
             for(uint32_t i=0;i<17;++i)printf(" %x", native_adreno_stall_mem[4+i]);
             printf("\n");
@@ -710,6 +710,140 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
             printf("PICASSO_GPU stall ib1 %llx read=%x:", (unsigned long long)ib1, unsigned(read));
             if(!read)for(uint32_t i=0;i<8;++i)printf(" %x", head[i]);
             printf("\n");
+            /* Where inside IB1 the SQE is *executing*. CP_IB1_REM_SIZE counts only dwords not yet fetched into the ROQ: the
+             * front-end prefetches ahead and REM stops once the ROQ is full (a6xx_progress), so a REM-only position is where the
+             * *fetch* stopped, not where the SQE is. progressState adds CP_ROQ_AVAIL_IB1's fetched-but-unconsumed dwords; the
+             * packet the SQE is on is base + 4*(size - effective_rem). Dump 24 dwords on each side through the job's address
+             * space: a wait packet here names the condition the CP is stuck on. */
+            {
+                const uint64_t base=(uint64_t)words[11]<<32|words[10];
+                uint32_t total=0;
+                for(uint32_t i=0;i+3<job->word_count;i+=4)
+                    if(((uint64_t)job->words[i+2]<<32|job->words[i+1])==base) {total=job->words[i+3]&0xfffff;break;}
+                uint32_t st[6]={};
+                const IOReturn ps=stalled->progressState(st);
+                printf("PICASSO_GPU stall ibnow: base=%llx size=%x rem=%x roq=%x effrem=%x ps=%x",
+                    (unsigned long long)base,total,words[12],(unsigned)(st[4]>words[12]?st[4]-words[12]:0),st[4],unsigned(ps));
+                if(total && ps==kIOReturnSuccess && st[4]<=total) {
+                    const uint64_t at=base+4ull*(total-st[4]);
+                    uint32_t now[48]={};
+                    const uint64_t start=at>=base+96?at-96:base;
+                    const IOReturn nowread=space->peekWordsUncached(start,now,48);
+                    printf(" at=%llx read=%x:", (unsigned long long)at, unsigned(nowread));
+                    if(!nowread)for(uint32_t i=0;i<48;++i)printf(" %x", now[i]);
+                }
+                printf("\n");
+            }
+            /* The packets the SQE executed in this IB up to where it stopped, with their positions: where the client's
+             * stream spends its synchronization (waits, markers, events, blits, context bunches, IB calls). The stream is
+             * read forward in chunks and only the last lines are kept, so a long blit prefix does not crowd out the packets
+             * next to the stop: the marker there names the phase, and an unsatisfied wait packet names the condition. */
+            if(stall_prints<=2) {
+                const uint64_t base=(uint64_t)words[11]<<32|words[10];
+                uint32_t total=0;
+                for(uint32_t i=0;i+3<job->word_count;i+=4)
+                    if(((uint64_t)job->words[i+2]<<32|job->words[i+1])==base) {total=job->words[i+3]&0xfffff;break;}
+                uint32_t st[6]={};
+                if(!stalled->progressState(st) && total && st[4]<=total) {
+                    struct TraceLine {size_t at;const char *nm;uint32_t cnt,p[4];};
+                    TraceLine tail[32]={};unsigned tailn=0;
+                    uint32_t nblit=0,nwait=0,nevent=0,nmarker=0,ncrb=0,nib=0,ndraw=0,ncond=0,nskip=0;
+                    const size_t limit=(size_t)(total-st[4]);
+                    size_t pos=0;
+                    uint32_t w[256];
+                    while(pos<limit) {
+                        size_t n=limit-pos;if(n>256)n=256;
+                        if(space->peekWordsUncached(base+4ull*pos,w,n))break;
+                        size_t i=0;bool crossed=false;
+                        while(i<n) {
+                            const uint32_t h=w[i];
+                            const char *nm=nullptr;uint32_t cnt=0;
+                            size_t adv=1;
+                            if((h>>28)==7) {
+                                const uint32_t op=(h>>16)&0x7f;cnt=h&0x7fff;adv=1+(size_t)cnt;
+                                switch(op) {
+                                case 0x12:nm="WAIT_MEM_WRITES";++nwait;break;
+                                case 0x26:nm="WAIT_IDLE";++nwait;break;
+                                case 0x3c:nm="WAIT_REG_MEM";++nwait;break;
+                                case 0x14:nm="WAIT_TS";++nwait;break;
+                                case 0x46:nm="EVENT";++nevent;break;
+                                case 0x2c:nm="BLIT";++nblit;break;
+                                case 0x3f:nm="IB";++nib;break;
+                                case 0x5c:nm="CRB";++ncrb;break;
+                                case 0x65:nm="MARKER";++nmarker;break;
+                                case 0x1d:nm="SKIP_IB2_G";++nskip;break;
+                                case 0x23:nm="SKIP_IB2_L";++nskip;break;
+                                case 0x47:nm="COND_EXEC";++ncond;break;
+                                case 0x38:nm="DRAW_INDX_OFF";++ndraw;break;
+                                case 0x29:nm="DRAW_INDX_IND";++ndraw;break;
+                                case 0x2a:nm="DRAW_IND_MULTI";++ndraw;break;
+                                case 0x28:nm="DRAW_IND";++ndraw;break;
+                                case 0x24:nm="DRAW_AUTO";++ndraw;break;
+                                case 0x33:nm="EXEC_CS";++ndraw;break;
+                                case 0x63:nm="SET_MODE";break; case 0x64:nm="VIS_OVR";break;
+                                case 0x3e:nm="REG_TO_MEM";break; case 0x3d:nm="MEM_WRITE";break;
+                                case 0x56:nm="PSEUDO";break; case 0x5f:nm="PROT_MODE";break;
+                                case 0x53:nm="TTBR0";break; case 0x2e:nm="BIN_DATA";break;
+                                }
+                            } else if((h>>28)==4) {
+                                adv=1+(size_t)(h&0x7f);
+                            }
+                            if(i+adv>n) {crossed=true;break;}
+                            if(nm) {
+                                TraceLine t;t.at=pos+i;t.nm=nm;t.cnt=cnt;
+                                for(uint32_t k=0;k<4&&k<cnt;++k)t.p[k]=w[i+1+k];
+                                if(tailn<32)tail[tailn++]=t;
+                                else {for(unsigned q=1;q<32;++q)tail[q-1]=tail[q];tail[31]=t;}
+                            }
+                            i+=adv;
+                        }
+                        if(i==0 && crossed) {
+                            /* A packet longer than the chunk: skip over its payload. */
+                            const uint32_t h=w[0];
+                            pos+=((h>>28)==7)?1+(size_t)(h&0x7fff):((h>>28)==4)?1+(size_t)(h&0x7f):1;
+                            continue;
+                        }
+                        pos+=i;
+                    }
+                    printf("PICASSO_GPU trace: ib=%llx executed=%lx blit=%u draw=%u wait=%u event=%u marker=%u crb=%u ib=%u cond=%u skip=%u\n",
+                        (unsigned long long)base,(unsigned long)limit,nblit,ndraw,nwait,nevent,nmarker,ncrb,nib,ncond,nskip);
+                    for(unsigned q=0;q<tailn;++q) {
+                        const TraceLine &t=tail[q];
+                        printf("PICASSO_GPU trace %04lx %s n=%x:",(unsigned long)t.at,t.nm,t.cnt);
+                        for(unsigned k=0;k<4&&k<t.cnt;++k)printf(" %x",t.p[k]);
+                        printf("\n");
+                    }
+                }
+            }
+            /* A 2D blit's setup names its source/destination buffers in pkt4 writes (GRAS/RB/TPL1 A2D) that can sit in an earlier
+             * chunk of this same submission. Walk the job's IBs (bounded) and print them: a blit engine that wedged needs its
+             * addresses, formats and pitches on record, and the VM's own view of each base address. */
+            {
+                static const struct {uint32_t lo,hi;} ranges[]={{0x8400,0x840f},{0x8c17,0x8c27},{0xb4c0,0xb4cf}};
+                uint32_t printed=0;
+                for(uint32_t i=0;i+3<job->word_count && printed<24;i+=4) {
+                    const uint64_t iba=(uint64_t)job->words[i+2]<<32|job->words[i+1];
+                    size_t ibd=job->words[i+3]&0xfffff;
+                    if(ibd>1024)ibd=1024;
+                    uint32_t w[1024]={};
+                    if(space->peekWordsUncached(iba,w,ibd))continue;
+                    for(size_t at=0;at<ibd && printed<24;) {
+                        const uint32_t hdr=w[at];
+                        if((hdr>>28)==4) {
+                            const uint32_t reg=(hdr>>8)&0x3ffff,n=hdr&0x7f;
+                            for(const auto &rg:ranges)if(reg>=rg.lo && reg<=rg.hi) {
+                                printf("PICASSO_GPU stall a2d: ib=%llx at=%llx reg=%x n=%u:",
+                                    (unsigned long long)iba,(unsigned long long)at,reg,n);
+                                for(uint32_t k=0;k<n && at+1+k<ibd;++k)printf(" %x",w[at+1+k]);
+                                printf("\n");
+                                ++printed;break;
+                            }
+                            at+=1+n;
+                        } else if((hdr>>28)==7)at+=1+(hdr&0x3fff);
+                        else at+=1;
+                    }
+                }
+            }
             /* Validate the DRAM reader against a page whose content is known: the fence page's completion timestamp holds the fence the CP
              * wrote (2 here). A zero there would mean the reader, not the IB page, is wrong. And name the mapping the IB address falls in. */
             uint32_t cachedWord=0,dramWordV=0;

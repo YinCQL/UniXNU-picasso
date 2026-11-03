@@ -523,6 +523,23 @@ In priority order, one change at a time:
   lines.
 - The device's current state can be probed read-only: `/dev/cu.usbmodem*`, `fastboot devices`,
   `ioreg -p IOUSB -l`. Do not freeze these values in the handoff: probe them every round.
+- **`/tmp` is volatile (lost on a host reboot) and two build inputs live there.**
+  `ADRENO620_FW_DIR` (default `/tmp/picasso-gpu-fw`) holds `a650_gmu.bin`, `a650_sqe.fw`,
+  `a630_sqe.fw`, `a620_zap.mdt/.b00/.b01/.b02`; without it the generated
+  `adreno620_embedded_firmware.c` is empty and the boot aborts at stage 3 with
+  `GMU/SQE blobs were not staged`. `NOVATEK_TOUCH_FW` (default
+  `/tmp/picasso-vendor/blobs/candidate1.bin`, 0x22000 bytes) is needed by the touch driver's
+  archive. Both are in the kernel of any older image: mount
+  `out/<tag>/picasso/payload/payload.img` (FAT, `hdiutil attach -readonly`), copy
+  `EFI/UniXNU/Payloads/kernel.macho`, resolve the `_native_adreno620_fw_*` symbols against the
+  `LC_SEGMENT_64` file offsets, and write the bytes out under the names above (the ZAP CRCs in
+  `Adreno620Board.cpp` verify the extraction). `/tmp/build-wf-addon.sh` is also recreated from
+  §6.1's description after a reboot.
+  **Persistent copies now live in the project tree (git-ignored, survive a host reboot):**
+  `build/picasso-gpu-fw/` (the seven GPU firmware files), `build/picasso-vendor/blobs/candidate1.bin`
+  (touch firmware) and `build/local/build-wf-addon.sh` (the packing script). Build with
+  `ADRENO620_FW_DIR=$PWD/build/picasso-gpu-fw NOVATEK_TOUCH_FW=$PWD/build/picasso-vendor/blobs/candidate1.bin`
+  and copy `build/local/build-wf-addon.sh` to `/tmp` only as a convenience.
 
 ## 10. Pending work after the stall is fixed
 
@@ -625,3 +642,47 @@ Client side (read-only reference copies):
 - Data seed: `build/owner-data-8g-noautodim-20261101.dbr`.
 - Kernelcache: `/Users/silenzio/Desktop/development/ios/UniXNU/out/ipsw/21H461/kernelcache.decompressed`.
 - PR: #13, `YinCQL/UniXNU-picasso`, head `silenzio111:stage12/picasso-cpufreq-big`, open.
+
+## 14. wf77–wf81 (2026-11-03): marker stall located, trust register is TZ-owned, SQE bumped
+
+- **wf77 (reverted).** Programmed a UCHE GMEM window + `gmem_base` as a guess;
+  the stall persisted. Mainline after checking: for ADRENO_6XX_GEN3 (`a650` family) `a6xx_hw_init`
+  deliberately skips `UCHE_GMEM_RANGE_MIN/MAX`, and `MSM_PARAM_GMEM_BASE` returns 0 from GEN3 on
+  (`TILE6_2` is a GMEM offset). The change was reverted; the port keeps `gmem_base = 0`.
+- **wf78/wf79 (measured stall position).** `progressState()` now adds `CP_ROQ_AVAIL_IB1 >> 16` to
+  `CP_IB1_REM_SIZE`, i.e. the true SQE position. The stall is deterministic across boots and stable
+  over seconds at one packet: `CP_SET_MARKER` payload `0x15`. Per the Mesa register description
+  (`adreno_pm4.xml`) only bits 0-3 are parsed: MODE = 5 = `RM6_ENDVIS`; bit 4 (0x10) is ignored by
+  the firmware. It is emitted by Turnip's `tu6_render_tile` right after the per-tile `draw_cs` IB
+  call, before `CP_SKIP_IB2_ENABLE_GLOBAL(0)` and the tile-store IB. At the stall: all blocks idle
+  (`RBBM_STATUS = 0x800005`: only `CP_BUSY`/AHB bits), no CP fault/opcode error,
+  `CP_STATUS_1 = 0x8000471f`, `RBBM_INT_0_STATUS = 0x01900000`
+  (`CP_CACHE_FLUSH_TS` | `HANG_DETECT` | `UCHE_OOB_ACCESS`). Fence 7 retired; fence 8 stopped there.
+- **The SQE firmware says exactly what blocks (wf81/wf82).** `afuc-disasm` (Mesa 24, built at
+  `/tmp/mesa24/mesa-mesa-24.0.0/build/src/freedreno/afuc/afuc-disasm`) on the official
+  `a650_sqe.fw` shows the `CP_SET_MARKER` handler: for MARKER 5 it clears `$14` bits 7/15, writes
+  command bit 5 (`0x20`) to SQE control register `0x080`, then spins until bit 5 of control register
+  `0x069` clears (`l890`/`l895`), then clears `0x082`/`0x080`. The identical handshake serves
+  `CP_SET_BIN_DATA5` (also bit 5) and other handlers (bits 1/2), so the wait itself works — the
+  ENDVIS instance waits on a hardware visibility/bin operation that never completes. That points at
+  the draws the SQE launched just before the marker (asynchronous to the SQE), not at the marker
+  encoding; `UCHE_OOB_ACCESS` is the only error bit and suggests the draws fault.
+- **wf80: `RBBM_SECVID_TRUST_CNTL` must not be written.** Mainline's no-zap fallback writes 0 there,
+  but on this device the register is TZ-owned: reading it returns the bootloader's `1`, and the
+  *write* never returns — GPU init stops at that line (no `cp: sqe started`, no Metal, no
+  submission), while the rest of userland boots. The port now only reads and prints it.
+- **AMSBC is a separate pending test.** Mainline sets `amsbc` (bit 4) in `RB_NC_MODE_CNTL` for
+  UBWC >= 3.0 (`SM7250` is UBWC 3.0), so `0x12` is the mainline-correct value. wf81 keeps the
+  previous `0x2` to isolate the SQE change; switch it to `0x12` in its own boot.
+- **SQE firmware floor.** The vendor `a650_sqe.fw` is version `0x87`; mainline's floor for a650 is
+  `0x095`. Installed linux-firmware's `a650_sqe.fw` (version `0x112`, 31964 bytes, CRC32
+  `0xf59c2772`) in `build/picasso-gpu-fw/`, kept the vendor file as `a650_sqe_vendor_0x87.fw`, and
+  updated the `kSqeAlt` pin (size/CRC32/first-bytes) in `Adreno620Board.cpp` — the probe rejects any
+  image that matches neither pin. The firmware is embedded at **kernel build time** from
+  `ADRENO620_FW_DIR`, so the build must run with
+  `ADRENO620_FW_DIR=$PWD/build/picasso-gpu-fw`; `adreno620 fw sqe 31964 bytes` in the build log and
+  `native_adreno620_fw_sqe_size = 31964u` in `out/picasso/tree/build/adreno-picasso/` are the check.
+- **wf81** image: kernel `5f41dca2eb1ff109c06085a4223136adfa4d3750cdd88054a5340019769e319d`,
+  payload args include `sheng-gpu-metal=1 sheng-gpu-addon=1`, addon
+  `0dbe0ef2…` (`build/ngpu-addon-wf60.bin`). Booted from RAM 2026-11-03 09:26 CST; device
+  serial this round `52cc791d`. Log `out/wf81-runs/run1.log`. Result: see the run log / next section.

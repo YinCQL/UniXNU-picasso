@@ -196,9 +196,10 @@ constexpr uint32_t kApriv = 0x0000006Eu;                /* BIT(6)|5|3|2|1 */
 constexpr uint32_t kCpProtectCntl = 0x0000000Bu;        /* PROT_EN|FAULT_ON_VIOL|INF_SPAN */
 
 /* UBWC 3.0, highest bank bit 14 (SM7250 GPU DT: qcom,ubwc-mode = <3>,
- * qcom,highest-bank-bit = <14>; the same values the upstream SM7250 UBWC patch
- * records). KGSL encodes mode 3 as feild 0 (not UBWC 1.0), amsbc=1 is only for
- * A640/A680, and hbb14 gives hbb_lo=1, hbb_hi=0. */
+ * qcom,highest-bank-bit = <14>). KGSL encodes mode 3 as field 0 (not UBWC 1.0);
+ * hbb14 gives hbb_lo=1, hbb_hi=0. Mainline additionally sets amsbc (bit 4) for
+ * UBWC >= 3.0; that is a separate pending change, so this boot keeps 0x2 to
+ * isolate the SQE firmware bump. */
 constexpr uint32_t kRbNcModeCntl = 0x00000002u;
 constexpr uint32_t kTpl1NcModeCntl = 0x00000002u;
 constexpr uint32_t kSpNcModeCntl = 0x00000022u;         /* uavflagprd_inv=2 for a650 family */
@@ -413,6 +414,12 @@ bool hardwareInit()
     gpuWrite64(A620_RBBM_SECVID_TSB_TRUSTED_BASE, 0);
     gpuWrite(A620_RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
 
+    /* RBBM_SECVID_TRUST_CNTL is read only (wf80: reading it returns the bootloader's 1, but writing the
+     * 0 that a6xx hw_init's no-zap fallback writes hangs GPU init at the write, before the CP starts).
+     * It is TZ's register on this device; the port leaves it alone and prints the value for the record. */
+    printf("PICASSO_GPU cp: RBBM_SECVID_TRUST_CNTL=%08x (TZ-owned, not written)\n",
+        gpuRead(A620_RBBM_SECVID_TRUST_CNTL));
+
     /* Turn on 64-bit addressing for all blocks. */
     const uint32_t addrMode[] = {
         kGpuCpAddrModeCntl, kGpuVscAddrModeCntl, kGpuGrasAddrModeCntl, kGpuRbAddrModeCntl,
@@ -470,6 +477,12 @@ bool hardwareInit()
 
     gpuWrite(A620_RBBM_INTERFACE_HANG_INT_CNTL, kRbbmHangIntCntl);
     gpuWrite(A620_UCHE_CLIENT_PF, (1u << 7) | 1u);
+
+    /* No GMEM VA range for this chip: a6xx_hw_init writes UCHE_GMEM_RANGE_MIN/MAX only outside the
+     * a650 family/a702/a730 set, and msm reports MSM_PARAM_GMEM_BASE as 0 from ADRENO_6XX_GEN3 on. The
+     * GPU decodes TILE6_2 (GMEM-tiled) addresses as offsets into its own 512 KiB tile memory; a window
+     * here would move Turnip's tile addresses out of that space (wf77 programmed 0x40000000 and only
+     * added UCHE OOB accesses). The trap/write-through window above is the only UCHE range this chip takes. */
 
     const uint32_t bicubic[5] = {0, 0x3FE05FF4u, 0x3FA0EBEEu, 0x3F5193EDu, 0x3F0243F0u};
     for (uint32_t i = 0; i < 5; ++i) gpuWrite(kGpuTpl1BicubicWeights + i, bicubic[i]);
@@ -756,7 +769,7 @@ bool publishGpu()
     info = {};
     info.chip_id = 0x06020001u;               /* the ADT's qcom,chipid for this GPU */
     info.gmem_bytes = 512u * 1024u;
-    info.gmem_base = 0;
+    info.gmem_base = 0;                      /* msm MSM_PARAM_GMEM_BASE: 0 from ADRENO_6XX_GEN3 on (no UCHE window; TILE6_2 is an offset) */
     info.uche_trap_base = 0x1fffffffff000ull;
     info.va_start = GpuClientVaStart;
     info.va_size = (uint64_t(1) << ias) - GpuClientVaStart;
