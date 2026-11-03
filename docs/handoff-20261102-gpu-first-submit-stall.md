@@ -831,3 +831,22 @@ Client side (read-only reference copies):
   `b6de7d04f067dd967bc3afad584ceedd4047a9bc`, trust
   `f7c04cffd2c46fb847cf08cb10e37cb95b44dfe190f1b9a759c008ffc1cf19e2`; image
   `out/wf89/picasso/boot/wf89.img`, log `out/wf89-runs/run1.log`.
+- **wf89 result: Turnip runs end to end, its GPU work has no effect.** Lines:
+  `Y replay skipped…`, `Y turnip`, a watchdog sample `W 6200 s4 u0/k0 …` (the worker was blocked
+  in the kernel at `0x6200`, render begin, at the 15 s sample), then `T s0 r0 v512 c0 g0/4096`
+  and `M s6501 … device: ShaderCache(ShaderCacheEr…` (the Metal bridge self-test refused at its
+  shader cache). Interpretation: every Vulkan call succeeded and every fence retired
+  (`s0 r0`), but (a) `fillTest` writes only the **first half** of a 4 KiB buffer and expects the
+  second half untouched, so `v512` is exactly what "the fill never happened" looks like (the
+  untouched half is the 512 good words); (b) the compute shader wrote 0 of 1024 words;
+  (c) the render read-back has 0 triangle-or-clear pixels out of 4096. The raw test's own
+  submits on the same connection just before retired and wrote memory correctly, so Submit /
+  WaitFence / BO mapping are fine — this is specific to Turnip's command streams (or to the
+  visibility of their writes).
+- **wf90: sample what the GPU left behind.** `fillTest`, `computeTest` and `renderTest` now keep
+  the first/middle/last dword they read back (`gFillSample`, `gComputeSample`, `gRenderSample`)
+  and `turnipPhase()` streams a second line `S f… k… r…`. That separates "the GPU wrote nothing"
+  (samples `deadbeef`/`5a5a5a5a`) from "the GPU wrote the wrong thing" (samples holding a
+  pattern or zeros). Plugin CDHash `289b3036b5cdce84414a19db5f5a19f17a09831b`, trust
+  `a9d1b5456d37770bb27212d736636012e717440afae3d486acdc91dd7b2066af`; image
+  `out/wf90/picasso/boot/wf90.img`, log `out/wf90-runs/run1.log`.
