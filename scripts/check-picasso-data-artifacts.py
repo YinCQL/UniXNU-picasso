@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import plistlib
 import runpy
 import struct
 import subprocess
@@ -70,6 +71,14 @@ def check(work, tree, output):
             'Unexpected source OS image hash')
     require(digest(seed_dir / 'source-var-manifest.json') == seed['source_manifest_sha256'],
             'Source manifest hash mismatch')
+    # The development seed must carry the native idle-timer preference, rather
+    # than hiding a display power request or altering an original OS input.
+    preference = plistlib.dumps({'SBDisableAutoDim': True}, fmt=plistlib.FMT_BINARY, sort_keys=True)
+    require(seed.get('generated_preferences') == [dict(
+        path='mobile/Library/Preferences/com.apple.springboard.plist',
+        values={'SBDisableAutoDim': True}, type='file', uid=501, gid=501, mode=0o600,
+        bytes=len(preference), sha256=hashlib.sha256(preference).hexdigest())],
+        'Missing or invalid native auto-dim preference provenance')
     identity = str(uuid.UUID(seed['volume_uuid'])).upper()
     require(uuid.UUID(identity).int != 0, 'Zero Data UUID')
     config = (work / '.config').read_text()

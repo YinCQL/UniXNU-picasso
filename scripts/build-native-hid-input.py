@@ -18,7 +18,8 @@ event_methods=qualify_hid_event_driver(reference)
 kernel_methods=set(reference.names.values())
 event_header=('// Qualified IOHIDFamily-2031.120.4 event driver; generated, never committed.\n'
               '// Zero entries are kernel exports rebound by NativePrelink to the compiled XNU.\n'
-              '#pragma once\nstatic const uintptr_t kOriginalEventDriverMethods[]={\n' +
+              '#pragma once\nstatic constexpr uintptr_t kOriginalEventDriverVptr=0xfffffff005d06a68ULL;\n'
+              'static const uintptr_t kOriginalEventDriverMethods[]={\n' +
               ''.join(f'    {0 if address in kernel_methods else address:#x}ULL,\n' for address in event_methods) + '};\n')
 (OUT/'OriginalHidEventABI.h').write_text(event_header)
 header='''// Generated from the qualified original image; opaque private storage only.

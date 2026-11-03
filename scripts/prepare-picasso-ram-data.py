@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Prepare a volatile APFS Data seed from the unchanged 21H461 OS (macOS/root).
 
-Only the original private/var and missing empty runtime directories are copied.
-The source is mounted read-only; no launch policy, preferences or keys are edited.
+Copy original private/var, add missing runtime directories and a development
+auto-dim preference. The source stays read-only; its preferences and keys are unchanged.
 All output, including failed preparations and mountpoint directories, is retained.
 """
 import argparse
@@ -191,6 +191,30 @@ def add_directories(target):
     return created
 
 
+def add_boot_preferences(target):
+    """Keep this development image awake while cold SpringBoard setup runs."""
+    relative = 'mobile/Library/Preferences/com.apple.springboard.plist'
+    if audit_path(target, 'mobile/Library/Preferences').get('type') != 'directory':
+        raise ValueError('Boot preference parent must be a real directory')
+    path = target / relative
+    if os.path.lexists(path):
+        raise ValueError('Boot preferences must not overwrite an original object')
+    # 21H461 SBIdleTimerDefaults reads this boolean; the global coordinator
+    # acquires its normal idle-timer-disable assertion. Manual power stays live.
+    values = {'SBDisableAutoDim': True}
+    blob = plistlib.dumps(values, fmt=plistlib.FMT_BINARY, sort_keys=True)
+    with path.open('xb') as stream:
+        stream.write(blob)
+    os.chown(path, 501, 501)
+    os.chmod(path, 0o600)
+    actual = metadata(path)
+    expected = dict(type='file', uid=501, gid=501, mode=0o600,
+                    bytes=len(blob), sha256=hashlib.sha256(blob).hexdigest())
+    if actual != expected or plistlib.loads(path.read_bytes()) != values:
+        raise ValueError('Boot preference contents/ownership/mode mismatch')
+    return [dict(path=relative, values=values, **actual)]
+
+
 def inspect_packed(path, raw=None):
     """Validate DBRDISK1 and hash its reconstruction, optionally checking raw bytes.
 
@@ -322,6 +346,7 @@ def prepare(tree, source, output, config):
             identity = canonical_uuid(info['VolumeUUID'])
             copy_var(source_var, target, manifest)
             created = add_directories(target)
+            preferences = add_boot_preferences(target)
             verify_var(target, manifest)
             if inventory(source_var) != manifest:
                 raise ValueError('Original var changed during preparation')
@@ -346,6 +371,7 @@ def prepare(tree, source, output, config):
         source_regular_files=len(files), source_regular_bytes=sum(entry['bytes'] for entry in files),
         source_manifest_sha256=sha256(manifest_path), original_paths=source_paths,
         created_directories=created, packer_sha256=sha256(packer_path),
+        generated_preferences=preferences,
         guest_mutable=True, persistent=False, ownership_preserved=True,
         os_inputs_modified=False, hardware_tested=False,
         excluded=['private/var/staged_system_apps'],

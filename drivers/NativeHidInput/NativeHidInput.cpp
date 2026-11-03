@@ -239,10 +239,14 @@ static void install(IORegistryEntry *driver) {
 #include "OriginalHidEventABI.h"
 static void install(IORegistryEntry *driver) {
     if(originalDispatch || !driver)return;
-    const OSMetaClass *meta=driver->getMetaClass();
-    const char *name=meta?meta->getClassName():nullptr;
-    if(!name || strcmp(name,"IOHIDEventDriver"))return;
     uintptr_t *table=*reinterpret_cast<uintptr_t **>(driver);
+    // The qualified constructor stores this exact vptr. Validate the binary
+    // class before reading its table, including when class-name metadata is
+    // unavailable. A subclass or unrelated table must never be truncated.
+    if(reinterpret_cast<uintptr_t>(table)!=kOriginalEventDriverVptr) {
+        printf("PICASSO_HID edge hook rejected vptr=%llx\n",(unsigned long long)reinterpret_cast<uintptr_t>(table));
+        return;
+    }
     constexpr unsigned slots=sizeof(kOriginalEventDriverMethods)/sizeof(kOriginalEventDriverMethods[0]);
     static_assert(slots==220 && slots>kDispatch,"qualified original event-driver extent");
     for(unsigned i=0;i<slots;++i) {
