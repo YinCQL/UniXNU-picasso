@@ -9,11 +9,18 @@ from native_prelink import macho,backed_offset,exports
 def run(cmd,**kw):return subprocess.check_output([str(x) for x in cmd],timeout=90,**kw)
 def require(value,why):
     if not value:raise SystemExit(why)
-from picasso_original_abi import load_reference, qualify_hid
+from picasso_original_abi import load_reference, qualify_hid, qualify_hid_event_driver
 reference=load_reference()
 names=reference.names
 vptr=0xfffffff005d045c0
 methods=qualify_hid(reference)
+event_methods=qualify_hid_event_driver(reference)
+kernel_methods=set(reference.names.values())
+event_header=('// Qualified IOHIDFamily-2031.120.4 event driver; generated, never committed.\n'
+              '// Zero entries are kernel exports rebound by NativePrelink to the compiled XNU.\n'
+              '#pragma once\nstatic const uintptr_t kOriginalEventDriverMethods[]={\n' +
+              ''.join(f'    {0 if address in kernel_methods else address:#x}ULL,\n' for address in event_methods) + '};\n')
+(OUT/'OriginalHidEventABI.h').write_text(event_header)
 header='''// Generated from the qualified original image; opaque private storage only.
 #pragma once
 #include <IOKit/IOService.h>

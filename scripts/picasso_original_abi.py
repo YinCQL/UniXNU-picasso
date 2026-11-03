@@ -136,3 +136,29 @@ def qualify_hid(reference):
             bytes.fromhex('680240f9081543f9e00313aae20316aae30315aae40314aa00013fd6'),
             'Original handleReport forwards timestamp, report, type and options')
     return methods
+
+
+def qualify_hid_event_driver(reference):
+    # IOHIDFamily-2031.120.4: constructors name the class and store these vptrs.
+    # The instance table is 220 slots; the former 256-slot copy read past it.
+    require(reference.read(0xfffffff004af09bc, 12) ==
+            bytes.fromhex('a89000d008a12991080000f9'),
+            'Original IOHIDEventDriver constructor vptr')
+    require(reference.read(0xfffffff004afb130, 12) ==
+            bytes.fromhex('6890009008610c91080000f9'),
+            'Original IOHIDEvent constructor vptr')
+    driver = reference.pointers(0xfffffff005d06a68, 220)
+    event = reference.pointers(0xfffffff005d07318, 37)
+    require(all(driver) and reference.read(0xfffffff005d06a68 + 220 * 8, 24) == bytes(24),
+            'Exact original 220-slot event driver')
+    require(all(event) and reference.read(0xfffffff005d07318 + 37 * 8, 24) == bytes(24),
+            'Exact original 37-slot IOHIDEvent')
+    require(driver[198] == 0xfffffff004aface8 and
+            event[18] == 0xfffffff004afcf90 and event[23] == 0xfffffff004afcfb8 and
+            event[24] == 0xfffffff004afefdc and event[25] == 0xfffffff004afe4c4,
+            'Original dispatch and event field virtuals')
+    require(reference.read(event[18], 12) == bytes.fromhex('080840f9000540b9c0035fd6'),
+            'Original event type accessor layout')
+    require(reference.read(0xfffffff004afcf04, 8) == bytes.fromhex('000c40f9a00100b4'),
+            'Original appendChild children pointer at 24')
+    return driver

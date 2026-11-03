@@ -71,6 +71,7 @@ static const unsigned char touchDescriptor[]={
 // calls); _children at +24 (IOHIDEvent.h; appendChild stores into it and free releases it). _parent is never set (appendChild only
 // stores the child, int-163 skipped every finger by comparing it), so each child is an IOHIDEvent by its class instead.
 namespace edge {
+extern "C" {volatile uint32_t native_touch_edge_dispatch[2];} // total events, digitizer events
 #if defined(NATIVE_HID_SOURCE_API) && NATIVE_HID_SOURCE_API && !__has_feature(ptrauth_calls)
 // Source-only bring-up without pointer authentication emits ordinary digitizer reports: a copied vtable of another family's ABI is never used.
 extern "C" {volatile uint32_t native_touch_hid_multi[3];}
@@ -130,12 +131,16 @@ static bool mark(void *child) {
     return edged;
 }
 static void dispatch(IOService *self,OSObject *event,IOOptionBits options) {
-    if(event && call<uint32_t,IOOptionBits>(event,kGetType,kDivGetType,0)==kDigitizer) {
+    native_touch_edge_dispatch[0]=native_touch_edge_dispatch[0]+1;
+    const uint32_t type=event?call<uint32_t,IOOptionBits>(event,kGetType,kDivGetType,0):0;
+    if(event && type==kDigitizer) {
+        native_touch_edge_dispatch[1]=native_touch_edge_dispatch[1]+1;
         OSArray *children=*reinterpret_cast<OSArray **>(reinterpret_cast<uint8_t *>(event)+24);
-        if(children && OSDynamicCast(OSArray,children) && children->getCount()) {
+        const unsigned childCount=children && OSDynamicCast(OSArray,children)?children->getCount():0;
+        if(childCount) {
             // A collection (the driver's touch-screen dispatch): its mask is the union of its fingers', so it takes the bit as well.
             bool any=false;
-            for(unsigned i=0;i<children->getCount();++i) {
+            for(unsigned i=0;i<childCount;++i) {
                 OSObject *child=children->getObject(i);
                 if(child && child->metaCast("IOHIDEvent"))any|=mark(child);
                 else native_touch_edge_stats[3]=native_touch_edge_stats[3]+1;
@@ -145,6 +150,12 @@ static void dispatch(IOService *self,OSObject *event,IOOptionBits options) {
                 call<void,uint32_t,int32_t,IOOptionBits>(event,kSetInteger,kDivSetInteger,kMask,(int32_t)(mask|kFromEdgeTip),0);
             }
         } else if(!children) mark(event);   // one transducer dispatched on its own
+        if(native_touch_edge_dispatch[1]<=4) {
+            printf("PICASSO_HID digitizer event mask=%x children=%u contacts=%u edge=%u skipped=%u\n",
+                (unsigned)call<int32_t,uint32_t,IOOptionBits>(event,kGetInteger,kDivGetInteger,kMask,0),
+                childCount,(unsigned)native_touch_edge_stats[1],
+                (unsigned)native_touch_edge_stats[2],(unsigned)native_touch_edge_stats[3]);
+        }
     }
 #if __has_feature(ptrauth_calls)
     originalDispatch(self,event,options);
@@ -225,16 +236,30 @@ static void install(IORegistryEntry *driver) {
     native_touch_edge_stats[0]=1;
 }
 #else
+#include "OriginalHidEventABI.h"
 static void install(IORegistryEntry *driver) {
     if(originalDispatch || !driver)return;
+    const OSMetaClass *meta=driver->getMetaClass();
+    const char *name=meta?meta->getClassName():nullptr;
+    if(!name || strcmp(name,"IOHIDEventDriver"))return;
     uintptr_t *table=*reinterpret_cast<uintptr_t **>(driver);
-    uintptr_t *copy=static_cast<uintptr_t *>(IOMalloc(kSlots*sizeof(uintptr_t)));
+    constexpr unsigned slots=sizeof(kOriginalEventDriverMethods)/sizeof(kOriginalEventDriverMethods[0]);
+    static_assert(slots==220 && slots>kDispatch,"qualified original event-driver extent");
+    for(unsigned i=0;i<slots;++i) {
+        // NativePrelink rebinds exported kernel methods; retained family methods
+        // keep their qualified addresses. Both kinds must remain non-null.
+        if(!table[i] || (kOriginalEventDriverMethods[i] && table[i]!=kOriginalEventDriverMethods[i])) {
+            printf("PICASSO_HID edge hook rejected slot=%u\n",i);return;
+        }
+    }
+    uintptr_t *copy=static_cast<uintptr_t *>(IOMalloc(slots*sizeof(uintptr_t)));
     if(!copy)return;
-    memcpy(copy,table,kSlots*sizeof(uintptr_t));
+    memcpy(copy,table,slots*sizeof(uintptr_t));
     originalDispatch=copy[kDispatch];copy[kDispatch]=(uintptr_t)&dispatch;
     __asm__ volatile("dmb ish":::"memory");
     *reinterpret_cast<uintptr_t **>(driver)=copy;
     native_touch_edge_stats[0]=1;
+    printf("PICASSO_HID edge hook installed slots=%u dispatch=%u\n",slots,kDispatch);
 }
 #endif
 #endif

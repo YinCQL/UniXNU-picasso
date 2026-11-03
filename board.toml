@@ -221,7 +221,7 @@ kernel_args = [
   # the question.
   "native-ufs-diagnostics=0",
   # Request the optional NativeUfs store window for changed Data pages.
-  # The generated APFS seed has 512 MiB logical capacity.
+  # The generated APFS seed has 1024 MiB sparse logical capacity.
   "sheng-data-persist=2",
   # Diagnostic bring-up isolation: the original watchdogd's service checks do
   # not complete on this kernel yet. Disable only its launch job for this boot.
@@ -306,6 +306,8 @@ kernel_args = [
   "offline-hid-home=1",
   # Expose the combined digitizer and register its sink for startup swipes.
   "sheng-touch-hid=1",
+  # Start the firmware-backed physical panel once the digitizer sink exists.
+  "sheng-touch=4",
   # The synthetic bottom-edge swipe that unlocks this iPad identity; auto-home did
   # not leave the lock screen. One gesture every 20 s from t=540 s covers the window
   # in which SpringBoard takes the panel.
