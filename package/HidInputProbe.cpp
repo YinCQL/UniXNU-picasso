@@ -11,6 +11,7 @@
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
 #include <mach/mach_time.h>
+#include "TouchPublish.h"
 extern kmod_info_t g_kernel_kmod_info;
 extern "C" void native_hid_static_init(void) __asm__("__GLOBAL__sub_I_NativeHidInput.cpp");
 extern "C" IOService *native_hid_input_allocate(void);
@@ -31,8 +32,10 @@ char native_hid_input_props[1024];
 // Touch snapshot published through the ShengHidInput digitizer (NativeHidInput.cpp reads the same globals).
 extern volatile uint32_t native_touch_seq,native_touch_count,native_touch_hid_reports;
 extern volatile int native_touch_xs[12],native_touch_ys[12],native_touch_ids[12];
+extern volatile uint32_t native_touch_writer_lock,native_touch_physical_active;
 // Edge-marking counters of the digitizer wrapper: [1] contacts begun, [2] of them starting at a panel edge.
 extern volatile uint32_t native_touch_edge_stats[4];
+extern volatile uint32_t native_touch_edge_dispatch[2];
 extern volatile uint32_t native_legacy_transfer_calls;
 // Optional unattended Home presses for hardware, which has no external harness writing the mailbox:
 // offline-hid-auto-home=<seconds after the second presented frame>, offline-hid-auto-home-count (default 1)
@@ -53,7 +56,8 @@ bool native_hid_input_requested(void) {
         __asm__ volatile("mrs %0, cntfrq_el0":"=r"(autoFrequency));
         if(autoFirst && autoFrequency)autoNext=counterNow()+(uint64_t)autoFirst*autoFrequency;
     }
-    if(autoFirst && autoFrequency && autoSent<autoCount && counterNow()>=autoNext) {
+    if(__atomic_load_n(&native_touch_physical_active,__ATOMIC_ACQUIRE)!=2 &&
+       autoFirst && autoFrequency && autoSent<autoCount && counterNow()>=autoNext) {
         ++autoSent;autoNext+=(uint64_t)autoInterval*autoFrequency;return true;
     }
     if(native_hid_input_command!=1)return false;
@@ -166,32 +170,31 @@ void native_hid_input_observed(unsigned event,int result) {
     }
 }
 __attribute__((noinline)) void native_hid_checkpoint(void) { __asm__ volatile("" ::: "memory"); }
-// The digitizer registers its notify callback here at start(). Picasso has no
-// board touch producer yet, so this probe owns the sink: the weak definition in
-// PicassoBootProgressStubs.c would be a no-op and the driver has no timer left
-// to poll the seqlock.
-// The sink storage lives in PicassoBootProgressStubs.c (always linked); this probe
-// only notifies after publishing a frame.
+// Synthetic and physical contacts share the sink and writer lock owned by
+// PicassoBootProgressStubs.c. Physical input stops this unattended sequence.
 extern "C" void native_touch_notify(void);
 extern "C" int native_touch_sink_ready(void);
 // One finger-set frame for the virtual digitizer. The reader (NativeHidInput::touchSend) treats an odd
 // sequence as torn and retries, so the sequence brackets the snapshot.
-static void swipePublish(unsigned count,int id,int x,int y) {
-    const uint32_t seq=native_touch_seq;
-    native_touch_seq=seq+1;
-    __asm__ volatile("dmb ish":::"memory");
-    native_touch_count=count;
-    if(count){native_touch_ids[0]=id;native_touch_xs[0]=x;native_touch_ys[0]=y;}
-    __asm__ volatile("dmb ish":::"memory");
-    native_touch_seq=seq+2;
+static void swipeNotify(void *context) {
+    *static_cast<bool *>(context)=true;
     native_touch_notify();
+}
+static bool swipePublish(unsigned count,int id,int x,int y) {
+    bool published=false;
+    nvt_touch_publication publication={&native_touch_seq,&native_touch_count,
+        native_touch_xs,native_touch_ys,native_touch_ids,12,swipeNotify,&published,&native_touch_writer_lock};
+    nvt_touch_publish_if(&publication,&x,&y,&id,count,
+        &native_touch_physical_active);
+    return published;
 }
 // Publish a frame and wait (bounded) for the event driver to take it; returns false when no report
 // moved in 200 ms, which means the digitizer is not attached and further frames are pointless.
 static bool swipeFrame(unsigned count,int x,int y) {
     const uint32_t want=native_touch_hid_reports+1;
-    swipePublish(count,1,x,y);
+    if(!swipePublish(count,1,x,y))return false;
     for(unsigned i=0;i<100;++i) {
+        if(__atomic_load_n(&native_touch_physical_active,__ATOMIC_ACQUIRE)==2)return false;
         if(native_touch_hid_reports>=want)return true;
         IOSleep(2);
     }
@@ -209,10 +212,14 @@ static void swipeGesture(void) {
         IOSleep(12);   // ~300 ms per gesture; unpaced, the 25 frames land in about 50 ms
     }
     swipeFrame(0,15240,1200);
-    printf("PICASSO_HID swipe %u moved=%u reports=%u edge=%u/%u\n",swipeSent,moved?1:0,(unsigned)native_touch_hid_reports,(unsigned)native_touch_edge_stats[1],(unsigned)native_touch_edge_stats[2]);
+    printf("PICASSO_HID swipe %u moved=%u reports=%u edge=%u/%u hook=%u dispatch=%u/%u\n",
+        swipeSent,moved?1:0,(unsigned)native_touch_hid_reports,(unsigned)native_touch_edge_stats[1],
+        (unsigned)native_touch_edge_stats[2],(unsigned)native_touch_edge_stats[0],
+        (unsigned)native_touch_edge_dispatch[0],(unsigned)native_touch_edge_dispatch[1]);
 }
 void native_hid_swipe_tick(unsigned now) {
     if(!swipeDue || now<swipeDue)return;
+    if(__atomic_load_n(&native_touch_physical_active,__ATOMIC_ACQUIRE)==2){swipeDue=0;return;}
     if(swipeSent>=swipeTotal) {swipeDue=0;return;}
     ++swipeSent;
     swipeDue=now+20;
@@ -261,8 +268,9 @@ void native_hid_input_probe(void) {
                     unsigned split=0;
                     unsigned swipes=0;
                     PE_parse_boot_argn("sheng-touch-split",&split,sizeof(split));
+                    PE_parse_boot_argn("sheng-touch-hid",&touchHid,sizeof(touchHid));
                     const bool swipeWanted=PE_parse_boot_argn("offline-hid-swipe",&swipes,sizeof(swipes)) && swipes;
-                    const bool splitWanted=split==1 && PE_parse_boot_argn("sheng-touch-hid",&touchHid,sizeof(touchHid)) && touchHid==1;
+                    const bool splitWanted=split==1 && touchHid==1;
                     bool touchReady=false;
                     if(started && splitWanted) {
                         // Separate digitizer service (primary usage Digitizer/Touch Screen, Built-In).
@@ -274,11 +282,15 @@ void native_hid_input_probe(void) {
                         // The classic IOHIDEventDriver opens the combined keyboard device, and a second
                         // IOHIDResource child never matched it on picasso. The digitizer therefore lives
                         // in the same device (sheng-touch-hid=1), which registered the sink in start().
-                        touchReady=true;
+                        touchReady=touchHid==1 && native_touch_sink_ready();
                     }
+                    touchReady=touchReady && native_touch_sink_ready();
                     if(touchReady && swipeWanted) {
                         printf("PICASSO_HID swipe armed sink=%d count=%u\n",native_touch_sink_ready(),swipes);
                         swipeTotal=swipes;swipeSent=0;swipeDue=1;   // first gesture on the next monitor pass
+                    } else if(swipeWanted) {
+                        printf("PICASSO_HID swipe unavailable started=%u digitizer=%u sink=%d\n",
+                            started?1:0,touchHid==1?1:0,native_touch_sink_ready());
                     }
                     // The offline devices live for this bounded boot. Its
                     // service attachment and timer remain genuine live objects.

@@ -71,6 +71,11 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
 
+      - name: Prepare authenticated stock touch firmware
+        run: |
+          python3 scripts/fetch-picasso-touch-firmware.py --output out/picasso/novatek/firmware.bin
+          echo "NOVATEK_TOUCH_FW=$PWD/out/picasso/novatek/firmware.bin" >> "$GITHUB_ENV"
+
       - name: Download the target IPSW
         run: |
           mkdir -p out/ipsw
@@ -98,6 +103,12 @@ jobs:
           python3 ./unixnu ipsw fetch OS KernelCache StaticTrustCache Cryptex1,SystemTrustCache 2>&1 | tee out/picasso/logs/actions-ipsw.log
           echo "UNIXNU_KERNELCACHE=$PWD/out/ipsw/21H461/kernelcache.decompressed" >> "$GITHUB_ENV"
           python3 scripts/prepare-original-trust.py --tree "$TREE" --inputs out/ipsw/21H461 --output out/picasso/original-static-system.bundle 2>&1 | tee out/picasso/logs/actions-trust.log
+
+      - name: Check original display and HID ABI inputs
+        run: |
+          python3 scripts/check-picasso-original-abi.py --kernelcache "$UNIXNU_KERNELCACHE" \
+            --native-prelink-dir "$UNIXNU_TREE/kits/NativePrelink" \
+            --output out/picasso/logs/original-abi.json
 
       - name: Prepare volatile APFS Data from the original OS
         run: |
@@ -199,6 +210,7 @@ jobs:
             device/out/picasso/kernel/**
             device/out/picasso/payload/**
             device/out/picasso/logs/**
+            device/out/picasso/novatek/*.json
             device/out/picasso/tree/build/sheng-platform-power/*.json
             device/out/picasso/tree/build/sheng-platform-power/*.log
             device/out/picasso/tree/build/sheng-platform-power/*.o

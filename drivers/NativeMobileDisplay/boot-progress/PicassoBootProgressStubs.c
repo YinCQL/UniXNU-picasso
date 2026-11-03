@@ -35,6 +35,10 @@ WEAK volatile uint64_t native_hid_input_object;
 // probe) calls native_touch_notify() after publishing a frame.
 static void (*native_touch_sink_fn)(void *);
 static void *native_touch_sink_context;
+// Physical and synthetic publishers share one writer; 2 permanently gives
+// physical input control of the snapshot for this boot.
+volatile uint32_t native_touch_writer_lock;
+volatile uint32_t native_touch_physical_active;
 void native_touch_set_sink(void (*sink)(void *), void *context) {
     __atomic_store_n(&native_touch_sink_context, context, __ATOMIC_RELEASE);
     __atomic_store_n(&native_touch_sink_fn, sink, __ATOMIC_RELEASE);

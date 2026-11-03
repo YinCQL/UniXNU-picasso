@@ -117,18 +117,18 @@ def main():
     short_raw = out / 'short.cdr'
     short_raw.write_bytes(raw_bytes[:-1])
     rejected('raw size mismatch', lambda: data.inspect_packed(packed, short_raw))
-    empty_data = out / 'empty256.dbrdisk'
-    empty_data.write_bytes(struct.pack('<8sIIQQ', b'DBRDISK1', 1, page, data.DATA_BYTES, 0))
+    empty_data = out / 'empty1024.dbrdisk'
+    empty_data.write_bytes(struct.pack('<8sIIQQ', b'DBRDISK1', 1, page, 1024 * 1024**2, 0))
 
     def verify_sparse():
         result = data.inspect_packed(empty_data)
         digest = hashlib.sha256()
-        for _ in range(256):
+        for _ in range(1024):
             digest.update(bytes(1024**2))
         assert result['logical_bytes'] == data.DATA_BYTES
         assert result['raw_sha256'] == digest.hexdigest()
 
-    passes('256 MiB logical empty disk hashes without dense allocation', verify_sparse)
+    passes('1024 MiB logical empty disk hashes without dense allocation', verify_sparse)
 
     identity = '10203040-5060-7080-9010-203040506070'
     config = ('# preserve this comment\nCONFIG_XNU_NATIVE_RAM_BLOCK=y\n'
@@ -212,6 +212,47 @@ def main():
 
         passes('source audit blocks absolute and parent-directed intermediate symlinks', verify_audit)
     rejected('source audit rejects parent traversal', lambda: data.audit_path(source, '../outside'))
+
+    # Content and path checks are real; root-only 501:501/0600 ownership is
+    # modelled explicitly on the unprivileged host. macOS preparation checks it.
+    preferences = out / 'boot-preferences'
+    parent = preferences / 'mobile/Library/Preferences'
+    parent.mkdir(parents=True)
+    preference_path = parent / 'com.apple.springboard.plist'
+    native_metadata = data.metadata
+
+    def preference_metadata(path):
+        result = native_metadata(path)
+        if path == preference_path:
+            result.update(uid=501, gid=501, mode=0o600)
+        return result
+
+    def preference_case():
+        with mock.patch.object(data.os, 'chown', create=True) as owner, \
+                mock.patch.object(data.os, 'chmod', wraps=data.os.chmod) as mode, \
+                mock.patch.object(data, 'metadata', side_effect=preference_metadata):
+            report = data.add_boot_preferences(preferences)
+            owner.assert_called_once_with(preference_path, 501, 501)
+            mode.assert_called_once_with(preference_path, 0o600)
+        blob = preference_path.read_bytes()
+        assert plistlib.loads(blob) == {'SBDisableAutoDim': True}
+        assert report == [dict(path='mobile/Library/Preferences/com.apple.springboard.plist',
+                               values={'SBDisableAutoDim': True}, **preference_metadata(preference_path))]
+        assert report[0]['sha256'] == hashlib.sha256(blob).hexdigest()
+
+    passes('native auto-dim preference content/provenance and 501:501/0600 calls', preference_case)
+    original_preference = preference_path.read_bytes()
+    rejected('boot preference refuses an existing original object', lambda: data.add_boot_preferences(preferences))
+    assert preference_path.read_bytes() == original_preference
+    bad_parent = out / 'bad-preference-parent'
+    (bad_parent / 'mobile/Library').mkdir(parents=True)
+    (bad_parent / 'mobile/Library/Preferences').write_bytes(b'not a directory')
+    rejected('boot preference refuses a non-directory parent', lambda: data.add_boot_preferences(bad_parent))
+    if link_ok:
+        bad_link = out / 'linked-preference-parent'
+        (bad_link / 'mobile/Library').mkdir(parents=True)
+        os.symlink(str(parent), bad_link / 'mobile/Library/Preferences', target_is_directory=True)
+        rejected('boot preference refuses a symlink parent', lambda: data.add_boot_preferences(bad_link))
 
     # Exercise metadata mismatch independently of the host's available UID model.
     fake = {'uid': 501, 'gid': 501, 'mode': 0o700, 'type': 'directory'}
