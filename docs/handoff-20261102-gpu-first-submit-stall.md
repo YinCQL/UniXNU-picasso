@@ -868,3 +868,18 @@ Client side (read-only reference copies):
   the client's IB. Plugin CDHash `0d2e7bfb013c0e2ac6d85dffb49ef689a8b30d06`, trust
   `693690d75959f1fc08f3e3f6a89cb417b310c32bc44a3bc6dd1bcff3dddac08f`; image
   `out/wf91/picasso/boot/wf91.img`, log `out/wf91-runs/run1.log`.
+- **wf91 result: the CP executes Turnip's IB.** `Q t1020e2c31 a1 r0`: the `CP_REG_TO_MEM`
+  (`CP_ALWAYS_ON_COUNTER` → query buffer) and the `CP_MEM_WRITE` (availability) that Turnip
+  records inside this command buffer both ran, with a sane counter value and `VK_SUCCESS` for the
+  query read. So the IB is not skipped, the client's page table is in place, and the CP is
+  executing the client's packets. The timestamp was recorded **before** the fill, so it proves
+  the leading packets only.
+- **wf92: a timestamp on each side of the fill.** `fillTest` now records two timestamps in the
+  same command buffer — query 0 before `vkCmdFillBuffer`, query 1 after it — and
+  `turnipPhase()` streams `Q <q0 value>/<q0 avail> <q1 value>/<q1 avail> r<VkResult>`. q1 ≠ 0
+  means the CP executed the fill's state/draw packets and the failure is downstream (the 3D
+  pipeline producing no writes); q1 = 0 means the CP stopped or aborted at those packets, and the
+  fill's command stream is the place to look (protect/unknown packet). Plugin CDHash
+  `4d06d7c3d0d57343052219f0430075ef3cc69c07`, trust
+  `f2958b9942377eee1aac7b5062131b0f79cafaf571f7f00bb8640843339d2229`; image
+  `out/wf92/picasso/boot/wf92.img`, log `out/wf92-runs/run1.log`.
