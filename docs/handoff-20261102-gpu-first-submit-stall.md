@@ -685,4 +685,32 @@ Client side (read-only reference copies):
 - **wf81** image: kernel `5f41dca2eb1ff109c06085a4223136adfa4d3750cdd88054a5340019769e319d`,
   payload args include `sheng-gpu-metal=1 sheng-gpu-addon=1`, addon
   `0dbe0ef2…` (`build/ngpu-addon-wf60.bin`). Booted from RAM 2026-11-03 09:26 CST; device
-  serial this round `52cc791d`. Log `out/wf81-runs/run1.log`. Result: see the run log / next section.
+  serial this round `52cc791d`. Log `out/wf81-runs/run1.log`. Result: GPU init and Metal publish
+  succeeded with SQE 0x112 (`sqe=a650_sqe.fw version=0x112 security=1`), fence 2 retired, then the
+  first client stream (pid 56 backboardd) stalled at the same `RM6_ENDVIS` packet (fence 6 pending,
+  cpFence 5) with the same idle-block/`UCHE_OOB` signature. **The SQE version is not the cause.**
+- **wf82: force Turnip's sysmem path.** `TU_DEBUG=sysmem` (Mesa's `use_sysmem_rendering()` returns
+  true unconditionally) skips GMEM, hardware binning, `CP_SET_BIN_DATA5` and the `RM6_ENDVIS`
+  marker. The plugin sets it with `setenv("TU_DEBUG", "sysmem", 1)` in both device-open paths of
+  `UniXNU/drivers/NativeMetal/NativeAdrenoMetalPlugin.mm` (render server at the other `setenv`
+  calls near `CA_DISABLE_FRAMEBUFFER_COMPRESSION`, and `clientDevice`), before
+  `native_bridge_metal_open()`. Rebuild chain:
+  `python3 scripts/build-adreno-metal-plugin.py` (needs `DEVELOPER_DIR`; rebuilds the pinned Rust
+  bridge, re-copies `build/mesa-tu-ios/.../libvulkan_freedreno.dylib`, re-signs 4 KiB),
+  `python3 scripts/make-owner-trust-bundle.py`, then
+  `python3 scripts/make-gpu-addon.py --publish --clients '*' <out>`.
+  wf82 inputs: addon `383631181b9dabde1bd224a6dca5170562d426d9bc3a88c28f39f610b3319c2c`
+  (`build/ngpu-addon-wf82.bin`), trust `dc9e20501b0490b75489c461f78f2b6c42a3e9b070ca43d79443f785ae0483d3`,
+  plugin CDHash `812154a79c0042e710c26b4c827223219dd96bf6`, kernel unchanged from wf81. The old trust
+  bundle/trust.json are backed up as `build/owner-trust-wf81.bundle` and `build/trust-wf81.json`.
+  Image `out/wf82/picasso/boot/wf82.img`; log `out/wf82-runs/run1.log`.
+- **wf82 result (measured): no stall.** GPU init, Metal publish, the client's first submission and its
+  fence all complete; `grep -c "PICASSO_GPU stall"` is 0 (wf81: 2), the display path runs repeated
+  frame cycles (`PICASSO_DISPLAY event=6 sample=1/2`, `event=8/9/10`, `frame kind=0`), and SpringBoard
+  comes up. So the hang is specific to the GMEM/hardware-binning path (the per-tile draw CS plus the
+  `RM6_ENDVIS` completion handshake), not to the ring/submit/fence machinery, memory mapping, the
+  SQE image, or the draws' command encoding. Next measurements: (a) does the presented frame have
+  content (`nonblack=`); (b) one surface was rejected with format `0x62336138` (`b3a8`, 10-bit deep
+  framebuffer — the render server's deep preference), while the display driver only takes 8-bit;
+  (c) then return to the GMEM path: the `RM6_ENDVIS` handler's control-0x069 bit-5 completion still
+  never arrives with binning, so compare the VSC/bin state programmed by the tile sequence.
