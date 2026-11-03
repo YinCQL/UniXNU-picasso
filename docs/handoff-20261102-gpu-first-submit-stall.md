@@ -1411,3 +1411,11 @@ Client side (read-only reference copies):
   nothing, and backboardd's five submissions remain the whole client load. The next question is
   therefore inside the UI stack (why the UI process opens the accelerator but commits no
   work/surface), not in the GPU driver or the accelerator's availability.
+- **wf130 display path is alive; only the content is missing.** After the compositor takes over,
+  the display driver still runs its transfer path: `event=10 sample=1` copies the whole
+  framebuffer (`b=0x9e3400` = 1080×2400×4) and later samples copy dirty regions
+  (`b=0x1a700`), `event=6/9` report success, no `failure=1`. The scanout is black because no
+  client commits a surface, not because the display transfer or the GPU submission path is
+  broken. A next round should follow the UI process (SpringBoard): it opens `AGXAccelerator`
+  (result 0) but never issues a Submit, so look for where its render-server/display-link setup
+  stops before the first surface commit.
