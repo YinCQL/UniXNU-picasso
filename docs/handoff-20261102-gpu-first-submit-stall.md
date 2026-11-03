@@ -1474,3 +1474,13 @@ Client side (read-only reference copies):
   through the plugin each frame. The path to GPU-rendering every UI frame is in the
   compositor/plugin (CoreAnimation render-server) side, not in the kernel GPU driver — the
   driver, the accelerator, the timestamp and the Turnip queue all work end to end.
+- **wf133 measurement over ~10 minutes: UI presents do not submit GPU work.** The display went
+  from 3 to 12 accepted/transferred/retired presents (51 s → 566 s, `reject=0`,
+  `transfer_fail=0`), while the GPU counter stayed at exactly `submissions=3` through live
+  samples 1–11 (~290 s → ~600 s). So the lock-screen frames are *not* produced by new Adreno
+  command streams: the compositor presents a surface it does not re-render through the plugin.
+  The three submits that do exist coincide with the first three presents and with the plugin's
+  own Turnip smoke, so they cannot be attributed to UI drawing either. Conclusion: the GPU is
+  proven capable of rendering (Turnip smoke passes with pixel read-back), but the on-screen UI
+  is not GPU-rendered yet — that is compositor/render-server work (CoreAnimation ⇄ plugin
+  device), not kernel-driver work.
