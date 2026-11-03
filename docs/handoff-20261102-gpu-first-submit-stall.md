@@ -1023,3 +1023,32 @@ Client side (read-only reference copies):
   `ADRENO620_FW_DIR=$PWD/build/picasso-gpu-fw`, pinned 31964-byte SQE embedded); image
   `out/wf99/picasso/boot/wf99.img` (sha `5bfce36e…`), same addon as wf98; log
   `out/wf99-runs/run1.log`.
+- **wf99 result: the boot-slumber request does not exist on this firmware and, left pending, it breaks
+  HFI startup.** Serial: `gmu: rail-on vote=01000404 (cmd-db 625000000 Hz) idx=4/4 polls=10000
+  info=00000000 gx 000000c0->00000080` — no ack; `sptprac power (pre-HFI) status=00000080`; then
+  `hfi: stage=1 id=4 status=10 fw=0`, `first mismatched response header=00000000 ret=00000000
+  code=00000000`, `abort: stage=3`, `end stage=3 step=3 error=-32`. The un-acked request bit 22 stayed
+  set in `HOST2GMU_INTR_SET` (mainline calls `a6xx_gmu_oob_clear(oob_boot_slumber)` when
+  `gfx_rail_on` fails; this port did not), and the firmware's HFI exchange then failed. The vendor
+  driver settles the question: downstream KGSL `adreno_a6xx_gmu.c` gates `a6xx_gmu_gfx_rail_on()` on
+  `ADRENO_QUIRK_HFI_USE_REG` (a DT quirk), maps OOB for every non-a630/a615 target as
+  `BIT(30 - req*2)` / `BIT(31 - req)`, and `adreno_has_sptprac_gdsc()` is true only for a630/a615 —
+  a620 keeps the GMU owning GX and SP/TP, and the port's GPU_SET (30/31) is exactly that mapping. The
+  rail-on code and the bit-30 "boot-slumber clear" are reverted (on a620 bit 30 is the GPU_SET
+  *request* bit, so that write would have re-requested it). The manual SPTPRAC write is retained only
+  as a diagnostic no-op.
+- **wf100: leave secure mode with `CP_SET_SECURE_MODE(0)`.** Official evidence (zap shader series,
+  freedreno): a5xx/a6xx GPUs power on in **secure mode**, which restricts what memory the GPU can
+  write; mainline leaves it via the zap shader + `CP_SET_SECURE_MODE(0)`, or, on targets without
+  zap, by writing `RBBM_SECVID_TRUST_CNTL = 0` from the CPU — which this port measured as a bus hang
+  (wf80). The port has no PIL/SCM to run the zap, never sends the CP packet, and reads
+  `RBBM_SECVID_TRUST_CNTL = 1` at hw_init. This is the one state known to differ from a
+  rendering-clean target and it matches the measured signature exactly (the CP executes; every
+  draw/blit/compute from the 3D/UCHE path leaves non-secure client memory untouched). The kernel now
+  submits `CP_SET_SECURE_MODE(0)` (opcode `0x66`, one payload dword) on the ring right after
+  `cpInit()`, prints `RBBM_SECVID_TRUST_CNTL` before/after and the packet's idle result, and continues
+  with the no-op IB. `left=1` with `trust 1 -> 0` means the GPU switched to non-secure operation;
+  `left=0` with a CP status dump means the secure world refused the packet and the zap (PIL/SCM) is
+  mandatory. Kernel `3e13b81b94a005f87df310ddbc6897a22a1f03dfb4a468348402f9ad62938b0e` (rebuilt with
+  `ADRENO620_FW_DIR`); image `out/wf100/picasso/boot/wf100.img`, same addon as wf98; log
+  `out/wf100-runs/run1.log`.

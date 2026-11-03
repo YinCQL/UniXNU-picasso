@@ -207,6 +207,7 @@ constexpr uint32_t kSpNcModeCntl = 0x00000022u;         /* uavflagprd_inv=2 for 
 constexpr uint32_t kUcheModeCntl = 0x00200000u;         /* hbb_lo << 21 */
 
 constexpr uint32_t kCpMeInitOpcode = 0x48;
+constexpr uint32_t kCpSetSecureModeOpcode = 0x66;       /* adreno_pm4.xml CP_SET_SECURE_MODE */
 constexpr uint32_t kCpNopOpcode = 0x10;
 constexpr uint32_t kCpIndirectBufferOpcode = 0x3F;
 constexpr uint32_t kCpEventWriteOpcode = 0x46;
@@ -597,6 +598,30 @@ bool cpInit()
         return false;
     }
     printf("PICASSO_GPU cp: me_init idle\n");
+    return true;
+}
+
+/* wf100: mainline a6xx_gpu_init sends CP_SET_SECURE_MODE(0) once the zap shader
+ * has loaded, then flushes and waits for the ring to idle. The GPU powers on in
+ * secure mode; this packet is what switches the CP (and through it the GPU) to
+ * non-secure operation. The port has no PIL/SCM to run the zap, never sent this
+ * packet, and measures RBBM_SECVID_TRUST_CNTL = 1 — mainline's no-zap fallback
+ * writes that register to 0 from the CPU, which this port measured as a bus hang
+ * (wf80). This is the TZ-sanctioned alternative, and it is the only GPU state
+ * known to differ from a rendering-clean target. */
+bool leaveSecureMode()
+{
+    uint32_t words[2] = {};
+    const uint32_t payload[1] = {0};
+    if (!packet(words, 2, 0, kCpSetSecureModeOpcode, payload, 1)) return false;
+    uint32_t end = 0;
+    if (!submitRing(words, 2, &end)) return false;
+    printf("PICASSO_GPU cp: CP_SET_SECURE_MODE(0) submitted wptr=%u\n", end);
+    if (!waitIdle(end, kMeInitTimeoutUs)) {
+        printCpStatus("secure-mode");
+        return false;
+    }
+    printf("PICASSO_GPU cp: CP_SET_SECURE_MODE(0) idle rptr=%u\n", gpuRead(A620_CP_RB_RPTR));
     return true;
 }
 
@@ -1174,12 +1199,22 @@ extern "C" int native_adreno620_cp_start(void)
     }
 
     if (!cpInit()) return -1;
+    /* wf100: mainline's CP_SET_SECURE_MODE(0), the zap-path counterpart of the
+     * no-zap SECVID_TRUST_CNTL write. The GPU powers on in secure mode; leaving
+     * it there is the one measured difference from a rendering-clean target. */
+    {
+        const uint32_t trustBefore = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
+        const bool left = leaveSecureMode();
+        const uint32_t trustAfter = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
+        printf("PICASSO_GPU cp: secure mode left=%d trust %08x -> %08x\n",
+            int(left), trustBefore, trustAfter);
+    }
     uint32_t fence = 0;
     if (!submitNoop(&fence)) return -1;
     if (!waitFence(fence, kFenceTimeoutUs, true)) return -1;
 
     /* The GPU is initialized: a6xx_gmu_clear_oob(GPU_SET), the last step of
-     * mainline hw_init. (Zap is not loaded, so no CP_SET_SECURE_MODE.) */
+     * mainline hw_init. */
     native_adreno620_gmu_release_gpu_set();
     s.started = true;
     printf("PICASSO_GPU cp: ready fence=%u\n", fence);
