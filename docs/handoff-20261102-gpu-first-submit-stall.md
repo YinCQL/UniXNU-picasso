@@ -1682,3 +1682,34 @@ Client side (read-only reference copies):
   occur in wf142 (0 stall lines), consistent with the stalls being backboardd submission delay
   under P-core contention rather than a CP or SMMU fault. Image
   `out/wf142/picasso/boot/wf142.img`, log `out/wf142-runs/run1.log`.
+
+- **wf143: touch delivered to HID now drives new frames; the scanout still goes through the CPU copy.**
+  Single change vs wf142: `offline-hid-swipe=16` appended as a kernel argument (994/1000 bytes).
+  The virtual swipe proves the whole input→redraw path without a finger: `PICASSO_HID swipe armed
+  sink=1 count=16`, then `swipe 2 moved=1 reports=26 edge=1/1`, and reports climb 26, 52, 78 …
+  to 766 while `PICASSO_NVT report` only appears for real fingers (4 lines here). The compositor
+  reacts immediately: presents jump from 8 to 492+, and the kernel GPU counter reaches
+  `PICASSO_GPU submits live 7: submissions=1454 ibs=29457 max=71 many=717` (from 14 submissions in
+  wf139). `PICASSO_DISPLAY_STATE trigger=submissions` shows `submit=576 accept=576
+  transfer=577 retire=575` with `copies=575 copy_bytes=1201978752` — i.e. 585 frames each paid a
+  ~2 MiB CPU copy (`PICASSO_DISPLAY event=10 a=0x111a88` ticks). The GPU hand-off is still refused:
+  `PICASSO_GPU text: P2 ee00002c7` (open type 0x4148 not served), because this tree's
+  `drivers/NativeMobileDisplay` has no presenter and `NativeAdrenoStubs.c` provides empty
+  `native_gop_handoff_call/memory`. Image `out/wf143/picasso/boot/wf143.img`, log
+  `out/wf143-runs/run1.log`.
+
+- **wf144: the GPU now writes the scanout directly; the per-frame CPU copy is gone.** Single change vs
+  wf143: `sheng-fb-gpu=1` on the kernel command line (988/1000 bytes) plus the ported hand-off path
+  (see below); kernel `sha256 752eeea5a331fd81…`. Port: `NativeGOPPresenter.cpp`/`NativeGOPWire.h`
+  copied verbatim from UniXNU/NativeMobileDisplay, new `NativeGOPGlue.cpp` creates the presenter and
+  attaches it to the display's nub (`NativeGOPPresenter::start` validates its mapped framebuffer
+  against `PE_current_console`), and `NativeLegacyDisplay.cpp` offers each finished frame through
+  `native_legacy_gpu_offer()` with early retirement (default on) and falls back to the CPU path on
+  failure. Boot shows `PICASSO_DISPLAY gpu presenter attached`; the plugin's hand-off status changes
+  from `P2 ee00002c7` (mode refused) to `P4 e0` (serving). The decisive counters:
+  `PICASSO_DISPLAY_STATE … submit=380 accept=380 reject=0 transfer=380 retire=380 copies=0
+  copy_bytes=0`, `PICASSO_DISPLAY event=10` zero occurrences (wf143 had 575 copies / 1.2 GB), while
+  presents keep arriving (`PICASSO_GPU text: PF 276/0 …`, SpringBoard/backboardd sync samples) and
+  the `PICASSO_GRID` rows 20–23 show UI content. The six `PICASSO_GPU stall:` events are the same
+  50 ms class seen in wf142/143, not a regression. Image `out/wf144/picasso/boot/wf144.img`, log
+  `out/wf144-runs/run1.log`.

@@ -20,6 +20,11 @@
 extern "C" {
 extern kmod_info_t g_kernel_kmod_info;
 void native_legacy_display_static_init(void) __asm__("__GLOBAL__sub_I_NativeLegacyDisplay.cpp");
+// The presenter is compiled from NativeGOPPresenter.cpp with the same
+// mod_init stripping as the display; its class-registration initializer runs
+// inside the display probe's preModLoad/postModLoad bracket.
+void native_gop_presenter_static_init(void) __asm__("__GLOBAL__sub_I_NativeGOPPresenter.cpp");
+bool native_gop_glue_start(IOService *nub);
 IOService *native_legacy_display_allocate(void);
 void picasso_keystore_probe(void) __attribute__((weak));
 bool picasso_aks_ready(void) __attribute__((weak));
@@ -189,6 +194,9 @@ extern "C" kern_return_t native_publish_display_and_report(int level) {
         nub->setName("NativeGOPFramebuffer");
         nubAttached = nub->attach(parent);
         if (nubAttached) nubStarted = nub->start(parent);
+        // The hand-off presenter maps the same GOP device memory (index 0).
+        // It stays out of GPU mode unless sheng-fb-gpu=1.
+        if (nubStarted) native_gop_glue_start(nub);
         if (nubStarted && nub->setProperty("device_type", typeData)) {
             nub->setName("gop-display", gIODTPlane);
             dtAttached = nub->attachToParent(treeParent, gIODTPlane);
@@ -364,6 +372,18 @@ extern "C" void native_legacy_retirement_observed(IOService *) {
     __atomic_store_n(&displayStats.lastRetireTick, mach_absolute_time(), __ATOMIC_RELAXED);
     report(9, 1, 0, 0);
 }
+// GPU hand-off observations. BootProgress.c reads these weak imports; a
+// refused offer keeps the CPU copy, and a failed copy is counted here.
+extern "C" volatile uint32_t native_legacy_gpu_fallbacks, native_legacy_gpu_last_status;
+extern "C" volatile uint64_t native_legacy_early_retires, native_legacy_early_failures;
+extern "C" void native_legacy_swap_stage(unsigned stage) {
+    (void)stage;
+}
+extern "C" void native_legacy_gpu_fallback_observed(int status) {
+    native_legacy_gpu_fallbacks = native_legacy_gpu_fallbacks + 1;
+    native_legacy_gpu_last_status = (uint32_t)status;
+}
+
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t bytes) {
     __atomic_add_fetch(&displayStats.copies, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&displayStats.copyBytes, bytes, __ATOMIC_RELAXED);
@@ -542,6 +562,7 @@ extern "C" void native_legacy_display_probe(void) {
     void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if (!handle) { report(0, 1, kIOReturnNoMemory, 0); return; }
     native_legacy_display_static_init();
+    native_gop_presenter_static_init();
     OSReturn status = OSMetaClass::postModLoad(handle);
     report(0, 1, status, 0);
     if (status) return;
@@ -584,6 +605,9 @@ extern "C" void native_legacy_display_late_probe(void) {
         nub->setDeviceMemory(ranges); nub->setName("NativeGOPFramebuffer");
         nubAttached = nub->attach(parent);
         if (nubAttached) nubStarted = nub->start(parent);
+        // The hand-off presenter maps the same GOP device memory (index 0).
+        // It stays out of GPU mode unless sheng-fb-gpu=1.
+        if (nubStarted) native_gop_glue_start(nub);
         if (nubStarted && nub->setProperty("device_type", typeData)) {
             nub->setName("gop-display", gIODTPlane);
             dtAttached = nub->attachToParent(treeParent, gIODTPlane);

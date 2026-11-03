@@ -285,6 +285,11 @@ kernel_args = [
   "offline-legacy-transfer=1",
   "offline-legacy-cpu-present=1",
   "sheng-vsync=60",
+  # GPU scanout hand-off: the display driver offers each finished frame to the
+  # Adreno plugin, which blits it into the GOP mapping instead of the CPU
+  # copying the whole frame. Without this argument the plugin answers
+  # P2 ee00002c7 and the display keeps the CPU path (the rollback).
+  "sheng-fb-gpu=1",
   # State-only AppleKeyStore probe used by the display/keystore diagnostics.
   "picasso-aks-state=1",
   # Read GPUCC clock and GDSC state without touching the GPU core. SMMU and
