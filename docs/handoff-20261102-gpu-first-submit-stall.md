@@ -1364,3 +1364,20 @@ Client side (read-only reference copies):
   still fail: 7 `Timestamp` (`e00002c7`) and 9 `Metadata` (`e00002c2`). The display scans out
   content throughout (`PICASSO_DISPLAY frame kind=0 nonblack=41011`). Kernel `c7df15dd…`; image
   `out/wf127/picasso/boot/wf127.img`; log `out/wf127-runs/run1.log`.
+- **wf128: the client's submissions are a one-shot bring-up, not a render loop.** The new +180 s
+  sample reads `submits final: submissions=6 ibs=6 max=1 many=0`, `metal final: opens=3
+  foreign=1` — one board probe plus five client submissions, all in the first burst, then
+  nothing. The tunnelled ABI per connection is the plugin's device setup (Params, BoAlloc ×4,
+  BoMap ×4, BoCpuMap/Unmap ×4, DeviceInfo, one Submit and one WaitFence, both 0). No stall, so
+  the GPU retires each fence; nothing browses the accelerator afterwards. The first scanout
+  frame reports the same `nonblack=41011` as every earlier boot (wf100/wf103), i.e. that number
+  is the boot logo at handoff and the frame-report channel is capped, so it says nothing about
+  the later screen — the `sheng-display-grid` sampler added in wf129 reads the scanout surface
+  back as a 12×24 luminance grid to answer that directly.
+- **wf128 kernel panic at ~4.5 min is unrelated to the GPU.** `panic(cpu 6 …)`: thread wait info
+  count mismatch while capturing snapshots for a task, expected 4 found 3, `kern_stackshot.c:
+  3451`; the panicking task is pid 176 `osanalyticshelper`. That is XNU's stackshot racing a
+  thread exit in the sampled task. wf129 therefore adds
+  `com.apple.osanalytics.osanalyticshelper` to `sheng-disable-jobs` (the established mechanism
+  for problematic daemons here) so long-run GPU observation is not cut short by it. Log
+  `out/wf128-runs/run1.log`.
