@@ -22,6 +22,7 @@ kern_return_t OSKextLoadKextWithIdentifier(const char *);
 volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
 volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
 volatile uint32_t native_hid_input_command;
+volatile uint32_t native_hid_input_events[8];
 volatile uint32_t native_touch_writer_lock;
 void native_novatek_touch_probe(void);
 }
@@ -34,7 +35,6 @@ static bool planArmed;
 static PicassoHidPlan gesture;
 static void (*touchSink)(void *);
 static void *touchContext;
-static unsigned reports[8];
 static int results[8];
 static unsigned autoStop;
 
@@ -68,7 +68,7 @@ extern "C" __attribute__((weak)) void native_buttons_set_sink(void (*)(void *, u
 extern "C" void native_hid_input_observed(unsigned event, int result) {
     if (event >= 8) return;
     __atomic_store_n(&results[event], result, __ATOMIC_RELEASE);
-    unsigned n = __atomic_add_fetch(&reports[event], 1, __ATOMIC_ACQ_REL);
+    unsigned n = __atomic_add_fetch(&native_hid_input_events[event], 1, __ATOMIC_ACQ_REL);
     if (event < 3 || ((event == 4 || event == 5 || event == 6) && result && n <= 8))
         IOLog("PICASSO_HID event=%u sample=%u result=%x\n", event, n, result);
 }
@@ -169,7 +169,7 @@ static void inputTick(thread_call_param_t, thread_call_param_t) {
     if (!attempted) { attempted = true; attachInput(); }
     if (!inputDevice) return;
     const uint64_t now = milliseconds();
-    const bool ready = touchSink && __atomic_load_n(&reports[3], __ATOMIC_ACQUIRE) &&
+    const bool ready = touchSink && __atomic_load_n(&native_hid_input_events[3], __ATOMIC_ACQUIRE) &&
         __atomic_load_n(&results[3], __ATOMIC_ACQUIRE) == 1;
     static bool touchStarted, stopPrinted;
     if (ready && !touchStarted) { touchStarted = true; native_novatek_touch_probe(); }
