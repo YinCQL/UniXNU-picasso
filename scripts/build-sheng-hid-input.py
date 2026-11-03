@@ -56,6 +56,7 @@ def compile_cpp(record_path, source, obj):
         '-Wno-deprecated-enum-enum-conversion', '-Wno-unnecessary-virtual-specifier',
         '-Wno-unknown-warning-option', '-Wno-missing-designated-field-initializers',
         '-I', str(ROOT / '.cache/xnu-work/osfmk'), '-I', str(source.parent),
+        '-I', str(ROOT / 'drivers/NativeNovatekTouch'),
     ])
     # The recorded command starts with -include meta_features.h, which lives in
     # the record's own build directory.

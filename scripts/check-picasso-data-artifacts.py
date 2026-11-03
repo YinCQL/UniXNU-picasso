@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import plistlib
 import runpy
 import struct
 import subprocess
@@ -57,7 +58,7 @@ def check(work, tree, output):
     for key in ('logical_bytes', 'packed_bytes', 'packed_sha256', 'raw_sha256',
                 'page_size', 'extent_count'):
         require(seed[key] == packed[key], f'Data report mismatch: {key}')
-    require(packed['logical_bytes'] == 256 * 1024**2, 'Expected 256 MiB sparse logical disk')
+    require(packed['logical_bytes'] == 1024 * 1024**2, 'Expected 1024 MiB sparse logical disk')
     require(packed['packed_bytes'] <= 4 * 1024**2, 'Packed seed exceeds its memory/payload budget')
     # Base seed provenance is independent of the optional runtime UFS overlay.
     require(seed['persistent'] is False and seed['ownership_preserved'] is True
@@ -70,6 +71,14 @@ def check(work, tree, output):
             'Unexpected source OS image hash')
     require(digest(seed_dir / 'source-var-manifest.json') == seed['source_manifest_sha256'],
             'Source manifest hash mismatch')
+    # The development seed must carry the native idle-timer preference, rather
+    # than hiding a display power request or altering an original OS input.
+    preference = plistlib.dumps({'SBDisableAutoDim': True}, fmt=plistlib.FMT_BINARY, sort_keys=True)
+    require(seed.get('generated_preferences') == [dict(
+        path='mobile/Library/Preferences/com.apple.springboard.plist',
+        values={'SBDisableAutoDim': True}, type='file', uid=501, gid=501, mode=0o600,
+        bytes=len(preference), sha256=hashlib.sha256(preference).hexdigest())],
+        'Missing or invalid native auto-dim preference provenance')
     identity = str(uuid.UUID(seed['volume_uuid'])).upper()
     require(uuid.UUID(identity).int != 0, 'Zero Data UUID')
     config = (work / '.config').read_text()

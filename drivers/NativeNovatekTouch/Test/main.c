@@ -62,22 +62,23 @@ static int fake_xfer(void *ctx, const uint8_t *tx, uint8_t *rx, size_t len) {
         if (data && addr <= 0x3F0FE && 0x3F0FE < addr + data && mem[0x3F0FE] == 0x69) {
             ++bootloader_resets;
             crc_enabled = 0;
-            mem[FAKE_EVENT_BUF + 0x60] = mem[FAKE_EVENT_BUF + 0x61] = 0;
+            mem[FAKE_EVENT_BUF + 0x60] = 0;
         }
         if (data && addr <= 0x3F30E && 0x3F30E < addr + data && (mem[0x3F30E] & 0x80)) crc_enabled = 1;
         if (data && addr <= 0x3F10D && 0x3F10D < addr + data && mem[0x3F10D] == 1) {
             ++boot_rdy_writes;
-            if (boot_ready_ok()) mem[FAKE_EVENT_BUF + 0x61] = 0xa0;
+            if (boot_ready_ok()) mem[FAKE_EVENT_BUF + 0x60] = 0xa0;
             else ++boot_ready_rejects;
         }
         return 0;
     }
-    // Full-duplex: the first received byte is clocked while the address byte is sent and is ignored; the chip's
-    // data starts at rx[1] (the vendor's spi_write_then_read sends one address byte, then reads len bytes).
-    const size_t data = len - 1;
+    // Address and dummy cycles precede data. Distinct canaries catch a shifted read.
+    if (len < 3 || tx[1] != 0) return -1;
+    const size_t data = len - 2;
     if (!rx || !data || (size_t)addr + data > MEM_SIZE) return -1;
-    rx[0] = 0;
-    memcpy(rx + 1, mem + addr, data);
+    rx[0] = 0xee;
+    rx[1] = 0xdd;
+    memcpy(rx + 2, mem + addr, data);
     return 0;
 }
 static void fake_delay(void *ctx, unsigned ms) { (void)ctx; (void)ms; ++bus_delays; }
@@ -91,14 +92,9 @@ static void model_reset(void) {
     engine_resets = bootloader_resets = boot_rdy_writes = boot_ready_rejects = bus_delays = 0;
     crc_enabled = 0;
     expect_image = NULL;
-    // Trim id at chip_info + 1: {0x0c, ignored, ignored, 0x72, 0x66, 0x03}.
-    mem[0x1F64E] = 0x4e;
-    mem[0x1F64F] = 0x0c;
-    mem[0x1F650] = 0xaa;
-    mem[0x1F651] = 0xbb;
-    mem[0x1F652] = 0x72;
-    mem[0x1F653] = 0x66;
-    mem[0x1F654] = 0x03;
+    // Trim id starts at chip_info after the two SPI lead-in bytes.
+    const uint8_t trim[6] = {0x0c, 0xaa, 0xbb, 0x72, 0x66, 0x03};
+    memcpy(mem + 0x1F64E, trim, sizeof(trim));
     // FWINFO: fw_ver, ~fw_ver, 18 x 36, abs_x_max 1080, abs_y_max 2400 (big-endian).
     const uint8_t info[8] = {0x2a, 0xd5, 18, 36, 0x04, 0x38, 0x09, 0x60};
     memcpy(mem + FAKE_EVENT_BUF + 0x78, info, sizeof(info));
@@ -174,12 +170,15 @@ static void test_board(void) {
 // ---------------------------------------------------------------------------------------------------------------
 // Publication seqlock.
 // ---------------------------------------------------------------------------------------------------------------
-static volatile uint32_t pub_seq, pub_count;
+static volatile uint32_t pub_seq, pub_count, pub_lock;
 static volatile int pub_xs[12], pub_ys[12], pub_ids[12];
 static unsigned sink_calls;
-static void sink(void *ctx) { CHECK(ctx == (void *)0x1234); ++sink_calls; }
+static void sink(void *ctx) {
+    CHECK(ctx == (void *)0x1234 && pub_lock == 0 && !(pub_seq & 1));
+    ++sink_calls;
+}
 static void test_publish(void) {
-    struct nvt_touch_publication p = {&pub_seq, &pub_count, pub_xs, pub_ys, pub_ids, 12, sink, (void *)0x1234};
+    struct nvt_touch_publication p = {&pub_seq, &pub_count, pub_xs, pub_ys, pub_ids, 12, sink, (void *)0x1234, &pub_lock};
     const int xs[2] = {100, 200}, ys[2] = {300, 400}, ids[2] = {3, 4};
     CHECK(nvt_touch_publish(&p, xs, ys, ids, 2) == 2);
     CHECK(pub_seq == 2 && pub_count == 2 && pub_xs[0] == 100 && pub_xs[1] == 200 && pub_ys[0] == 300 &&
@@ -191,6 +190,33 @@ static void test_publish(void) {
     for (unsigned i = 0; i < 12; ++i) { many_x[i] = (int)i; many_y[i] = (int)i; many_ids[i] = (int)i; }
     CHECK(nvt_touch_publish(&p, many_x, many_y, many_ids, 20) == 12 && pub_count == 12 && pub_seq == 6);
     CHECK(sink_calls == 3);
+    // A busy writer keeps the previous contact and does not notify the sink.
+    pub_lock = 1;
+    CHECK(nvt_touch_publish(&p, xs, ys, ids, 2) == 0);
+    CHECK(pub_seq == 6 && pub_count == 12 && sink_calls == 3 && pub_lock == 1);
+    pub_lock = 0;
+    CHECK(nvt_touch_publish(&p, NULL, ys, ids, 2) == 0);
+    CHECK(pub_seq == 6 && pub_count == 12 && sink_calls == 3);
+    CHECK(nvt_touch_publish(&p, NULL, NULL, NULL, 0) == 0);
+    CHECK(pub_seq == 8 && pub_count == 0 && sink_calls == 4 && pub_lock == 0);
+    pub_seq = UINT32_MAX - 1;
+    CHECK(nvt_touch_publish(&p, xs, ys, ids, 2) == 2 && pub_seq == 0 && pub_count == 2);
+    // After physical takeover, even a synthetic lift must not erase the real finger.
+    unsigned takeover = 2;
+    CHECK(nvt_touch_publish_if(&p, NULL, NULL, NULL, 0, &takeover) == 0);
+    CHECK(pub_count == 2 && pub_seq == 0 && sink_calls == 5 && pub_lock == 0);
+    takeover = 0;
+    CHECK(nvt_touch_publish_if(&p, NULL, NULL, NULL, 0, &takeover) == 0);
+    CHECK(pub_count == 0 && pub_seq == 2 && sink_calls == 6 && pub_lock == 0);
+    // A failed physical writer cannot stop the synthetic producer before storing a contact.
+    pub_lock = 1;
+    CHECK(nvt_touch_publish_snapshot(&p, xs, ys, ids, 2, NULL, &takeover) == 0);
+    CHECK(takeover == 0 && pub_seq == 2 && sink_calls == 6);
+    pub_lock = 0;
+    CHECK(nvt_touch_publish_snapshot(&p, xs, ys, ids, 2, NULL, &takeover) == 2);
+    CHECK(takeover == 2 && pub_seq == 4 && pub_count == 2 && sink_calls == 7);
+    CHECK(nvt_touch_publish_if(&p, NULL, NULL, NULL, 0, &takeover) == 0);
+    CHECK(pub_seq == 4 && pub_count == 2 && sink_calls == 7 && pub_lock == 0);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -200,7 +226,7 @@ static void test_protocol(void) {
     CHECK(nvt_crc32_words((const uint8_t[]){1, 2, 3, 4}, 4, 4) == 0xade61088u);
     CHECK(nvt_crc32_words((const uint8_t[]){1, 2, 3}, 3, 3) == 0x615eab4au);   // the tail word is zero padded
 
-    // Framing: a write selects the page then sends offset|0x80; a read sends the offset with no dummy byte.
+    // Framing: a write sends offset|0x80; a read sends the offset and a dummy byte before data.
     model_reset();
     uint8_t pattern[300];
     for (unsigned i = 0; i < sizeof(pattern); ++i) pattern[i] = (uint8_t)(i * 7 + 3);
@@ -218,7 +244,7 @@ static void test_protocol(void) {
           bootloader_resets == 1);
     CHECK(!memcmp(chip.id, (const uint8_t[]){0x0c, 0xaa, 0xbb, 0x72, 0x66, 0x03}, 6));
     model_reset();
-    mem[0x1F652] = 0x00;   // masked-in byte 0x72 wrong
+    mem[0x1F651] = 0x00;   // masked-in byte 0x72 wrong
     CHECK(nvt_identify(&chip) == NVT_ERR_CHIP && bootloader_resets == 5);
 
     // Firmware parser.
@@ -277,13 +303,13 @@ static void test_protocol(void) {
     CHECK(rd4(0x3F128) == 0x10000 && rd4(0x3F12C) == 0x20000);
     CHECK(rd4(0x3F118) == 0x40 && rd4(0x3F130) == 0x20);
     CHECK(rd4(0x3F100) == fw.part[0].crc && rd4(0x3F104) == fw.part[1].crc);
-    CHECK(mem[FAKE_EVENT_BUF + 0x61] == 0xa0);
+    CHECK(mem[FAKE_EVENT_BUF + 0x60] == 0xa0);
     // A boot ROM that never reports ready is retried three times and then fails.
     model_reset();
     model_expect(&fw);
     CHECK(nvt_identify(&chip) == 0);
     expect_ilm_size = 0x40;
-    mem[FAKE_EVENT_BUF + 0x61] = 0;   // nothing sets it to 0xa0 once boot_ready_ok fails; force failure below
+    mem[FAKE_EVENT_BUF + 0x60] = 0;   // nothing sets it to 0xa0 once boot_ready_ok fails; force failure below
     expect_dlm_bin = 0x101;           // break the DLM comparison so boot_ready_ok returns false
     resets = bootloader_resets;
     CHECK(nvt_download_firmware(&chip, &fw) == NVT_ERR_TIMEOUT && bootloader_resets - resets == 3);

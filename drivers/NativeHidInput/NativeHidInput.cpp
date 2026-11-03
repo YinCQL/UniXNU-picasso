@@ -71,6 +71,7 @@ static const unsigned char touchDescriptor[]={
 // calls); _children at +24 (IOHIDEvent.h; appendChild stores into it and free releases it). _parent is never set (appendChild only
 // stores the child, int-163 skipped every finger by comparing it), so each child is an IOHIDEvent by its class instead.
 namespace edge {
+extern "C" {volatile uint32_t native_touch_edge_dispatch[2];} // total events, digitizer events
 #if defined(NATIVE_HID_SOURCE_API) && NATIVE_HID_SOURCE_API && !__has_feature(ptrauth_calls)
 // Source-only bring-up without pointer authentication emits ordinary digitizer reports: a copied vtable of another family's ABI is never used.
 extern "C" {volatile uint32_t native_touch_hid_multi[3];}
@@ -130,12 +131,16 @@ static bool mark(void *child) {
     return edged;
 }
 static void dispatch(IOService *self,OSObject *event,IOOptionBits options) {
-    if(event && call<uint32_t,IOOptionBits>(event,kGetType,kDivGetType,0)==kDigitizer) {
+    native_touch_edge_dispatch[0]=native_touch_edge_dispatch[0]+1;
+    const uint32_t type=event?call<uint32_t,IOOptionBits>(event,kGetType,kDivGetType,0):0;
+    if(event && type==kDigitizer) {
+        native_touch_edge_dispatch[1]=native_touch_edge_dispatch[1]+1;
         OSArray *children=*reinterpret_cast<OSArray **>(reinterpret_cast<uint8_t *>(event)+24);
-        if(children && OSDynamicCast(OSArray,children) && children->getCount()) {
+        const unsigned childCount=children && OSDynamicCast(OSArray,children)?children->getCount():0;
+        if(childCount) {
             // A collection (the driver's touch-screen dispatch): its mask is the union of its fingers', so it takes the bit as well.
             bool any=false;
-            for(unsigned i=0;i<children->getCount();++i) {
+            for(unsigned i=0;i<childCount;++i) {
                 OSObject *child=children->getObject(i);
                 if(child && child->metaCast("IOHIDEvent"))any|=mark(child);
                 else native_touch_edge_stats[3]=native_touch_edge_stats[3]+1;
@@ -145,6 +150,12 @@ static void dispatch(IOService *self,OSObject *event,IOOptionBits options) {
                 call<void,uint32_t,int32_t,IOOptionBits>(event,kSetInteger,kDivSetInteger,kMask,(int32_t)(mask|kFromEdgeTip),0);
             }
         } else if(!children) mark(event);   // one transducer dispatched on its own
+        if(native_touch_edge_dispatch[1]<=4) {
+            printf("PICASSO_HID digitizer event mask=%x children=%u contacts=%u edge=%u skipped=%u\n",
+                (unsigned)call<int32_t,uint32_t,IOOptionBits>(event,kGetInteger,kDivGetInteger,kMask,0),
+                childCount,(unsigned)native_touch_edge_stats[1],
+                (unsigned)native_touch_edge_stats[2],(unsigned)native_touch_edge_stats[3]);
+        }
     }
 #if __has_feature(ptrauth_calls)
     originalDispatch(self,event,options);
@@ -225,16 +236,34 @@ static void install(IORegistryEntry *driver) {
     native_touch_edge_stats[0]=1;
 }
 #else
+#include "OriginalHidEventABI.h"
 static void install(IORegistryEntry *driver) {
     if(originalDispatch || !driver)return;
     uintptr_t *table=*reinterpret_cast<uintptr_t **>(driver);
-    uintptr_t *copy=static_cast<uintptr_t *>(IOMalloc(kSlots*sizeof(uintptr_t)));
+    // The qualified constructor stores this exact vptr. Validate the binary
+    // class before reading its table, including when class-name metadata is
+    // unavailable. A subclass or unrelated table must never be truncated.
+    if(reinterpret_cast<uintptr_t>(table)!=kOriginalEventDriverVptr) {
+        printf("PICASSO_HID edge hook rejected vptr=%llx\n",(unsigned long long)reinterpret_cast<uintptr_t>(table));
+        return;
+    }
+    constexpr unsigned slots=sizeof(kOriginalEventDriverMethods)/sizeof(kOriginalEventDriverMethods[0]);
+    static_assert(slots==220 && slots>kDispatch,"qualified original event-driver extent");
+    for(unsigned i=0;i<slots;++i) {
+        // NativePrelink rebinds exported kernel methods; retained family methods
+        // keep their qualified addresses. Both kinds must remain non-null.
+        if(!table[i] || (kOriginalEventDriverMethods[i] && table[i]!=kOriginalEventDriverMethods[i])) {
+            printf("PICASSO_HID edge hook rejected slot=%u\n",i);return;
+        }
+    }
+    uintptr_t *copy=static_cast<uintptr_t *>(IOMalloc(slots*sizeof(uintptr_t)));
     if(!copy)return;
-    memcpy(copy,table,kSlots*sizeof(uintptr_t));
+    memcpy(copy,table,slots*sizeof(uintptr_t));
     originalDispatch=copy[kDispatch];copy[kDispatch]=(uintptr_t)&dispatch;
     __asm__ volatile("dmb ish":::"memory");
     *reinterpret_cast<uintptr_t **>(driver)=copy;
     native_touch_edge_stats[0]=1;
+    printf("PICASSO_HID edge hook installed slots=%u dispatch=%u\n",slots,kDispatch);
 }
 #endif
 #endif
@@ -258,6 +287,7 @@ class NativeHidInput : public IOHIDDevice {
 #endif
     }
     uint32_t lastSeq=0;
+    bool touchRetry=false;
     // Fingers sent as down in the previous report; a vanished identifier gets one explicit tip-up report.
     int prevIds[TOUCH_FINGERS]={-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
     int prevX[TOUCH_FINGERS]={},prevY[TOUCH_FINGERS]={};
@@ -265,8 +295,8 @@ class NativeHidInput : public IOHIDDevice {
         if(value<0)value=0;if(value>=maximum)value=maximum-1;
         return (unsigned)((long long)value*32767/(maximum-1));
     }
-    // One finger set to the event driver. The touch thread (kits/sheng/TouchProbe.cpp) calls touchNotify after it publishes a frame; there is no timer
-    // watching the seqlock any more (it woke the work loop every 8 ms for nothing).
+    // Producers notify on each snapshot. The existing one-second timer retries
+    // only an undelivered snapshot, including a failed lift, without a busy poll.
     static void touchNotify(void *context) {
         NativeHidInput *self=static_cast<NativeHidInput *>(context);
         if(self && self->inputLoop)self->inputLoop->runAction(&NativeHidInput::touchAction,self);
@@ -278,16 +308,16 @@ class NativeHidInput : public IOHIDDevice {
     }
     void touchSend() {
         NativeHidInput *self=this;
-        if(!self->hasEventDriverCached())return;
         uint32_t before=native_touch_seq;
-        if((before&1) || before==self->lastSeq)return;
+        if(before==self->lastSeq){self->touchRetry=false;return;}
+        self->touchRetry=true;
+        if(!self->hasEventDriverCached() || (before&1))return;
         __asm__ volatile("dmb ish":::"memory");
         unsigned count=native_touch_count;if(count>TOUCH_FINGERS)count=TOUCH_FINGERS;
         int ids[TOUCH_FINGERS],xs[TOUCH_FINGERS],ys[TOUCH_FINGERS];
         for(unsigned i=0;i<count;++i){ids[i]=native_touch_ids[i];xs[i]=native_touch_xs[i];ys[i]=native_touch_ys[i];}
         __asm__ volatile("dmb ish":::"memory");
         if(native_touch_seq!=before)return;      // torn read: retry on the next tick
-        self->lastSeq=before;
         // Sizes follow the axis maxima of the touch core: 30480 long, 20320 short, mapped to the same 0..32767 range.
         unsigned char report[1+TOUCH_FINGERS*6+1]={3};
         unsigned slot=0;
@@ -316,16 +346,18 @@ class NativeHidInput : public IOHIDDevice {
             f[4]=(unsigned char)self->prevY[j];f[5]=(unsigned char)(self->prevY[j]>>8);
             ++slot;edge::native_touch_hid_multi[2]=edge::native_touch_hid_multi[2]+1;
         }
-        for(unsigned j=0;j<TOUCH_FINGERS;++j) {
-            self->prevIds[j]=j<downCount?nextIds[j]:-1;
-            if(j<downCount){self->prevX[j]=nextX[j];self->prevY[j]=nextY[j];}
-        }
-        if(!slot)return;
+        if(!slot){self->lastSeq=before;self->touchRetry=false;return;}
         report[1+TOUCH_FINGERS*6]=(unsigned char)slot;
         IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
         IOReturn result=buffer?self->submitReport(buffer):kIOReturnNoMemory;
         OSSafeReleaseNULL(buffer);
         native_hid_input_observed(6,result);
+        if(result!=kIOReturnSuccess){self->touchRetry=true;return;}
+        self->lastSeq=before;self->touchRetry=false;
+        for(unsigned j=0;j<TOUCH_FINGERS;++j) {
+            self->prevIds[j]=j<downCount?nextIds[j]:-1;
+            if(j<downCount){self->prevX[j]=nextX[j];self->prevY[j]=nextY[j];}
+        }
         native_touch_hid_reports=native_touch_hid_reports+1;
     }
     // The button driver's thread calls buttonsNotify on every change of the pressed set.
@@ -369,6 +401,7 @@ class NativeHidInput : public IOHIDDevice {
     static void tick(OSObject *owner,IOTimerEventSource *source) {
         NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return;
         native_hid_live_checkpoint(self);
+        if(self->touchRetry && (self->touchEnabled || self->touchOnly))self->touchSend();
         if(self->touchOnly){source->setTimeoutMS(1000);return;}
         if(!self->down && !hasEventDriver(self,4)) {
             native_hid_input_observed(3,0);
