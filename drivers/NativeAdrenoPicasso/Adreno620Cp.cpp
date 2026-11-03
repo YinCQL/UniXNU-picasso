@@ -1039,6 +1039,18 @@ void tzLogThread(void *, wait_result_t)
     tzLogDump();
 }
 
+/* wf125: a print-only heartbeat. Every fatal post-zap boot stops mid-console
+ * without the CDC panic marker, so the open question is whether the machine
+ * froze or only the PID1 thread stopped printing. This thread touches no
+ * hardware: one line every five seconds keeps that distinction measurable. */
+void heartbeatThread(void *, wait_result_t)
+{
+    for (unsigned beat = 1;; ++beat) {
+        IOSleep(5000);
+        printf("PICASSO_GPU beat %u\n", beat);
+    }
+}
+
 /* wf104: the zap shader. Mainline hw_init() loads it right after a6xx_cp_init()
  * and then sends CP_SET_SECURE_MODE(0) (a6xx_gpu.c); adreno_zap_shader_load()
  * runs the MDT through the QCOM PAS calls. The two pieces:
@@ -1401,6 +1413,18 @@ bool loadZap()
                 printf("PICASSO_GPU tzlog: thread failed\n");
         }
     }
+    /* wf125: independent liveness tick, no hardware touched. */
+    {
+        uint32_t heartbeat = 0;
+        if (PE_parse_boot_argn("sheng-gpu-heartbeat", &heartbeat,
+                sizeof heartbeat) && heartbeat) {
+            thread_t thread = nullptr;
+            if (kernel_thread_start(heartbeatThread, nullptr, &thread) == KERN_SUCCESS)
+                thread_deallocate(thread);
+            else
+                printf("PICASSO_GPU beat: thread failed\n");
+        }
+    }
     /* wf114: the full PAS session with the metadata at the 4K-aligned carveout
      * address (reserved_pil 0x8bc17400 + 0xC00, inside the 0x3e8c00-byte
      * region). wf112 measured the first INIT returning QCOM_SCM_INTERRUPTED
@@ -1450,9 +1474,26 @@ bool loadZap()
         ok = auth.a0 == 0 && auth.a1 == 0;
     }
 
-    regionMap->release();
-    regionBuffer->complete();
-    regionBuffer->release();
+    /* wf125: the vendor never returns the relocatable region to the allocator
+     * — pil_alloc_region() caches priv->region and only pil_release_region() /
+     * pil_free_memory() free it on error or shutdown. PAS_MEM_SETUP hands TZ
+     * this physical range for the auth read, so it is the one kernel allocation
+     * TZ knows about. wf124 measured the consequence of freeing it: PID1 blocks
+     * in a dyld-cache pread the moment the page cache reuses those pages, and
+     * wf126 (same kernel, region retained) hashes all 64 caches and reaches
+     * launchd's "Early boot complete". Retention is therefore the default;
+     * sheng-gpu-keep-region=0 restores the freeing path for comparison. */
+    uint32_t keepRegion = 1;
+    const bool retainRegion = !PE_parse_boot_argn("sheng-gpu-keep-region",
+        &keepRegion, static_cast<int>(sizeof keepRegion)) || keepRegion;
+    if (retainRegion) {
+        printf("PICASSO_GPU zap: region retained phys=%08x span=%x\n",
+            uint32_t(regionPhys), uint32_t(regionBytes));
+    } else {
+        regionMap->release();
+        regionBuffer->complete();
+        regionBuffer->release();
+    }
     if (altMap) altMap->release();
     metadataMap->release();
     metadata->complete();
@@ -2054,6 +2095,20 @@ extern "C" int native_adreno620_cp_start(void)
         const uint32_t trustAfter = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
         printf("PICASSO_GPU cp: secure mode left=%d trust %08x -> %08x\n",
             int(left), trustBefore, trustAfter);
+    }
+    /* wf125: the CP was started in secure mode and its RBBM interrupt sources
+     * are enabled by hw_init (RBBM_INT_0_MASK). After the zap the GPU is the
+     * only block whose state changed, and an asserted line this kernel has no
+     * handler for would freeze every CPU that takes it. sheng-gpu-mask-irqs=1
+     * records what is pending at the secure-mode boundary and masks the block. */
+    uint32_t maskIrqs = 0;
+    if (PE_parse_boot_argn("sheng-gpu-mask-irqs", &maskIrqs,
+            static_cast<int>(sizeof maskIrqs)) && maskIrqs) {
+        const uint32_t irqStatus = gpuRead(A620_RBBM_INT_0_STATUS);
+        gpuWrite(A620_RBBM_INT_0_STATUS, irqStatus);
+        gpuWrite(A620_RBBM_INT_0_MASK, 0);
+        printf("PICASSO_GPU cp: irqs masked status=%08x mask=%08x\n",
+            irqStatus, gpuRead(A620_RBBM_INT_0_MASK));
     }
     uint32_t fence = 0;
     if (!submitNoop(&fence)) return -1;

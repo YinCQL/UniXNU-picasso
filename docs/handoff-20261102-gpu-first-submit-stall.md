@@ -1322,3 +1322,35 @@ Client side (read-only reference copies):
   out after a zap-less `CP_SET_SECURE_MODE(0)` in wf102. Kernel
   `0c81f913bccb3624970193bbd17ae984ecdb92d97f9f6353cf5ccb3cdb20ebee`; image
   `out/wf121/picasso/boot/wf121.img`; log `out/wf121-runs/run1.log`.
+- **wf122: the early reset is not the Metal publication.** A control build with
+  `sheng-gpu-metal=0 sheng-gpu-addon=0` (zap still on) also stops during PID1's dyld-cache
+  hashing, so the accelerator publication/addon is not the trigger. Every fatal boot shares one
+  component: the `sheng-gpu-tzlog=1` probe thread. It prints its first header
+  (`hyplog address=801fe000 size=00002000 magic=… 44554d50`) and then never prints again in
+  wf119/wf120/wf121/wf122 — it wedges inside `dumpTextRuns()` reading the TZ/minidump carveout
+  at `0x146ab720` from Non-secure EL1. Logs `out/wf122-runs/run1.log` (and wf119/wf120/wf121).
+- **wf124: removing the TZ-log scan fixes the early hang.** The identical wf122 kernel with
+  `sheng-gpu-tzlog=0` (payload-only rebuild, Metal still off) passes the exact line where
+  wf122/121 stopped and continues into launchd, the CPU-frequency governor and the NVT touch
+  panel (`stage4 loop irq=1`), device alive. Conclusion: reading the secure log carveout from
+  the AP is a self-inflicted hang (a fault inside the probe thread that the APSS watchdog later
+  turns into a reset); it is a diagnostic only and must stay off. Image
+  `out/wf124/picasso/boot/wf124.img`; log `out/wf124-runs/run1.log`.
+- **wf124, second finding: PID1 still blocks in a dyld-cache pread.** With the scan gone the
+  machine stays alive, but PID1 prints its last line (`n4k progress s=14 stage=read
+  off=3600000`) and never returns from that 1 MiB pread while other threads keep printing. The
+  cause is the region buffer: `PAS_MEM_SETUP` handed TZ `0xc8d00000` (1 MiB of ordinary kernel
+  pages), `loadZap()` freed it right after AUTH, the page cache reused those pages for the dyld
+  cache, and the UFS write into TZ-retained memory never completes. The vendor never frees it:
+  `pil_alloc_region()` caches `priv->region` and only `pil_release_region()`/`pil_free_memory()`
+  free it on error or shutdown.
+- **wf126: retaining the region completes the boot with the zap on.** `sheng-gpu-keep-region=1`
+  (new `PICASSO_GPU zap: region retained phys=c8c00000 span=1000`) lets PID1 hash all 64 dyld
+  caches (`n4k end s=14 … req=111722496`, through s=64), the boot reaches `launchd: Early boot
+  complete`, services link (`keybagd → launchd/notifyd/logd`), and the new print-only heartbeat
+  ticks throughout (`beat 1…10`). The GPU path itself (`zap: loaded=1`, `secure mode left=1`,
+  `cp: ready fence=1`) is unchanged from wf121. Retention is now the default
+  (`sheng-gpu-keep-region=0` restores the old behaviour); new gated diagnostics shipped in the
+  same kernel: `sheng-gpu-heartbeat` and `sheng-gpu-mask-irqs`. Kernel
+  `e84e81db27f350079c9e33077c45091942e2a001e16f1a7fd3d9dbf702dae647`; image
+  `out/wf126/picasso/boot/wf126.img`; log `out/wf126-runs/run1.log`.
