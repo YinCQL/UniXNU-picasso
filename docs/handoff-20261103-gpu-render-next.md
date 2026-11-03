@@ -1,7 +1,7 @@
 # Handoff 2026-11-03 — GPU 渲染已上岸，余下调度与新帧调度问题
 
-> 给下一个 agent。本文件替代口头交接；`docs/handoff-20261102-gpu-first-submit-stall.md` 是完整的轮次记录（wf70–wf144），需要细节时按镜像号查。
-> 截至 wf143：内存 4.95 GiB、调度已修、触摸能触发重绘，剩余唯一大项是 GPU scanout hand-off（wf144 正在验证，见 §4B）。
+> 给下一个 agent。本文件替代口头交接；`docs/handoff-20261102-gpu-first-submit-stall.md` 是完整的轮次记录（wf70–wf145），需要细节时按镜像号查。
+> 截至 wf145：内存 4.95 GiB、调度已修、触摸能触发重绘、GPU 直接写 scanout（wf144/wf145 验证，copies 冻结在 2 次预热帧）。用户目标的三项（内存 / CPU 调度 / GPU 渲染与交互）均已达成；余下是启动速度与调优。
 > 设备状态以每轮探测为准，本文中的串口/镜像号只代表写作时的状态。
 
 ## 1. 目标与当前结论
@@ -71,6 +71,8 @@ sheng-touch-hid=1 sheng-touch=4 sheng-touch-start=60
 - 但每帧仍是 CPU 全帧拷贝：`PICASSO_DISPLAY_STATE trigger=submissions … copies=575 copy_bytes=1201978752`，`PICASSO_DISPLAY event=10 a=0x111a88`；插件状态 `PICASSO_GPU text: P2 ee00002c7`（0x4148 hand-off 未被服务）。
 - wf144 的改动（相对 wf143）：移植 UniXNU `NativeMobileDisplay` 的 `NativeGOPPresenter.cpp`/`NativeGOPWire.h`，新增 `NativeGOPGlue.cpp`，`NativeLegacyDisplay.cpp` 增加 `native_legacy_gpu_offer/complete` 与 early-retire（`sheng-early-retire`，默认 1），内核 cmdline 增加 `sheng-fb-gpu=1`（总 988 字节）。启动已确认 `PICASSO_DISPLAY gpu presenter attached`。
 - 通过标准：`PICASSO_GPU text` 出现 `P4`；`PICASSO_DISPLAY event=10` 不再出现；`PICASSO_DISPLAY_STATE … copies/copy_bytes` 停止增长（或只偶发失败回退）；present/GPU submissions 继续增长。
+- **wf144 结果**：`PICASSO_GPU text: P4 e0`（e0=成功），`PICASSO_DISPLAY_STATE … submit=569 accept=569 transfer=568 retire=567 copies=0 copy_bytes=0`，`PICASSO_DISPLAY event=10` 0 条，`PICASSO_GPU text: PF 276/0`（276 帧、0 失败），GRID rows 20–23 有 UI 内容。CPU 全帧拷贝彻底消失。
+- **wf145 结果（带虚拟滑动，987/1000 字节）**：滑动 2–9 全部送达（reports 26→208），内核 `PICASSO_GPU submits live 1: submissions=441 ibs=2655`；显示侧 `PICASSO_DISPLAY_STATE … submit=256 accept=256 transfer=253 retire=254 copies=2 copy_bytes=10368000`，`PF` 同步增长。那 2 次 CPU 拷贝发生在 `P4` 之前（插件尚未 waitSwap，display 已经被滑动唤醒并出了两帧），属于预期回退；进入 hand-off 后 copies 冻结在 2，不再随提交增长。evidence `out/wf145-runs/run1.log`。
 - 若 presenter 未 attach 或 offer 被拒，先查 `PICASSO_DISPLAY gpu presenter unavailable` 与 presenter 的 `start()` 返回；映射来源是 nub 的 provider index 0 + `kIOMapInhibitCache`，必须与 GPU 写 scanout 的物理页一致。
 
 ### C. 首次启动慢 / pipeline 缓存

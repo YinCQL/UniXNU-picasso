@@ -9,6 +9,7 @@
 #   DRAM_SIZE      board.toml [payload.adt] dram_size (e.g. 0x180000000)
 #   DATA_RAMDISK   packed APFS Data seed (default: the current 8 GiB seed)
 #   FD             firmware volume (default: uefi/SILICIUM_UEFI.fd in this tree)
+#   GRID=0         omit sheng-display-grid=10 (room for extra kernel args)
 #
 # The kernel and the UEFI firmware are not rebuilt here. Build them first with
 #   python3 unixnu build kernel prelink
@@ -53,8 +54,9 @@ export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 export UNIXNU_KERNELCACHE=/Users/silenzio/Desktop/development/ios/UniXNU/out/ipsw/21H461/kernelcache.decompressed
 ARGS=(--kernel-arg sheng-disable-jobs=com.apple.driverkitd,com.apple.cameracaptured,com.apple.osanalytics.osanalyticshelper
       --kernel-arg offline-hid-start=60 --kernel-arg sheng-cpufreq=4 --kernel-arg sheng-gpu=4
-      --kernel-arg sheng-gpu-metal=1 --kernel-arg sheng-gpu-addon=1 --kernel-arg sheng-display-grid=10
+      --kernel-arg sheng-gpu-metal=1 --kernel-arg sheng-gpu-addon=1
       --kernel-arg sheng-touch-hid=1 --kernel-arg sheng-touch=4 --kernel-arg sheng-touch-start=60)
+if [ "${GRID:-1}" != "0" ]; then ARGS+=(--kernel-arg sheng-display-grid=10); fi
 for extra in "$@"; do ARGS+=(--kernel-arg "$extra"); done
 python3 unixnu build payload --out "out/${TAG}" --kernel out/picasso/kernel/kernel.macho \
   --data-ramdisk "$DATA_RAMDISK" \

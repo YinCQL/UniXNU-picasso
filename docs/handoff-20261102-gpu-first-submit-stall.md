@@ -1713,3 +1713,16 @@ Client side (read-only reference copies):
   the `PICASSO_GRID` rows 20–23 show UI content. The six `PICASSO_GPU stall:` events are the same
   50 ms class seen in wf142/143, not a regression. Image `out/wf144/picasso/boot/wf144.img`, log
   `out/wf144-runs/run1.log`.
+
+- **wf145: interaction runs entirely through the hand-off; the CPU copies only the two pre-hand-off frames.**
+  wf144 arguments plus `offline-hid-swipe=16`, minus `sheng-display-grid=10` to stay inside the
+  command-line budget (987/1000). The virtual swipes are delivered end to end (`PICASSO_HID swipe 2
+  moved=1 reports=26 edge=1/1` through `swipe 8 reports=182 edge=7/7`), the UI presents continuously
+  (`PICASSO_GPU text: PF 191/0` — 191 frames, 0 failures), and the display counters read
+  `PICASSO_DISPLAY_STATE trigger=submissions … submit=192 accept=192 reject=0 transfer=189
+  retire=190 copies=2 copy_bytes=10368000` (later still 256/2 and the kernel counter
+  `PICASSO_GPU submits live 1: submissions=441 ibs=2655`). Both CPU copies happened before the plugin's hand-off
+  client became ready (`PICASSO_DISPLAY event=10 sample=1 a=0xa0976`, `sample=2 a=0x1175b4`, printed
+  just before `PICASSO_GPU text: P4 e0`); after that the copy counters stay frozen while submissions
+  climb, which is the expected first-frame fallback. Image `out/wf145/picasso/boot/wf145.img`, log
+  `out/wf145-runs/run1.log`.
