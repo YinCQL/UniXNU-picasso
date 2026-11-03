@@ -784,3 +784,50 @@ Client side (read-only reference copies):
   and the Turnip phase. Plugin CDHash `3eafe5d89e4ad9031096f08be381bfe71e272dec`, trust
   `b405de012859fa1485b1bd275855719ff84507220c2a10bf45a863069d3434ba`, addon
   `5cc7e0c739cf…`; image `out/wf86/picasso/boot/wf86.img`, log `out/wf86-runs/run1.log`.
+- **wf86 result: the raw GPU test passes in every process; no later phase is visible.** Three
+  processes streamed their report lines — `mediaserv s32 e0 v4/4 t0 a256/0`,
+  `WidgetRen s32 e0 v4/4 t0 a256/0`, `SpringBoa s32 e0 v4/4 t0 a256/0`: 32 successful steps, no
+  error, both cache-mode runs verify 4/4 dwords (backboardd, pid 56, also ran both runs — two
+  submits and two `wire` dumps in the log — but its report line was the pending one and never
+  printed). The kernel's `tunnel:` print stops after 32 calls, so later submits are invisible by
+  design. After the reports the log shows no `freshScan`/`replayPhase`/`turnipPhase` line, no new
+  opens and no stall.
+- **wf87: flush every text line and test only the render server.** The driver prints a streamed
+  line only when the *next* line starts, so the last line of a phase (exactly the important one)
+  was invisible; `streamText`/`streamText7` now send a second start marker to flush. Phase
+  boundaries also stream `Y prescan` and `Y turnip`, and the plugin's test thread runs only in
+  `backboardd` (several processes were sharing the single text stream and its 64-line print
+  budget). Plugin CDHash `aaa079a9b4b8ac1a9edbfabbb280f3293f439f1a`, trust
+  `5553f9abfc07e2ccfe8398050c19690a4a82ed376dde495f06b385be10d34375`, addon
+  `8458be94e9a56991f5aaedeee9c8328f87ffd8290ae49c2566d4d06cba80651f`;
+  image `out/wf87/picasso/boot/wf87.img`, log `out/wf87-runs/run1.log`.
+- **wf87 result: the replay stops at its first prefix.** With the render server alone and flushed lines the log
+  shows `Y prescan` and then `F 0/21 o17 c2 e-`: none of the 21 prefixes retired; the first one
+  (opcode `0x17` `CP_THREAD_CONTROL`, 2 dwords) did not complete, so the whole-IB run was not
+  attempted. No `PICASSO_GPU stall` line follows, and the test thread then ends (no `Y turnip`, no
+  new connection): either the prefix's submit was refused or its fence wait timed out, but the
+  current line does not say which. The raw test's own submits on the same connection had just
+  retired, so the ring/submit/fence machinery works; the difference is the submitted buffer
+  (recorded Turnip BO addresses and contents) and the packet itself.
+- **wf88: name the prefix failure.** The `F` line now carries `x<first error>` and `h<1 if the fence
+  timed out>` so the next boot distinguishes a refused submit from a hung one. Plugin CDHash
+  `31b9f04ee1755259e9183f57eb652ff57be7c3c4`, trust
+  `ce7517bc62a47aa0d6d54c1d3a76e9c7ee1a1a898a925a08a10d6ce9f6b73752`; image
+  `out/wf88/picasso/boot/wf88.img`, log `out/wf88-runs/run1.log`.
+- **wf88 result: the prefix failure is a refused map, not a hang.** `F 0/21 o17 c2 e- xe00002c2 h0`:
+  the error is `kIOReturnBadArgument` and the fence never timed out (`h0`). It comes from
+  `replayLoad()`, not from `Submit`. Cause: every user connection is scoped by
+  `core->setScope(base, GpuClientVaStart, window)` (`NativeAdrenoPublish.cpp`, `GpuClientVaStart =
+  0x100000000` in `NativeAdrenoGpuContext.h`) and `NativeAdrenoUserClient::mapBo()` refuses any iova
+  outside `[window_start, window_start + window_bytes)`; the replay recording (Turnip's first
+  submission captured earlier) has its IB at `0x20027000` and buffers at `0x100000`…, all below the
+  window. The raw test's own BOs map at `info.va_start` — 0x100000000 — and retire. So the replay
+  is not a render failure; it cannot be mapped by a client of this driver.
+- **wf89: skip the unmappable replay, run the Turnip smoke.** `adrenoUserTest()` now checks
+  `turnipreplay::kIbIova >= GpuClientVaStart` (0x100000000). When the recording is below the client
+  window it streams `Y replay skipped: recording below the client window`, skips `freshScan`,
+  `replayPhase` and `replaySecondClient`, and calls `turnipPhase()` directly — the Turnip
+  fill/compute/triangle test allocates its own BOs inside the window. Plugin CDHash
+  `b6de7d04f067dd967bc3afad584ceedd4047a9bc`, trust
+  `f7c04cffd2c46fb847cf08cb10e37cb95b44dfe190f1b9a759c008ffc1cf19e2`; image
+  `out/wf89/picasso/boot/wf89.img`, log `out/wf89-runs/run1.log`.
