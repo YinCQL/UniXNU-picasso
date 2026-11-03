@@ -248,7 +248,7 @@ def offline_policy_directory(target):
 
 
 def verify_offline_policy(target, jobs):
-    report = dict(disabled_jobs=jobs, watchdogd_disabled=False, files=[])
+    report = dict(disabled_jobs=jobs, watchdogd_disabled='com.apple.watchdogd' in jobs, files=[])
     contents = offline_policy_contents(jobs)
     if not contents:
         return report
