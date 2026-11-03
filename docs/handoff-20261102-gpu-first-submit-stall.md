@@ -1102,3 +1102,18 @@ Client side (read-only reference copies):
   Kernel `5b89210f2765d825a2f5dbf6e4c148d061566fba0d4a11c9c05b749390a7fa42` (embedded SQE size
   31460 confirmed in `out/picasso/tree/build/adreno-picasso/adreno620_embedded_firmware.c`); image
   `out/wf101/picasso/boot/wf101.img`, same addon as wf98; log `out/wf101-runs/run1.log`.
+- **wf101 result: the device's own SQE is not the difference.** The probe accepted the vendor image
+  (`firmware: … sqe=a650_sqe.fw version=0x87 security=1`), the CP came up (`cp: ready fence=1`,
+  `end stage=4 step=4 error=0 done=1`), and the raw test is byte-identical to the pinned-SQE runs
+  (`C s600df00d cc0debeef afedcba98 b0`). The Turnip smoke is also identical:
+  `T s0 r0 v512 c0 g0/4096`, `S fdeadbeef … kdeadbeef … r5a5a…`, `Q 68feefef/68fef02e 1/0 r0`.
+  The SQE generation is not what drops the draws; both the vendor 0x087 and the pinned
+  linux-firmware 0x112 execute the same simple packets and leave the 3D/A2D path silent.
+- **wf102: `CP_SET_SECURE_MODE(0)` against the vendor SQE (same image, one boot arg).** wf100 proved
+  the pinned SQE answers the packet with `CP_OPCODE_ERROR`; the device's own SQE is what stock
+  Android uses with the same packet. Boot the wf101 image with `sheng-gpu-secure-mode=1`. If the
+  packet is accepted and the no-op fence still retires, the GPU is switched by the CP packet alone
+  (the zap then only matters for the TSB/secure-world bookkeeping) and the smoke is the decisive
+  read; if the fence hangs again, the zap path (PAS/SCM) is mandatory. Image
+  `out/wf102/picasso/boot/wf102.img`, kernel `5b89210f…` (vendor SQE), same addon; log
+  `out/wf102-runs/run1.log`.
