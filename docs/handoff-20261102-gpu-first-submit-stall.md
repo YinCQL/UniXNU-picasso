@@ -1663,3 +1663,22 @@ Client side (read-only reference copies):
   window because it is not contiguous with 0xC0000000. Image
   `out/wf141/picasso/boot/wf141.img`, log `out/wf141-runs/run1.log`. `board.toml` now defaults to
   `dram_size=0x180000000` and `owned_memory_size=0x140000000`.
+
+- **wf142: the scheduler sends default-priority work to the A55 cluster; the GPU hitches go away.**
+  Single scheduling change in `patches/picasso-cpu-topology-xnu.patch`: the Edge scheduler's bucket
+  threshold `bucket >= TH_BUCKET_SHARE_UT` becomes `TH_BUCKET_SHARE_DF`. The patch's own comment
+  describes "utility and background buckets on the boot cluster", but `TH_BUCKET_SHARE_UT` left the
+  DF bucket — the normal timeshare priorities 21-31, including `BASEPRI_DEFAULT` — defaulting to the
+  P cluster. `TH_BUCKET_SHARE_DF` puts DF, UT and BG on the boot (E) cluster; only fixed-priority,
+  foreground and interactive buckets keep the P preference. Kernel rebuilt cleanly from the updated
+  patch (`sha256 dce21a26…`, the patch-fingerprint change re-cloned and re-applied the whole chain).
+  Memory and Data are unchanged from wf141 (`vm_page_bootstrap: 1254624 free / 42272 wired`,
+  `NATIVE_OWNER_DATA done stage=4 error=0 readonly=0`), no panic. Load now reaches the E cluster:
+  the `PICASSO_CPUFREQ gov` d0 (six A55) series reads 0, 5, 77, 32, 24, 26, 33, 55, 44, 55 %
+  through SpringBoard start, while wf141 at the same phase read 41, 44, 30 % with the P cores
+  pinned at 99-100 %. The P cores still read 99 %, which is expected: the patch keeps FG/IN (UI)
+  buckets on P by design, and no CLPC exists to rebalance them. The wf141 GPU stalls
+  (`PICASSO_GPU stall: fence=51 pending=56089`, three snapshot events, 216 printed lines) do not
+  occur in wf142 (0 stall lines), consistent with the stalls being backboardd submission delay
+  under P-core contention rather than a CP or SMMU fault. Image
+  `out/wf142/picasso/boot/wf142.img`, log `out/wf142-runs/run1.log`.

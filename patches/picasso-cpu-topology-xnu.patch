@@ -68,7 +68,7 @@
 +static uint32_t
 +sched_edge_default_preferred_cluster(sched_bucket_t bucket)
 +{
-+	if (bucket >= TH_BUCKET_SHARE_UT) {
++	if (bucket >= TH_BUCKET_SHARE_DF) {
 +		return pset0.pset_cluster_id;
 +	}
 +	const ml_topology_info_t *topology = ml_get_topology_info();
