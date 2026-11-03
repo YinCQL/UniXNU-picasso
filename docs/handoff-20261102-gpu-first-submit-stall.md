@@ -932,3 +932,23 @@ Client side (read-only reference copies):
   `GMU_HFI_CTRL_INIT`, printing `PICASSO_GPU gmu: sptprac power (pre-HFI) status=…`. If the rail
   then reports powered and the smoke writes memory, the missing SPTPRAC power-up is the root cause
   of both the silent sysmem no-op and the GMEM `RM6_ENDVIS` stall.
+- **wf95 result: SPTPRAC is firmware-managed here.** `sptprac power (pre-HFI) status=000000c0`
+  (GX itself still off at that point, bits 6/7) and at `hw_init` `00000000 -> 00000000`: bits 3/5
+  never set. Mainline's `a6xx_sptprac_enable` only applies on the legacy GMU path; this board's
+  GMU answers the *non-legacy* `GMU_OOB_GPU_SET` (set_new bit 30, ack 31) and owns the GX/SP power,
+  so the manual SPTPRAC register is a no-op. The SPTPRAC lead is closed.
+- **wf96: test the CP's render-mode condition directly.** Turnip wraps every sysmem draw in
+  `CP_COND_REG_EXEC` with `MODE(RENDER_MODE) | SYSMEM`, and the CP decides it from the state set by
+  `CP_SET_MARKER(RM6_DIRECT_RENDER)`. If that marker does not take effect, every sysmem draw section
+  is skipped silently — CP reaches the end of the IB, no fault, no memory write, exactly the
+  measurements of wf89–wf95 (and the GMEM counterpart would leave the visibility handshake waiting,
+  as wf81 saw). `runTest()` now appends to its IB: `CP_SET_MARKER(RM6_DIRECT_RENDER)` (opcode
+  `0x65`, payload 1), `CP_COND_REG_EXEC` (`0x47`, payloads `(3<<28)|(1<<27)` and body dwords 4)
+  around one `CP_MEM_WRITE` of `0x600df00d` to target word 4, then an unconditional `CP_MEM_WRITE`
+  of `0xc0debeef` to word 5, and streams `C s<word4> c<word5>`. `s=600df00d, c=c0debeef` means the
+  marker/condition works and the failure is inside the draws; `s=deadbeef, c=c0debeef` means the
+  marker never sets SYSMEM and Turnip's sections are skipped. Plugin CDHash
+  `e4a87280ec504e3fe913c565c6b28d7304c41839`, trust
+  `ee0a9247f36775b10dec02eaa4627c3d6f5b82bfb5b840cba82ef74f08bfb2ed`; image
+  `out/wf96/picasso/boot/wf96.img`, log `out/wf96-runs/run1.log` (kernel unchanged from wf95,
+  `1f63e127…`).
