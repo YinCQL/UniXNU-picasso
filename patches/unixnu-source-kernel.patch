@@ -5090,20 +5090,19 @@ diff --git a/patches/xnu/zzzzzz-picasso-zva-fallback.patch b/patches/xnu/zzzzzz-
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzzz-picasso-zva-fallback.patch
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,97 @@
 +--- a/osfmk/arm64/sleh.c
 ++++ b/osfmk/arm64/sleh.c
-+@@ -67,2 +67,5 @@
-+ #include <sys/code_signing.h>
-++#if defined(BCM2837) && (DEVELOPMENT || DEBUG)
-++#include <sys/proc.h>
-++#endif
-+ #include <kperf/kperf.h>
-+@@ -1499,3 +1502,65 @@
++@@ -166,3 +166,4 @@
++ extern void picasso_user_breakpoint(void *, uint32_t, uint32_t, uint64_t);
++ extern void picasso_user_abort(void *, uint32_t, uint64_t, int, uint32_t, uint64_t);
+++extern int picasso_ui_process_pid(void);
++ #endif
++@@ -1499,2 +1500,62 @@
 ++/* PICASSO_ZVA_BEGIN: 20H392 zero-fill fallback for the non-Apple port. */
 ++#if defined(BCM2837) && (DEVELOPMENT || DEBUG)
 ++static void
-++picasso_zva_observe(uint64_t address, uint64_t pc, uint64_t target)
+++picasso_zva_observe(uint64_t address, uint64_t pc, uint64_t target, int pid)
 ++{
 ++    static unsigned reports;
 ++    unsigned ticket = __atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED);
@@ -5118,7 +5117,7 @@ new file mode 100644
 ++        : "r"(address) : "memory");
 ++    ml_set_interrupts_enabled(interrupts);
 ++    printf("PICASSO_ZVA fallback=%u pid=%d cpu=%u address=%llx pc=%llx target=%llx PAR=%llx MIDR=%llx DCZID=%llx MAIR=%llx SCTLR=%llx\n",
-++        ticket + 1, proc_selfpid(), cpu, (unsigned long long)address,
+++        ticket + 1, pid, cpu, (unsigned long long)address,
 ++        (unsigned long long)pc, (unsigned long long)target, (unsigned long long)par,
 ++        (unsigned long long)midr, (unsigned long long)dczid,
 ++        (unsigned long long)mair, (unsigned long long)sctlr);
@@ -5141,10 +5140,8 @@ new file mode 100644
 ++    if (pc < slide || pc - slide != 0x1d1b021f4ULL ||
 ++        get_saved_state_reg(state, 1) != 0 || !get_saved_state_reg(state, 2) ||
 ++        (address & 63) || far != address) return false;
-++    char name[32] = {0};
-++    proc_name(proc_selfpid(), name, sizeof(name));
-++    if (strcmp(name, "backboardd") && strcmp(name, "SpringBoard") &&
-++        strcmp(name, "Preferences") && strcmp(name, "mediaserverd")) return false;
+++    int pid = picasso_ui_process_pid();
+++    if (pid <= 0) return false;
 ++    static const uint32_t zva[] = {0xd50b7423, 0x91010063, 0xf1010042, 0x54ffffa8};
 ++    static const uint32_t stores[] = {
 ++        0xa8000461, 0xa8010461, 0xa8020461, 0xa8030461,
@@ -5155,7 +5152,7 @@ new file mode 100644
 ++    if (copyin((user_addr_t)pc, code, sizeof(zva)) || memcmp(code, zva, sizeof(zva))) return false;
 ++    uint64_t target = pc + 0x78;
 ++    if (copyin((user_addr_t)target, code, sizeof(stores)) || memcmp(code, stores, sizeof(stores))) return false;
-++    picasso_zva_observe(address, pc, target);
+++    picasso_zva_observe(address, pc, target, pid);
 ++    set_saved_state_pc(state, target);
 ++    return true;
 ++}
@@ -5164,9 +5161,7 @@ new file mode 100644
 ++
 + static int
 + handle_alignment_fault_from_user(arm_saved_state_t *state, kern_return_t *vmfr)
-+ {
-+@@ -1609,6 +1674,11 @@
-+ 		kern_return_t vmfkr = KERN_SUCCESS;
++@@ -1610,4 +1671,9 @@
 + 		thread->machine.recover_esr = 0;
 + 		thread->machine.recover_far = 0;
 ++#if defined(BCM2837) && (DEVELOPMENT || DEBUG)
@@ -5176,4 +5171,20 @@ new file mode 100644
 ++#endif
 + 		int result = handle_alignment_fault_from_user(state, &vmfkr);
 + 		if (result == 0) {
-+ 			/* Successfully emulated, or instruction
++--- a/bsd/kern/kern_exit.c
+++++ b/bsd/kern/kern_exit.c
++@@ -1382,4 +1382,14 @@
++ /* PICASSO_USER_ABORT_BEGIN: bounded final EL0 access-fault diagnostics. */
++ #if __arm64__ && (DEVELOPMENT || DEBUG)
+++/* Keep process internals in BSD; Mach exception code consumes only a pid. */
+++int picasso_ui_process_pid(void);
+++int
+++picasso_ui_process_pid(void)
+++{
+++    proc_t p = current_proc();
+++    if (!p || (strcmp(p->p_name, "backboardd") && strcmp(p->p_name, "SpringBoard") &&
+++        strcmp(p->p_name, "Preferences") && strcmp(p->p_name, "mediaserverd"))) return 0;
+++    return proc_getpid(p);
+++}
++ void picasso_user_abort(void *, uint32_t, uint64_t, int, uint32_t, uint64_t);
++ void

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the production DC ZVA qualification with host copyin/process models."""
+"""Exercise the production DC ZVA qualification and BSD process bridge with host models."""
 import argparse
 import hashlib
 import json
@@ -23,6 +23,8 @@ def main():
     added = '\n'.join(line[2:] for line in section.splitlines() if line.startswith('++'))
     helper = re.search(r'static bool\npicasso_user_zva\(.*?\n}', added, re.S)[0]
     (out / 'zva.inc').write_text(helper, encoding='utf-8')
+    process = re.search(r'int\npicasso_ui_process_pid\(void\)\n\{.*?\n}', added, re.S)[0]
+    (out / 'process.inc').write_text(process, encoding='utf-8')
     fixture = root / 'scripts/tests/picasso-zva-host.c'
     shutil.copyfile(fixture, out / 'fixture.c')
     compiler = os.environ.get('CC') or shutil.which('clang')
@@ -47,7 +49,7 @@ def main():
         runs.append(dict(asan=asan, pass_=True, log=result.stdout))
     (out / 'results.json').write_text(json.dumps(dict(pass_=True, scope=__doc__, runs=runs,
         inputs={str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
-                for p in (path, fixture)}), indent=2) + '\n', encoding='utf-8')
+                for p in (path, fixture, Path(__file__))}), indent=2) + '\n', encoding='utf-8')
     print('PASS: DC ZVA qualification, rejected faults preserve state; normal + ASan')
 
 

@@ -17,8 +17,14 @@ static bool get_saved_state_cpsr(arm_saved_state_t *s){return s->user;}
 static uint64_t get_saved_state_pc(arm_saved_state_t *s){return s->pc;}
 static uint64_t get_saved_state_reg(arm_saved_state_t *s,unsigned r){assert(r<4);return s->x[r];}
 static void set_saved_state_pc(arm_saved_state_t *s,uint64_t v){s->pc=v;}
-static int proc_selfpid(void){return 50;}
-static void proc_name(int pid,char *out,unsigned size){assert(pid==50);snprintf(out,size,"%s",name);}
+struct process { const char *p_name; };
+typedef struct process *proc_t;
+static struct process process;
+static bool no_process;
+static int test_pid=50;
+static proc_t current_proc(void){process.p_name=name;return no_process ? NULL : &process;}
+static int proc_getpid(proc_t p){assert(p==&process);return test_pid;}
+#include "process.inc"
 static uint32_t zva_bytes[4]={0xd50b7423,0x91010063,0xf1010042,0x54ffffa8};
 static uint32_t store_bytes[13]={0xa8000461,0xa8010461,0xa8020461,0xa8030461,0x91010063,0xf1010042,0x54ffff48,0x8b020063,0xa8000461,0xa8010461,0xa8020461,0xa8030461,0xd65f03c0};
 static int copyin(user_addr_t addr,void *out,size_t size){
@@ -26,7 +32,7 @@ static int copyin(user_addr_t addr,void *out,size_t size){
  if(addr==code_pc){assert(size==sizeof(zva_bytes));memcpy(out,zva_bytes,size);return fail_zva;}
  assert(addr==code_pc+0x78 && size==sizeof(store_bytes));memcpy(out,store_bytes,size);return fail_stores;
 }
-static void picasso_zva_observe(uint64_t a,uint64_t pc,uint64_t target){assert(a==0x11128f040 && pc==code_pc && target==code_pc+0x78);++observed;}
+static void picasso_zva_observe(uint64_t a,uint64_t pc,uint64_t target,int pid){assert(a==0x11128f040 && pc==code_pc && target==code_pc+0x78 && pid==test_pid);++observed;}
 #include "zva.inc"
 int main(void){
  unsigned cases=0;
@@ -48,6 +54,11 @@ int main(void){
   assert(!picasso_user_zva(&s,0x92000061^(1U<<i),s.x[3],0x43b50000));assert(!memcmp(&s,&valid,sizeof(s)));++cases;}
  arm_saved_state_t s=valid;assert(!picasso_user_zva(&s,0x92000061,s.x[3]+64,0x43b50000));
  assert(!picasso_user_zva(&s,0x92000061,s.x[3],0));cases+=2;
+ for(unsigned i=0;i<3;++i){s=valid;no_process=(i==0);test_pid=(i==2 ? -1 : 0);
+  unsigned before_reads=reads,before_observed=observed;
+  assert(!picasso_user_zva(&s,0x92000061,s.x[3],0x43b50000));
+  assert(!memcmp(&s,&valid,sizeof(s)) && reads==before_reads && observed==before_observed);++cases;}
+ no_process=false;test_pid=50;
  const char *names[]={"backboardd","SpringBoard","Preferences","mediaserverd"};
  for(unsigned i=0;i<4;++i){s=valid;name=names[i];assert(picasso_user_zva(&s,0x92000061,s.x[3],0x43b50000));
   assert(s.pc==valid.pc+0x78 && !memcmp(s.x,valid.x,sizeof(s.x)));++cases;}
