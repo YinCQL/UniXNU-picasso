@@ -523,6 +523,26 @@ static void gridSampleThread(void *, wait_result_t)
     }
 }
 
+/* The mode the display presents to userland, which is not always the panel's
+ * row count: the phone identity asks for a 1080x2340 canvas over this
+ * 1080x2400 panel, and the copy path centres it with 30-row black bars. The
+ * height comes from the board ADT (built by make-picasso-adt.py) so the
+ * command line stays within its 1000-byte budget. A missing, zero or
+ * out-of-range value keeps the panel geometry. */
+extern "C" uint32_t native_legacy_display_mode_height(uint32_t panelHeight) {
+    uint32_t height = 0;
+    IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+    if (chosen) {
+        OSObject *property = chosen->getProperty("display-height");
+        OSData *data = OSDynamicCast(OSData, property);
+        if (data && data->getLength() == sizeof(height))
+            memcpy(&height, data->getBytesNoCopy(), sizeof(height));
+        OSSafeReleaseNULL(chosen);
+    }
+    if (height < panelHeight / 2 || height > panelHeight) height = panelHeight;
+    return height;
+}
+
 extern "C" bool native_legacy_gop_mapping_observed(IOService *, IOMemoryMap *map, uint32_t width, uint32_t height) {
     PE_Video video = {};
     if (PE_current_console(&video) || map->getPhysicalAddress() != video.v_baseAddr ||

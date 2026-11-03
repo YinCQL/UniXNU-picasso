@@ -115,6 +115,11 @@ extern "C" kmod_info_t g_kernel_kmod_info;
 extern "C" volatile int native_gpu_addon_stage, native_gpu_addon_status;
 extern "C" volatile int native_gpu_addon2_stage, native_gpu_addon2_status;
 extern "C" volatile int native_gpu_addon3_stage, native_gpu_addon3_status;
+/* sheng-staged-apps=1 (zzy-staged-system-apps.patch): the one-time copy of the OS volume's staged
+ * system apps into Data. Stage 1 copying, 2 complete, 3 already complete, -1 no source, -2 out of
+ * memory. Reported with the periodic GPU counters so a boot that never finishes the copy is visible. */
+extern "C" volatile int native_staged_apps_stage, native_staged_apps_dirs, native_staged_apps_files,
+    native_staged_apps_mib, native_staged_apps_failed, native_staged_apps_error;
 /* Submissions and IBs the production submit object has seen: the plugin's
  * arrival is visible here even though its own report is not printed. */
 extern "C" volatile uint32_t native_adreno_submit_ibs[4];
@@ -1886,10 +1891,12 @@ void addonReport(void *, wait_result_t)
     for (unsigned round = 1;; ++round) {
         IOSleep(30000);
         printf("PICASSO_GPU submits live %u: submissions=%u ibs=%u max=%u many=%u "
-               "opens=%u report=%s\n", round,
+               "opens=%u report=%s apps=%d/%d/%d/%d/%x\n", round,
             native_adreno_submit_ibs[0], native_adreno_submit_ibs[1],
             native_adreno_submit_ibs[2], native_adreno_submit_ibs[3],
-            native_adreno_metal_opens(), native_adreno_metal_report());
+            native_adreno_metal_opens(), native_adreno_metal_report(),
+            native_staged_apps_stage, native_staged_apps_dirs, native_staged_apps_files,
+            native_staged_apps_mib, native_staged_apps_error);
     }
 }
 

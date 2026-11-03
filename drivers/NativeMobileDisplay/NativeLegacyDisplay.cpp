@@ -16,6 +16,8 @@
 extern "C" __attribute__((noreturn)) void native_legacy_backend_guard(unsigned,void *,void *);
 extern "C" IOService *native_legacy_display_allocate(void);
 extern "C" bool native_legacy_gop_mapping_observed(IOService *,IOMemoryMap *,uint32_t,uint32_t);
+// The mode height userland sees; the panel can be taller (1080x2340 mode over a 1080x2400 panel).
+extern "C" uint32_t native_legacy_display_mode_height(uint32_t panelHeight);
 extern "C" void native_legacy_registration_observed(IOService *);
 extern "C" void native_legacy_client_enter(task_t,uint32_t);
 extern "C" void native_legacy_client_observed(IOReturn,IOUserClient *);
@@ -54,6 +56,10 @@ extern "C" uint64_t mach_continuous_time(void);
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
+    // The GOP panel's geometry. getDisplayDimensions() reports the mode (a
+    // shorter 2340-row phone canvas when the ADT asks for it), so every panel
+    // store and bounds check uses these instead.
+    uint32_t panelWidth=0,panelHeight=0;
     // Previous frame for native_legacy_copy_diff (rows packed at width*4, same bytes as one GOP frame). The client always
     // sends a full-frame dirty rect, so the only reusable dirty information is this shadow; IPC-backed dirty rects are a no-op here.
     void *copyShadow=nullptr;
@@ -279,7 +285,8 @@ public:
         if(!surface) {
             // Validated blank swap (all layers disabled over black): solid-fill the actual GOP.
             PE_Video blank={};
-            uint32_t bw=0,bh=0;getDisplayDimensions(&bw,&bh);
+            uint32_t bw=panelWidth,bh=panelHeight;
+            if(!bw || !bh)getDisplayDimensions(&bw,&bh);
             uint64_t blankLength=(uint64_t)bw*bh*4;
             if(PE_current_console(&blank) || blank.v_baseAddr!=bootMapping->getPhysicalAddress() ||
                blank.v_width!=bw || blank.v_height!=bh || blank.v_depth!=32 || blank.v_rotate ||
@@ -302,7 +309,8 @@ public:
         if(!surface->metaCast("IOSurface"))return;
         IOMemoryDescriptor *memory=native_legacy_surface_descriptor(surface);
         PE_Video video={};
-        uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
+        uint32_t width=panelWidth,height=panelHeight;
+        if(!width || !height)getDisplayDimensions(&width,&height);
         uint64_t length=(uint64_t)width*height*4;
         uint64_t sourceStride=native_legacy_surface_stride(surface);
         uint64_t allocation=native_legacy_surface_allocation(surface);
@@ -506,7 +514,8 @@ public:
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-validate",&enabled,sizeof(enabled));
         if(enabled==1 && logicalPM && primary && bootMapping && request) {
             reason=2;OSObject *surfaces[4]={};memcpy(surfaces,bytes+2624,sizeof(surfaces));surface=surfaces[0];
-            uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
+            uint32_t width=panelWidth,height=panelHeight;
+            if(!width || !height)getDisplayDimensions(&width,&height);
             /* A phone canvas (1080x2340 over a 1080x2400 panel) names its own smaller height in the swap; accept it
              * when it is at most the panel's and both rectangles cover exactly that canvas. The copy path centres it
              * and fills the bars. */
@@ -594,12 +603,16 @@ public:
         bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                    mapping->getLength()==video.v_rowBytes*video.v_height;
         if(valid) {
-            installBootDimensions((uint32_t)video.v_width,(uint32_t)video.v_height);
+            panelWidth=(uint32_t)video.v_width;panelHeight=(uint32_t)video.v_height;
+            const uint32_t modeHeight=native_legacy_display_mode_height(panelHeight);
+            installBootDimensions(panelWidth,modeHeight);
             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
-            valid=width==video.v_width && height==video.v_height;
+            valid=width==panelWidth && height==modeHeight;
             if(valid) {
                 OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=true; // Text/graphics is console policy, not display identity.
-                valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
+                // The observer validates the GOP mapping against the panel, not the mode: the panel is still
+                // 2400 rows when userland is told the mode is a 2340-row phone canvas.
+                valid=native_legacy_gop_mapping_observed(this,bootMapping,panelWidth,panelHeight);
                 /* offline-legacy-bench=1: measure the three sides of a frame copy once, through this exact mapping.
                  * The 10.4 MB frame copy costs ~130 ms here (PICASSO_DISPLAY event=10); these one-megabyte timings
                  * separate destination stores, destination reads and a cached-to-cached memcpy. */

@@ -263,3 +263,45 @@ Implementation:
   survived in the persistent Data volume. Result: the UI rendered as an iOS/phone interface.
 - persist=0 is NOT a usable cache-clearing method on this board: the packed Data provider refuses the volume
   (`disk1: device is not ready`, IOBlockStorageDriver start failures, APFS truncate loop).
+
+## 2026-11-03 layout pass: wf167 geometry, wf168 wallpaper (built, not yet booted)
+
+Acceptance was written before the runs:
+
+1. **Status bar / geometry**: identity iPhone13,1 (iPhone 12 mini, target-type D52g), mode 1080x2340
+   presented to userland while the panel keeps 1080x2400; scale 3 -> 360x780 pt; 30-row black bars top
+   and bottom. Pass = red `rdar:45025538` bar gone, status bar/clock/battery laid out normally, no
+   NSException, and `PICASSO_DISPLAY_STATE` shows accepted 1080x2340 swaps (copy_bytes near
+   10,108,800/frame plus bar fills) rather than 10,368,000.
+2. **Wallpaper**: default iPadOS 17 Flat wallpaper overlaid as PNG through the GPU addon
+   (`make-wallpaper-overlay.py` output packed with `--wallpaper`). Pass =
+   `PICASSO_GPU addon: ... wallpaper=5/0` (stage 5, errno 0) and a non-black home screen.
+3. **Apps**: the home screen's missing icons are the 29 bundles under the OS volume's
+   `private/var/staged_system_apps` (Mail/Notes/Clock/News/Podcasts/TV/Books/Health/Fitness/Home/Maps
+   ...). They are shadowed by the Data mount and never installed; the Data seed explicitly excludes
+   them. Pass = SystemAppMigrator/installd reports installing them and SpringBoard shows the default
+   icon set with real icons (not placeholder grid).
+
+Implementation in this pass:
+- `scripts/make-picasso-adt.py`: phone row is now iPhone13,1 / D52g / "iPhone 12 mini" /
+  compatible-device-fallback iPhone13,1; `/chosen/display-height = 2340` goes with `display-scale = 3`.
+- `NativeLegacyDisplay.cpp`: `panelWidth/panelHeight` keep the 2400-row GOP; `getDisplayDimensions`
+  reports the mode (2340); the letterbox copy centers 2340 rows and fills 30+30 rows black.
+- `PicassoDisplaySupport.cpp`: `native_legacy_display_mode_height()` reads `/chosen/display-height`
+  and clamps it to the panel.
+- `build-wf-payload.sh`: payload FAT is 88 MiB (wallpaper addon leaves only 0.23 MB of guard margin
+  at 80 MiB).
+
+Artifacts:
+- wf167 (geometry only, soft addon 30f0e0…): kernel c2222971901f3d45, args 995/1000 bytes,
+  `out/wf167/picasso/boot/wf167.img` (94,457,856 bytes), payload FAT 88 MiB.
+- wf168 (wf167 + wallpaper addon f2c573f765693579, 22,603,216 bytes): same kernel/args,
+  `out/wf168/picasso/boot/wf168.img`.
+
+Known open questions for the boot test:
+- The wallpaper overlay is mounted over the `~ipad` 7570 Flat animation only. Under a phone identity
+  PosterBoard may pick a different variant; if the screen stays black but the log says `wallpaper=5/0`,
+  retarget the overlay mount (or add the other 7570 variants) rather than the provider path.
+- The geometry change alone may or may not remove the red bar: if it persists, the next lever is the
+  `UIStatusBarVisualProviderClassName` override or a display edge-info publication, decided after the
+  boot log/screenshot.

@@ -38,7 +38,7 @@ for t in removed:
     assert line in s, t
     s=s.replace(line,'',1)
 assert 'size_mib = 60\n' in s
-s=s.replace('size_mib = 60\n','size_mib = 80\n',1)
+s=s.replace('size_mib = 60\n','size_mib = 88\n',1)
 import re
 owned=os.environ.get('OWNED_MEMORY')
 if owned:
