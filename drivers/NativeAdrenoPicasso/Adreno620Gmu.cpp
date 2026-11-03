@@ -1629,10 +1629,19 @@ extern "C" int native_adreno620_hfi_handshake(void)
 
     /* Stages through CORE_FW_START, the first GX vote, the GPU_SET OOB and START, in one uninterrupted sequence
      * (a6xx_gmu_resume's order); no console output between CORE_FW_START and the vote. */
-    const unsigned perfIndex = bin->initial_level < bin->count ?
-        unsigned(bin->count - 1 - bin->initial_level) : unsigned(bin->count - 1);
-    printf("PICASSO_GPU hfi: initial perf index=%u (dt level=%u of %lu)\n",
-        perfIndex, bin->initial_level, static_cast<unsigned long>(bin->count));
+    /* The HFI perf table is ascending by frequency while qcom,gpu-pwrlevels lists levels descending, so
+     * the port's old `count - 1 - initial_pwrlevel` picked index 1 (275 MHz) for this speed bin. The DT's
+     * top-level qcom,initial-pwrlevel = 3 names the nominal level, and index 3 is 500 MHz in both the 5-
+     * and 7-level bins; start there. sheng-gpu-perf-index overrides it for before/after measurements. */
+    unsigned perfIndex = bin->count > 3 ? 3u : unsigned(bin->count - 1);
+    unsigned requestedIndex = 0;
+    if (PE_parse_boot_argn("sheng-gpu-perf-index", &requestedIndex, sizeof requestedIndex) &&
+        requestedIndex < bin->count) {
+        perfIndex = requestedIndex;
+    }
+    printf("PICASSO_GPU hfi: initial perf index=%u (dt level=%u of %lu, boot index=%u %s)\n",
+        perfIndex, bin->initial_level, static_cast<unsigned long>(bin->count), requestedIndex,
+        perfIndex == requestedIndex ? "from boot arg" : "nominal");
     unsigned lastStage = 0;
     const AdrenoHfiStatus status = hfiStartupBeforeStart(config, perfIndex, &lastStage);
     printf("PICASSO_GPU hfi: run status=%d last-stage=%u skipped=%u\n",
