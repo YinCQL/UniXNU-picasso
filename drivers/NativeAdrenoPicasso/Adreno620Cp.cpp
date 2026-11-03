@@ -279,6 +279,15 @@ uint32_t gpuRead(uint32_t dword)
     return read32(gState->gpu, uint64_t(dword) * 4);
 }
 
+/* wf130: NativeAdrenoTimer's CP source hands back CP_ALWAYS_ON_COUNTER's dword
+ * indices (0x980/0x981); the GPU window is already mapped and powered here. */
+IOReturn gpuTimerRead32(void *, uint32_t dword, uint32_t *value)
+{
+    if (!value) return kIOReturnBadArgument;
+    *value = gpuRead(dword);
+    return kIOReturnSuccess;
+}
+
 void gpuWrite(uint32_t dword, uint32_t value)
 {
     write32(gState->gpu, uint64_t(dword) * 4, value);
@@ -1707,8 +1716,24 @@ bool publishGpu()
     clock.cookie = nullptr;
     clock.now_us = ringNowUs;
     clock.idle = nullptr;
+    /* wf130: CP_ALWAYS_ON_COUNTER is the userspace timestamp mainline exposes
+     * (a6xx_get_timestamp reads it through gpu_read64); without a bound timer
+     * the client's GetTimestamp answers Unsupported. Attach once, from the GPU
+     * window this driver already maps. */
+    static NativeAdrenoTimer gpuTimer;
+    static bool gpuTimerAttached = false;
+    if (!gpuTimerAttached) {
+        NativeAdrenoTimeIo timerIo = { nullptr, gpuTimerRead32 };
+        if (gpuTimer.attach(&timerIo, NativeAdrenoTimeCp) == kIOReturnSuccess) {
+            uint64_t ticks = 0;
+            gpuTimerAttached = gpuTimer.read(&ticks) == kIOReturnSuccess;
+            printf("PICASSO_GPU cp: gpu timer attached=%d ticks=%llu\n",
+                int(gpuTimerAttached),
+                static_cast<unsigned long long>(ticks));
+        }
+    }
     const IOReturn published = native_adreno_publish(vm, &gSubmit, ring, &clock,
-        nullptr, &info, ias, 40);
+        gpuTimerAttached ? &gpuTimer : nullptr, &info, ias, 40);
     printf("PICASSO_GPU cp: publish status=%08x service=%p va_size=%llx\n",
         unsigned(published), native_adreno_published_service(),
         static_cast<unsigned long long>(info.va_size));

@@ -1381,3 +1381,17 @@ Client side (read-only reference copies):
   `com.apple.osanalytics.osanalyticshelper` to `sheng-disable-jobs` (the established mechanism
   for problematic daemons here) so long-run GPU observation is not cut short by it. Log
   `out/wf128-runs/run1.log`.
+- **wf129: the compositor takes the display but draws nothing yet.** With the analytics daemon
+  skipped the boot stays up (no panic), and the grid sampler shows the transition precisely:
+  frames 1–8 are the bootloader's sparse top-left text (row 0 `000f00000000`), and between
+  frames 8 and 9 — as backboardd opens the accelerator — the framebuffer becomes fully black
+  and stays black through frame 18. So userland now owns the scanout (it cleared the firmware
+  image) but no surface is presented; the client's submissions are still the one-shot setup
+  (`submits final: submissions=6`). Image `out/wf129/picasso/boot/wf129.img`; log
+  `out/wf129-runs/run1.log`.
+- **wf130: the missing piece for scheduling is the userspace timer.** `native_adreno_publish()`
+  was called with `timer = nullptr`, so every client's `GetTimestamp` answered Unsupported and
+  Turnip had no GPU clock. The publish path now attaches a `NativeAdrenoTimer` over
+  `CP_ALWAYS_ON_COUNTER` (dword 0x980/0x981 in the already-mapped GPU window — the register
+  mainline's `a6xx_get_timestamp` reads) and logs `gpu timer attached=<0|1> ticks=<…>`; the
+  refused `SetMetadata` record now prints its shape instead of only returning BadArgument.
