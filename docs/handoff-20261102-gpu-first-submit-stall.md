@@ -714,3 +714,20 @@ Client side (read-only reference copies):
   framebuffer — the render server's deep preference), while the display driver only takes 8-bit;
   (c) then return to the GMEM path: the `RM6_ENDVIS` handler's control-0x069 bit-5 completion still
   never arrives with binning, so compare the VSC/bin state programmed by the tile sequence.
+- **wf83: run the project's own GPU test.** `NativeAdrenoMetalPlugin.mm` normally selects the
+  production publish path when the addon carries `NativeAdrenoMetal.publish`; without it the plugin
+  runs `adrenoUserTest()` (the raw kernel test plus the Turnip smoke: fill buffer, compute shader,
+  triangle render, pixel read-back) on a thread. The Data volume keeps the `.publish` file written
+  by earlier addons (`native_gpu_addon_prepare()` only writes files present in the blob; it never
+  deletes strays), so the test build makes `publish::requested()` return false directly. The smoke
+  path also sets `TU_DEBUG=sysmem,nocb` (was `nocb`), so the render/read-back test avoids the GMEM
+  `RM6_ENDVIS` stall. The kernel mirrors each completed plugin text line to the console
+  (`PICASSO_GPU text: …`, at most 64 lines, in the `0x7fff`/`0x7ffe` handler) because the periodic
+  report runs only once and is empty by then. Kernel `471840b5adb79a606046773c2f31dd22e3d28d844f88b821506000bb01c93b1a`;
+  addon `09f978bd2506fb47edc71117122ce05f29bf3bb8bb9810350bc6a521cbada233`
+  (`build/ngpu-addon-wf83-test.bin`), trust
+  `66b959f5622f9ed7e03fc464052a06de78be65ec665c5c0452908bbced33f29a`, plugin CDHash
+  `9fa727f087f9b06b68991aa800fec3e87ab86d56`; image `out/wf83/picasso/boot/wf83.img`, log
+  `out/wf83-runs/run1.log`. The expected lines start with `T s<stage>
+  r<VkResult> v<fill> c<compute> g<triangle pixels>/<stray>` (NativeTurnipSmoke.h header) and the
+  replay scan's `F <retired>/<prefixes> o<opcode> c<dwords> e<…>`.

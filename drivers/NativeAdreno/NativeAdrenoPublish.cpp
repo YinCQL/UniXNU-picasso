@@ -971,6 +971,11 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
             static char *line=native_adreno_metal_diag.report2;
             static_assert(sizeof(native_adreno_metal_diag.report)==sizeof(native_adreno_metal_diag.report2),"stream lines");
             if(value==0x7fff || value==0x7ffe) {
+                /* Diagnostic (wf83): mirror each completed plugin text line to the console, so a boot log carries the
+                 * userspace test's result even though the periodic report runs only once. Bounded: the render server
+                 * rewrites report2 every ten seconds, so cap the number of lines. */
+                static unsigned lines;
+                if(line[0] && lines++<64) printf("PICASSO_GPU text: %s\n", line);
                 line=value==0x7fff?native_adreno_metal_diag.report2:native_adreno_metal_diag.report;
                 /* A line from a process other than the render server goes to that process's own row (native_adreno_client_text): the render server
                  * rewrites report2 every ten seconds, so the reason another process's device failed would be gone from it. */
