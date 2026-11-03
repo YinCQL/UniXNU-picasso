@@ -99,6 +99,12 @@ jobs:
           echo "UNIXNU_KERNELCACHE=$PWD/out/ipsw/21H461/kernelcache.decompressed" >> "$GITHUB_ENV"
           python3 scripts/prepare-original-trust.py --tree "$TREE" --inputs out/ipsw/21H461 --output out/picasso/original-static-system.bundle 2>&1 | tee out/picasso/logs/actions-trust.log
 
+      - name: Check original display and HID ABI inputs
+        run: |
+          python3 scripts/check-picasso-original-abi.py --kernelcache "$UNIXNU_KERNELCACHE" \
+            --native-prelink-dir "$UNIXNU_TREE/kits/NativePrelink" \
+            --output out/picasso/logs/original-abi.json
+
       - name: Prepare volatile APFS Data from the original OS
         run: |
           python3 ./unixnu defconfig picasso_defconfig
