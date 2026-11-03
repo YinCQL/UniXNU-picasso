@@ -71,6 +71,11 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
 
+      - name: Prepare authenticated stock touch firmware
+        run: |
+          python3 scripts/fetch-picasso-touch-firmware.py --output out/picasso/novatek/firmware.bin
+          echo "NOVATEK_TOUCH_FW=$PWD/out/picasso/novatek/firmware.bin" >> "$GITHUB_ENV"
+
       - name: Download the target IPSW
         run: |
           mkdir -p out/ipsw
@@ -205,6 +210,7 @@ jobs:
             device/out/picasso/kernel/**
             device/out/picasso/payload/**
             device/out/picasso/logs/**
+            device/out/picasso/novatek/*.json
             device/out/picasso/tree/build/sheng-platform-power/*.json
             device/out/picasso/tree/build/sheng-platform-power/*.log
             device/out/picasso/tree/build/sheng-platform-power/*.o
