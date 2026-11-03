@@ -1405,3 +1405,9 @@ Client side (read-only reference copies):
   is complete for a client; what remains for visible rendering is the UI producing and
   committing surfaces, which is independent of the GPU driver. Image
   `out/wf130/picasso/boot/wf130.img`; log `out/wf130-runs/run1.log`.
+- **wf130 follow-up: SpringBoard does reach the accelerator.** The IOKit trace shows SpringBoard
+  (pid 27) matching and opening `AGXAccelerator` with `result=0 object=1` (the `foreign=1` open
+  the Metal diag counts), so the service is reachable from the UI process. It still submits
+  nothing, and backboardd's five submissions remain the whole client load. The next question is
+  therefore inside the UI stack (why the UI process opens the accelerator but commits no
+  work/surface), not in the GPU driver or the accelerator's availability.
