@@ -66,6 +66,7 @@ constexpr uint32_t kGmuHost2GmuIntrRaw = 0x1F996;
 constexpr uint32_t kGmuRsccControlReq = 0x23B07;
 constexpr uint32_t kGmuRsccControlAck = 0x23B08;
 constexpr uint32_t kGmuGxPwrStatus = 0x1F8D0;   /* GMU_SPTPRAC_PWR_CLK_STATUS (sheng kGxStatus) */
+constexpr uint32_t kGmuSptpracPowerControl = 0x1A881;   /* GPU_GMU_GX_SPTPRAC_POWER_CONTROL (a6xx_gmu.xml) */
 constexpr uint32_t kGmuRpmhPowerState = 0x1F8EC; /* GPU_GMU_CX_GMU_RPMH_POWER_STATE (a6xx_gmu_check_idle_level) */
 constexpr uint32_t kGmuGeneral7 = 0x1F9CC;
 constexpr uint32_t kGmuAoHostIntrClr = 0x23B04;
@@ -1206,6 +1207,21 @@ int startCm3()
         }
         return -1;
     }
+    /* a6xx_gmu_fw_start's legacy sequence, in mainline's order: after gmu_start (the CM3 handshake above) and
+     * before hfi_start, power the SP/TP rail (a6xx_sptprac_enable): GPU_GMU_GX_SPTPRAC_POWER_CONTROL =
+     * 0x778000, then poll GMU_SPTPRAC_PWR_CLK_STATUS until (status & 0x38) == 0x28. wf94 did this from
+     * hw_init, after the firmware was already running HFI, and the status stayed 0/0 — the firmware ignores
+     * the manual control once it owns the rail. */
+    coreWrite(kGmuSptpracPowerControl, 0x778000u);
+    barrier();
+    uint32_t sptprac = 0;
+    for (unsigned index = 0; index < 100; ++index) {
+        sptprac = coreRead(kGmuGxPwrStatus);
+        if ((sptprac & 0x38u) == 0x28u) break;
+        IODelay(1);
+    }
+    printf("PICASSO_GPU gmu: sptprac power (pre-HFI) status=%08x (want &38==28)\n", sptprac);
+
     coreWrite(kGmuHfiCtrlInit, 1);
     barrier();
     observed = 0;

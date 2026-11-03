@@ -916,3 +916,19 @@ Client side (read-only reference copies):
   `export ADRENO620_FW_DIR=$PWD/build/picasso-gpu-fw` (that directory's `a650_sqe.fw` is the
   pinned 31964-byte v0x112 image). The kernel was rebuilt again with the variable set; its hash and
   the wf94 image/log are below.
+- **wf94: SPTPRAC write from hw_init changes nothing.** Kernel `acede28f…` (rebuilt with
+  `ADRENO620_FW_DIR`); the probe accepted `sqe=a650_sqe.fw version=0x112 security=1`. Measured:
+  the GMU status register is live and GX comes up (`gx: oob … status=000000c0->00000000 on`), but
+  after the new `a6xx_sptprac_enable` in `hardwareInit()` the line reads
+  `sptprac power: status 00000000 -> 00000000 (want &38==28)` — bits 3/5 never set, before or
+  after `0x778000`. The smoke result is identical to wf92 (`T s0 r0 v512 c0 g0/4096`,
+  `S fdeadbeef… kdeadbeef… r5a5a…`, `Q …/… 1/0 r0`). So at `hw_init` time, with HFI already
+  running, the firmware ignores the manual SPTPRAC control.
+- **wf95: move SPTPRAC to mainline's place — after `gmu_start`, before `hfi_start`.**
+  `a6xx_gmu_fw_start()` runs `a6xx_gmu_gfx_rail_on()` and `a6xx_sptprac_enable()` between the CM3
+  release and `a6xx_hfi_start()`. `Adreno620Gmu.cpp::startCm3()` now writes
+  `GPU_GMU_GX_SPTPRAC_POWER_CONTROL = 0x778000` and polls `GMU_SPTPRAC_PWR_CLK_STATUS` for
+  `(status & 0x38) == 0x28` immediately after the CM3 boot handshake and before
+  `GMU_HFI_CTRL_INIT`, printing `PICASSO_GPU gmu: sptprac power (pre-HFI) status=…`. If the rail
+  then reports powered and the smoke writes memory, the missing SPTPRAC power-up is the root cause
+  of both the silent sysmem no-op and the GMEM `RM6_ENDVIS` stall.

@@ -167,6 +167,7 @@ constexpr uint32_t kGpuTpl1AddrModeCntl = 0x0B601;
 
 /* GMU-window dwords (a6xx_gmu.xml). */
 constexpr uint32_t kGmuSptpracClockControl = 0x1A880;
+constexpr uint32_t kGmuSptpracPowerControl = 0x1A881;   /* GPU_GMU_GX_SPTPRAC_POWER_CONTROL: 0x778000 powers SP/TP */
 constexpr uint32_t kGmuCgcModeCntl = 0x23B09;
 constexpr uint32_t kGmuCgcDelayCntl = 0x23B0A;
 constexpr uint32_t kGmuCgcHystCntl = 0x23B0B;
@@ -401,6 +402,25 @@ bool hardwareInit()
     if (gx & kGxOffBits) {
         printf("PICASSO_GPU cp: GX is off before hw_init (status=%08x)\n", gx);
         return false;
+    }
+
+    /* a6xx_sptprac_enable() (a6xx_gmu.c). This device is a legacy GMU (gmu_is_wrapper is not set in
+     * a6xx_catalog, and the DT property is absent), and on that path mainline powers the SP/TP rail
+     * itself: it writes GPU_GMU_GX_SPTPRAC_POWER_CONTROL = 0x778000 and polls
+     * GMU_SPTPRAC_PWR_CLK_STATUS until (status & 0x38) == 0x28. The port booted the GMU through the
+     * HFI/OOB GPU_SET handshake but never wrote this register, and the measured result was a CP that
+     * runs while no shader work happens: every draw, blit and compute left the client's memory
+     * untouched and every fence retired (wf90-wf92). */
+    {
+        const uint32_t before = gmuRead(kGmuGxPwrStatus);
+        gmuWrite(kGmuSptpracPowerControl, 0x778000u);
+        uint32_t status = before;
+        for (unsigned poll = 0; poll < 100; ++poll) {
+            status = gmuRead(kGmuGxPwrStatus);
+            if ((status & 0x38u) == 0x28u) break;
+            IODelay(1);
+        }
+        printf("PICASSO_GPU cp: sptprac power: status %08x -> %08x (want &38==28)\n", before, status);
     }
 
     /* Clear GBIF halt in case the GX domain was not collapsed. */
