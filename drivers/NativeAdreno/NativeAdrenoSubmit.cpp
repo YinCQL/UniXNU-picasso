@@ -2,6 +2,9 @@
 #include "NativeAdrenoSubmit.h"
 #include "AdrenoPM4.h"
 #include <IOKit/IOLib.h>
+extern "C" int proc_selfpid(void);
+/* Board diagnostics: CP_INTERRUPT_STATUS, CP_HW_FAULT, CP_PROTECT_STATUS and one CP_SQE_STAT sample, for a stalled fence. Absent on the host. */
+extern "C" uint32_t native_adreno_cp_fault_regs(uint32_t *out,uint32_t count) __attribute__((weak_import));
 
 /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
@@ -127,6 +130,12 @@ IOReturn NativeAdrenoSubmit::useVm(NativeAdrenoVm *vm,const NativeAdrenoRingCloc
     status=write_table_(table_cookie_,vm->ttbr0());
     if(status)return poison();
     native_adreno_table_switches[1]=native_adreno_table_switches[1]+1;
+    /* The bank now runs this process's table: printed for the first switches so a stalled first submission can be read against it. */
+    static uint32_t switch_prints;
+    if(switch_prints<6) {
+        ++switch_prints;
+        printf("PICASSO_GPU table switch: vm=%p ttbr0=%llx\n", vm, (unsigned long long)vm->ttbr0());
+    }
     table_vm_=vm;return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoSubmit::forgetVm(NativeAdrenoVm *vm,const NativeAdrenoRingClock *clock,uint32_t timeout_us)
@@ -405,6 +414,48 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     uint32_t cached=~0u,before=~0u,ignored=0,after=~0u;
     /* Write-combined stores this CPU made before the call (the client's command words) complete before anything below. */
     __asm__ volatile("dsb sy":::"memory");
+    /* The first few submissions print the wire buffers as the client sent them and what the memory holds after that barrier, before the
+     * ring is written: the board's own probe submissions are the control (their IB is in a board buffer). Bounded. */
+    static uint32_t wire_prints;
+    if(wire_prints<8 && count) {
+        ++wire_prints;
+        for(size_t i=0;i<count && i<2;++i) {
+            const NativeAdrenoSubmitBuffer &buffer=buffers[i];
+            uint64_t miova=0;size_t mbytes=0;unsigned permissions=0;
+            const IOReturn described=vm_->describe(buffer.handle,&miova,&mbytes,&permissions);
+            uint32_t cachedWord=0,dramWordV=0;
+            const IOReturn sampled=vm_->sampleWord(buffer.iova,&cachedWord,&dramWordV);
+            uint32_t head[8]={};
+            const IOReturn read=vm_->peekWordsUncached(miova,head,8);
+            printf("PICASSO_GPU wire: pid=%d vm=%p next=%llu h=%llu iova=%llx bytes=%llu map=", proc_selfpid(),
+                vm_, (unsigned long long)vm_->nextHandle(), (unsigned long long)buffer.handle,
+                (unsigned long long)buffer.iova, (unsigned long long)buffer.bytes);
+            if(described)printf("%x",unsigned(described));
+            else printf("%llx/%llu",(unsigned long long)miova,(unsigned long long)mbytes);
+            printf(" sample=%x/%x/%x bo=", unsigned(sampled), cachedWord, dramWordV);
+            if(read)printf("%x",unsigned(read));
+            else for(uint32_t k=0;k<8;++k)printf(" %x", head[k]);
+            printf("\n");
+        }
+        /* Where this process's command stream is, if its named buffer reads zero: every mapping and that mapping's own first words. */
+        if(wire_prints<=4)vm_->dumpMappings("wire",24);
+        /* The whole submitted buffer, and the whole address space, through the truly uncached DRAM reader: whether the client's
+         * words are anywhere at all (an offset, another BO) or nowhere (never stored, or still in a write-combine buffer). The
+         * Turnip prologue's first word (CP_EVENT_WRITE cache-invalidate) is the needle. Bounded and client submissions only. */
+        static uint32_t scan_prints;
+        if(scan_prints<2 && proc_selfpid()!=0) {
+            ++scan_prints;
+            uint64_t scanned=0,nz=0,first_off=0,needle_off=UINT64_MAX;uint32_t first_word=0;
+            if(vm_->scanMapping(buffers[0].handle,0x70460001,65536,&scanned,&nz,&first_off,&first_word,&needle_off))
+                printf("PICASSO_GPU scan wire: h=%llu scanned=%llu nz=%llu first=%llx:%x needle=70460001 at=%llx\n",
+                    (unsigned long long)buffers[0].handle,(unsigned long long)scanned,(unsigned long long)nz,
+                    (unsigned long long)first_off,first_word,(unsigned long long)needle_off);
+            uint64_t sh=0,soff=0;uint32_t sw=0;
+            const uint32_t hits=vm_->scanVm(0x70460001,65536,512*1024,&sh,&soff,&sw);
+            printf("PICASSO_GPU scan vm: needle=70460001 hits=%u h=%llu off=%llx word=%x\n",hits,
+                (unsigned long long)sh,(unsigned long long)soff,sw);
+        }
+    }
     /* int-098/099: with write-combined user BOs and no maintenance the CP stopped at the end of the first IB, as in int-065..069 when an
      * IB sat in a CPU cache. While write-combined BOs are trusted, every line of this submission's IBs is compared as a CPU cache and
      * DRAM hold it (bounded). A dirty line means a client view still caches its BOs: maintain every BO from now on, this submission
@@ -484,7 +535,8 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     uint32_t base=fence_issued_;
     for(unsigned i=0;i<ring_count_;++i)if((int32_t)(ring(i)->lastSubmitted()-base)>0)base=ring(i)->lastSubmitted();
     const uint32_t number=(value=base)+1;
-    status=preemption()?target->submitFramed(words,word_count,number,&value):target->submitFramed(words,word_count,&value);
+    status=a6xx_?target->submit(words,word_count,&value):
+        preemption()?target->submitFramed(words,word_count,number,&value):target->submitFramed(words,word_count,&value);
     if(status) {
         if(!value)fence_issued_=base;
         /* A poisoned ring may already have consumed the WPTR write, so the
@@ -624,6 +676,217 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
     for(uint32_t i=0;i<NativeAdrenoRingStallWords;++i)native_adreno_stall[2+i]=words[i];
     native_adreno_stall[1]=stall_timeouts;
     native_adreno_stall[0]=next;
+    /* The first few stalled fences print the CP and SMMU state directly: a client's first submission on its own page table either
+     * never reaches the CP (RPTR behind WPTR, no fault) or faults on an address the table did not map (FSR/FAR below). Bounded, so a
+     * fence that never advances cannot flood the console. */
+    static uint32_t stall_prints;
+    if(stall_prints<6) {
+        ++stall_prints;
+        uint32_t cpFence=0;
+        (void)stalled->fenceValue(&cpFence);
+        printf("PICASSO_GPU stall: fence=%u pending=%llu us cpFence=%u rptr=%u wptr=%u\n", next,
+            (unsigned long long)pending, cpFence, stalled->readPointer(), stalled->writePointer());
+        printf("PICASSO_GPU stall cp:");
+        for(uint32_t i=0;i<NativeAdrenoRingStallWords;++i)printf(" %x", words[i]);
+        printf("\nPICASSO_GPU stall smmu: %x %x %x %x job=%x\n", fault[0], fault[1], fault[2], fault[3], job ? job->vm_next : 0);
+        /* The board's own fault registers: CP_INTERRUPT_STATUS (0x823) names an SQE error the ring's stall state does not read,
+         * CP_HW_FAULT, CP_PROTECT_STATUS and one CP_SQE_STAT sample. Absent on the host. */
+        if(native_adreno_cp_fault_regs) {
+            uint32_t regs[4]={0xffffffff,0xffffffff,0xffffffff,0xffffffff};
+            (void)native_adreno_cp_fault_regs(regs,4);
+            printf("PICASSO_GPU stall cpregs: cpint=%x hwfault=%x protect=%x sqe=%x\n", regs[0],regs[1],regs[2],regs[3]);
+        }
+        if(job) {
+            printf("PICASSO_GPU stall job: count=%u words=%u:", job->count, job->word_count);
+            for(uint32_t i=0;i<job->word_count && i<32;++i)printf(" %x", job->words[i]);
+            printf("\nPICASSO_GPU stall ib:");
+            for(uint32_t i=0;i<17;++i)printf(" %x", native_adreno_stall_mem[4+i]);
+            printf("\n");
+            /* peekFetch gives up when the words 12 dwords below the fetch address lie outside the BO (an IB that starts
+             * at a page boundary); read the fetch address itself, which is inside the mapping. */
+            const uint64_t ib1=(uint64_t)words[11]<<32|words[10];
+            uint32_t head[8]={};
+            const IOReturn read=space->peekWordsUncached(ib1,head,8);
+            printf("PICASSO_GPU stall ib1 %llx read=%x:", (unsigned long long)ib1, unsigned(read));
+            if(!read)for(uint32_t i=0;i<8;++i)printf(" %x", head[i]);
+            printf("\n");
+            /* Where inside IB1 the SQE is *executing*. CP_IB1_REM_SIZE counts only dwords not yet fetched into the ROQ: the
+             * front-end prefetches ahead and REM stops once the ROQ is full (a6xx_progress), so a REM-only position is where the
+             * *fetch* stopped, not where the SQE is. progressState adds CP_ROQ_AVAIL_IB1's fetched-but-unconsumed dwords; the
+             * packet the SQE is on is base + 4*(size - effective_rem). Dump 24 dwords on each side through the job's address
+             * space: a wait packet here names the condition the CP is stuck on. */
+            {
+                const uint64_t base=(uint64_t)words[11]<<32|words[10];
+                uint32_t total=0;
+                for(uint32_t i=0;i+3<job->word_count;i+=4)
+                    if(((uint64_t)job->words[i+2]<<32|job->words[i+1])==base) {total=job->words[i+3]&0xfffff;break;}
+                uint32_t st[6]={};
+                const IOReturn ps=stalled->progressState(st);
+                printf("PICASSO_GPU stall ibnow: base=%llx size=%x rem=%x roq=%x effrem=%x ps=%x",
+                    (unsigned long long)base,total,words[12],(unsigned)(st[4]>words[12]?st[4]-words[12]:0),st[4],unsigned(ps));
+                if(total && ps==kIOReturnSuccess && st[4]<=total) {
+                    const uint64_t at=base+4ull*(total-st[4]);
+                    uint32_t now[48]={};
+                    const uint64_t start=at>=base+96?at-96:base;
+                    const IOReturn nowread=space->peekWordsUncached(start,now,48);
+                    printf(" at=%llx read=%x:", (unsigned long long)at, unsigned(nowread));
+                    if(!nowread)for(uint32_t i=0;i<48;++i)printf(" %x", now[i]);
+                }
+                printf("\n");
+            }
+            /* The packets the SQE executed in this IB up to where it stopped, with their positions: where the client's
+             * stream spends its synchronization (waits, markers, events, blits, context bunches, IB calls). The stream is
+             * read forward in chunks and only the last lines are kept, so a long blit prefix does not crowd out the packets
+             * next to the stop: the marker there names the phase, and an unsatisfied wait packet names the condition. */
+            if(stall_prints<=2) {
+                const uint64_t base=(uint64_t)words[11]<<32|words[10];
+                uint32_t total=0;
+                for(uint32_t i=0;i+3<job->word_count;i+=4)
+                    if(((uint64_t)job->words[i+2]<<32|job->words[i+1])==base) {total=job->words[i+3]&0xfffff;break;}
+                uint32_t st[6]={};
+                if(!stalled->progressState(st) && total && st[4]<=total) {
+                    struct TraceLine {size_t at;const char *nm;uint32_t cnt,p[4];};
+                    TraceLine tail[32]={};unsigned tailn=0;
+                    uint32_t nblit=0,nwait=0,nevent=0,nmarker=0,ncrb=0,nib=0,ndraw=0,ncond=0,nskip=0;
+                    const size_t limit=(size_t)(total-st[4]);
+                    size_t pos=0;
+                    uint32_t w[256];
+                    while(pos<limit) {
+                        size_t n=limit-pos;if(n>256)n=256;
+                        if(space->peekWordsUncached(base+4ull*pos,w,n))break;
+                        size_t i=0;bool crossed=false;
+                        while(i<n) {
+                            const uint32_t h=w[i];
+                            const char *nm=nullptr;uint32_t cnt=0;
+                            size_t adv=1;
+                            if((h>>28)==7) {
+                                const uint32_t op=(h>>16)&0x7f;cnt=h&0x7fff;adv=1+(size_t)cnt;
+                                switch(op) {
+                                case 0x12:nm="WAIT_MEM_WRITES";++nwait;break;
+                                case 0x26:nm="WAIT_IDLE";++nwait;break;
+                                case 0x3c:nm="WAIT_REG_MEM";++nwait;break;
+                                case 0x14:nm="WAIT_TS";++nwait;break;
+                                case 0x46:nm="EVENT";++nevent;break;
+                                case 0x2c:nm="BLIT";++nblit;break;
+                                case 0x3f:nm="IB";++nib;break;
+                                case 0x5c:nm="CRB";++ncrb;break;
+                                case 0x65:nm="MARKER";++nmarker;break;
+                                case 0x1d:nm="SKIP_IB2_G";++nskip;break;
+                                case 0x23:nm="SKIP_IB2_L";++nskip;break;
+                                case 0x47:nm="COND_EXEC";++ncond;break;
+                                case 0x38:nm="DRAW_INDX_OFF";++ndraw;break;
+                                case 0x29:nm="DRAW_INDX_IND";++ndraw;break;
+                                case 0x2a:nm="DRAW_IND_MULTI";++ndraw;break;
+                                case 0x28:nm="DRAW_IND";++ndraw;break;
+                                case 0x24:nm="DRAW_AUTO";++ndraw;break;
+                                case 0x33:nm="EXEC_CS";++ndraw;break;
+                                case 0x63:nm="SET_MODE";break; case 0x64:nm="VIS_OVR";break;
+                                case 0x3e:nm="REG_TO_MEM";break; case 0x3d:nm="MEM_WRITE";break;
+                                case 0x56:nm="PSEUDO";break; case 0x5f:nm="PROT_MODE";break;
+                                case 0x53:nm="TTBR0";break; case 0x2e:nm="BIN_DATA";break;
+                                }
+                            } else if((h>>28)==4) {
+                                adv=1+(size_t)(h&0x7f);
+                            }
+                            if(i+adv>n) {crossed=true;break;}
+                            if(nm) {
+                                TraceLine t;t.at=pos+i;t.nm=nm;t.cnt=cnt;
+                                for(uint32_t k=0;k<4&&k<cnt;++k)t.p[k]=w[i+1+k];
+                                if(tailn<32)tail[tailn++]=t;
+                                else {for(unsigned q=1;q<32;++q)tail[q-1]=tail[q];tail[31]=t;}
+                            }
+                            i+=adv;
+                        }
+                        if(i==0 && crossed) {
+                            /* A packet longer than the chunk: skip over its payload. */
+                            const uint32_t h=w[0];
+                            pos+=((h>>28)==7)?1+(size_t)(h&0x7fff):((h>>28)==4)?1+(size_t)(h&0x7f):1;
+                            continue;
+                        }
+                        pos+=i;
+                    }
+                    printf("PICASSO_GPU trace: ib=%llx executed=%lx blit=%u draw=%u wait=%u event=%u marker=%u crb=%u ib=%u cond=%u skip=%u\n",
+                        (unsigned long long)base,(unsigned long)limit,nblit,ndraw,nwait,nevent,nmarker,ncrb,nib,ncond,nskip);
+                    for(unsigned q=0;q<tailn;++q) {
+                        const TraceLine &t=tail[q];
+                        printf("PICASSO_GPU trace %04lx %s n=%x:",(unsigned long)t.at,t.nm,t.cnt);
+                        for(unsigned k=0;k<4&&k<t.cnt;++k)printf(" %x",t.p[k]);
+                        printf("\n");
+                    }
+                }
+            }
+            /* A 2D blit's setup names its source/destination buffers in pkt4 writes (GRAS/RB/TPL1 A2D) that can sit in an earlier
+             * chunk of this same submission. Walk the job's IBs (bounded) and print them: a blit engine that wedged needs its
+             * addresses, formats and pitches on record, and the VM's own view of each base address. */
+            {
+                static const struct {uint32_t lo,hi;} ranges[]={{0x8400,0x840f},{0x8c17,0x8c27},{0xb4c0,0xb4cf}};
+                uint32_t printed=0;
+                for(uint32_t i=0;i+3<job->word_count && printed<24;i+=4) {
+                    const uint64_t iba=(uint64_t)job->words[i+2]<<32|job->words[i+1];
+                    size_t ibd=job->words[i+3]&0xfffff;
+                    if(ibd>1024)ibd=1024;
+                    uint32_t w[1024]={};
+                    if(space->peekWordsUncached(iba,w,ibd))continue;
+                    for(size_t at=0;at<ibd && printed<24;) {
+                        const uint32_t hdr=w[at];
+                        if((hdr>>28)==4) {
+                            const uint32_t reg=(hdr>>8)&0x3ffff,n=hdr&0x7f;
+                            for(const auto &rg:ranges)if(reg>=rg.lo && reg<=rg.hi) {
+                                printf("PICASSO_GPU stall a2d: ib=%llx at=%llx reg=%x n=%u:",
+                                    (unsigned long long)iba,(unsigned long long)at,reg,n);
+                                for(uint32_t k=0;k<n && at+1+k<ibd;++k)printf(" %x",w[at+1+k]);
+                                printf("\n");
+                                ++printed;break;
+                            }
+                            at+=1+n;
+                        } else if((hdr>>28)==7)at+=1+(hdr&0x3fff);
+                        else at+=1;
+                    }
+                }
+            }
+            /* Validate the DRAM reader against a page whose content is known: the fence page's completion timestamp holds the fence the CP
+             * wrote (2 here). A zero there would mean the reader, not the IB page, is wrong. And name the mapping the IB address falls in. */
+            uint32_t cachedWord=0,dramWordV=0;
+            const IOReturn sampled=space->sampleWord(stalled->fenceIova()+4,&cachedWord,&dramWordV);
+            printf("PICASSO_GPU stall fencepage: read=%x cached=%x dram=%x handle=%llx\n", unsigned(sampled),
+                cachedWord, dramWordV, (unsigned long long)space->handleAt(ib1));
+            /* Which process and address space the stalled job belongs to: two connections allocate the same handles and IOVAs. */
+            printf("PICASSO_GPU stall ids: pid=%d fence=%u jvm=%p vm=%p space=%p snext=%llu buf0=%llu\n", job->owner,
+                job->fence, job->vm, vm_, space, (unsigned long long)space->nextHandle(),
+                (unsigned long long)(job->count?job->handles[0]:0));
+            /* The buffer the job itself named, while its mapping still exists: the ring's IB address reads whatever is mapped there
+             * now, which after a free and reuse would be another BO. */
+            uint64_t bufiova=0;size_t bufbytes=0;unsigned bufperm=0;
+            const IOReturn bufstate=job->count?space->describe(job->handles[0],&bufiova,&bufbytes,&bufperm):kIOReturnBadArgument;
+            uint32_t bufhead[8]={};
+            const IOReturn bufread=bufstate?bufstate:space->peekWordsUncached(bufiova,bufhead,8);
+            printf("PICASSO_GPU stall bufinfo: describe=%x iova=%llx bytes=%llu perm=%u read=%x:", unsigned(bufstate),
+                (unsigned long long)bufiova,(unsigned long long)bufbytes,bufperm,unsigned(bufread));
+            if(!bufread)for(uint32_t i=0;i<8;++i)printf(" %x", bufhead[i]);
+            printf("\n");
+            printf("PICASSO_GPU stall ib1c:");
+            for(uint32_t i=0;i<8;++i) {
+                uint32_t c=0,d=0;
+                if(space->sampleWord(ib1+4ull*i,&c,&d)) {printf(" --");continue;}
+                printf(" %x/%x", c, d);
+            }
+            printf("\n");
+            /* Once: the whole address space this job ran in, each mapping's first words. Where a zero IB page's command stream is. */
+            static uint32_t stall_map_dumps;
+            if(stall_map_dumps<2) {
+                ++stall_map_dumps;
+                space->dumpMappings("stall",48);
+                /* Whether the client's stream appeared in its buffer after the first snapshot, through the uncached reader. */
+                if(job->count) {
+                    uint64_t scanned=0,nz=0,first_off=0,needle_off=UINT64_MAX;uint32_t first_word=0;
+                    if(space->scanMapping(job->handles[0],0x70460001,65536,&scanned,&nz,&first_off,&first_word,&needle_off))
+                        printf("PICASSO_GPU scan stall: h=%llu scanned=%llu nz=%llu first=%llx:%x needle at=%llx\n",
+                            (unsigned long long)job->handles[0],(unsigned long long)scanned,(unsigned long long)nz,
+                            (unsigned long long)first_off,first_word,(unsigned long long)needle_off);
+                }
+            }
+        }
+    }
 }
 IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *clock,
     uint32_t timeout_us)

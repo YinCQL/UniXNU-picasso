@@ -32,6 +32,14 @@ extern "C" bool native_legacy_prepare_scanout(void);
 extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
 extern "C" void native_legacy_retirement_observed(IOService *);
+// GPU scanout hand-off (boot-arg sheng-fb-gpu=1): a finished frame is offered
+// to the privileged GPU client instead of being copied. The presenter's offer
+// either takes the frame or refuses it, in which case this file keeps the CPU
+// path unchanged. A failed GPU copy falls back for the rest of the kick.
+extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+extern "C" void native_legacy_swap_stage(unsigned stage);
+extern "C" void native_legacy_gpu_fallback_observed(int status);
+extern "C" {extern volatile uint64_t native_legacy_early_retires,native_legacy_early_failures;}
 extern "C" void native_legacy_retirement_failed(IOService *);
 // Display refresh tick (boot-arg sheng-vsync=<Hz>, 0 or absent: off). The original family sends the compositor's vsync message (type 5)
 // through native_legacy_vsync_notify, the unchanged original sender, but only a platform subclass calls it from the panel's vblank and
@@ -46,11 +54,23 @@ extern "C" uint64_t mach_continuous_time(void);
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
+    // Previous frame for native_legacy_copy_diff (rows packed at width*4, same bytes as one GOP frame). The client always
+    // sends a full-frame dirty rect, so the only reusable dirty information is this shadow; IPC-backed dirty rects are a no-op here.
+    void *copyShadow=nullptr;
+    uint64_t copyShadowBytes=0;
+    bool copyShadowValid=false;
+    void releaseCopyShadow() {if(copyShadow)IOFree(copyShadow,copyShadowBytes);copyShadow=nullptr;copyShadowBytes=0;copyShadowValid=false;}
     uint32_t scanBudget=4;
     uint64_t frameCount=0;
     bool primary=false;
     bool logicalPM=false;
     bool transferred=false;
+    // The frame currently owned by the GPU client (valid until its completion),
+    // and whether that swap already retired when the client took it.
+    const OriginalLegacySwapRequest *gpuRequest=nullptr;
+    uint64_t gpuLength=0;
+    bool gpuBypass=false;
+    bool gpuRetired=false;
     // Preserve every accepted request until the original family retires it.
     // A full table rejects the new request without evicting a live entry.
     const OriginalLegacySwapRequest *validated[8]={};
@@ -71,13 +91,24 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     uint64_t vsyncInterval=0,vsyncNext=0;
     unsigned vsyncHz=0;
     bool vsyncArmed=false;
+    /* wf131 measured the compositor kicking the swap queue three times with the client queue
+     * at +5592 still empty every time, so the tick that stands in for the absent panel
+     * subclass never armed and userspace never received a vsync. The kick itself proves a
+     * display client exists, and the original sender walks the client queue (a no-op when it
+     * is empty), so treat a kick as "wanted" for the rest of the boot: wf132. */
+    bool vsyncKicked=false;
     bool vsyncWanted() const {
         const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+5592,sizeof(head));return head;
     }
+    bool vsyncActive() const { return vsyncWanted() || vsyncKicked; }
     // Selector 72's registration of a vsync client ends in kickSwapQueue (slot 290), which arms the tick; the tick stops by itself once
     // the last client is removed.
     void armVsync() {
-        if(!vsyncTimer || vsyncArmed || !vsyncWanted())return;
+        /* wf131: the tick only arms for a registered vsync client; print the reason the first
+         * few times so "no vsync ever" is distinguishable from "vsync client never registered". */
+        static unsigned armPrints;
+        if(armPrints<8){++armPrints;printf("PICASSO_DISPLAY vsync: arm timer=%p armed=%d wanted=%d kicked=%d\n",vsyncTimer,int(vsyncArmed),int(vsyncWanted()),int(vsyncKicked));}
+        if(!vsyncTimer || vsyncArmed || !vsyncActive())return;
         vsyncArmed=true;vsyncNext=mach_absolute_time()+vsyncInterval;
         vsyncTimer->wakeAtTime(vsyncNext);native_legacy_vsync_observed(0,vsyncHz);
     }
@@ -85,7 +116,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     void vsyncTick() {
         vsyncArmed=false;
         if(!vsyncTimer)return;
-        if(!vsyncWanted()){native_legacy_vsync_observed(2,vsyncHz);return;}
+        if(!vsyncActive()){native_legacy_vsync_observed(2,vsyncHz);return;}
         const uint64_t now=mach_absolute_time();
         native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);
         native_legacy_vsync_observed(1,vsyncHz);
@@ -115,10 +146,26 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         OSSafeReleaseNULL(vsyncTimer);vsyncArmed=false;
     }
 public:
-    void free() override {stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+    // Called by the GPU client's completion (any thread): the swap finishes on
+    // the framebuffer's work loop, where the queue and the vsync clients live.
+    void gpuComplete(int status) {
+        struct Args {NativeLegacyDisplay *display;int status;};
+        Args *args=(Args *)IOMalloc(sizeof(Args));
+        if(!args){finishGpuSwap(status);return;}
+        args->display=this;args->status=status;
+        IOWorkLoop *loop=getWorkLoop();
+        auto action=[](OSObject *,void *a0,void *,void *,void *)->IOReturn {
+            Args *a=(Args *)a0;a->display->finishGpuSwap(a->status);IOFree(a,sizeof(Args));return kIOReturnSuccess;
+        };
+        if(loop && loop->runAction(action,this,args)==kIOReturnSuccess)return;
+        IOFree(args,sizeof(Args));
+        finishGpuSwap(status);
+    }
+    void free() override {stopVsync();releaseCopyShadow();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
         stopVsync();
-        transferred=false;for(auto &entry: validated)entry=nullptr;
+        releaseCopyShadow();
+        transferred=false;gpuRequest=nullptr;gpuRetired=false;for(auto &entry: validated)entry=nullptr;
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
     }
@@ -200,12 +247,19 @@ public:
     // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
     bool kicking=false,rekick=false;
     void kickSwapQueue() override {
+        /* wf131: whether the compositor's queued swap ever reaches the kick, and whether a
+         * vsync client is registered at that moment. wf132: the kick also establishes that a
+         * display client exists, which is what the tick needs to run. */
+        static unsigned kickPrints;
+        if(kickPrints<8){++kickPrints;printf("PICASSO_DISPLAY vsync: kick wanted=%d armed=%d\n",int(vsyncWanted()),int(vsyncArmed));}
+        vsyncKicked=true;
         armVsync();
         if(kicking){rekick=true;return;}
         kicking=true;
         do {
             rekick=false;
             kickOnce();
+            gpuBypass=false;
         } while(rekick && !transferred);
         kicking=false;
     }
@@ -238,6 +292,7 @@ public:
                 native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
             }
             __asm__ volatile("dsb sy" ::: "memory");
+            copyShadowValid=false;   // the GOP is solid black now; the shadow no longer describes the panel
             transferred=true;
             native_legacy_frame_observed(1,0,0,0,0,0);
             native_legacy_transfer_observed(kIOReturnSuccess,request,blankLength);
@@ -259,6 +314,26 @@ public:
            !native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
             native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
+        // The diagnostic renderer repaints the page over the scanout until it
+        // is told the system owns the display; every accepted frame needs that,
+        // GPU-copied or not (int-093). A failed prepare is retried next kick.
+        if(!gpuBypass) {
+            if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+        }
+        if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
+            // The GPU writes the scanout memory behind the CPU's back: the
+            // differential copy's picture of it is stale from now on.
+            native_legacy_swap_stage(1);
+            copyShadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
+            // Retire as soon as the client owns the frame (the presenter retains
+            // it); the next frame waits for the copy because transferred stays
+            // set until finishGpuSwap.
+            unsigned early=1;PE_parse_boot_argn("sheng-early-retire",&early,sizeof early);
+            if(early==1 && retireSwap(request,true)) {
+                gpuRetired=true;native_legacy_early_retires=native_legacy_early_retires+1;
+            }
+            return;
+        }
         IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
         if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
@@ -277,27 +352,88 @@ public:
             if(native_legacy_frame_scan(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,scan))
                 native_legacy_frame_observed(0,scan[0],scan[1],scan[2],scan[3],scan[4]);
         }
-        if(!native_legacy_prepare_scanout()) {
-            OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
+        /* offline-legacy-bench=2: on the first real frame, time reads of the swap's own source memory through the
+         * swap's mapping and through a copyback mapping of the same descriptor, each twice (cold and warm), plus a
+         * cached control buffer and a store to the real destination. Together with the frame copy that follows, this
+         * separates source-read cost, attribute choice and scheduling delays from destination store cost. */
+        unsigned bench=0;PE_parse_boot_argn("offline-legacy-bench",&bench,sizeof bench);
+        if(bench>=2 && frameCount==1) {
+            const uint64_t benchBytes=1u<<20,benchWords=benchBytes/8;
+            const volatile uint64_t *srcWords=(const volatile uint64_t *)source->getVirtualAddress();
+            volatile uint64_t *fb=(volatile uint64_t *)bootMapping->getVirtualAddress();
+            IOMemoryMap *alt=memory->map(kIOMapAnywhere|kIOMapReadOnly|kIOMapCopybackCache);
+            uint64_t *ctrl=(uint64_t *)IOMalloc(benchBytes);
+            uint64_t t0=0,t1=0,sum=0;
+            if(ctrl)for(uint64_t i=0;i<benchWords;++i)ctrl[i]=i*0x9e3779b97f4a7c15ull;
+            for(unsigned pass=0;pass<2;++pass) {
+                sum=0;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+                for(uint64_t i=0;i<benchWords;++i)sum+=srcWords[i];
+                __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+                printf("PICASSO_DISPLAY bench2 src pass=%u ticks=%llu sum=%llx opts=%x\n",pass,t1-t0,sum,(unsigned)source->getMapOptions());
+            }
+            if(alt && alt->getVirtualAddress()) {
+                const volatile uint64_t *altWords=(const volatile uint64_t *)alt->getVirtualAddress();
+                for(unsigned pass=0;pass<2;++pass) {
+                    sum=0;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+                    for(uint64_t i=0;i<benchWords;++i)sum+=altWords[i];
+                    __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+                    printf("PICASSO_DISPLAY bench2 alt pass=%u ticks=%llu sum=%llx opts=%x\n",pass,t1-t0,sum,(unsigned)alt->getMapOptions());
+                }
+            } else printf("PICASSO_DISPLAY bench2 alt unavailable\n");
+            if(ctrl) {
+                __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+                for(uint64_t i=0;i<benchWords;++i)ctrl[i]=i*0xd1b54a32d192ed03ull;
+                __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+                printf("PICASSO_DISPLAY bench2 ctrlstore ticks=%llu\n",t1-t0);
+                sum=0;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+                for(uint64_t i=0;i<benchWords;++i)sum+=ctrl[i];
+                __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+                printf("PICASSO_DISPLAY bench2 ctrlread ticks=%llu sum=%llx\n",t1-t0,sum);
+            }
+            __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+            for(uint64_t i=0;i<benchWords;++i)fb[i]=0xdeadbeef00000000ull|i;
+            __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+            printf("PICASSO_DISPLAY bench2 fbstore ticks=%llu\n",t1-t0);
+            OSSafeReleaseNULL(alt);if(ctrl)IOFree(ctrl,benchBytes);
         }
         uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
-        if(!native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
-            bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
-            source->getLength(),sourceStride,width,height)) {
-            OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
+        // The client's swap always covers the whole frame, so reuse the existing shadow-diff copy: a static frame stores no
+        // device bytes and a small update stores only the changed 64-byte blocks. Fall back to the plain copy on any
+        // unsupported geometry or an allocation failure, and invalidate the shadow whenever the plain path or a blank ran.
+        uint64_t stored=length;
+        int copied=0;
+        if(!copyShadow || copyShadowBytes<length) {
+            releaseCopyShadow();
+            copyShadow=IOMalloc(length);
+            if(copyShadow)copyShadowBytes=length;
+        }
+        if(copyShadow) {
+            const uint64_t diff=native_legacy_copy_diff(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+                bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
+                source->getLength(),sourceStride,width,height,copyShadow,copyShadowValid?1:0);
+            if(diff!=UINT64_MAX){stored=diff;copyShadowValid=true;copied=1;}
+            else copyShadowValid=false;
+        }
+        if(!copied) {
+            stored=length;
+            if(!native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+                bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
+                source->getLength(),sourceStride,width,height)) {
+                OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
+            }
         }
         __asm__ volatile("dsb sy" ::: "memory");
-        {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,length);}
+        {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
         OSSafeReleaseNULL(source);transferred=true;
         native_legacy_transfer_observed(kIOReturnSuccess,request,length);
         finishTransfer(request);
     }
     // Hands the pending head to the unchanged family after the CPU copy.
-    bool retireSwap(const OriginalLegacySwapRequest *request) {
+    bool retireSwap(const OriginalLegacySwapRequest *request,bool force=false) {
         unsigned retire=0,cpuPresent=0;
         PE_parse_boot_argn("offline-legacy-retire",&retire,sizeof(retire));
         PE_parse_boot_argn("offline-legacy-cpu-present",&cpuPresent,sizeof(cpuPresent));
-        if(!(retire==1 || cpuPresent==1))return false;
+        if(!(retire==1 || cpuPresent==1 || force))return false;
         if(!activateOnlyPendingSwap(request))return false;
         removeValidated(request);
         IOMobileFramebufferLegacy::completeCurrentSwap();
@@ -305,14 +441,34 @@ public:
         return true;
     }
     // Separately gated retirement after a real scanout store, shared by copied and blank frames.
-    void finishTransfer(const OriginalLegacySwapRequest *request) {
+    void finishTransfer(const OriginalLegacySwapRequest *request,bool force=false) {
         // Only after the real copy and store barrier: select the actual pending head and let the unchanged family release it and wake
         // waiters. This reports memory scanout completion, not a panel vblank or hardware fence.
-        if(!retireSwap(request)){native_legacy_retirement_failed(this);return;}
+        if(!retireSwap(request,force)){native_legacy_retirement_failed(this);return;}
         // The unchanged family has retired this generation and released its current reference. Permit the next independently validated
         // single pending frame. Keep the latch set while completion can reenter this method, and whenever retirement remains disabled.
         transferred=false;
         kickSwapQueue();
+    }
+    // The GPU client reported its copy (status 0) or lost the frame. Success
+    // retires the swap like a finished CPU copy; anything else reinstates the
+    // CPU copy for the next kick.
+    void finishGpuSwap(int status) {
+        const OriginalLegacySwapRequest *request=gpuRequest;
+        if(!request)return;
+        gpuRequest=nullptr;
+        if(gpuRetired) {
+            gpuRetired=false;
+            if(status==0)native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
+            else {native_legacy_early_failures=native_legacy_early_failures+1;native_legacy_gpu_fallback_observed(status);gpuBypass=true;}
+            transferred=false;kickSwapQueue();return;
+        }
+        if(status==0) {
+            native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
+            finishTransfer(request,true);return;
+        }
+        native_legacy_gpu_fallback_observed(status);
+        transferred=false;gpuBypass=true;kickSwapQueue();
     }
     IOReturn collectCompletionReports(uint32_t,void *,uint32_t *count,uint32_t) override {
         // The original completion helper passes null optional outputs and
@@ -404,7 +560,11 @@ public:
         PE_Video video={};IOService *provider=getProvider();
         if(!provider || PE_current_console(&video) ||
            !picasso_gop_video(video))return false;
-        IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
+        /* The scanout store dominates a frame: 1080x2400x4 = 10.4 MB per copy. An inhibit-cache (strongly ordered)
+         * mapping turns every 8-byte store into its own bus transaction (~130 ms per frame at 19.2 MHz cntpct, measured
+         * as PICASSO_DISPLAY event=10). Write-combining lets the CPU merge sequential stores into 64-byte lines, which
+         * is the standard attribute for a framebuffer the display controller also reads. */
+        IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapWriteCombineCache);
         if(!mapping)return false;
         bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                    mapping->getLength()==video.v_rowBytes*video.v_height;
@@ -415,6 +575,31 @@ public:
             if(valid) {
                 OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=true; // Text/graphics is console policy, not display identity.
                 valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
+                /* offline-legacy-bench=1: measure the three sides of a frame copy once, through this exact mapping.
+                 * The 10.4 MB frame copy costs ~130 ms here (PICASSO_DISPLAY event=10); these one-megabyte timings
+                 * separate destination stores, destination reads and a cached-to-cached memcpy. */
+                unsigned bench=0;PE_parse_boot_argn("offline-legacy-bench",&bench,sizeof bench);
+                if(valid && bench==1) {
+                    volatile uint64_t *fb=(volatile uint64_t *)bootMapping->getVirtualAddress();
+                    uint64_t *a=(uint64_t *)IOMalloc(1u<<20),*b=(uint64_t *)IOMalloc(1u<<20);
+                    if(a && b) {
+                        uint64_t t0=0,t1=0;
+                        for(uint64_t i=0;i<(1u<<17);++i)a[i]=i*0x9e3779b97f4a7c15ull;
+                        __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+                        for(uint64_t i=0;i<(1u<<17);++i)b[i]=a[i];
+                        __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+                        printf("PICASSO_DISPLAY bench memcpy1m ticks=%llu\n",t1-t0);
+                        __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+                        for(uint64_t i=0;i<(1u<<17);++i)fb[i]=0xdeadbeef00000000ull|i;
+                        __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+                        printf("PICASSO_DISPLAY bench fbwrite1m ticks=%llu\n",t1-t0);
+                        __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t0)::"memory");
+                        uint64_t sum=0;for(uint64_t i=0;i<(1u<<17);++i)sum+=fb[i];
+                        __asm__ volatile("dsb sy\n\tisb\n\tmrs %0, cntpct_el0":"=r"(t1)::"memory");
+                        printf("PICASSO_DISPLAY bench fbread1m ticks=%llu sum=%llx\n",t1-t0,sum);
+                    }
+                    if(a)IOFree(a,1u<<20);if(b)IOFree(b,1u<<20);
+                }
             }
         }
         OSSafeReleaseNULL(mapping);return valid;
@@ -431,3 +616,4 @@ public:
 };
 OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)
 IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
+extern "C" void native_legacy_gpu_complete(void *display,int status) {if(display)static_cast<NativeLegacyDisplay *>(display)->gpuComplete(status);}

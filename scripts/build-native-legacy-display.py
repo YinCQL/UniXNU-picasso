@@ -313,6 +313,12 @@ def main():
     shutil.copy2(DRIVER / "NativeLegacyDisplay.cpp", OUT / "NativeLegacyDisplay.cpp")
     shutil.copy2(DRIVER / "NativeLegacyRequest.h", OUT / "NativeLegacyRequest.h")
     shutil.copy2(DRIVER / "PicassoGop.h", OUT / "PicassoGop.h")
+    # GPU scanout hand-off: the presenter is upstream code (NativeGOPPresenter
+    # plus its wire ABI); the glue is the Picasso-side create/attach that the
+    # upstream tree leaves to its integrating board.
+    shutil.copy2(DRIVER / "NativeGOPPresenter.cpp", OUT / "NativeGOPPresenter.cpp")
+    shutil.copy2(DRIVER / "NativeGOPWire.h", OUT / "NativeGOPWire.h")
+    shutil.copy2(DRIVER / "NativeGOPGlue.cpp", OUT / "NativeGOPGlue.cpp")
 
     require(
         audit["legacy_virtual_entries"] == 358
@@ -436,6 +442,24 @@ def main():
         "Late staging changed NativeLegacyDisplay instructions",
     )
 
+    presenter_source = OUT / "NativeGOPPresenter.cpp"
+    presenter_obj = OUT / "NativeGOPPresenter.o"
+    compile_source(presenter_source, presenter_obj, ["-I", str(OUT)])
+    presenter_late = OUT / "NativeGOPPresenter.late.o"
+    subprocess.run(
+        [
+            str(llvm / "llvm-objcopy"),
+            "--remove-section=__DATA,__mod_init_func",
+            "--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp",
+            str(presenter_obj),
+            str(presenter_late),
+        ],
+        check=True,
+    )
+    glue_source = OUT / "NativeGOPGlue.cpp"
+    glue_object = OUT / "NativeGOPGlue.o"
+    compile_source(glue_source, glue_object, ["-I", str(OUT)])
+
     support_source = DRIVER / "PicassoDisplaySupport.cpp"
     support_object = OUT / "picasso-display-support.o"
     compile_source(
@@ -483,6 +507,8 @@ def main():
             str(bindings_object),
             str(keyevents_late),
             str(keystore_object),
+            str(presenter_late),
+            str(glue_object),
             *[str(path) for path in support_objects],
         ],
         check=True,
@@ -497,6 +523,9 @@ def main():
         AUDIT_JSON,
         support_source,
         DRIVER / "PicassoGop.h",
+        DRIVER / "NativeGOPPresenter.cpp",
+        DRIVER / "NativeGOPWire.h",
+        DRIVER / "NativeGOPGlue.cpp",
         keyevents_source,
         keystore_source,
     ]

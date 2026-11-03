@@ -67,9 +67,18 @@ public:
     NativeAdrenoGpuContext()=default;
     NativeAdrenoGpuContext(const NativeAdrenoGpuContext &)=delete;
     NativeAdrenoGpuContext &operator=(const NativeAdrenoGpuContext &)=delete;
-    /* The report is the GMU context's: route counts cover both streams. */
-    IOReturn bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const unsigned slots[2],
-        const uint16_t sids[2],void (*progress)(uint32_t step),NativeAdrenoGmuContextReport *report);
+    /* The report is the GMU context's: route counts cover the streams. */
+    IOReturn bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const unsigned *slots,
+        const uint16_t *sids,size_t stream_count,void (*progress)(uint32_t step),
+        NativeAdrenoGmuContextReport *report);
+    /* The two-stream form every existing caller uses. */
+    IOReturn bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,unsigned slot0,unsigned sid0,
+        unsigned slot1,unsigned sid1,void (*progress)(uint32_t step),NativeAdrenoGmuContextReport *report)
+    {
+        const unsigned slots[2]={slot0,slot1};
+        const uint16_t sids[2]={static_cast<uint16_t>(sid0),static_cast<uint16_t>(sid1)};
+        return bringUp(io,bank,asid,slots,sids,2,progress,report);
+    }
     bool ready() const {return ready_;}
     /* The GPU address size of every table of this bank (ias). */
     unsigned inputBits() const {return input_bits_;}
@@ -106,6 +115,12 @@ private:
 extern "C" IOReturn NativeAdrenoGpuContextBringup(volatile uint8_t *smmu,size_t bytes,unsigned bank,unsigned asid,
     unsigned slot0,unsigned sid0,unsigned slot1,unsigned sid1,void (*progress)(uint32_t),
     NativeAdrenoGmuContextReport *report);
+/* The same context with up to 8 exact streams: the GPU's secure aliases of a
+ * stream (SID bit 10) share its context bank, as the iommus mask in the device
+ * tree does, and must be attached in the same call as the non-secure SIDs. */
+extern "C" IOReturn NativeAdrenoGpuContextBringupStreams(volatile uint8_t *smmu,size_t bytes,unsigned bank,
+    unsigned asid,const unsigned *slots,const uint16_t *sids,size_t stream_count,
+    void (*progress)(uint32_t),NativeAdrenoGmuContextReport *report);
 /* sqe, ring, memptrs, pwrup, scratch: physical base, size and GPU address, only after Ready. */
 extern "C" IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[GpuBufferCount]);
 /* The GPU address size (ias) of the ready GPU context, 0 before Ready. */

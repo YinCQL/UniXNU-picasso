@@ -748,9 +748,22 @@ IOReturn NativeAdrenoUserClient::setMetadata(const NativeAdrenoAbiMetadata *requ
 {
     if(!request)return kIOReturnBadArgument;
     if(!open_)return kIOReturnNotReady;
+    /* wf130: a Metal client's SetMetadata answers BadArgument (e00002c2). Print
+     * the refused record's shape so the reason (reserved bits, length, or a
+     * handle this connection does not own) is visible instead of inferred. */
+    static unsigned rejects;
+    if((request->reserved || request->bytes>NativeAdrenoAbiMetadataBytes) && rejects<4) {
+        ++rejects;
+        printf("PICASSO_GPU metadata: refused reserved=%x bytes=%u\n",
+            unsigned(request->reserved), unsigned(request->bytes));
+    }
     if(request->reserved || request->bytes>NativeAdrenoAbiMetadataBytes)return kIOReturnBadArgument;
     Entry *entry=find(request->handle);
-    if(!entry || entry->unreleasable)return kIOReturnBadArgument;
+    if(!entry || entry->unreleasable){
+        if(rejects<4) { ++rejects; printf("PICASSO_GPU metadata: unknown handle=%llu\n",
+            (unsigned long long)request->handle); }
+        return kIOReturnBadArgument;
+    }
     if(request->bytes)memcpy(entry->metadata,request->text,request->bytes);
     entry->metadata_bytes=request->bytes;
     return kIOReturnSuccess;

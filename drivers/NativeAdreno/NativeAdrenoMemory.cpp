@@ -157,21 +157,22 @@ IOReturn NativeAdrenoMemory::prepareSystem(size_t bytes,bool write_combined,Nati
     if(!descriptor)return kIOReturnNoMemory;
     if(!made)made=wired=mach_absolute_time();   /* a contiguous run: made and wired in one step */
     if(descriptor->getLength()!=bytes) {descriptor->complete();descriptor->release();return kIOReturnUnsupported;}
-    bool cleaned=false;
-    /* Default-attribute pages may still hold the zero fill in a CPU's cache: written back here, by physical runs, as allocateSystem would. */
-    if(!write_combined) {
-        cleaned=true;
-        for(size_t offset=0;offset<bytes && cleaned;) {
-            IOByteCount length=0;
-            const addr64_t physical=descriptor->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
-            if(!physical || (physical&4095) || length<4096) {cleaned=false;break;}
-            if(length>bytes-offset)length=bytes-offset;
-            length&=~IOByteCount(4095);
-            if(NativeAdrenoMaintainPhysicalPages(physical,length,NativeAdrenoClean)!=kIOReturnSuccess)cleaned=false;
-            offset+=length;
-        }
-        if(cleaned)NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
+    bool cleaned=true;
+    /* The zero fill can still be resident in a CPU's cache as dirty lines, whatever the BO's mapping attribute. Write it back
+     * before the BO is exposed: a write-combined client view stores around the CPU cache, so a zero line written back after the
+     * client's command words would overwrite them (wf73: the first 704 bytes of backboardd's submitted IB were zeroed between the
+     * wire snapshot and the 50 ms stall snapshot, and the CP fetched a zero first packet). The earlier form skipped this for
+     * write-combined BOs, assuming no cacheable line could exist; the allocation's own zero fill is made before any attribute. */
+    for(size_t offset=0;offset<bytes && cleaned;) {
+        IOByteCount length=0;
+        const addr64_t physical=descriptor->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
+        if(!physical || (physical&4095) || length<4096) {cleaned=false;break;}
+        if(length>bytes-offset)length=bytes-offset;
+        length&=~IOByteCount(4095);
+        if(NativeAdrenoMaintainPhysicalPages(physical,length,NativeAdrenoClean)!=kIOReturnSuccess)cleaned=false;
+        offset+=length;
     }
+    if(cleaned)NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
     out->descriptor=descriptor;out->bytes=bytes;out->write_combined=write_combined;out->cleaned=cleaned;out->made=made;out->wired=wired;
     return kIOReturnSuccess;
 }
@@ -197,8 +198,8 @@ IOReturn NativeAdrenoMemory::allocateSystem(size_t bytes,unsigned bits,size_t bu
     if(status==kIOReturnSuccess) {
         system_=true;prepared_=true;bytes_=bytes;write_combined_=write_combined;noteSystem((int64_t)bytes);
         status=descriptor_->getLength()==bytes?takeSegments(descriptor_,bytes,UINT64_C(1)<<bits,false):kIOReturnUnsupported;
-        /* Default-attribute pages may still hold the zero fill in this CPU's cache: written back before the GPU reads them. */
-        if(status==kIOReturnSuccess && !write_combined && !cleaned) {
+        /* The zero fill's dirty lines are written back before the GPU (or a client view) reads the BO, write-combined or not. */
+        if(status==kIOReturnSuccess && !cleaned) {
             status=maintainImported(0,bytes,NativeAdrenoClean);
             NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
         }

@@ -1,0 +1,87 @@
+diff --git a/DarwinBootPkg/Driver/DarwinBoot.c b/DarwinBootPkg/Driver/DarwinBoot.c
+index 25ce2d2..23a14c6 100644
+--- a/DarwinBootPkg/Driver/DarwinBoot.c
++++ b/DarwinBootPkg/Driver/DarwinBoot.c
+@@ -398,7 +398,7 @@ DiagDraw (CONST CHAR16 *Text, UINTN Row)
+ 
+ STATIC
+ EFI_STATUS
+-AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address)
++AllocateWindow (KERNEL *Kernel, UINT64 *WindowSize, EFI_PHYSICAL_ADDRESS *Address)
+ {
+   EFI_MEMORY_DESCRIPTOR *Map;
+   EFI_MEMORY_DESCRIPTOR *Descriptor;
+@@ -413,6 +413,8 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
+   UINT64                BestStart;
+   UINT64                BestBytes;
+   UINT64                RunBytes;
++  UINT64                Requested;
++  UINT64                Usable;
+ 
+   *Address = 0;
+   Map = NULL;
+@@ -421,7 +423,14 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
+   BestBytes = 0;
+   Status = GetMap (&Map, &Capacity, &Size, &Key, &Stride);
+   if (EFI_ERROR (Status)) { if (Map != NULL) { FreePool (Map); } return Status; }
+-  Status = EFI_OUT_OF_RESOURCES;
++
++  //
++  // XNU manages one contiguous physical range that starts at this window, so a
++  // request larger than the largest conventional run can never be satisfied.
++  // Size the request down to that run (the ADT value stays an upper bound and a
++  // preference) instead of refusing to boot: a firmware memory map that grows or
++  // shrinks must never turn into a device with no loader.
++  //
+   for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
+     Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
+     if ((Descriptor->Type != EfiConventionalMemory) || (Descriptor->NumberOfPages == 0)) { continue; }
+@@ -429,15 +438,36 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
+                   Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages));
+     RunBytes = End - Descriptor->PhysicalStart;
+     if (RunBytes > BestBytes) { BestBytes = RunBytes; BestStart = Descriptor->PhysicalStart; }
++  }
++  if ((BestBytes <= (Kernel->Base & (BLOCK_SIZE - 1))) ||
++      (BestBytes - (Kernel->Base & (BLOCK_SIZE - 1)) < (Kernel->End - Kernel->Base))) {
++    FreePool (Map);
++    return EFI_OUT_OF_RESOURCES;
++  }
++  Usable  = BestBytes - (Kernel->Base & (BLOCK_SIZE - 1));
++  Usable &= ~((UINT64)BLOCK_SIZE - 1);
++  Requested = *WindowSize;
++  if (*WindowSize > Usable) {
++    *WindowSize = Usable;
++    Print (L"DARWINBOOT: window %lx clamped to %lx (largest free run %lx at %lx)\n",
++           Requested, *WindowSize, BestBytes, BestStart);
++  }
++
++  Status = EFI_OUT_OF_RESOURCES;
++  for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
++    Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
++    if ((Descriptor->Type != EfiConventionalMemory) || (Descriptor->NumberOfPages == 0)) { continue; }
++    End = RunEnd (Map, Size, Stride, Descriptor->PhysicalStart,
++                  Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages));
+     Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, BLOCK_SIZE) + (Kernel->Base & (BLOCK_SIZE - 1));
+-    if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate) || (End - Candidate < WindowSize)) { continue; }
+-    Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
++    if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate) || (End - Candidate < *WindowSize)) { continue; }
++    Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (*WindowSize), &Candidate);
+     if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
+   }
+   if (EFI_ERROR (Status)) {
+     CHAR16 Line[96];
+     UINTN  Row = 1;
+-    UnicodeSPrint (Line, sizeof (Line), L"NO WINDOW %lx BIG RUN %lx @ %lx", WindowSize, BestBytes, BestStart);
++    UnicodeSPrint (Line, sizeof (Line), L"NO WINDOW %lx BIG RUN %lx @ %lx", *WindowSize, BestBytes, BestStart);
+     DiagDraw (Line, 0);
+     for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
+       Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
+@@ -599,7 +629,7 @@ Boot (
+   }
+   Status = ReadBootVideo (Video);
+   if (EFI_ERROR (Status)) { goto Fail; }
+-  Status = AllocateWindow (&Kernel, WindowSize, &Address);
++  Status = AllocateWindow (&Kernel, &WindowSize, &Address);
+   if (EFI_ERROR (Status)) { goto Fail; }
+   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
+   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;

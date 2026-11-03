@@ -4,12 +4,15 @@
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOUserClient.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSKext.h>
 #include <libkern/OSKextLibPrivate.h>
 #include <kern/clock.h>
+#include <kern/task.h>
+#include <kern/thread.h>
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
 #include "PicassoGop.h"
@@ -17,6 +20,11 @@
 extern "C" {
 extern kmod_info_t g_kernel_kmod_info;
 void native_legacy_display_static_init(void) __asm__("__GLOBAL__sub_I_NativeLegacyDisplay.cpp");
+// The presenter is compiled from NativeGOPPresenter.cpp with the same
+// mod_init stripping as the display; its class-registration initializer runs
+// inside the display probe's preModLoad/postModLoad bracket.
+void native_gop_presenter_static_init(void) __asm__("__GLOBAL__sub_I_NativeGOPPresenter.cpp");
+bool native_gop_glue_start(IOService *nub);
 IOService *native_legacy_display_allocate(void);
 void picasso_keystore_probe(void) __attribute__((weak));
 bool picasso_aks_ready(void) __attribute__((weak));
@@ -186,6 +194,9 @@ extern "C" kern_return_t native_publish_display_and_report(int level) {
         nub->setName("NativeGOPFramebuffer");
         nubAttached = nub->attach(parent);
         if (nubAttached) nubStarted = nub->start(parent);
+        // The hand-off presenter maps the same GOP device memory (index 0).
+        // It stays out of GPU mode unless sheng-fb-gpu=1.
+        if (nubStarted) native_gop_glue_start(nub);
         if (nubStarted && nub->setProperty("device_type", typeData)) {
             nub->setName("gop-display", gIODTPlane);
             dtAttached = nub->attachToParent(treeParent, gIODTPlane);
@@ -336,7 +347,7 @@ extern "C" void native_legacy_swap_validation_observed(bool ok, unsigned reason,
     if (reason < 8) __atomic_add_fetch(&displayStats.rejectReasons[reason], 1, __ATOMIC_RELAXED);
     __atomic_store_n(&displayStats.lastSubmitTick, mach_absolute_time(), __ATOMIC_RELAXED);
     report(6, ok, reason, 0, !ok);
-    if ((total % 600) == 0) reportDisplayState("submissions");
+    if ((total % 64) == 0) reportDisplayState("submissions");
 }
 extern "C" void native_legacy_surface_rejected(uint64_t width, uint64_t height, uint32_t format,
     uint32_t planes, uint64_t stride, uint64_t allocation, uint64_t length) {
@@ -361,12 +372,31 @@ extern "C" void native_legacy_retirement_observed(IOService *) {
     __atomic_store_n(&displayStats.lastRetireTick, mach_absolute_time(), __ATOMIC_RELAXED);
     report(9, 1, 0, 0);
 }
+// GPU hand-off observations. BootProgress.c reads these weak imports; a
+// refused offer keeps the CPU copy, and a failed copy is counted here.
+extern "C" volatile uint32_t native_legacy_gpu_fallbacks, native_legacy_gpu_last_status;
+extern "C" volatile uint64_t native_legacy_early_retires, native_legacy_early_failures;
+extern "C" void native_legacy_swap_stage(unsigned stage) {
+    (void)stage;
+}
+extern "C" void native_legacy_gpu_fallback_observed(int status) {
+    native_legacy_gpu_fallbacks = native_legacy_gpu_fallbacks + 1;
+    native_legacy_gpu_last_status = (uint32_t)status;
+}
+
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t bytes) {
     __atomic_add_fetch(&displayStats.copies, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&displayStats.copyBytes, bytes, __ATOMIC_RELAXED);
     __atomic_store_n(&displayStats.lastCopyTicks, ticks, __ATOMIC_RELAXED);
     __atomic_store_n(&displayStats.lastCopyBytes, bytes, __ATOMIC_RELAXED);
-    report(10, ticks, bytes, 0);
+    // Keep more than the generic four samples: the copy cost alternates between two source surfaces, so a handful of
+    // consecutive frames is what separates a real per-surface cost from a scheduling delay.
+    static unsigned copySamples;
+    if (copySamples < 32) {
+        unsigned sample = __atomic_add_fetch(&copySamples, 1, __ATOMIC_RELAXED);
+        printf("PICASSO_DISPLAY event=10 sample=%u a=%llx b=%llx c=%llu failure=0\n",
+            sample, ticks, bytes, __atomic_load_n(&displayStats.copies, __ATOMIC_RELAXED));
+    }
 }
 extern "C" void native_legacy_vsync_observed(unsigned event, unsigned hz) {
     if (event == 1) {
@@ -450,6 +480,49 @@ extern "C" bool native_legacy_surface_ready(void) {
     return found;
 }
 
+/* wf129: a coarse read-back of the scanout surface, so "the UI is up" can be
+ * judged from the serial log alone. A 12x24 luminance grid, one hex digit per
+ * cell, is sampled every sheng-display-grid seconds; read-only, and inactive
+ * unless that boot argument is present. */
+static uint64_t gridPhysical, gridBytes, gridPeriodMs;
+static uint32_t gridWidth, gridHeight, gridStride;
+
+static void gridSampleThread(void *, wait_result_t)
+{
+    IOMemoryDescriptor *descriptor = IOMemoryDescriptor::withPhysicalAddress(
+        gridPhysical, gridBytes, kIODirectionIn);
+    if (!descriptor) { printf("PICASSO_GRID: descriptor failed\n"); return; }
+    IOMemoryMap *map = descriptor->createMappingInTask(kernel_task, 0,
+        kIOMapAnywhere | kIOMapInhibitCache);
+    descriptor->release();
+    if (!map) { printf("PICASSO_GRID: mapping failed\n"); return; }
+    volatile const uint8_t *fb = reinterpret_cast<volatile const uint8_t *>(
+        static_cast<uintptr_t>(map->getAddress()));
+    for (unsigned sample = 1;; ++sample) {
+        IOSleep(static_cast<unsigned>(gridPeriodMs));
+        printf("PICASSO_GRID frame=%u\n", sample);
+        /* wf131: the state line carries submissions/accepted/transfers/copies/vsync_ticks, so
+         * the grid run also shows whether the display service is being fed frames at all. */
+        reportDisplayState("grid");
+        for (uint32_t row = 0; row < 24; ++row) {
+            char text[13];
+            for (uint32_t col = 0; col < 12; ++col) {
+                const uint32_t x = (col * gridWidth + gridWidth / 2) / 12;
+                const uint32_t y = (row * gridHeight + gridHeight / 2) / 24;
+                const volatile uint32_t *pixel =
+                    reinterpret_cast<volatile const uint32_t *>(
+                        fb + uint64_t(y) * gridStride + uint64_t(x) * 4);
+                const uint32_t value = *pixel;
+                const uint32_t luma = ((value & 0xff) * 11 +
+                    ((value >> 8) & 0xff) * 59 + ((value >> 16) & 0xff) * 30) / 100;
+                text[col] = "0123456789abcdef"[luma >> 4];
+            }
+            text[12] = 0;
+            printf("PICASSO_GRID %02u %s\n", row, text);
+        }
+    }
+}
+
 extern "C" bool native_legacy_gop_mapping_observed(IOService *, IOMemoryMap *map, uint32_t width, uint32_t height) {
     PE_Video video = {};
     if (PE_current_console(&video) || map->getPhysicalAddress() != video.v_baseAddr ||
@@ -463,6 +536,21 @@ extern "C" bool native_legacy_gop_mapping_observed(IOService *, IOMemoryMap *map
     printf("PICASSO_DISPLAY mapped ok=%u base=%llx bytes=%llx width=%u height=%u stride=%lu depth=%lu console=%lu scale=2\n",
         ok, map->getPhysicalAddress(), map->getLength(), width, height,
         video.v_rowBytes, video.v_depth, video.v_display);
+    gridPhysical = map->getPhysicalAddress();
+    gridBytes = map->getLength();
+    gridWidth = width;
+    gridHeight = height;
+    gridStride = video.v_rowBytes;
+    uint32_t gridSeconds = 0;
+    if (PE_parse_boot_argn("sheng-display-grid", &gridSeconds,
+            static_cast<int>(sizeof gridSeconds)) && gridSeconds) {
+        gridPeriodMs = gridSeconds > 3600u ? 3600000u : uint64_t(gridSeconds) * 1000u;
+        thread_t thread = nullptr;
+        if (kernel_thread_start(gridSampleThread, nullptr, &thread) == KERN_SUCCESS)
+            thread_deallocate(thread);
+        else
+            printf("PICASSO_GRID: thread failed\n");
+    }
     return ok;
 }
 
@@ -474,6 +562,7 @@ extern "C" void native_legacy_display_probe(void) {
     void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if (!handle) { report(0, 1, kIOReturnNoMemory, 0); return; }
     native_legacy_display_static_init();
+    native_gop_presenter_static_init();
     OSReturn status = OSMetaClass::postModLoad(handle);
     report(0, 1, status, 0);
     if (status) return;
@@ -516,6 +605,9 @@ extern "C" void native_legacy_display_late_probe(void) {
         nub->setDeviceMemory(ranges); nub->setName("NativeGOPFramebuffer");
         nubAttached = nub->attach(parent);
         if (nubAttached) nubStarted = nub->start(parent);
+        // The hand-off presenter maps the same GOP device memory (index 0).
+        // It stays out of GPU mode unless sheng-fb-gpu=1.
+        if (nubStarted) native_gop_glue_start(nub);
         if (nubStarted && nub->setProperty("device_type", typeData)) {
             nub->setName("gop-display", gIODTPlane);
             dtAttached = nub->attachToParent(treeParent, gIODTPlane);

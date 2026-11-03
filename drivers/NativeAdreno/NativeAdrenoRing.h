@@ -56,6 +56,10 @@ class NativeAdrenoRing final {
     uint64_t ring_iova_=0,fence_iova_=0;
     uint32_t next_=0,rptr_shadow_=0,seqno_=0,completed_=0,submissions_=0;
     bool attached_=false,poisoned_=false,reset_pending_=false;
+    bool a6xx_=false;
+    /* HW_APRIV rings have the CP write the read pointer into the fence page
+     * (memptrs.rptr); the register is not the authority there. */
+    bool shadow_rptr_=false;
     uint32_t context_=0;
     /* The GPU page table the CP runs (TTBR0 with its ASID in bits 63:48) and whether the next framed prologue must switch to it. */
     uint64_t table_=0;
@@ -97,6 +101,35 @@ public:
     IOReturn attach(const NativeAdrenoRingIo *,const NativeAdrenoRingCache *,
         void *ring,size_t ring_bytes,uint64_t ring_iova,
         void *fence,size_t fence_bytes,uint64_t fence_iova);
+    /* Take over a ring the board already programmed and left idle: same
+     * arguments as attach plus the CP's current write pointer and fence
+     * value. No register is written and the fence page is not cleared (the
+     * live completion value must stay). The caller guarantees the CP is
+     * quiescent at wptr and that the CPU view is non-cacheable. */
+    IOReturn adopt(const NativeAdrenoRingIo *,const NativeAdrenoRingCache *,
+        void *ring,size_t ring_bytes,uint64_t ring_iova,
+        void *fence,size_t fence_bytes,uint64_t fence_iova,
+        uint32_t wptr,uint32_t seqno);
+    /* A6xx (a620) submission profile: the fence is CP_EVENT_WRITE with the
+     * CACHE_FLUSH_TS event (0x04), not A7XX's CACHE_CLEAN event write. Framed
+     * (thread-control) submissions are refused; only the plain path is valid
+     * on a6xx. Set before the first submit. */
+    void setA6xxFence(bool on) {a6xx_=on;}
+    /* A submission the board issued on this ring outside the class (stage 4's
+     * own probe pair, after the ring was adopted): its write pointer and fence
+     * become the class's own, so the next submission appends after the words
+     * the CP already read. Without the write pointer, next_ stays where adopt
+     * found it (the probe pair's two submissions moved the CP past it), and
+     * used = (next_ - rptr) & mask wraps to almost the whole ring: every
+     * submit is then refused as NoResources ("ring full"). The completion
+     * value stays what the class last observed; the next wait reads it. */
+    void noteExternalSubmit(uint32_t wptr,uint32_t value)
+    {
+        if(!attached_ || poisoned_ || !ring_bytes_) return;
+        const uint32_t words=(uint32_t)(ring_bytes_/sizeof(uint32_t));
+        if(wptr<words) next_=wptr;
+        if((int32_t)(value-seqno_)>0) seqno_=value;
+    }
     /* Programs nothing. Refuses while submissions are unobserved or poisoned,
      * because only the caller can establish real GPU quiescence and unmap. */
     IOReturn detach();

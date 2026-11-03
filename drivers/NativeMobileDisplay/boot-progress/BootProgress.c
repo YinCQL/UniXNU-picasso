@@ -15,6 +15,7 @@ extern kern_return_t host_statistics64(host_t host, host_flavor_t flavor, host_i
 #include <string.h>
 extern void proc_selfname(char *, int);
 extern int proc_selfpid(void);
+extern int printf(const char *, ...);
 #include <machine/machine_routines.h>
 #include <kern/misc_protos.h>
 #include <kern/boot_progress.h>
@@ -147,6 +148,10 @@ extern void boot_log_tick(unsigned) __attribute__((weak_import));
 // SM7250 cpufreq-hw probe (sheng-cpufreq=<1..4>); maps the domains once and starts the mode 4 governor.
 extern void sheng_cpufreq_probe(void) __attribute__((weak_import));
 extern void sheng_cpufreq_poll(void) __attribute__((weak_import));
+// A620 GPU platform/firmware/stage probe (sheng-gpu=<1..5>); returns immediately and never publishes a Metal device.
+// The firmware setter is a strong definition from the build-time embedded arrays, or a weak no-op when no blob was staged.
+extern void native_adreno620_set_embedded_firmware(void) __attribute__((weak_import));
+extern void native_adreno_probe(void) __attribute__((weak_import));
 extern char boot_process_rows[10][120] __attribute__((weak_import));
 extern unsigned boot_ui_trace_role_rows(unsigned,char [][120],unsigned,unsigned) __attribute__((weak_import));
 extern char native_touch_rows[4][120] __attribute__((weak_import));
@@ -717,10 +722,29 @@ static uint32_t bp_cpu_cnt[8][64];
 enum {BpKernSamples = 32768};
 static uint32_t bp_kern[BpKernSamples][4];
 static uint32_t bp_kern_head;
+// Interrupt context must not use getCpuDatap(): it is current_thread()->machine.CpuDatap, a field that a
+// context switch/thread creation updates asynchronously and that a mismatched header layout can read at the
+// wrong offset (the shipped wf8 object read machine.preemption_count, value 1, as the pointer: panic far=1).
+// TPIDR_EL0 carries this CPU's encoded cpu/cluster id and cswitch.s set_thread_registers reloads it from the
+// running CPU's cpu_data on every switch, so the local CPU comes from there; the per-CPU data itself is a
+// static array reachable through cpu_datap(), never through the interrupted thread.
+#define BpTpidrCpuMask 0x0000000000000fffull
+static unsigned bp_cpu_number(void) {
+  uint64_t tpidr=0;
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tpidr));
+  return (unsigned)(tpidr&BpTpidrCpuMask);
+}
+static cpu_data_t *bp_cpu_datap(void) {
+  const int max=ml_get_max_cpu_number();
+  const unsigned cpu=bp_cpu_number();
+  if(max<0 || cpu>(unsigned)max)return NULL;
+  return cpu_datap((int)cpu);
+}
 static void bp_kernel_chain(uint64_t pc) {
   uint32_t *e=bp_kern[__atomic_fetch_add(&bp_kern_head,1,__ATOMIC_RELAXED)%BpKernSamples];
   e[0]=(uint32_t)pc;e[1]=e[2]=e[3]=0;
-  const arm_saved_state_t *s=getCpuDatap()->cpu_int_state;thread_t thread=current_thread();
+  cpu_data_t *cdp=bp_cpu_datap();
+  const arm_saved_state_t *s=cdp?cdp->cpu_int_state:NULL;thread_t thread=current_thread();
   if(!s || !thread || !thread->kernel_stack)return;
   const uint64_t low=(uint64_t)thread->kernel_stack,high=low+(uint64_t)kernel_stack_size;
   uint64_t fp=(uint64_t)get_saved_state_fp(s);
@@ -740,7 +764,7 @@ void boot_progress_irq(uint64_t pc,uint64_t psr,uint64_t sp) {
         const uint64_t kernel=(psr&0x1f)!=0;
         const uint32_t at=__atomic_fetch_add(&bp_prof_head,1,__ATOMIC_RELAXED);
         bp_prof[at%BpProfSamples]=((uint64_t)(pid&0xffff)<<48)|(kernel<<47)|(pc&((1ull<<47)-1));
-        bp_cpu_cnt[getCpuDatap()->cpu_number&7][pid%61]++;
+        bp_cpu_cnt[bp_cpu_number()&7][pid%61]++;
         if(kernel)bp_kernel_chain(pc);
       }
     }
@@ -1184,10 +1208,30 @@ static void monitor(void *arg, wait_result_t result) {
   // Board CPU frequency control (sheng-cpufreq=<1..4>). Inert without the boot argument; the poll below refreshes the
   // report row each round and votes domains that only read enabled once their cores come online.
   if(sheng_cpufreq_probe)sheng_cpufreq_probe();
+  // A620 GPU probe: platform inputs and firmware-container checks only; stages 4-5 stay behind hooks that do not exist
+  // yet, so this cannot start the GPU or change what userland sees.
+  if(native_adreno620_set_embedded_firmware)native_adreno620_set_embedded_firmware();
+  if(native_adreno_probe)native_adreno_probe();
   for (;;) {
     __atomic_fetch_add(&thread_count,1,__ATOMIC_RELAXED);
     boot_progress_poll();
     unsigned now=seconds();
+    // sheng_cpufreq_probe() dumps the topology before the secondary CPUs are online (en=1 pn=0). Report the
+    // scheduler's active E/P counts once the whole machine is up, so an AMP build's split is visible in the log.
+    {
+      static unsigned topo_reported;
+      const ml_topology_info_t *topo=ml_get_topology_info();
+      if(!topo_reported && topo) {
+        const unsigned en=ml_get_cpu_number_type(CLUSTER_TYPE_E,true,true);
+        const unsigned pn=ml_get_cpu_number_type(CLUSTER_TYPE_P,true,true);
+        if(en+pn>=topo->num_cpus) {
+          topo_reported=1;
+          printf("PICASSO_CPUFREQ topo online cpus=%u clusters=%u types=%x en=%u pn=%u cl-e=%u cl-p=%u\n",
+                 topo->num_cpus,topo->num_clusters,topo->cluster_types,en,pn,
+                 ml_get_cluster_number_type(CLUSTER_TYPE_E),ml_get_cluster_number_type(CLUSTER_TYPE_P));
+        }
+      }
+    }
     if(nprocs>0 && !named){thread_set_thread_name(current_thread(),"boot_progress");named=1;}
     // Report the warm-reset marker the touch probe left in IMEM on the previous boot. Self-gated to once, and
     // to a time before userland starts flooding the CDC console.
