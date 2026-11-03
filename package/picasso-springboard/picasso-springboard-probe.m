@@ -94,7 +94,7 @@ static BOOL picasso_install_statusbar(void)
 }
 
 __attribute__((constructor))
-static void picasso_sb_probe(void)
+static void picasso_springboard_probe(void)
 {
     BOOL installed = picasso_install_statusbar();
     // Either logging path can be denied by a process sandbox. A kernel exec

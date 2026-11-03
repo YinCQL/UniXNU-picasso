@@ -5090,10 +5090,16 @@ diff --git a/patches/xnu/zzzzzz-picasso-zva-fallback.patch b/patches/xnu/zzzzzz-
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzzz-picasso-zva-fallback.patch
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,86 @@
 +--- a/osfmk/arm64/sleh.c
 ++++ b/osfmk/arm64/sleh.c
-+@@ -1499,3 +1499,65 @@
++@@ -67,2 +67,5 @@
++ #include <sys/code_signing.h>
+++#if defined(BCM2837) && (DEVELOPMENT || DEBUG)
+++#include <sys/proc.h>
+++#endif
++ #include <kperf/kperf.h>
++@@ -1499,3 +1502,65 @@
 ++/* PICASSO_ZVA_BEGIN: 20H392 zero-fill fallback for the non-Apple port. */
 ++#if defined(BCM2837) && (DEVELOPMENT || DEBUG)
 ++static void
@@ -5159,7 +5165,7 @@ new file mode 100644
 + static int
 + handle_alignment_fault_from_user(arm_saved_state_t *state, kern_return_t *vmfr)
 + {
-+@@ -1609,6 +1671,11 @@
++@@ -1609,6 +1674,11 @@
 + 		kern_return_t vmfkr = KERN_SUCCESS;
 + 		thread->machine.recover_esr = 0;
 + 		thread->machine.recover_far = 0;

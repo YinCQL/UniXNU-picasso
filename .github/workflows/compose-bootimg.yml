@@ -91,7 +91,7 @@ jobs:
         run: |
           mkdir -p out/picasso
           python3 scripts/build-picasso-sb-inject.py \
-            package/picasso-springboard/picasso-sb-probe.m out/picasso/libpicasso-sb.dylib
+            package/picasso-springboard/picasso-springboard-probe.m out/picasso/libpicasso-sb.dylib
 
       - name: Prepare authenticated stock touch firmware
         run: |
