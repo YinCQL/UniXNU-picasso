@@ -991,3 +991,35 @@ Client side (read-only reference copies):
   `7a4a10b3f025fb8bb32bc7c7d4d1ed8ccc990c540bbb65654f18351026faf21f`, trust
   `25cfd9ab6dacdf3b848c2f60a3623f0f81bcd02a295349979eb250ca3a9f4b3a`; log
   `out/wf98-runs/run1.log` (900 s capture window).
+- **wf98 result: client type-4 register writes take effect; the whole stack below the 3D pipe is
+  proven.** `C s600df00d cc0debeef afedcba98 b0`: the marker/condition still works, the type-4
+  write of `0xfedcba98` into `CP_SCRATCH(0)` (0x883) landed, `CP_REG_TO_MEM` read it back, and the
+  read of `RBBM_GPR0_CNTL` returned 0 (a read, allowed by RDONLY). The full smoke completed in the
+  900 s window: `T s0 r0 v512 c0 g0/4096`, `S fdeadbeef … kdeadbeef deadbeef deadbeef r5a5a…`,
+  `Q 71b6394b/71b63989 1/0 r0`, and `M s6501 … ShaderCache(ShaderCacheEr…`. So every layer except
+  the 3D/A2D pipeline is now measured working: the client IB executes, register writes reach the
+  hardware, Turnip's render-mode conditional sections run, fences retire, and the timestamps
+  bracket the fill. This also closes the wf96 "missing T" question: the smoke simply starts late
+  in the boot and needs a capture window longer than 600 s.
+- **wf99: mainline's `a6xx_gmu_gfx_rail_on()` — the one official boot step the port never
+  implemented.** `a6xx_gmu_fw_start()` (legacy path, which this tree takes for every a6xx,
+  a650-family included: `gmu->legacy` is set unconditionally in `a6xx_gmu_probe`) runs, between
+  the CM3 handshake and `hfi_start`:
+  1. `a6xx_gmu_gfx_rail_on()`: `GMU_BOOT_SLUMBER_OPTION = 0`, `GMU_GX_VOTE_IDX = vote & 0xff`,
+     `GMU_MX_VOTE_IDX = (vote >> 8) & 0xff` with the *highest* available ARC vote, then the
+     `GMU_OOB_BOOT_SLUMBER` handshake (`HOST2GMU_INTR_SET` bit 22, ack `GMU2HOST_INTR_INFO`
+     bit 30, ack cleared with `GMU2HOST_INTR_CLR` bit 30);
+  2. `a6xx_sptprac_enable()` — the wf95 code, which could never take while GX was still off;
+  3. `hfi_start`.
+  The port ran (2) at the right *time* but without (1), and wf98's capture shows the GX status at
+  that point is `0x000000c0` (`GX_HM_GDSC_POWER_OFF | GX_HM_CLK_OFF`): the SPTPRAC write was issued
+  to a rail that was not on. `startCm3()` now performs (1) immediately before the SPTPRAC write,
+  using the same speed-bin table and `arcVote()` the HFI startup already uses (highest level;
+  measured speed bin `0x84` → 625 MHz for this part), and prints the vote indices, poll count,
+  interrupt info, and GX status before/after. `native_adreno620_gmu_release_gpu_set()` now also
+  performs mainline's second half, `a6xx_gmu_clear_oob(GMU_OOB_BOOT_SLUMBER)` (bit 30 into
+  `HOST2GMU_INTR_SET`), right after the existing GPU_SET clear. Kernel
+  `e3baefc99e524ccd7ff43956da90a6989fe7010316405e9f342e22bb560f322e` (rebuilt with
+  `ADRENO620_FW_DIR=$PWD/build/picasso-gpu-fw`, pinned 31964-byte SQE embedded); image
+  `out/wf99/picasso/boot/wf99.img` (sha `5bfce36e…`), same addon as wf98; log
+  `out/wf99-runs/run1.log`.

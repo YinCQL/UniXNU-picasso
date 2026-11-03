@@ -67,6 +67,13 @@ constexpr uint32_t kGmuRsccControlReq = 0x23B07;
 constexpr uint32_t kGmuRsccControlAck = 0x23B08;
 constexpr uint32_t kGmuGxPwrStatus = 0x1F8D0;   /* GMU_SPTPRAC_PWR_CLK_STATUS (sheng kGxStatus) */
 constexpr uint32_t kGmuSptpracPowerControl = 0x1A881;   /* GPU_GMU_GX_SPTPRAC_POWER_CONTROL (a6xx_gmu.xml) */
+/* a6xx_gmu_gfx_rail_on: GMU_BOOT_SLUMBER_OPTION / GMU_GX_VOTE_IDX / GMU_MX_VOTE_IDX, then the BOOT_SLUMBER OOB
+ * (request HOST2GMU_INTR_SET bit 22, ack GMU2HOST_INTR_INFO bit 30, clear bit 30) — a6xx_gmu.xml offsets. */
+constexpr uint32_t kGmuBootSlumberOption = 0x1CBF8;
+constexpr uint32_t kGmuGxVoteIdx = 0x1CBF9;
+constexpr uint32_t kGmuMxVoteIdx = 0x1CBFA;
+constexpr uint32_t kBootSlumberRequestBit = 22;
+constexpr uint32_t kBootSlumberAckBit = 30;
 constexpr uint32_t kGmuRpmhPowerState = 0x1F8EC; /* GPU_GMU_CX_GMU_RPMH_POWER_STATE (a6xx_gmu_check_idle_level) */
 constexpr uint32_t kGmuGeneral7 = 0x1F9CC;
 constexpr uint32_t kGmuAoHostIntrClr = 0x23B04;
@@ -1207,11 +1214,46 @@ int startCm3()
         }
         return -1;
     }
-    /* a6xx_gmu_fw_start's legacy sequence, in mainline's order: after gmu_start (the CM3 handshake above) and
-     * before hfi_start, power the SP/TP rail (a6xx_sptprac_enable): GPU_GMU_GX_SPTPRAC_POWER_CONTROL =
-     * 0x778000, then poll GMU_SPTPRAC_PWR_CLK_STATUS until (status & 0x38) == 0x28. wf94 did this from
-     * hw_init, after the firmware was already running HFI, and the status stayed 0/0 — the firmware ignores
-     * the manual control once it owns the rail. */
+    /* a6xx_gmu_fw_start's legacy sequence, in mainline's order. First a6xx_gmu_gfx_rail_on(): tell the
+     * firmware the boot sequence has started (GMU_BOOT_SLUMBER_OPTION = 0), hand it the "default" (highest)
+     * power level as GMU_GX_VOTE_IDX / GMU_MX_VOTE_IDX, then take the BOOT_SLUMBER OOB (request
+     * HOST2GMU_INTR_SET bit 22, ack GMU2HOST_INTR_INFO bit 30, clear bit 30). Without this the GX rail is
+     * still off when the SPTPRAC write below runs (wf98 measured GMU_SPTPRAC_PWR_CLK_STATUS = 0x000000c0,
+     * GX_HM_GDSC_POWER_OFF | GX_HM_CLK_OFF, at this exact point), so that write could never take; the port
+     * only brought GX up later, through the runtime GPU_SET OOB after HFI start. */
+    {
+        const uint32_t gxBefore = coreRead(kGmuGxPwrStatus);
+        const adreno620::PwrlevelBin *bin = adreno620::pwrlevelBinForSpeed(readSpeedBin());
+        if (!bin) bin = &adreno620::defaultPwrlevelBin();
+        uint32_t bootVote = 0;
+        const bool voted = s.cmdDb.valid &&
+            arcVote(s.cmdDb, s.cmdDb.gfx, s.cmdDb.gfxCount, s.cmdDb.mx, s.cmdDb.mxCount,
+                vlvlForFrequency(bin->levels[0].frequency_hz), &bootVote);
+        coreWrite(kGmuBootSlumberOption, 0);
+        if (voted) {
+            coreWrite(kGmuGxVoteIdx, bootVote & 0xFFu);
+            coreWrite(kGmuMxVoteIdx, (bootVote >> 8) & 0xFFu);
+        }
+        barrier();
+        coreWrite(kGmuHost2GmuIntrSet, 1u << kBootSlumberRequestBit);
+        barrier();
+        uint32_t bootInfo = 0;
+        unsigned bootPolls = 0;
+        for (; bootPolls < 10000; ++bootPolls) {
+            bootInfo = coreRead(kGmuGmu2HostIntrInfo);
+            if (bootInfo & (1u << kBootSlumberAckBit)) break;
+            IODelay(100);
+        }
+        coreWrite(kGmuGmu2HostIntrClr, 1u << kBootSlumberAckBit);
+        const uint32_t gxAfter = coreRead(kGmuGxPwrStatus);
+        printf("PICASSO_GPU gmu: rail-on vote=%08x (%s %llu Hz) idx=%u/%u polls=%u info=%08x gx %08x->%08x\n",
+            bootVote, voted ? "cmd-db" : "no-vote", (unsigned long long)bin->levels[0].frequency_hz,
+            coreRead(kGmuGxVoteIdx), coreRead(kGmuMxVoteIdx), bootPolls, bootInfo, gxBefore, gxAfter);
+    }
+    /* Then power the SP/TP rail (a6xx_sptprac_enable): GPU_GMU_GX_SPTPRAC_POWER_CONTROL = 0x778000, then
+     * poll GMU_SPTPRAC_PWR_CLK_STATUS until (status & 0x38) == 0x28. wf94 did this from hw_init, after the
+     * firmware was already running HFI, and the status stayed 0/0 — the firmware ignores the manual control
+     * once it owns the rail. */
     coreWrite(kGmuSptpracPowerControl, 0x778000u);
     barrier();
     uint32_t sptprac = 0;
@@ -1446,11 +1488,14 @@ int gxPowerOn(unsigned perfIndex)
 extern "C" void native_adreno620_gmu_release_gpu_set(void)
 {
     if (!gState) return;
-    /* a6xx_gmu_clear_oob(GMU_OOB_GPU_SET) for a non-legacy GMU: writing the
-     * clear_new bit (31) into HOST2GMU_INTR_SET releases the request. */
+    /* a6xx_gpu_init's "we are done touching the GPU" step, in mainline's order: clear the GPU_SET OOB
+     * (non-legacy clear bit 31), then, for a legacy GMU, take the GMU out of its special boot mode with
+     * a6xx_gmu_clear_oob(GMU_OOB_BOOT_SLUMBER) (clear bit 30 into HOST2GMU_INTR_SET). */
     coreWrite(kGmuHost2GmuIntrSet, 1u << 31);
     barrier();
-    printf("PICASSO_GPU gx: oob released\n");
+    coreWrite(kGmuHost2GmuIntrSet, 1u << kBootSlumberAckBit);
+    barrier();
+    printf("PICASSO_GPU gx: oob released (gpu_set, boot_slumber)\n");
 }
 
 extern "C" int native_adreno620_gmu_boot(const uint8_t *gmu, size_t gmuBytes,
