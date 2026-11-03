@@ -1419,3 +1419,13 @@ Client side (read-only reference copies):
   broken. A next round should follow the UI process (SpringBoard): it opens `AGXAccelerator`
   (result 0) but never issues a Submit, so look for where its render-server/display-link setup
   stops before the first surface commit.
+- **wf130 follow-up: backboardd retries property-carrying opens and XNU refuses them.** The
+  IOKit probe's op=3 is `IOServiceOpen`; the wf130 log has ~70 of them on `AGXAccelerator` from
+  backboardd, and all but the first return `e00002c7` (`kIOReturnUnsupported`). The trace's
+  refusal site is the stock `if (properties) return kIOReturnUnsupported;` gate in
+  `is_io_service_open_extended`, i.e. the *kernel* rejects opens that carry an OSDictionary,
+  not the driver. The three property-less plugin opens (type 0x4147) succeed and are the ones
+  that submit. Next round: determine whether the Metal plugin's loader needs the
+  property-carrying open (and therefore needs this XNU's service-properties support enabled or
+  a grant for this service), since that refusal is the most concrete outstanding difference
+  between the boot's GPU setup and a RenderServer that submits frames.
