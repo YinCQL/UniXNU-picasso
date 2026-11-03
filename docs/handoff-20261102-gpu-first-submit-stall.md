@@ -731,3 +731,30 @@ Client side (read-only reference copies):
   `out/wf83-runs/run1.log`. The expected lines start with `T s<stage>
   r<VkResult> v<fill> c<compute> g<triangle pixels>/<stray>` (NativeTurnipSmoke.h header) and the
   replay scan's `F <retired>/<prefixes> o<opcode> c<dwords> e<…>`.
+- **wf83 result: the built-in test is ABI-stale.** With the plugin forced onto its test path, the
+  display kept showing the port's boot UI (`PICASSO_DISPLAY frame kind=0 nonblack=41011`, repeated),
+  i.e. no black scanout, but the test's submits were refused: `tunnel: call=5 status=e00002c2`
+  (`NativeAdrenoMethodSubmit` → `kIOReturnBadArgument`) twice, and no `PICASSO_GPU text:` line ever
+  completed. Cause: the plugin/test headers in the UniXNU checkout are ABI **v1**
+  (`NativeAdrenoAbiVersion = 1`, 16 buffers) while the kernel driver in this worktree and the Turnip
+  Darwin backend are ABI **v2** (128 buffers, extra flags/methods); the raw test and the smoke
+  submit v1-shaped requests, which the v2 `Submit` validation rejects. The production path is
+  unaffected because it submits through Turnip's v2 backend. To use the built-in test on this
+  driver, the UniXNU `NativeAdrenoABI.h`/test would have to be updated to v2.
+- **wf84: force the 8-bit framebuffer.** On wf82 the render server presented a 1080x2400 BGRA
+  surface whose scanned content was black, and one 10-bit `b3a8` (2-plane) surface was rejected by
+  the legacy display. The plugin now also sets
+  `CAEnableDeepFramebuffer = false` (with the compression preferences, before the device opens), so
+  the render server should choose the 8-bit framebuffer the display can scan out. Kernel unchanged
+  from wf83 (`471840b5…`); addon `fc614ec3761a133c0db032cee6c1bb4b493788f3173af9e44d9686f06856d4c8`,
+  trust `e2a64cb6dc8e22c2e7ff0aacd6108492cee521dba305af25cd6d85be9276f750`, plugin CDHash
+  `0f18fdbeca158504f7ef4c2433a9acb2c60fe881`; image `out/wf84/picasso/boot/wf84.img`, log
+  `out/wf84-runs/run1.log`.
+- **Next GMEM measurement (not yet run).** At the `RM6_ENDVIS` stall, dump the VSC state the
+  SQE/marker depends on and sample its streams: `VSC_BIN_SIZE`, `VSC_BIN_COUNT`,
+  `VSC_PIPE_CONFIG(0..)`, `VSC_PRIM_STRM_PITCH/LIMIT`, `VSC_DRAW_STRM_PITCH/LIMIT`,
+  `VSC_DRAW_STRM_ADDRESS` (`0xc34`), `VSC_PRIM_STRM_ADDRESS` (`0xc30`),
+  `VSC_DRAW_STRM_SIZE_ADDRESS` (`0xc03`), the `VSC_DRAW/PRIM_STRM_SIZE_REG` counters, and a sample
+  of the two stream buffers plus the size buffer through the job's address space. If the stream
+  buffers are zero the visibility pass never wrote (VSC not running → look at power/clock/register
+  state); if they hold data the ENDVIS wait is waiting on something else (the draw pipeline).
