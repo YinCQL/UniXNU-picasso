@@ -147,3 +147,119 @@ fastboot -s 52cc791d boot out/wfNNN/picasso/boot/wfNNN.img
 4. **调度余量**：仅在需要时再动 `sched_edge_ui_bucket_stays_on_p()`/CLPC；DTB 拓扑已被证明正确，不要回头改。
 
 > 判断"目标完成"的标准：锁屏出现后，手指的每一次上滑/点击都能在 `PICASSO_NVT report` 后紧跟新的 `PICASSO_DISPLAY_STATE submit=` 和 `PICASSO_GPU submits live` 增长，且 `copies/copy_bytes` 不再增长（GPU 直接写 scanout）。
+
+## 9. 下一阶段目标与验收（2026-11-03 设定，先写标准后测）
+
+1. **GPU 性能**：Adreno 620 的 perf index 从 1 提到 DT 标称档 3；补一个可复现的填充/三角形基准，记录毫秒。
+   验收：基准耗时相对当前配置缩短 ≥ 50%；滑动动画连续、无掉帧（提交/呈现计数在滑动期间持续增长）。
+2. **稳定性（swap 时序）**：VM 的 swapfile 创建线程在只读 root 上先跑，45 s 报 EROFS（errno 30），Data 卷挂到 `/private/var` 后不再重试。
+   修复：Data 挂载成功后清掉失败时间戳并唤醒创建线程；验收：日志出现 swap 创建成功，随后连续 30 分钟 0 panic、0 服务退出。
+3. **真实交互**：用真实手指（Novatek/`sheng-touch`，不是注入滑动）解锁锁屏并进入主屏。
+   验收：手指上滑即可解锁；主屏连续滑动 30 秒不卡死（触点报告与 present/GPU 提交持续增长）。
+
+约束：只用 `fastboot boot`；CDC 串口独占；`boot-progress=2` 不得删除；cmdline ≤ 1000 字节；一次只改一个变量；单项卡满 3 小时记录现状后转下一项。
+
+### 9.1 实现（待测）
+
+- **perf index**：`drivers/NativeAdrenoPicasso/Adreno620Gmu.cpp` 原先 `count-1-initial_level` 在 speed bin 0x84（5 档）得到 HFI index 1 = 275 MHz；HFI 表是升序，DT 顶层 `qcom,initial-pwrlevel=3` 对应 nominal 500 MHz = index 3。默认改为 3，`sheng-gpu-perf-index=<n>` 可覆盖（基准用 1）。
+- **基准**：`NativeTurnipSmoke.h` 在原有 4 KiB fill / 64x64 triangle 验证之外，加 GPU-bound 计时并输出 `B fill=<ms> tri=<ms> compute=<ms>`：fill 为 16 MiB `vkCmdFillBuffer` 三次取最快，triangle 为同一 pass/draw 重复 256 次（1M fragment）两次取最快，compute 为原 dispatch。插件测试模式（addon 无 `NativeAdrenoMetal.publish`）启动时自动运行；两次 boot 使用同一镜像，仅 boot arg 不同。
+
+## wf147a freeze (2026-11-03 19:44 CST)
+
+- Image: wf147a (kernel 381fde44, bench addon without `.publish`, perf-index=1, sheng-fb-gpu=1).
+- User reported "现在又卡死了" during normal UI use; no app launch this time.
+- Log: `out/wf147a-runs/run1.log`. Last submit at 243.1 s; vsync checks at 261 s still show submit=255 unchanged. transfer_fail=2 (event=7 status 0xe00002d8 kIOReturnNotReady). `PICASSO_GPU submits final: submissions=480 ibs=5855 max=73 many=109` printed earlier.
+- The bench addon carries no `.publish`, so `requested()` is false and `adrenoUserTest()`/Turnip smoke never ran in this image: no T/B rows. Benchmark therefore needs the prod addon (publish + clients backboardd) with the perf index set by boot arg.
+
+## Benchmark protocol and acceptance (written before wf147c results)
+
+- Image pair: wf147c (prod addon: publish + clients backboardd, `sheng-gpu-perf-index=1`) vs wf147d (same addon, no perf-index arg -> DT nominal index 3). Everything else identical, kernel 381fde44.
+- Row emitted by the plugin's self-test in backboardd: `B fill=X.XXms tri=Y.YYms compute=Z.ZZms` (fill = 16 MiB vkCmdFillBuffer best of 3; tri = 256x 64x64 draw pass best of 2; compute best of 3). Same code path each boot.
+- Primary metric: fill_ms and tri_ms. Acceptance: wf147d >= 50% shorter than wf147c on both fill and tri. Secondary: compute_ms (should not regress materially).
+- Sanity gate: both runs must print `initial perf index=1` / `initial perf index=3` respectively and a `T s...` row before B.
+- Swipe smoothness is judged separately on the stable image (wf147d) via `PICASSO_DISPLAY_STATE` submit rate during real touch swipes, and the user's visual report.
+
+## wf147c freeze (2026-11-03 20:01 CST) - same BO fault at perf index 1
+
+- Image wf147c: prod addon (publish, clients=backboardd), perf index 1 (275 MHz), kernel 381fde44.
+- User: "现在卡住了". Last submit at 199.45 s, submit counter stuck at 355; `PICASSO_GPU stall far=1338f508 handle=0` twice (same page as wf153's 1338f1xx and wf70's 1338f508); `PICASSO_GPU submits final: submissions=632`.
+- `PICASSO_SERVICE exit pid=51 name=mobiletimerd rv=9 exit_signal=9` (SIGKILL).
+- Conclusion: the freeze is not perf-index dependent. It is the GPU BO lifetime fault in the driver; benchmark and soak both need the fix first.
+- Consequence for the benchmark: the published plugin never starts the self-test (publish path returns before the test thread), so wf147a/wf147c/wf147d cannot emit T/B. Benchmark needs a gated self-test in the publish path.
+
+## iPhone identity (wf149) - per upstream docs/guide/mobilegestalt.md
+
+- ADT identity changed to the upstream phone row: root `model=iPhone10,3`, `target-type=D22`; `/product` name/description `iPhone X`, `artwork-device-idiom=phone`, `artwork-device-subtype=2340`, `artwork-scale-factor=3`, gamut P3, `compatible-device-fallback=iPhone10,3`; `/buttons` stays without `menu`, `home-button-type=2`.
+- Root `compatible` (xiaomi,picasso / qcom,lito) left untouched, as the guide requires; an Apple board name would match original platform kexts.
+- MobileGestalt caches answers under /private/var; the Data volume here is the fresh RAM seed each boot, so the cache is empty by construction (no stale pad/home-button answers).
+- Build wiring: board.toml key `iphone_identity = true` (selected by `IPHONE_IDENTITY=1` in scripts/build-wf-payload.sh) -> `--iphone-identity` in the board ADT tool. The prepared build tree's copy of make-picasso-adt.py carries the option; the payload builder in the upstream cache understands the board key.
+- Verified in the generated ADT: `iPhone10,3`, `D22`, `iPhone X`, `phone`, subtype 2340, no 2732.
+- Expectation from the guide: with an iPadOS root (21H461) the identity selects phone behaviour in UIKit/SpringBoard but the installed system stays iPadOS; the guide pairs a phone identity with an iOS root. Boot outcome recorded below.
+
+### Geometry note
+
+- Panel: 1080 x 2400 physical. With `artwork-scale-factor = 3` the logical canvas would be 360 x 800 pt.
+- The requested identity declares `artwork-device-subtype = 2340` (the upstream iPhone X / 12 mini artwork class), i.e. 360 x 780 pt. UIKit lays the phone UI out on 780 pt; the panel's remaining 60 px (20 pt) is outside that canvas and is not part of the layout. The display driver still scans out the full 2400 lines.
+- If the UI must fill exactly 1080 x 2400, the subtype has to be 2400 (360 x 800 pt); that deviates from the upstream documented phone row.
+
+### Why the iPhone identity alone did not change the layout
+
+- wf149 booted with the phone ADT (AMFI read `model=iPhone10,3`), but the UI looked identical to the iPad layout.
+- Root cause: `NativeMobileDisplay/PicassoDisplaySupport.cpp` published `/chosen/display-scale = 2` itself (matchWord at the first GOP mapping) and rejected any other value. UIKit's logical screen is pixels/display-scale = 1080/2 x 2400/2 = 540 x 1200 pt, a pad-sized canvas, regardless of the ADT artwork fields.
+- Fix for wf150: the driver now takes `sheng-display-scale` (1..4, default 2) and publishes that value; `sheng-display-scale=3` gives a 360 x 800 pt canvas.
+- The ADT still declares the upstream phone row (iPhone10,3 / D22 / phone / 2340 / 3); /chosen/display-scale is the value UIKit actually consumes.
+
+## Three-condition phone layout (wf155)
+
+The user's acceptance for the phone layout requires all three at once:
+1. identity: model iPhone10,3 (or 13,1), idiom phone, subtype 2340, scale 3;
+2. display: `sheng-display-scale=3` -> 360x800 pt canvas;
+3. aspect: the 2340-tall canvas must be letterboxed into the 2400-row panel, bars not left white.
+
+Implementation:
+- The ADT now writes `/chosen/display-scale = 3` in phone mode (the property must exist from boot, not only when the display driver adds it). The driver reads `sheng-display-scale` and writes the same value, so its check matches.
+- `NativeLegacyDisplay` now accepts a swap whose request/surface name a canvas shorter than the panel (1080x2340): the validator accepts `requestWidth == panel width && panel/2 < requestHeight <= panel height`, and the copy path centres the source rows and fills the top/bottom bars with opaque black. The exact-panel GPU scanout fast path is kept; a letterboxed frame takes the CPU copy path and invalidates the shadow.
+- Expected visible result: 360x800 pt phone canvas, phone size class (compact width), 30 px black bars top and bottom, no white bands.
+
+## Real touch depends on offline-hid-home=1 (wf155/wf158 regression, fixed in wf159)
+
+- Symptom: NVT points reach the kernel (`PICASSO_NVT point ...`) but the UI never reacts.
+- Root cause: package/HidInputProbe.cpp creates the HID device only inside `if (resource && sendHome==1 && ...)`,
+  i.e. when the kernel command line carries `offline-hid-home=1`. The same NativeHidInput device is what submits the
+  Novatek digitizer reports; without it there is no IOHIDDevice for touches.
+- Log signature: working boots (wf148/wf151) print `PICASSO_HID stage=3 ... meta=0 object=fffffff...` and later
+  `PICASSO_HID event driver ready`; the regressed boots print `meta=-1 object=0` and never print the ready line.
+- Fix: keep `offline-hid-home=1`. wf155..wf158 had it removed by NO_HIDHOME=1 only to save command-line bytes.
+- wf159: phone identity + display-scale=3 + HID arguments intact (cmdline 988 bytes, under 1000).
+
+## wf159 freeze: the GPU scanout path, not the Metal plugin
+
+- wf159 was built with the unpublished (software) addon but kept `sheng-fb-gpu=1`. It rendered 1491 frames with
+  touch working, then froze: submit stuck at 1491, transfer_fail=3, six `stall: fence=` blocks (same signature
+  `smmu 400 1338f508 13c43`, cpint=0 hwfault=0 protect=0 sqe=4000), no stall recovery.
+- So the UI freeze is in the GOP scanout/handoff GPU path as well; the published Metal plugin is not required for
+  the hang. The board installs no NativeAdrenoRestart hook, so a CP that stops is never reset.
+- wf161 therefore disables the handoff (`NO_FBGPU=1`, no `sheng-fb-gpu=1`) and keeps the phone identity, HID
+  (`offline-hid-home=1`) and `sheng-display-scale=3`: a stable-interaction candidate for the 30 s swipe and the
+  30 minute soak. GPU performance is measured on the dedicated benchmark images (wf156/wf157, `sheng-gpu-bench=1`).
+
+## Why Settings still said iPad: the Data volume is persistent
+
+- `sheng-data-persist=2` (board.toml) means the 8 GiB packed Data seed has its changed pages backed by the
+  NativeUfs store window at the end of userdata (drivers/NativeUfs/NativeUfs.cpp:1195-1241). The Data volume is
+  therefore NOT pristine per boot.
+- MobileGestalt's answers are cached in
+  /private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist,
+  so the iPad answers written by all earlier iPad-identity boots survive the ADT change and keep the device class at pad.
+- wf162 therefore boots with `sheng-data-persist=0` (pure RAM seed, no persistent window): the cache is empty by
+  construction, which isolates the identity question. This also loses persistence, so it is a diagnostic image;
+  the production fix is to clear that one cache path once (or keep persist=0 for identity test images).
+
+## wf163: phone identity took effect (user-confirmed "看到 iOS 的界面")
+
+- Same phone ADT as wf161/162 (iPhone10,3 / D22 / phone / 2340 / scale 3), HID restored, no GPU handoff,
+  `sheng-data-persist=2`, but `/chosen/unique-chip-id` changed from ...a541 to ...a543.
+- The MobileGestalt cache is keyed by build + platform UUID; the new UUID invalidated the stale iPad answers that
+  survived in the persistent Data volume. Result: the UI rendered as an iOS/phone interface.
+- persist=0 is NOT a usable cache-clearing method on this board: the packed Data provider refuses the volume
+  (`disk1: device is not ready`, IOBlockStorageDriver start failures, APFS truncate loop).

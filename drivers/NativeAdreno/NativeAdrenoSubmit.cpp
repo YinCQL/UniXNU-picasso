@@ -2,6 +2,7 @@
 #include "NativeAdrenoSubmit.h"
 #include "AdrenoPM4.h"
 #include <IOKit/IOLib.h>
+#include <pexpert/pexpert.h>
 extern "C" int proc_selfpid(void);
 /* Board diagnostics: CP_INTERRUPT_STATUS, CP_HW_FAULT, CP_PROTECT_STATUS and one CP_SQE_STAT sample, for a stalled fence. Absent on the host. */
 extern "C" uint32_t native_adreno_cp_fault_regs(uint32_t *out,uint32_t count) __attribute__((weak_import));
@@ -52,6 +53,14 @@ static void peekFetch(const NativeAdrenoVm *vm,uint64_t fetch,volatile uint32_t 
 }
 static uint32_t stall_fence,stall_timeouts,stall_stage;   /* stage: 0 none yet, 1 write pointer given again, 2 translations dropped, 3 bus drained */
 static uint64_t stall_began_us,stall_last_us;   /* the fence's first and latest timed-out wait */
+/* What the stall handler may do for a fence pending 50 ms: sheng-gpu-unstick bit 0 drops the client's translations,
+ * bit 1 gives the write pointer again, bit 2 drains the bus at the second stage. 7 is the previous behaviour. */
+static uint32_t unstickMask()
+{
+    static uint32_t mask=7;static bool read;
+    if(!read) {uint32_t value=7;if(PE_parse_boot_argn("sheng-gpu-unstick",&value,sizeof value))mask=value;read=true;}
+    return mask;
+}
 /* How long fences stayed pending from their first timed-out wait to their last: [i] under 1 << i ms for i < 7, [7] 64 ms or more. */
 extern "C" {volatile uint32_t native_adreno_fence_pending[8];}
 /* What the stall handler tried: [0] attempts, [1] the fence of the last attempt, [2] attempts after which that fence completed, [3] the
@@ -636,7 +645,14 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
     if(now && stage_due(stall_stage,0,pending,50000)) {
         native_adreno_unstick[0]=native_adreno_unstick[0]+1;native_adreno_unstick[1]=stall_fence;stall_stage=1;
         const uint32_t r0=stalled->readPointer(),w0=stalled->writePointer()&0xffff;
-        (void)vm_->invalidateTlb();(void)stalled->kick();
+        /* sheng-gpu-unstick selects what the handler does: bit 0 drop the client's translations, bit 1 give the
+         * write pointer again, bit 2 drain the bus at the second stage. Default 7 keeps the previous behaviour;
+         * 2 isolates "give the write pointer again" without the TLB invalidate that runs while the job is still
+         * executing. The handler fires at 50 ms on every fence, and a fence that takes longer than 50 ms is
+         * ordinary work, not a lost write pointer (a job lasts about 5 ms). */
+        const uint32_t unstick=unstickMask();
+        if(unstick&1)(void)vm_->invalidateTlb();
+        if(unstick&2)(void)stalled->kick();
         log(stall_fence,1,pending,r0&0xffff,w0);
     }
     /* Still stopped well after that: the way a6xx drains the bus before a reset, which lets a write that was never acknowledged end. */
@@ -644,7 +660,7 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
         uint32_t ack[2]={};
         native_adreno_unstick[4]=native_adreno_unstick[4]+1;native_adreno_unstick[7]=stall_fence;stall_stage=3;
         const uint32_t r0=stalled->readPointer(),w0=stalled->writePointer()&0xffff;
-        (void)stalled->drainBus(ack);
+        if(unstickMask()&4)(void)stalled->drainBus(ack);
         native_adreno_unstick[5]=ack[0];native_adreno_unstick[6]=ack[1];
         log(stall_fence,3,pending,r0&0xffff,w0);
     }
@@ -659,6 +675,20 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
     /* The IBs are the stalled job's: read them through its address space (the kernel's maps none of a client's BOs). */
     const Job *job=find(next);
     const NativeAdrenoVm *space=job && job->vm?job->vm:vm_;
+    /* The stall's SMMU far address: map it back to the client's BO handle so an unmapped or freed mapping is
+     * distinguishable from a stuck wait packet (handle 0 = not in this address space). */
+    /* The stall's SMMU state: only a latched fault (the kit's FSR_FAULT mask) is reported as one. 0x400 is the
+     * address-format bit alone and every logged "fault" so far read it as 0x400, so the far/handle line was a
+     * false positive; the client's IOVA window starts at 0x100000000, so the full 64-bit FAR is looked up. */
+    {
+        static uint32_t fault_prints;
+        if((fault[0]&0xc00001feu) && fault_prints<6) {
+            ++fault_prints;
+            const uint64_t far=(uint64_t)fault[2]<<32|fault[1];
+            printf("PICASSO_GPU fault: fsr=%x far=%llx handle=%llx job=%x\n", fault[0],
+                (unsigned long long)far, (unsigned long long)(space?space->handleAt(far):0), job?job->vm_next:0);
+        }
+    }
     if(!stalled->ibBefore(words[8],&ib,&size))peekIb(space,ib,size,words[12],&native_adreno_stall_mem[4]);
     else peekFetch(space,(uint64_t)words[11]<<32|words[10],&native_adreno_stall_mem[4]);
     if(!stalled->ibBefore(words[16],&ib,&size))peekIb(space,ib,size,words[18],&native_adreno_stall_mem[4+17]);

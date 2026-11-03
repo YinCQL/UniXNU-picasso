@@ -135,6 +135,8 @@ def main():
     parser.add_argument('--chip-id', type=lambda value: int(value, 16), default=None)
     parser.add_argument('--ipad-identity', action='store_true',
                         help='/product and /buttons describe an iPad-class device without a Home button (MobileGestalt reads these from the tree)')
+    parser.add_argument('--iphone-identity', action='store_true',
+                        help='/product and /buttons describe an iPhone-class device (iPhone13,1 / D52g, phone idiom, 2340, scale 3); takes precedence over --ipad-identity')
     parser.add_argument('--cpu-regs', default='0',
                         help='Comma-separated CPU MPIDR affinity values (the /cpus reg of each core); the first is the running boot CPU. '
                              'SM7250 numbers its cores 0x000..0x700 in Affinity1. More than one adds /psci')
@@ -148,6 +150,11 @@ def main():
     parser.add_argument('--random-seed', metavar='HEX',
                         help='Exact 64-byte /chosen/random-seed value, for reproducible A/B trees')
     args = parser.parse_args()
+    # The upstream payload builder only knows the board's ipad_identity key; PICASSO_PHONE_IDENTITY=1 switches the
+    # same call to the phone row (iPhone10,3 / D22 / phone / 2340 / scale 3) without depending on a patched builder.
+    if os.environ.get('PICASSO_PHONE_IDENTITY') == '1':
+        args.iphone_identity = True
+        args.ipad_identity = False
     if (args.unique_chip_id is None) != (args.chip_id is None):
         parser.error('--unique-chip-id and --chip-id must be supplied together')
     if args.unique_chip_id is not None and not (0 < args.unique_chip_id < 1 << 64 and 0 < args.chip_id < 1 << 32):
@@ -187,8 +194,8 @@ def main():
     # an adhoc-signed userspace binary (launchd) is only accepted under the
     # dev-board policy that the iPad identity declares.
     identity = [
-        ('model', b'iPad7,1\0' if args.ipad_identity else b'picasso-first-boot\0'),
-        *([('target-type', b'J120\0')] if args.ipad_identity else []),
+        ('model', b'iPhone10,3\0' if args.iphone_identity else b'iPad7,1\0' if args.ipad_identity else b'picasso-first-boot\0'),
+        *([('target-type', b'D22\0')] if args.iphone_identity else [('target-type', b'J120\0')] if args.ipad_identity else []),
     ]
     tree = node('device-tree', [
         *identity,
@@ -205,6 +212,10 @@ def main():
                         # This boots the normal target OS. Volatile Data is
                         # described separately by ephemeral-storage below.
                         ('osenvironment', b'main\0'),
+                        # The scale MobileGestalt/UIKit read for the phone layout. It must be present from boot:
+                        # a property the display driver adds later is not what the userland's identity read picks
+                        # up. 1080x2400 at scale 3 is a 360x800 pt canvas.
+                        *([('display-scale', struct.pack('<I', 3))] if args.iphone_identity else []),
                         # Security status of a dev-fused, undemoted board (tuple 0,0,1,1),
                         # as MobileGestalt reads it. AMFI picks its code-signing trust
                         # policy from certificate-security-mode, and the original
@@ -214,7 +225,7 @@ def main():
                         *([('certificate-production-status', struct.pack('<I', 0)),
                            ('effective-production-status-ap', struct.pack('<I', 0)),
                            ('certificate-security-mode', struct.pack('<I', 1)),
-                           ('effective-security-mode-sep', struct.pack('<I', 1))] if args.ipad_identity else []),
+                           ('effective-security-mode-sep', struct.pack('<I', 1))] if (args.ipad_identity or args.iphone_identity) else []),
                         # This property describes the actual volatile Data RAM disk.
                         *([('ephemeral-storage', struct.pack('<I', 1))] if (args.data_ramdisk or args.packed_data_ramdisk) else []),
                         *( [('darwinboot-memory-size', struct.pack('<Q', args.owned_memory_size))]
@@ -250,20 +261,23 @@ def main():
         # gesture model does not match the panel.
         *([node('buttons', [('compatible', b'buttons\0'), ('device_type', b'buttons\0'),
                             ('button-names', b'hold\0voldown\0volup\0'),
-                            ('home-button-type', struct.pack('<I', 2))])] if args.ipad_identity else []),
+                            ('home-button-type', struct.pack('<I', 2))])] if (args.ipad_identity or args.iphone_identity) else []),
         # The original AppleImage4 panics without a product node. Under the iPad
         # identity this node is what MobileGestalt reports as the hardware: the
         # artwork fields describe the J120 panel (2732x2048 class, P3, scale 2) so
         # UIKit and the audio routing database pick iPad behaviour, and
         # compatible-device-fallback keeps a known device for lookups that use it.
-        node('product', [('product-name', b'iPad Pro (12.9-inch) (2nd generation)\0' if args.ipad_identity else b'Redmi K30 5G\0'),
+        node('product', [('product-name', b'iPhone X\0' if args.iphone_identity else
+                                         b'iPad Pro (12.9-inch) (2nd generation)\0' if args.ipad_identity else b'Redmi K30 5G\0'),
                          ('model', b'xiaomi,picasso\0'),
-                         *([('product-description', b'iPad Pro (12.9-inch) (2nd generation)\0'),
-                            ('artwork-device-idiom', b'pad\0'),
-                            ('artwork-device-subtype', struct.pack('<I', 2732)),
-                            ('artwork-scale-factor', struct.pack('<I', 2)),
+                         *([('product-description', b'iPhone X\0' if args.iphone_identity else
+                               b'iPad Pro (12.9-inch) (2nd generation)\0'),
+                            ('artwork-device-idiom', b'phone\0' if args.iphone_identity else b'pad\0'),
+                            ('artwork-device-subtype', struct.pack('<I', 2340 if args.iphone_identity else 2732)),
+                            ('artwork-scale-factor', struct.pack('<I', 3 if args.iphone_identity else 2)),
                             ('artwork-display-gamut', b'P3\0'),
-                            ('compatible-device-fallback', b'iPad6,7\0')] if args.ipad_identity else [])]),
+                            ('compatible-device-fallback', b'iPhone10,3\0' if args.iphone_identity else b'iPad6,7\0')]
+                           if (args.ipad_identity or args.iphone_identity) else [])]),
         node('pram', [('reg', struct.pack('<2Q', PANIC_LOG_PADDR, PANIC_LOG_SIZE))]),
         node('arm-io', [('device_type', b'arm-io\0'),
                         ('#address-cells', struct.pack('<I', 2)),

@@ -529,13 +529,17 @@ extern "C" bool native_legacy_gop_mapping_observed(IOService *, IOMemoryMap *map
         width != video.v_width || height != video.v_height) return false;
     if (displayChosen) return false;
     displayChosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
-    // Two scanout pixels per UI point. This is UI policy, not physical DPI.
-    bool ok = displayChosen && matchWord(displayChosen, "display-scale", 2, scaleAdded) &&
+    // Two scanout pixels per UI point. This is UI policy, not physical DPI; sheng-display-scale overrides it for a
+    // phone layout (1080x2400 at 3 -> 360x800 pt).
+    uint32_t displayScale = 2;
+    (void)PE_parse_boot_argn("sheng-display-scale", &displayScale, static_cast<int>(sizeof displayScale));
+    if (displayScale < 1 || displayScale > 4) displayScale = 2;
+    bool ok = displayChosen && matchWord(displayChosen, "display-scale", displayScale, scaleAdded) &&
         matchWord(displayChosen, "display-rotation", 0, rotationAdded);
     if (!ok) finishDisplayPolicy(false);
-    printf("PICASSO_DISPLAY mapped ok=%u base=%llx bytes=%llx width=%u height=%u stride=%lu depth=%lu console=%lu scale=2\n",
+    printf("PICASSO_DISPLAY mapped ok=%u base=%llx bytes=%llx width=%u height=%u stride=%lu depth=%lu console=%lu scale=%u\n",
         ok, map->getPhysicalAddress(), map->getLength(), width, height,
-        video.v_rowBytes, video.v_depth, video.v_display);
+        video.v_rowBytes, video.v_depth, video.v_display, displayScale);
     gridPhysical = map->getPhysicalAddress();
     gridBytes = map->getLength();
     gridWidth = width;

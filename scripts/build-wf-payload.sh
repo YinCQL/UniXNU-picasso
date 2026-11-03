@@ -48,8 +48,31 @@ dram=os.environ.get('DRAM_SIZE')
 if dram:
     s, n = re.subn(r'dram_size = "[^"]*"', f'dram_size = "{dram}"', s, count=1)
     assert n == 1, 'dram_size not found'
+if os.environ.get('DATA_PERSIST') is not None:
+    # 0 = pristine RAM Data every boot (clears the persistent MobileGestalt cache and any other Data writes),
+    # 1 = read-only persistent window, 2 = read/write (board default).
+    line = '  "sheng-data-persist=2",\n'
+    assert line in s, 'sheng-data-persist=2 missing'
+    s = s.replace(line, f'  "sheng-data-persist={os.environ["DATA_PERSIST"]}",\n', 1)
+if os.environ.get('NO_OFFLINE_HID') == '1':
+    for line in ('  "offline-hid-input=1",\n', '  "offline-hid-home=1",\n'):
+        assert line in s, line.strip()
+        s = s.replace(line, '', 1)
+if os.environ.get('NO_HIDHOME') == '1':
+    # DANGER: package/HidInputProbe.cpp creates the HID digitizer device (the path real Novatek touch
+    # reports go through) only when offline-hid-home=1 is set. Removing it disables real touch entirely
+    # (wf155/wf158: "PICASSO_HID stage=3 ... meta=-1 object=0", no "event driver ready").
+    line = '  "offline-hid-home=1",\n'
+    assert line in s, 'offline-hid-home=1 missing'
+    s = s.replace(line, '', 1)
+if os.environ.get('NO_FBGPU') == '1':
+    line = '  "sheng-fb-gpu=1",\n'
+    assert line in s, 'sheng-fb-gpu=1 missing'
+    s = s.replace(line, '', 1)
+
 open(p,'w').write(s)
 EOF
+if [ "${IPHONE_IDENTITY:-0}" = "1" ]; then export PICASSO_PHONE_IDENTITY=1; fi
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 export UNIXNU_KERNELCACHE=/Users/silenzio/Desktop/development/ios/UniXNU/out/ipsw/21H461/kernelcache.decompressed
 ARGS=(--kernel-arg sheng-disable-jobs=com.apple.driverkitd,com.apple.cameracaptured,com.apple.osanalytics.osanalyticshelper
@@ -61,7 +84,7 @@ for extra in "$@"; do ARGS+=(--kernel-arg "$extra"); done
 python3 unixnu build payload --out "out/${TAG}" --kernel out/picasso/kernel/kernel.macho \
   --data-ramdisk "$DATA_RAMDISK" \
   --owner-trust-cache "$OWNER_TRUST" --gpu-addon "$ADDON" \
-  --unique-chip-id 01dec0dec051a541 "${ARGS[@]}" 2>&1 | tail -3 || exit 1
+  --unique-chip-id "${UNIQUE_CHIP_ID:-01dec0dec051a541}" "${ARGS[@]}" 2>&1 | tail -3 || exit 1
 python3 unixnu bootimg --uefi /Users/silenzio/Desktop/development/ios/Mu-Silicium \
   --edk2 /Users/silenzio/Desktop/development/ios/Mu-Silicium/Mu_Basecore \
   --fd "$FD" --dtb uefi/mu-silicium/Resources/DTBs/picasso.dtb \

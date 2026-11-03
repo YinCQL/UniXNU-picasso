@@ -306,8 +306,16 @@ public:
         uint64_t length=(uint64_t)width*height*4;
         uint64_t sourceStride=native_legacy_surface_stride(surface);
         uint64_t allocation=native_legacy_surface_allocation(surface);
-        if(!memory || !memory->metaCast("IOMemoryDescriptor") || !native_legacy_surface_bounds(width,height,sourceStride,allocation,memory->getLength()) ||
-           native_legacy_surface_width(surface)<width || native_legacy_surface_height(surface)<height ||
+        const uint32_t sourceWidth=native_legacy_surface_width(surface);
+        const uint32_t sourceHeight=native_legacy_surface_height(surface);
+        /* A phone canvas is shorter than the panel: 2340 rows of artwork over a 2400-row panel. Accept it, put it in
+         * the middle and fill the bars with black instead of rejecting the swap (a rejected swap never completes and
+         * the render server stops presenting). The GPU copy path keeps the exact-geometry fast path. */
+        const bool letterbox=sourceWidth>=width && sourceHeight && sourceHeight<=height;
+        if(!memory || !memory->metaCast("IOMemoryDescriptor") ||
+           (sourceHeight<=height ? !native_legacy_surface_bounds(width,sourceHeight,sourceStride,allocation,memory->getLength())
+                                 : 1) ||
+           !letterbox ||
            !picasso_gop_format(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) ||
            PE_current_console(&video) || video.v_baseAddr!=bootMapping->getPhysicalAddress() ||
            video.v_width!=width || video.v_height!=height || video.v_depth!=32 || video.v_rotate ||
@@ -320,7 +328,7 @@ public:
         if(!gpuBypass) {
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
         }
-        if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
+        if(!gpuBypass && sourceHeight==height && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
             // The GPU writes the scanout memory behind the CPU's back: the
             // differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
@@ -338,9 +346,10 @@ public:
         if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
         }
-        if(!native_legacy_copy_layout(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+        const uint32_t barRows=height>sourceHeight?(height-sourceHeight)/2:0;
+        if(!letterbox || !native_legacy_copy_layout(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
             bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
-            source->getLength(),sourceStride,width,height)) {
+            source->getLength(),sourceStride,width,sourceHeight)) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
         }
         // Inspect the first four frames and a sparse periodic sample after
@@ -349,7 +358,7 @@ public:
         if(scanBudget || (frameCount%600)==0) {
             if(scanBudget)--scanBudget;
             uint64_t scan[5];
-            if(native_legacy_frame_scan(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,scan))
+            if(native_legacy_frame_scan(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,sourceHeight,scan))
                 native_legacy_frame_observed(0,scan[0],scan[1],scan[2],scan[3],scan[4]);
         }
         /* offline-legacy-bench=2: on the first real frame, time reads of the swap's own source memory through the
@@ -402,12 +411,12 @@ public:
         // unsupported geometry or an allocation failure, and invalidate the shadow whenever the plain path or a blank ran.
         uint64_t stored=length;
         int copied=0;
-        if(!copyShadow || copyShadowBytes<length) {
+        if(!letterbox && (!copyShadow || copyShadowBytes<length)) {
             releaseCopyShadow();
             copyShadow=IOMalloc(length);
             if(copyShadow)copyShadowBytes=length;
         }
-        if(copyShadow) {
+        if(!letterbox && copyShadow) {
             const uint64_t diff=native_legacy_copy_diff(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                 bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
                 source->getLength(),sourceStride,width,height,copyShadow,copyShadowValid?1:0);
@@ -416,11 +425,21 @@ public:
         }
         if(!copied) {
             stored=length;
-            if(!native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
-                bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
-                source->getLength(),sourceStride,width,height)) {
+            volatile unsigned char *panel=(volatile unsigned char *)bootMapping->getVirtualAddress();
+            if(!native_legacy_copy_pixels((volatile void *)(panel+(uint64_t)barRows*video.v_rowBytes),
+                bootMapping->getLength()-(uint64_t)barRows*video.v_rowBytes,video.v_rowBytes,
+                reinterpret_cast<const void *>(source->getVirtualAddress()),
+                source->getLength(),sourceStride,width,sourceHeight)) {
                 OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
             }
+            if(barRows) {
+                (void)native_legacy_fill_pixels((volatile void *)panel,bootMapping->getLength(),
+                    video.v_rowBytes,width,barRows,0xff000000U);
+                const uint64_t bottom=(uint64_t)(barRows+sourceHeight)*video.v_rowBytes;
+                (void)native_legacy_fill_pixels((volatile void *)(panel+bottom),
+                    bootMapping->getLength()-bottom,video.v_rowBytes,width,height-sourceHeight-barRows,0xff000000U);
+            }
+            if(letterbox)copyShadowValid=false;
         }
         __asm__ volatile("dsb sy" ::: "memory");
         {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
@@ -488,24 +507,30 @@ public:
         if(enabled==1 && logicalPM && primary && bootMapping && request) {
             reason=2;OSObject *surfaces[4]={};memcpy(surfaces,bytes+2624,sizeof(surfaces));surface=surfaces[0];
             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
+            /* A phone canvas (1080x2340 over a 1080x2400 panel) names its own smaller height in the swap; accept it
+             * when it is at most the panel's and both rectangles cover exactly that canvas. The copy path centres it
+             * and fills the bars. */
+            const uint32_t requestWidth=word(816),requestHeight=word(820);
+            const bool phoneCanvas=requestWidth==width && requestHeight>height/2 && requestHeight<=height;
+            const uint32_t canvasWidth=phoneCanvas?requestWidth:width,canvasHeight=phoneCanvas?requestHeight:height;
             if(surface && surface->metaCast("IOSurface") && !surfaces[1] && !surfaces[2] && !surfaces[3] &&
                native_legacy_single_layer_state(word(792),word(796),word(800))) {
                 reason=3;bool rectangles=true;
                 const unsigned rectOffsets[]={17,81};
                 for(unsigned offset: rectOffsets) {
                     uint32_t rect[4]={};memcpy(rect,bytes+offset,sizeof(rect));
-                    rectangles=rectangles && rect[0]==0 && rect[1]==0 && rect[2]==width && rect[3]==height;
+                    rectangles=rectangles && rect[0]==0 && rect[1]==0 && rect[2]==canvasWidth && rect[3]==canvasHeight;
                 }
                 bool options=true;for(unsigned offset=804;offset<=812;offset+=4)options=options && word(offset)==0;
-                if(width && height && rectangles && options && word(816)==width && word(820)==height) {
+                if(width && height && rectangles && options && requestWidth==canvasWidth && requestHeight==canvasHeight) {
                     reason=4;
                     IOMemoryDescriptor *memory=native_legacy_surface_descriptor(surface);
                     // A surface larger than the display (rows or lines padded to the GPU's alignment) is accepted: only the visible rectangle,
-                    // which the request's rectangles already name as the whole display, is copied.
-                    if(native_legacy_surface_width(surface)>=width && native_legacy_surface_height(surface)>=height &&
+                    // which the request's rectangles already name as the whole canvas, is copied.
+                    if(native_legacy_surface_width(surface)>=canvasWidth && native_legacy_surface_height(surface)>=canvasHeight &&
                        picasso_gop_format(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) &&
                        memory && memory->metaCast("IOMemoryDescriptor") &&
-                       native_legacy_surface_bounds(width,height,native_legacy_surface_stride(surface),
+                       native_legacy_surface_bounds(canvasWidth,canvasHeight,native_legacy_surface_stride(surface),
                            native_legacy_surface_allocation(surface),memory->getLength())) {
                         reason=0;accepted=true;
                     } else {
