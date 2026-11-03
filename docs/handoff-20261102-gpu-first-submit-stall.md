@@ -883,3 +883,28 @@ Client side (read-only reference copies):
   `4d06d7c3d0d57343052219f0430075ef3cc69c07`, trust
   `f2958b9942377eee1aac7b5062131b0f79cafaf571f7f00bb8640843339d2229`; image
   `out/wf92/picasso/boot/wf92.img`, log `out/wf92-runs/run1.log`.
+- **wf92 result: the CP runs through the fill's commands; the pipeline still does nothing.** `Q
+  6f855a49/6f855a8a 1/0 r0`: q0 (before the fill) = `0x6f855a49`, available; q1 (after the fill) =
+  `0x6f855a8a`, a **later** counter value, so the CP reached the trailing timestamp and did not
+  abort inside the fill's state/draw packets. (q1's availability word read 0 — secondary, Turnip's
+  availability write path; the value itself proves execution.) The samples were again
+  `deadbeef`/`5a5a5a5a`: the CP executes, the 3D/compute blocks do not produce writes.
+- **Root-cause candidate from the official source: SPTPRAC power.** `a6xx_catalog.c`'s a620 entry
+  has no GMU-wrapper quirk, so mainline's `a6xx_gmu_fw_start()` takes the legacy branch
+  (`a6xx_gmu_gfx_rail_on()` + `a6xx_sptprac_enable()`) for this chip. `a6xx_sptprac_enable()`
+  writes `GPU_GMU_GX_SPTPRAC_POWER_CONTROL = 0x778000` and polls `GMU_SPTPRAC_PWR_CLK_STATUS` until
+  `(status & 0x38) == 0x28`; `a6xx_set_hwcg()` only toggles the *clock* control. The port boots the
+  GMU through the HFI/`GMU_OOB_GPU_SET` handshake (which acks and keeps GX on) but never writes the
+  SPTPRAC power register. A CP that runs while SP/TP stay collapsed is exactly the measured
+  signature: CP-level turns (fence, timestamp, `CP_MEM_WRITE`) complete, every draw/blit/compute
+  leaves memory untouched, and the GMEM visibility handshake (`RM6_ENDVIS`) never completes (wf81).
+  Other catalog facts checked and matching the port: a620 uses `a650_sqe.fw`, `a650_protect`,
+  `a620_hwcg`, `PC_DBG_ECO_CNTL = prim_fifo_threshold | bit 9`. One difference noted: mainline's
+  a620 entry names `a621_gmu.bin`; the port pins `a650_gmu.bin` from the device's own firmware
+  (41308 bytes), which boots and runs HFI here — revisit only if SPTPRAC still refuses.
+- **wf93: power SPTPRAC.** `hardwareInit()` now performs mainline's `a6xx_sptprac_enable()` after
+  the GX-on check: `gmuWrite(0x1A881, 0x778000)`, then poll `GMU_SPTPRAC_PWR_CLK_STATUS` (0x1F8D0)
+  up to 100 × 1 µs for `(status & 0x38) == 0x28`, and print the before/after status. Kernel rebuilt
+  from `out/picasso/kernel/kernel.macho`; the previous kernel is kept at
+  `build/kernel-wf92-471840b5.macho` (sha `471840b5…`). Image `out/wf93/picasso/boot/wf93.img`,
+  log `out/wf93-runs/run1.log`.
