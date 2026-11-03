@@ -35,7 +35,7 @@ removed=["offline-hid-swipe=16","boot-ui-focus4=liveactivitiesd","sheng-gpu-prob
          "boot-ui-focus=chronod","picasso_usb_hold=0","picasso_usb_control_ms=15000"]
 for t in removed:
     line='  "'+t+'",\n'
-    assert line in s, t
+    # Diagnostic arguments may already be absent from the current board.
     s=s.replace(line,'',1)
 assert 'size_mib = 60\n' in s
 s=s.replace('size_mib = 60\n','size_mib = 80\n',1)
