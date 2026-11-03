@@ -1354,3 +1354,13 @@ Client side (read-only reference copies):
   same kernel: `sheng-gpu-heartbeat` and `sheng-gpu-mask-irqs`. Kernel
   `e84e81db27f350079c9e33077c45091942e2a001e16f1a7fd3d9dbf702dae647`; image
   `out/wf126/picasso/boot/wf126.img`; log `out/wf126-runs/run1.log`.
+- **wf127: a Metal client submits through the authenticated GPU.** Same fixed configuration with
+  `sheng-gpu-metal=1 sheng-gpu-addon=1`: `metal stage=5 registered=1` and `metal published`,
+  then backboardd (pid 56) opens the accelerator (`open: plugin type=4147`, `mount ok opens=1`),
+  and the tunnelled ABI runs end to end — `BoAlloc`, `BoMap` (up to 128 KiB/32 pages),
+  `BoCpuMap`/`Unmap`, `DeviceInfo` and **`Submit`/`WaitFence` all status 0**. Six command buffers
+  from pid 56 reach the production ring (`wire: pid=56 … bytes=756/796/996`, first word
+  `70460001`), with no `stall:` or `hang:` lines and the heartbeat continuing. Two selectors
+  still fail: 7 `Timestamp` (`e00002c7`) and 9 `Metadata` (`e00002c2`). The display scans out
+  content throughout (`PICASSO_DISPLAY frame kind=0 nonblack=41011`). Kernel `c7df15dd…`; image
+  `out/wf127/picasso/boot/wf127.img`; log `out/wf127-runs/run1.log`.

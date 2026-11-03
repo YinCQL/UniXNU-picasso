@@ -1845,6 +1845,16 @@ void addonReport(void *, wait_result_t)
     printf("PICASSO_GPU metal later: opens=%u foreign=%u report=%s report2=%s\n",
         native_adreno_metal_opens(), native_adreno_metal_foreign_opens(),
         native_adreno_metal_report(), native_adreno_metal_report2());
+    /* wf128: the first two samples land before the render server exists (backboardd opens the
+     * accelerator after the dyld-cache phase). This third sample, three minutes in, shows
+     * whether client submissions keep arriving instead of stopping after the first burst. */
+    IOSleep(120000);
+    printf("PICASSO_GPU submits final: submissions=%u ibs=%u max=%u many=%u\n",
+        native_adreno_submit_ibs[0], native_adreno_submit_ibs[1],
+        native_adreno_submit_ibs[2], native_adreno_submit_ibs[3]);
+    printf("PICASSO_GPU metal final: opens=%u foreign=%u report=%s report2=%s\n",
+        native_adreno_metal_opens(), native_adreno_metal_foreign_opens(),
+        native_adreno_metal_report(), native_adreno_metal_report2());
 }
 
 /* One entry of the production user-client dispatch, with the record sizes the
