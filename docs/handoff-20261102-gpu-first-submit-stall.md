@@ -1395,3 +1395,13 @@ Client side (read-only reference copies):
   `CP_ALWAYS_ON_COUNTER` (dword 0x980/0x981 in the already-mapped GPU window — the register
   mainline's `a6xx_get_timestamp` reads) and logs `gpu timer attached=<0|1> ticks=<…>`; the
   refused `SetMetadata` record now prints its shape instead of only returning BadArgument.
+- **wf130 result: the timestamp works; the UI still has no surfaces.** `gpu timer attached=1
+  ticks=184706151`, and the client's `GetTimestamp` now answers 0 instead of
+  `kIOReturnUnsupported`. The refused metadata is explained: `metadata: unknown handle=1` — the
+  client sets metadata on a handle its connection does not own, so `SetMetadata` correctly
+  refuses it (`e00002c2`). The rest is unchanged: five client submissions at connect, no render
+  loop, and the framebuffer goes black between grid frames 8 and 9 exactly as backboardd opens
+  the accelerator (the compositor takes the scanout but presents nothing). So the GPU-side ABI
+  is complete for a client; what remains for visible rendering is the UI producing and
+  committing surfaces, which is independent of the GPU driver. Image
+  `out/wf130/picasso/boot/wf130.img`; log `out/wf130-runs/run1.log`.
