@@ -77,13 +77,24 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     uint64_t vsyncInterval=0,vsyncNext=0;
     unsigned vsyncHz=0;
     bool vsyncArmed=false;
+    /* wf131 measured the compositor kicking the swap queue three times with the client queue
+     * at +5592 still empty every time, so the tick that stands in for the absent panel
+     * subclass never armed and userspace never received a vsync. The kick itself proves a
+     * display client exists, and the original sender walks the client queue (a no-op when it
+     * is empty), so treat a kick as "wanted" for the rest of the boot: wf132. */
+    bool vsyncKicked=false;
     bool vsyncWanted() const {
         const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+5592,sizeof(head));return head;
     }
+    bool vsyncActive() const { return vsyncWanted() || vsyncKicked; }
     // Selector 72's registration of a vsync client ends in kickSwapQueue (slot 290), which arms the tick; the tick stops by itself once
     // the last client is removed.
     void armVsync() {
-        if(!vsyncTimer || vsyncArmed || !vsyncWanted())return;
+        /* wf131: the tick only arms for a registered vsync client; print the reason the first
+         * few times so "no vsync ever" is distinguishable from "vsync client never registered". */
+        static unsigned armPrints;
+        if(armPrints<8){++armPrints;printf("PICASSO_DISPLAY vsync: arm timer=%p armed=%d wanted=%d kicked=%d\n",vsyncTimer,int(vsyncArmed),int(vsyncWanted()),int(vsyncKicked));}
+        if(!vsyncTimer || vsyncArmed || !vsyncActive())return;
         vsyncArmed=true;vsyncNext=mach_absolute_time()+vsyncInterval;
         vsyncTimer->wakeAtTime(vsyncNext);native_legacy_vsync_observed(0,vsyncHz);
     }
@@ -91,7 +102,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     void vsyncTick() {
         vsyncArmed=false;
         if(!vsyncTimer)return;
-        if(!vsyncWanted()){native_legacy_vsync_observed(2,vsyncHz);return;}
+        if(!vsyncActive()){native_legacy_vsync_observed(2,vsyncHz);return;}
         const uint64_t now=mach_absolute_time();
         native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);
         native_legacy_vsync_observed(1,vsyncHz);
@@ -207,6 +218,12 @@ public:
     // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
     bool kicking=false,rekick=false;
     void kickSwapQueue() override {
+        /* wf131: whether the compositor's queued swap ever reaches the kick, and whether a
+         * vsync client is registered at that moment. wf132: the kick also establishes that a
+         * display client exists, which is what the tick needs to run. */
+        static unsigned kickPrints;
+        if(kickPrints<8){++kickPrints;printf("PICASSO_DISPLAY vsync: kick wanted=%d armed=%d\n",int(vsyncWanted()),int(vsyncArmed));}
+        vsyncKicked=true;
         armVsync();
         if(kicking){rekick=true;return;}
         kicking=true;

@@ -1429,3 +1429,18 @@ Client side (read-only reference copies):
   property-carrying open (and therefore needs this XNU's service-properties support enabled or
   a grant for this service), since that refusal is the most concrete outstanding difference
   between the boot's GPU setup and a RenderServer that submits frames.
+- **wf131: the compositor does present, but the vsync stand-in never arms.** The display-state
+  line (now printed with every grid frame) shows backboardd's three swaps fully processed:
+  `submit=3 accept=3 reject=0 scans=3 nonblack=3 transfer=3 retire=3 copies=3
+  copy_bytes=11250048`, the last at ~157 s, then nothing more. New prints inside
+  `kickSwapQueue()`/`armVsync()` show `kick wanted=0 armed=0` on every kick: the vsync client
+  queue at +5592 reads empty, so the timer that stands in for the absent panel subclass never
+  arms and userspace never receives a vsync. The grid also corrects an earlier reading: the
+  screen is not all black — after the compositor takes over, the bootloader text is replaced by
+  a centred logo (rows 10–12, cols 6–7 in wf131) and wf130 later shows content at rows 3–4 and
+  20–23. Image `out/wf131/picasso/boot/wf131.img`; log `out/wf131-runs/run1.log`.
+- **wf132: a swap-queue kick makes the vsync tick run.** The kick proves a display client
+  exists, and the original sender walks the client queue (a no-op when empty), so
+  `vsyncKicked` keeps the tick active from the first kick on instead of depending on the
+  guessed +5592 head. Expected signature: `vsync_ticks` grows and the compositor submits more
+  than its initial three frames.

@@ -481,6 +481,9 @@ static void gridSampleThread(void *, wait_result_t)
     for (unsigned sample = 1;; ++sample) {
         IOSleep(static_cast<unsigned>(gridPeriodMs));
         printf("PICASSO_GRID frame=%u\n", sample);
+        /* wf131: the state line carries submissions/accepted/transfers/copies/vsync_ticks, so
+         * the grid run also shows whether the display service is being fed frames at all. */
+        reportDisplayState("grid");
         for (uint32_t row = 0; row < 24; ++row) {
             char text[13];
             for (uint32_t col = 0; col < 12; ++col) {
