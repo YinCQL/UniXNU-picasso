@@ -1720,8 +1720,9 @@ Client side (read-only reference copies):
   moved=1 reports=26 edge=1/1` through `swipe 8 reports=182 edge=7/7`), the UI presents continuously
   (`PICASSO_GPU text: PF 191/0` — 191 frames, 0 failures), and the display counters read
   `PICASSO_DISPLAY_STATE trigger=submissions … submit=192 accept=192 reject=0 transfer=189
-  retire=190 copies=2 copy_bytes=10368000` (later still 256/2 and the kernel counter
-  `PICASSO_GPU submits live 1: submissions=441 ibs=2655`). Both CPU copies happened before the plugin's hand-off
+  retire=190 copies=2 copy_bytes=10368000`; by the end of the run the display had accepted 512
+  frames with `copies=2` still frozen, and the kernel counter read `PICASSO_GPU submits live 5:
+  submissions=955 ibs=6915 max=27 many=109`, while swipe 15 delivered `reports=364 edge=14/14`. Both CPU copies happened before the plugin's hand-off
   client became ready (`PICASSO_DISPLAY event=10 sample=1 a=0xa0976`, `sample=2 a=0x1175b4`, printed
   just before `PICASSO_GPU text: P4 e0`); after that the copy counters stay frozen while submissions
   climb, which is the expected first-frame fallback. Image `out/wf145/picasso/boot/wf145.img`, log
