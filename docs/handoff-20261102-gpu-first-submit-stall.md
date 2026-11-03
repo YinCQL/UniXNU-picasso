@@ -1117,3 +1117,35 @@ Client side (read-only reference copies):
   read; if the fence hangs again, the zap path (PAS/SCM) is mandatory. Image
   `out/wf102/picasso/boot/wf102.img`, kernel `5b89210f…` (vendor SQE), same addon; log
   `out/wf102-runs/run1.log`.
+- **wf102 result: the CP packet alone cannot switch the GPU; the zap is mandatory.** With the
+  device's own SQE the packet is accepted (`CP_SET_SECURE_MODE(0) submitted wptr=11`,
+  `idle rptr=11`) and `RBBM_SECVID_TRUST_CNTL` still reads 1, but the very next no-op submission's
+  fence never arrives (`fence timeout wanted=1 have=0`, `end stage=4 … error=-40`). Without the
+  zap, switching the CP's secure state leaves its own memory writes unusable. The CP_PROTECT
+  opcode error in wf100 was SQE-specific; the real gate is the secure world.
+- **Official cause, confirmed:** a5xx/a6xx GPUs power on in **secure mode, where they "can only
+  render to protected buffers"** (Adreno zap-shader series). That is exactly this port's
+  signature: every CP packet works, every draw/blit/compute to non-protected client memory is
+  silently discarded. The only way out is the signed zap loaded through TZ (PAS) followed by
+  `CP_SET_SECURE_MODE(0)`; the CPU write to `SECVID_TRUST_CNTL` is blocked on this device (wf80).
+- **wf103: probe the SCM conduit and the PAS calls.** Before implementing the zap loader, measure
+  whether this kernel can talk to the QCOM secure monitor at all. `Adreno620Cp.cpp` gains an
+  SMC helper (same `smc #0` pattern as `drivers/ArmCpu/ArmCpu.cpp`) and `scmProbe()`, which asks
+  `SCM_SVC_INFO/IS_CALL_AVAIL` (`0x06/0x01`, owner SIP, SMC64 fast call) whether
+  `SCM_SVC_PIL` init_image `0x01`, mem_setup `0x02` and auth_and_reset `0x05` exist; the reply
+  registers are printed at hw_init. This changes no GPU state. Kernel
+  `f813105ec0f3ca92f1e1bfd2a84563df0f60fd95d54cbad095b5bbd71821890b`; image
+  `out/wf103/picasso/boot/wf103.img`, vendor SQE, same addon; log `out/wf103-runs/run1.log`.
+- **Zap loader design (for the boot after wf103, if the PAS calls answer).** From the decompiled
+  Picasso DTB and downstream sources: `qcom,kgsl-hyp` = `qcom,pil-tz-generic`, pas-id `0x0d`,
+  firmware-name `a620_zap`; `peripheral-loader.c` allocates a relocatable DMA region (the zap's
+  ELF segments are QCOM_MDT_RELOCATABLE), so no reserved carveout is needed. Sequence:
+  1. parse `a620_zap.mdt` as ELF32; metadata = program-header block (`phdrs[0].p_filesz` bytes)
+     followed immediately by the hash segment (for split firmware it is packed in the .mdt);
+  2. `PAS_INIT_IMAGE(0x0d, metadata_phys)` with arginfo `SCM_ARGS(2, VAL, RW)` = `0x82`
+     (`SCM_SIP_FNID(0x02,0x01)` = `0x0201`, SMC64 SIP call = `0x42000201` STD / `0xC2000201` FAST);
+  3. copy the .b00..b02 segments to `region + (p_paddr - min_paddr)`, then
+     `PAS_MEM_SETUP(0x0d, region_phys, span)` (arginfo `0x03`);
+  4. `PAS_AUTH_AND_RESET(0x0d)` (arginfo `0x01`) — TZ authenticates and runs the zap on the GPU;
+  5. then `CP_SET_SECURE_MODE(0)` and, if it takes, the Turnip smoke is the decisive read.
+  Metadata and image buffers must be physically contiguous, 4 KiB aligned and non-cacheable.

@@ -342,6 +342,54 @@ bool packet(uint32_t *words, size_t capacity, size_t at, uint32_t opcode,
     return true;
 }
 
+/* wf103: SCM (secure channel manager) probe. The GPU boots in secure mode and, per the
+ * zap-shader documentation, "can only render to protected buffers" until a signed zap is
+ * loaded through TZ and the CP is switched out of secure mode. Loading that zap needs the
+ * Qualcomm PAS SCM calls; this helper is the conduit those calls will use. It is the same
+ * instruction the platform's PSCI driver uses (drivers/ArmCpu/ArmCpu.cpp). */
+struct ScmReply { uint32_t a0, a1, a2, a3; };
+ScmReply scmSipCall(uint32_t function, uint32_t arginfo, uint64_t arg0,
+    uint64_t arg1 = 0, uint64_t arg2 = 0, uint64_t arg3 = 0)
+{
+    register uint64_t x0 __asm__("x0") = function;
+    register uint64_t x1 __asm__("x1") = arginfo;
+    register uint64_t x2 __asm__("x2") = arg0;
+    register uint64_t x3 __asm__("x3") = arg1;
+    register uint64_t x4 __asm__("x4") = arg2;
+    register uint64_t x5 __asm__("x5") = arg3;
+    __asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
+        : "r"(x4), "r"(x5)
+        : "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16",
+          "x17", "memory");
+    return ScmReply{uint32_t(x0), uint32_t(x1), uint32_t(x2), uint32_t(x3)};
+}
+
+void scmProbe()
+{
+    constexpr uint32_t kSipOwner = 2u;              /* ARM_SMCCC_OWNER_SIP */
+    constexpr uint32_t kOwnerShift = 24;
+    constexpr uint32_t kFastCall = 1u << 31;        /* ARM_SMCCC_FAST_CALL */
+    constexpr uint32_t kSmc64 = 1u << 30;           /* ARM_SMCCC_SMC_64 */
+    constexpr uint32_t kSvcInfo = 0x06u, kIsCallAvail = 0x01u;
+    constexpr uint32_t kSvcPil = 0x02u, kPasInitImage = 0x01u;
+    constexpr uint32_t kPasMemSetup = 0x02u, kPasAuthAndReset = 0x05u;
+    const uint32_t avail = (kFastCall | kSmc64 | (kSipOwner << kOwnerShift) |
+        (kSvcInfo << 8) | kIsCallAvail);
+    const uint64_t selector = (uint64_t(kSipOwner) << kOwnerShift) |
+        uint64_t((kSvcPil << 8) | kPasInitImage);
+    const ScmReply init = scmSipCall(avail, 1, selector);
+    const uint64_t setupSelector = (uint64_t(kSipOwner) << kOwnerShift) |
+        uint64_t((kSvcPil << 8) | kPasMemSetup);
+    const ScmReply setup = scmSipCall(avail, 1, setupSelector);
+    const uint64_t resetSelector = (uint64_t(kSipOwner) << kOwnerShift) |
+        uint64_t((kSvcPil << 8) | kPasAuthAndReset);
+    const ScmReply reset = scmSipCall(avail, 1, resetSelector);
+    printf("PICASSO_GPU scm: is-call-avail init a0=%08x a1=%08x a2=%08x a3=%08x\n",
+        init.a0, init.a1, init.a2, init.a3);
+    printf("PICASSO_GPU scm: is-call-avail memsetup a0=%08x a1=%08x; auth %08x/%08x\n",
+        setup.a0, setup.a1, reset.a0, reset.a1);
+}
+
 void printCpStatus(const char *where)
 {
     /* A6XX CP/RBBM fault and progress registers: 0x210 RBBM_STATUS, 0x213
@@ -404,6 +452,10 @@ bool hardwareInit()
         printf("PICASSO_GPU cp: GX is off before hw_init (status=%08x)\n", gx);
         return false;
     }
+
+    /* wf103: can this kernel reach the QCOM secure monitor, and does the firmware expose the
+     * PAS calls the zap needs? (No state is changed; the reply is the measurement.) */
+    scmProbe();
 
     /* a6xx_sptprac_enable() (a6xx_gmu.c). This device is a legacy GMU (gmu_is_wrapper is not set in
      * a6xx_catalog, and the DT property is absent), and on that path mainline powers the SP/TP rail
