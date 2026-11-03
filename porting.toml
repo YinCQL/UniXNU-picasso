@@ -1,0 +1,189 @@
+schema_version = 1
+
+[device]
+name = "picasso"
+soc = "SM7250"
+os_profile = "ipados-17.7.11-21H461"
+summary = "Redmi K30 5G bring-up has reached Adreno 620 GPU integration. Main targets iPadOS 17.7.11; CPU/GOP, authenticated UFS root and Novatek touch are implemented. PR13 reports GPU rendering with external Metal/Turnip inputs. Sustained UI stability, networking, audio and full power management remain unfinished."
+
+[[area]]
+id = "configuration"
+status = "implemented"
+components = ["ArmDTPlatform", "ArmCpu"]
+paths = ["board.toml", "upstream.rev", "unixnu", "configs/**", ".gitmodules", ".gitignore", ".github/**"]
+inputs = ["SM7250/picasso, iPad7,1 iPadOS 17.7.11 build 21H461 and the legacy UniXNU source overlay."]
+configuration = ["board.os_profile = ipados-17.7.11-21H461; kernel.defconfig = picasso_defconfig; upstream.rev = 75fba878a97af05ac990fe0310095f40c5681ceb.", "kernel.archives is an ordered replacement list: corecrypto, ArmDTPlatform, ArmCpu, Picasso AES, NativeUfs, NativeAdreno, AdrenoPicasso, NativeRamBlock, PMGR and Legacy display."]
+procedure = ["Inspect board.toml, configs/picasso_defconfig and upstream.rev.", "Run python3 ./unixnu --prepare to clone the pinned upstream and apply the board overlay in its isolated cache.", "Check the resolved archive and prelink inputs before building kernel/prelink."]
+findings = ["Main uses 21H461; feat/ios16-gpu is a separate OS target and its device results must not be substituted for main results.", "The joined default kernel_args was 1012 bytes. Omitting native-ufs-diagnostics=0 and picasso_usb_hold=0 reduces it to 968 bytes; both consumers initialize the value to zero. Boot, watchdog, input and GPU selections remain explicit.", "This board uses the legacy archive recipe. os_profile is identity metadata; adding the record does not migrate the builder to format 2. Catalog IDs below describe reusable interfaces and lineage; SM7250 board modules are identified by their actual paths and build names."]
+completion = ["The source pin resolves, ordered archives and patches match this board, and the final joined kernel command line passes the payload builder's 1000-byte guard."]
+limits = ["Format-2 profile/component resolution is not enabled. Additional command-line overrides consume the same 1000-byte budget."]
+next_action = ["Check the final payload.json command line and effective archive selection with each new image."]
+evidence = [{kind = "source", reference = "board.toml", result = "Target identity, ordered archives, prelink roots and default arguments."}, {kind = "source", reference = "unixnu", result = "Pinned isolated overlay preparation and legacy build entry point."}, {kind = "source", reference = "drivers/NativeUfs/NativeUfs.cpp", result = "The UFS diagnostic value defaults to zero."}, {kind = "source", reference = "patches/picasso-usb-console-xnu.patch", result = "The USB hold value defaults to zero."}]
+
+[[area]]
+id = "firmware"
+status = "implemented"
+components = ["DarwinBoot"]
+paths = ["uefi/**", "patches/firmware/**"]
+inputs = ["Mu-Silicium Picasso FD, BootShim, device DTB, GOP framebuffer, PSCI SMC and conventional-memory map."]
+configuration = ["firmware.config = picasso; firmware.dsc = Platforms/Xiaomi/picassoPkg/picasso.dsc; payload.loader = firmware.", "Android boot header v1, 4096-byte pages, kernel_offset = 0x8000, ramdisk_offset = 0x200000 and tags_offset = 0x1e00000."]
+procedure = ["Build Mu-Silicium with the Picasso configuration and retain its source revision, FD hash and DTB.", "Copy the intended FD to uefi/SILICIUM_UEFI.fd; compose BootShim/FD/DTB and the FAT ramdisk using the declared Android layout.", "During a temporary boot, capture the firmware memory map, GOP geometry and DarwinBoot allocation before ExitBootServices."]
+findings = ["The Android kernel slot contains BootShim and UEFI; DarwinBoot loads XNU from the FAT payload and passes a generated ADT, distinct from the firmware DTB.", "PR13 adds publication of high DRAM banks and clamps the 5 GiB kernel-window request to available conventional memory. Both the FD and kernel topology inputs must correspond to the intended build."]
+completion = ["UEFI enters its boot menu, loads the intended payload, starts XNU through PSCI and preserves framebuffer and reserved-memory handoff."]
+limits = ["Firmware and panel initialization are external to the XNU display driver. A committed FD alone does not identify the firmware used in a device log."]
+next_action = ["Record FD/DTB hashes and the final conventional-memory allocation with the next main image."]
+evidence = [{kind = "source", reference = "uefi/README.md", result = "FD source and replacement procedure."}, {kind = "source", reference = "patches/firmware/mu-silicium-publish-all-dram.patch", result = "Firmware DRAM publication adjustment."}, {kind = "source", reference = "patches/firmware/darwinboot-window-clamp.patch", result = "Loader allocation clamps to an available contiguous run."}]
+
+[[area]]
+id = "cpu"
+status = "implemented"
+components = ["ArmCpu", "ArmDTPlatform"]
+paths = ["drivers/ArmCpu/**", "drivers/NativeCpuFreq/**", "patches/picasso-cpu-*.patch", "scripts/*cpufreq*"]
+inputs = ["Six Cortex-A55 and two Cortex-A76 cores; MPIDR affinities 0x000..0x700; GICv3 distributor 0x17a00000/0x10000 and redistributors 0x17a60000/0x100000; 19.2 MHz counter."]
+configuration = ["cpus=8, sheng-smp=1, armcpu-spi-ipi=1 and armcpu-self-ipi=1; virtual timer INTID 19.", "CONFIG_XNU_ARMCPU, CONFIG_XNU_NATIVE_ARCH_TIMER and CONFIG_XNU_PICASSO_CPUFREQ; topology patch selects E/P clusters and AMP scheduling."]
+procedure = ["Generate the ADT and inspect CPU affinities and timer/GIC properties.", "Boot with PSCI and routed SPI IPIs, then compare per-core entry and timer/IPI counters.", "For a deliberate OSM governor test, supply sheng-cpufreq=<stage> and measure frequency/load/thermal behavior."]
+findings = ["The virtual timer is PPI 3, absolute INTID 19. This board routes cross-core IPIs through SPIs and uses a self-IPI to clear the new core's disabled-signal state.", "PR13's scheduler change places the default timeshare bucket on the E cluster while retaining P preference for higher-priority UI buckets; correct DTB topology alone does not establish balanced load."]
+completion = ["All eight CPUs reach their running checkpoints, timer/IPI delivery works, and separately measured governor transitions stay within hardware limits."]
+limits = ["The default command line does not enable the staged OSM governor. Sustained load, thermal control and sleep/resume remain separate validation."]
+next_action = ["Capture per-core timers, IPIs and E/P utilization during interactive rendering."]
+evidence = [{kind = "source", reference = "drivers/ArmCpu/ArmCpu.cpp", result = "CPU startup, interrupt routing and topology adaptation."}, {kind = "source", reference = "patches/picasso-cpu-topology-xnu.patch", result = "AMP/Edge scheduling policy for this two-cluster board."}, {kind = "source", reference = "drivers/NativeCpuFreq/CpuFreqProbe.cpp", result = "SM7250 OSM probe and staged governor."}]
+
+[[area]]
+id = "memory"
+status = "implemented"
+components = ["ArmSmmu4K"]
+paths = ["scripts/make-picasso-adt.py", "kits/ArmSmmu4K/**", "drivers/NativeAdreno/NativeAdrenoMemory*", "drivers/NativeAdreno/NativeAdrenoVm*"]
+inputs = ["6 GiB DRAM map, firmware reservations, the contiguous XNU window, 4 KiB pages, apps/GPU SMMU ownership and consumer DMA address widths."]
+configuration = ["payload.dram_size = 0x180000000; payload.adt.owned_memory_size = 0x140000000; packed_data_ramdisk = true.", "GPU SMMU = 0x03da0000/0x10000; controller allocations and page-table mappings must use their qualified address/cache policy."]
+procedure = ["Compare the firmware map with generated ADT ranges and reserved regions.", "Inspect DarwinBoot's actual window and XNU managed-page count; distinguish requested memory from granted memory.", "Validate buffer alignment, CPU/DMA addresses, SMMU mappings, synchronization and release ownership before submission."]
+findings = ["Installed DRAM, the requested loader window and resident sparse Data pages are different quantities. Reserved framebuffer/firmware holes remain excluded.", "PR13's committed handoff reports about 4.95 GiB managed memory under its experimental FD/image. That result is conditional on those inputs, not a guarantee that every 5 GiB request is satisfied."]
+completion = ["Handoff ranges and reservations do not overlap, the actual grant is propagated to XNU, and each active DMA consumer accesses only its owned mapped range."]
+limits = ["Every claimed mapping needs the corresponding firmware and image identity. Memory pressure, cache coherency and all peripheral DMA consumers are not fully qualified."]
+next_action = ["Measure managed/free/wired pages and DMA/SMMU faults during sustained UI use."]
+evidence = [{kind = "source", reference = "scripts/make-picasso-adt.py", result = "DRAM, kernel-window request, reservations and device register ranges."}, {kind = "source", reference = "drivers/NativeAdreno/NativeAdrenoVm.cpp", result = "GPU mapping and address-space ownership implementation."}, {kind = "source", reference = "docs/handoff-20261103-gpu-render-next.md", result = "Historical PR13 memory measurements and their experimental-image conditions."}]
+
+[[area]]
+id = "storage"
+status = "implemented"
+components = ["ShengUfs", "VerifiedRoot", "VirtioMmioBlock", "RamBlock", "SoftwareAES"]
+paths = ["drivers/NativeUfs/**", "drivers/NativeRamBlock/**", "policy/**", "scripts/*ufs*", "scripts/*root*", "scripts/*ram-data*", "scripts/*union*", "scripts/*verified*", "scripts/build-picasso-aes.py", "package/PicassoAes*"]
+inputs = ["SM7250 UFS host 0x01d84000/0x3000, PHY 0x01d80000/0x2000, GCC clocks/resets and apps-SMMU stream; LUN0 userdata with 4096-byte sectors and measured capacity 0xbdebfb000 bytes.", "Owner-signed OS/SystemOS windows, root UUID, original trust inputs and a separately formatted sparse APFS Data seed."]
+configuration = ["native-ufs-root=1, native-ufs-start-delay=5 and native-ufs-delay-yield=1; sheng-data-persist=2 requests the optional changed-page store.", "CONFIG_XNU_NATIVE_UFS, OWNER_ROOT_TRUST, OWNER_CACHE_MOUNT, OWNER_UNION_SYSTEMOS and OWNER_DATA_MOUNT; root UUID 04769D26-2CA0-4825-B443-E2E5F88300F2; current generated seed has 1024 MiB sparse logical capacity."]
+procedure = ["Check host/PHY clock, reset, power and SMMU resources before link startup; validate SCSI capacity, GPT and known-block reads.", "Verify signed window identities and source hashes, then expose authenticated OS/SystemOS and mount the union root.", "Prepare the separate APFS Data seed and compare its generated UUID to the compiled configuration.", "For persistence qualification, write known data, reboot, read it back and verify overlay bounds and identity."]
+findings = ["NativeUfs is the board's legacy implementation of the catalog's ShengUfs/block-root interfaces. VirtioMmioBlock is dependency lineage; CONFIG_XNU_NATIVE_VIRTIO_BLOCK remains disabled for this physical controller.", "SystemOS union lookup exposes standalone cryptex libraries on the process root; the dyld shared-cache directory alone is insufficient.", "Sparse logical Data capacity is not a contiguous allocation. Selecting overlay mode 2 does not establish successful mounting or reboot persistence."]
+completion = ["Known blocks and volume identities match signed inputs, root mounts and launchd starts; persistent Data additionally passes write/reboot/readback."]
+limits = ["The complete persistent Data path and prolonged write pressure require device testing. Userdata capacity does not establish an unmeasured GPT start LBA."]
+next_action = ["Capture overlay mount status, free-space/page pressure and a bounded persistence readback."]
+evidence = [{kind = "source", reference = "drivers/NativeUfs/NativeUfs.cpp", result = "Physical UFS transport and owned block-device publication."}, {kind = "source", reference = "scripts/prepare-picasso-ram-data.py", result = "Sparse seed creation, offline policy and generated UUID."}, {kind = "source", reference = "patches/unixnu-source-kernel.patch", result = "Signed root, SystemOS union and separate Data integration."}]
+
+[[area]]
+id = "display"
+status = "implemented"
+components = ["GopFramebuffer"]
+paths = ["drivers/NativeMobileDisplay/**", "scripts/*display*", "scripts/*legacy*", "scripts/*gop*", "scripts/*framebuffer*"]
+inputs = ["Firmware-owned GOP scanout, physical base/stride/size, BGRX8888 pixels, original IOMobileFramebufferLegacy/IOSurface ABI and optional GPU presenter client."]
+configuration = ["CONFIG_XNU_NATIVE_LEGACY_DISPLAY; offline-legacy-gop=1, offline-legacy-validate=1, offline-legacy-transfer=1 and offline-legacy-cpu-present=1.", "sheng-vsync=60 sends software refresh notifications; sheng-fb-gpu=1 enables the GPU handoff offer; boot-progress=2 retains the boot monitor."]
+procedure = ["Audit the original framebuffer classes, slots and swap structures against the pinned kernelcache.", "Validate GOP base, dimensions, stride and mappings, then present a known CPU frame before enabling the GPU handoff.", "Compare accepted/transferred/retired requests, presenter completions and CPU copy counters while exercising input."]
+findings = ["The original family retains its ABI and receives completion/retirement from the board subclass. CPU fallback and GPU scanout are distinct paths.", "PR13's committed handoff reports P4/e0, growing GPU presents and CPU copies frozen at two warmup frames on wf145. These measurements use an external addon and experimental command line.", "The main implementation still has an optional early-retirement path; a successful handoff observation does not prove producer lifetime correctness under every workload."]
+completion = ["Known frames have correct geometry/colors; interactive frames complete and retire without stalls or corruption; brightness/timing claims require separate panel measurements."]
+limits = ["No native DPU/pageflip/vblank or brightness control is claimed. Software vsync cannot prove tear-free scanout. The iOS16-GPU branch's later ownership fix has not been imported by this documentation change."]
+next_action = ["Qualify producer lifetime, cache policy and failed-import recovery on main while measuring interactive copy/retirement counters."]
+evidence = [{kind = "source", reference = "drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp", result = "Legacy swap validation, CPU copy and GPU offer/completion implementation."}, {kind = "source", reference = "drivers/NativeMobileDisplay/NativeGOPPresenter.cpp", result = "GPU client import, scanout and completion interface."}, {kind = "source", reference = "docs/handoff-20261103-gpu-render-next.md", result = "Reported wf144/wf145 scanout observations with their external inputs."}]
+
+[[area]]
+id = "input"
+status = "implemented"
+components = ["ShengHidInput", "ShengNovatekTouch", "QcomGeniSpi"]
+paths = ["drivers/NativeHidInput/**", "drivers/NativeNovatekTouch/**", "package/HidInput*", "scripts/*hid*", "scripts/*touch*", "scripts/*novatek*"]
+inputs = ["Novatek NT36672C sensor over Qualcomm GENI SPI, board pins/interrupts, matching fw01 firmware and original IOHIDDevice/EventDriver ABI."]
+configuration = ["CONFIG_XNU_SHENG_HIDINPUT and CONFIG_XNU_NOVATEK_TOUCH; offline-hid-input=1, offline-hid-home=1, sheng-touch-hid=1 and sheng-touch=4.", "Default synthetic input starts at 540 seconds with 16 swipes; experimental PR13 runs override attachment/start timing. Sensor coordinates cover 1080x2400."]
+procedure = ["Fetch and verify the pinned touch firmware, compile the original HID ABI bindings and expose the digitizer/EventDriver sink.", "Start stage-4 GENI SPI sampling only after the sink is ready, parse contact IDs and map coordinates to the configured panel.", "Exercise press/move/release and multiple contacts; correlate successful reports with accepted UI actions."]
+findings = ["The virtual source and physical sensor share the owned HID sink. Successful reports commit state; failed submissions retain the latest snapshot for retry.", "Original IOHIDEventDriver prelink avoids falling through to a unavailable DriverKit server. A probe-ready message or synthetic report count alone does not prove gesture acceptance."]
+completion = ["Coordinates and stable contact IDs match the panel, all releases arrive and physical gestures trigger the expected UI changes."]
+limits = ["Multitouch, buttons and long-run failure/recovery need separate device coverage; synthetic gestures do not replace physical input testing."]
+next_action = ["Record physical contacts, EventDriver delivery and resulting redraws during lock/unlock and Settings navigation."]
+evidence = [{kind = "source", reference = "drivers/NativeHidInput/NativeHidInput.cpp", result = "Original ABI digitizer publication and successful-report state handling."}, {kind = "source", reference = "drivers/NativeNovatekTouch/TouchProbe.cpp", result = "Firmware-backed stage-4 physical sampling and HID delivery."}, {kind = "source", reference = "scripts/fetch-picasso-touch-firmware.py", result = "Pinned sensor firmware input."}]
+
+[[area]]
+id = "gpu"
+status = "implemented"
+components = ["AdrenoPM4", "AdrenoFirmware", "ArmSmmu4K"]
+paths = ["drivers/NativeAdreno/**", "drivers/NativeAdrenoPicasso/**", "scripts/*adreno*", "scripts/*gpu*", "scripts/*metal*", "scripts/*turnip*", "scripts/*air*"]
+inputs = ["SM7250 Adreno620, GPU 0x03d00000, GMU 0x03d6a000, GPUCC 0x03d90000, GPU SMMU 0x03da0000, qualified CX/GX votes and A620 firmware.", "Matching SQE/GMU/ZAP firmware, Metal translation/Turnip addon, publication/client markers and owner trust bundle. External addon bytes are not committed here."]
+configuration = ["kernel.archives selects NativeAdreno and AdrenoPicasso; CONFIG_XNU_NATIVE_ADRENO and CONFIG_XNU_ADRENO620_PROBE are enabled.", "Default sheng-gpu-probe=1 is a read-only probe and sheng-fb-gpu=1 enables the presenter offer. Experimental rendering requires explicit sheng-gpu, Metal/addon options and corresponding payload inputs."]
+procedure = ["Check A620 DT/register identity, CX/GX clocks, power votes and GPU SMMU before accessing gated core registers.", "Validate/embed the correct vendor firmware, then stage GMU, SMMU, CP/rings and an observed fence completion.", "Build/package the matching published Metal/Turnip addon and owner trust; first render a known image, then connect CARenderServer and the GOP presenter.", "Compare VM faults, submissions, IBs, fences, presenter completions and CPU copy counts while exercising real touch."]
+findings = ["NativeAdreno is the legacy A740-origin transport adapted by SM7250/A620 board code; choosing Sm8550Platform merely because it is a catalog dependency would describe the wrong hardware.", "PR13's committed handoff reports Metal-to-Vulkan/Turnip rendering, completed submissions, redraws and GPU scanout under wf139..wf145 experimental inputs. The addon and its upstream plugin changes were external to this device source.", "Presenter attachment or accelerator discovery alone is insufficient evidence of GPU execution. Default main Compose does not provide the experimental addon/trust bundle."]
+completion = ["Qualified firmware/power/SMMU startup completes; real submissions and fences finish; a known image and interactive Metal client frames render without faults; scanout completions preserve producer ownership."]
+limits = ["GPU area status records source implementation, not complete device qualification. Matching external addon, firmware and trust inputs are required; shader cache/startup time, sustained stability and private frontend ABI coverage remain incomplete."]
+next_action = ["Reproduce the reported rendering with pinned addon/firmware hashes, qualify lifetime/cache/import recovery and collect faults during sustained UI interaction."]
+evidence = [{kind = "source", reference = "drivers/NativeAdrenoPicasso/Adreno620Gmu.cpp", result = "A620 GMU power and firmware startup integration."}, {kind = "source", reference = "drivers/NativeAdrenoPicasso/Adreno620Cp.cpp", result = "A620 command processor/ring integration."}, {kind = "source", reference = "drivers/NativeAdreno/NativeAdrenoSubmit.cpp", result = "Submission and fence implementation."}, {kind = "source", reference = "docs/handoff-20261103-gpu-render-next.md", result = "Historical PR13 GPU observations and external plugin/input conditions; this source note is not an independently archived device log."}]
+
+[[area]]
+id = "network"
+status = "implemented"
+components = []
+paths = ["drivers/NativeWlan/**", "scripts/*wlan*", "scripts/*wifi*"]
+inputs = ["Integrated WCSS/SNOC icnss block at 0x18800000/0x800000, apps-SMMU stream 0xc0, MSA shared region, SMP2P and QMI/WLFW firmware/control dependencies."]
+configuration = ["NativeWlan board/firmware/handshake foundation exists; the default board archive list and kernel_args do not start a WLAN stack."]
+procedure = ["Verify DTS/stock-kernel transport facts and matching firmware containers.", "Run make -C drivers/NativeWlan/Test test for the pure board/protocol layers.", "Implement controlled firmware startup and an XNU network interface before attempting association or packet transfer."]
+findings = ["The stock hardware path is integrated WCSS/SNOC, not PCIe or SDIO. The current foundation stops at the real transport/OS-interface blockers; selecting Ath12kWifi for a PCIe path would be misleading."]
+completion = ["Scanning, association, address configuration and sustained receive/transmit pass with declared firmware and interrupt/DMA handling."]
+limits = ["Only source foundations are recorded as implemented. No working Wi-Fi interface, association or packet transfer is claimed."]
+next_action = ["Identify the firmware/control service and implement the missing SNOC data path and XNU network interface."]
+evidence = [{kind = "source", reference = "drivers/NativeWlan/README.md", result = "Stock transport evidence, firmware dependencies and current blockers."}, {kind = "source", reference = "drivers/NativeWlan/WlanFirmware.c", result = "Container and WLFW handshake models."}]
+
+[[area]]
+id = "audio"
+status = "planned"
+components = []
+paths = ["package/*Audio*", "package/*Adsp*", "package/*Codec*", "scripts/*audio*", "scripts/*adsp*"]
+inputs = ["SM7250 DSP firmware/services, codec and amplifier routing, clocks, regulators, transport and target userland audio ABI."]
+configuration = ["No native DSP/codec playback or capture provider is selected by the current board archives."]
+procedure = ["Inventory stock DTS, firmware and DSP transport dependencies, then implement one controlled playback route before adding capture."]
+findings = ["Reaching SpringBoard or rendering through the GPU does not establish audio hardware or media-service support."]
+completion = ["Each declared route plays or captures a known format and handles stream start/stop without firmware or DMA faults."]
+limits = ["DSP startup, codec routes, playback and capture remain unimplemented for this port."]
+next_action = ["Record the stock DSP/codec resources and required firmware/service interfaces."]
+evidence = []
+
+[[area]]
+id = "power"
+status = "implemented"
+components = ["AppleKeyStoreState"]
+paths = ["package/PicassoPmgr*", "package/AppleKeyStore*", "scripts/*pmgr*", "scripts/*power*", "scripts/*battery*", "scripts/*watchdog*"]
+inputs = ["SM7250 APSS watchdog/PSHOLD and IMEM reset reason, firmware-owned rails/clocks, original ApplePMGRNub ABI and limited keystore state adapter."]
+configuration = ["sheng-pmgr=2, picasso-aks-state=1, picasso_usb_watchdog=1, picasso_usb_early_watchdog=1, watchdog_ms=30000, host_timeout_ms=60000 and picasso_usb_reset=watchdog.", "sheng-disable-watchdogd=1 isolates unavailable userspace checkins while preserving the selected native recovery path."]
+procedure = ["Publish the qualified PMGR nub before original security initialization and verify its expected state interface.", "Measure watchdog pet/timeout and reset reason under an attended test; treat logical PM callbacks separately from physical power transitions.", "Inventory battery/rail units and dependencies before implementing sleep/resume."]
+findings = ["The unchanged AMFI needs a PMGR-compatible provider. A logical adapter satisfies the required ABI without programming Apple PMGR hardware.", "AppleKeyStore state-only queries do not provide keybag operations. Native watchdog recovery does not establish battery, DVFS or suspend/resume support."]
+completion = ["Required logical services initialize and the selected recovery route reaches Fastboot; each later claimed power transition restores its dependent devices."]
+limits = ["Full regulators/battery, thermal policy and suspend/resume remain unfinished. Recovery timing needs an image-specific device observation."]
+next_action = ["Capture watchdog/reset reason and inventory battery and sleep/resume ownership on the target firmware."]
+evidence = [{kind = "source", reference = "package/PicassoPmgr.cpp", result = "Original-compatible PMGR publication and native watchdog provider."}, {kind = "source", reference = "patches/picasso-usb-console-xnu.patch", result = "USB host timeout, watchdog and reset integration."}]
+
+[[area]]
+id = "packaging"
+status = "implemented"
+components = ["XnuPrelink"]
+paths = ["scripts/build-wf-payload.sh", "scripts/*payload*", "scripts/*image*", "scripts/*bootimg*", "scripts/*prelink*", "scripts/prepare-original-trust.py", "patches/unixnu-source-kernel.patch", "package/Kit.toml"]
+inputs = ["Pinned XNU/21H461 kernelcache ABI, generated headers/archives, signed OS/SystemOS policy, original static/System trust caches, APFS Data seed, FD, DTB and BootShim."]
+configuration = ["kernel.prelink uses scripts/prelink-picasso.py, original kernelcache SHA f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7 and slide -0x1000000.", "payload.size_mib = 60, loader = firmware, packed_data_ramdisk = true; prelink roots include IOGPUFamily, IOSurface, IOMobileGraphicsFamily, IOHIDEventDriver and storage/security providers."]
+procedure = ["Prepare the isolated upstream: apply the source overlay, substitute the board USB patch, then add CPU-idle and CPU-topology patches in their explicit final order.", "Prepare IPSW/trust/root/Data inputs, build kernel and ordered archives, prelink qualified original providers and generate the ADT/FAT payload.", "Check payload content/argument limits and FD/DTB/BootShim identity, compose the Android image and read back hashes and its declared entries."]
+findings = ["The OS/kernelcache ABI, ADT, FD and external GPU frontend must match; a successful kernel link alone does not qualify the final image.", "The experimental payload helper removes diagnostic options from a temporary board. It now tolerates already absent options after the command-line cleanup; its developer-specific paths and 80 MiB experimental payload remain distinct from the 60 MiB Compose configuration."]
+completion = ["Kernel/prelink and ordered archives succeed, all declared payload inputs are present, the final command line is at most 1000 bytes and image layout/readback match the bootloader constraints."]
+limits = ["Full builds need macOS SDK and authenticated external inputs. The default workflow omits the experimental GPU addon; an old successful artifact cannot validate a new source revision."]
+next_action = ["Build the new main revision with pinned inputs and compare kernel/payload/FD/DTB and final arguments before a temporary boot."]
+evidence = [{kind = "source", reference = ".github/workflows/compose-bootimg.yml", result = "Complete default image assembly and build-input checks."}, {kind = "source", reference = "scripts/build-wf-payload.sh", result = "Experimental addon image assembly and optional-argument cleanup."}, {kind = "source", reference = "scripts/prelink-picasso.py", result = "Original provider binding and image ABI integration."}]
+
+[[area]]
+id = "diagnostics"
+status = "implemented"
+components = []
+paths = ["capture-logs.cmd", "scripts/capture-*", "scripts/*cdc*", "scripts/check-*", "scripts/audit-*", "scripts/probe-*", "scripts/read-*", "scripts/tests/**", "patches/picasso-usb-console-xnu.patch", "drivers/NativeMobileDisplay/boot-progress/**", "package/Boot*"]
+inputs = ["DWC3 USB CDC console, attended host, source/image/firmware identities and bounded display/HID/GPU checkpoints."]
+configuration = ["picasso_usb=2, picasso_usb_smmu=6, nointr_consio=1 and nointr_iolog=1; panic_screen=false; boot-progress=2 preserves ongoing bring-up monitoring."]
+procedure = ["Run capture-logs.cmd on Windows or scripts/capture-picasso-usb-console.py on macOS.", "Record the phone, source commit and FD/kernel/payload/image hashes; correlate register/queue/fence checkpoints with physical actions.", "Run the applicable existing host checks and the structured-record checker; use its base comparison for committed code ownership."]
+findings = ["USB console streaming and the recovery path are board adaptations; an ended host capture is not by itself a kernel crash.", "Source, host and device evidence have different scope. The historical PR13 handoff notes are linked as source evidence because the referenced experimental logs/addon builds are not archived in this repository.", "Porting record CI checks all 13 areas, identity and ownership against the previous main commit or pull-request base."]
+completion = ["Each claimed milestone has an accessible matching record and reproducible command; new code paths have an owning area with updated findings or evidence."]
+limits = ["This initial record uses implemented/planned statuses and committed source references; it does not invent full-revision host/device evidence for unavailable experimental logs."]
+next_action = ["Archive the next main image's device log as a linked artifact with full revision and firmware/image identity, then upgrade only the areas covered by that evidence."]
+evidence = [{kind = "source", reference = "capture-logs.cmd", result = "Windows console capture entry point."}, {kind = "source", reference = "scripts/capture-picasso-usb-console.py", result = "macOS USB CDC log capture."}, {kind = "source", reference = ".github/workflows/porting-record.yml", result = "Structured record validation on main pushes and pull requests."}]
