@@ -758,3 +758,29 @@ Client side (read-only reference copies):
   of the two stream buffers plus the size buffer through the job's address space. If the stream
   buffers are zero the visibility pass never wrote (VSC not running → look at power/clock/register
   state); if they hold data the ENDVIS wait is waiting on something else (the draw pipeline).
+- **wf85: align the test with ABI v2.** `UniXNU/drivers/NativeAdreno/NativeAdrenoABI.h` now says
+  `NativeAdrenoAbiVersion = 2`, `NativeAdrenoAbiMaxBuffers = 128`, with the submit assertion written
+  as `32 + 24 * NativeAdrenoAbiMaxBuffers` (the kernel's v2 record). The plugin was forced onto the
+  built-in test again (temporary `requested() { return false; }`), the addon carries no `.publish`,
+  and the kernel is unchanged (`471840b5…`, with the `PICASSO_GPU text:` mirror). Inputs: addon
+  `dff9413d93e0c6ac74e318dd0b46747621ae7aeb905491b38db9a38f5dc645b3`, trust
+  `7c10abad571ace6daad8d74cb0c21fe2f5a2532705752d61839f5833b3477c4d`, plugin CDHash
+  `640a55d7b4e7ae0a3c48e941d163d489d4ad9b1c`; image `out/wf85/picasso/boot/wf85.img`, log
+  `out/wf85-runs/run1.log`.
+- **wf85 result: the submit is fixed; the test now stops at its own timestamp call.** Measured:
+  `tunnel: call=5 status=0` twice (wf83: `e00002c2`), zero `PICASSO_GPU stall` lines, and the
+  two plugin processes (backboardd pid 56, mediaserverd pid 29) each get through Query,
+  GetDeviceInfo, alloc/map/CPU-map, submit and WaitFence. Then `tunnel: call=7 status=e00002c7`
+  (`kIOReturnUnsupported`): `NativeAdrenoUserClient::timestamp()` returns unsupported because the
+  published client has no `timer_` attached. `runTest()`'s `check()` recorded that as the run's
+  error, so `adrenoUserTest()` set `verifiedWc = -2` (skipping the write-combine run) and the
+  `verified == 4 && verifiedWc == 4` gate never let `freshScan()`/`replayPhase()`/`turnipPhase()`
+  start — no `streamText` line was ever completed (the first one is inside `freshScan`). The
+  `report()` line was also lost: `tunnel: call=9 status=e00002c2` (`kIOReturnBadArgument`) because
+  v2 `setMetadata()` validates the handle before recording, and the test deliberately uses a bogus
+  handle. Neither refusal is a GPU fault.
+- **wf86: timestamp is diagnostic only.** `NativeAdrenoUserTest.h` calls GetTimestamp without
+  `check()`, so a driver that refuses it no longer fails the run or skips the second cache-mode run
+  and the Turnip phase. Plugin CDHash `3eafe5d89e4ad9031096f08be381bfe71e272dec`, trust
+  `b405de012859fa1485b1bd275855719ff84507220c2a10bf45a863069d3434ba`, addon
+  `5cc7e0c739cf…`; image `out/wf86/picasso/boot/wf86.img`, log `out/wf86-runs/run1.log`.
