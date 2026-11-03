@@ -62,6 +62,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool primary=false;
     bool logicalPM=false;
     bool transferred=false;
+    bool benchmarked=false;
     // One bounded cached copy of visible pixels, independent of IOSurface lifetime.
     void *copyShadow=nullptr;
     uint64_t copyShadowBytes=0,copyShadowStride=0;
@@ -410,7 +411,8 @@ public:
          * cached control buffer and a store to the real destination. Together with the frame copy that follows, this
          * separates source-read cost, attribute choice and scheduling delays from destination store cost. */
         unsigned bench=0;PE_parse_boot_argn("offline-legacy-bench",&bench,sizeof bench);
-        if(bench>=2 && frameCount==1) {
+        if(bench>=2 && !benchmarked) {
+            benchmarked=true;
             const uint64_t benchBytes=1u<<20,benchWords=benchBytes/8;
             const volatile uint64_t *srcWords=(const volatile uint64_t *)source->getVirtualAddress();
             volatile uint64_t *fb=(volatile uint64_t *)bootMapping->getVirtualAddress();
