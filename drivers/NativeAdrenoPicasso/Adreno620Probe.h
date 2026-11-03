@@ -36,6 +36,11 @@ void native_adreno_set_firmware(const struct native_adreno620_firmware *firmware
  * Returns -1 when no firmware was staged. */
 int native_adreno620_sqe_firmware(const uint8_t **bytes, size_t *length);
 
+/* Both validated firmware images, for the board's cold GMU restart (the GMU one-shot boot gate is
+ * cleared and native_adreno620_gmu_boot re-runs). Returns -1 when no firmware was staged. */
+int native_adreno620_gmu_firmware(const uint8_t **gmu, size_t *gmu_bytes,
+    const uint8_t **sqe, size_t *sqe_bytes);
+
 /* The zap image the probe validated: the .mdt container (ELF header, program headers and the hash
  * segment, exactly qcom_mdt_read_metadata's metadata) plus the three split payloads. Missing
  * entries are left NULL. Returns -1 when no zap was staged. */

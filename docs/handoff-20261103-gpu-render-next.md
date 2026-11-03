@@ -305,3 +305,21 @@ Known open questions for the boot test:
 - The geometry change alone may or may not remove the red bar: if it persists, the next lever is the
   `UIStatusBarVisualProviderClassName` override or a display edge-info publication, decided after the
   boot log/screenshot.
+
+### Apps: the staged-app copy path already exists in the kernel
+
+- `UniXNU/patches/xnu/zzy-staged-system-apps.patch` (already applied to the kernel) copies the OS
+  volume's `private/var/staged_system_apps` through `data_mount->mnt_vnodecovered` into Data at the
+  first launchd exec and marks `/private/var/db/.sheng-staged-apps`. It is gated by
+  `sheng-staged-apps=1`, which no previous image passed — wf166's log has no staged line.
+- The 24 staged bundles that the phone `DefaultIconState.plist` names are exactly the missing icons;
+  their main executables' CDHashes are already in the original static trust cache (checked
+  MobileMail and Maps against `UniXNU/build/original-static-system-trust/original-static-system.bundle`),
+  so they can run from Data without a new trust entry.
+- wf169 = wf167 args + `sheng-staged-apps=1` and no `sheng-display-grid` (993/1000 bytes). The periodic
+  line now ends `apps=<stage>/<dirs>/<files>/<MiB>/<err>`; stage 2 or 3 with files ~4214 and MiB
+  ~467 means the copy completed (it is one-time; later boots report stage 3).
+- Five bundle IDs in the phone default layout (`mobilephone`, `compass`, `calculator`, `Passbook`,
+  `Bridge`) do not exist anywhere in this iPadOS root; those slots cannot be filled by this image.
+  The 168 number in the goal counts service bundles in `/Applications`, not home-screen icons; the
+  phone default layout has 30 entries (25 obtainable here).

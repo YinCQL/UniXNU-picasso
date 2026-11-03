@@ -115,6 +115,9 @@ extern "C" kmod_info_t g_kernel_kmod_info;
 extern "C" volatile int native_gpu_addon_stage, native_gpu_addon_status;
 extern "C" volatile int native_gpu_addon2_stage, native_gpu_addon2_status;
 extern "C" volatile int native_gpu_addon3_stage, native_gpu_addon3_status;
+/* The cold GMU restart (Adreno620Gmu.cpp) and the restart-hook registry (NativeAdrenoPublish.cpp). */
+extern "C" int native_adreno620_gmu_restart(void);
+extern "C" void native_adreno_set_restart(IOReturn (*)(void *, NativeAdrenoRing *, uint32_t), void *);
 /* sheng-staged-apps=1 (zzy-staged-system-apps.patch): the one-time copy of the OS volume's staged
  * system apps into Data. Stage 1 copying, 2 complete, 3 already complete, -1 no source, -2 out of
  * memory. Reported with the periodic GPU counters so a boot that never finishes the copy is visible. */
@@ -1563,6 +1566,92 @@ bool waitFence(uint32_t fence, unsigned timeoutUs, bool verbose)
     }
 }
 
+/* Probe the restarted CP without touching the fence page's numbering: one CP_NOP IB and a CACHE_FLUSH_TS
+ * event write to the scratch BO's second word. The production ring's replay then still starts at
+ * completed+1, exactly as recover() expects. */
+static bool restartProbe()
+{
+    CpState &s = *gState;
+    volatile uint32_t *scratch = reinterpret_cast<volatile uint32_t *>(s.scratch.base);
+    scratch[0] = 0;
+    scratch[2] = 0;
+    clean(s.scratch);
+    uint32_t nop = 0;
+    if (AdrenoPM4Type7(kCpNopOpcode, 0, &nop) != AdrenoPM4Success) return false;
+    scratch[0] = nop;
+    clean(s.scratch);
+    const uint64_t address = GpuScratchIova + 8;
+    const uint32_t ib[3] = {uint32_t(GpuScratchIova), uint32_t(GpuScratchIova >> 32), 1};
+    const uint32_t event[4] = {kCacheFlushTs | kEventWriteIrq,
+        uint32_t(address), uint32_t(address >> 32), 1};
+    uint32_t words[kIbSubmitDwords] = {};
+    if (!packet(words, kIbSubmitDwords, 0, kCpIndirectBufferOpcode, ib, 3)) return false;
+    if (!packet(words, kIbSubmitDwords, 4, kCpEventWriteOpcode, event, 4)) return false;
+    uint32_t end = 0;
+    if (!submitRing(words, kIbSubmitDwords, &end)) return false;
+    for (unsigned waited = 0; waited < kFenceTimeoutUs; waited += 100) {
+        invalidate(s.scratch);
+        if (read32(s.scratch, 8) >= 1) {
+            printf("PICASSO_GPU cp: restart probe ok wptr=%u\n", end);
+            return true;
+        }
+        IODelay(100);
+    }
+    printf("PICASSO_GPU cp: restart probe timeout wptr=%u scratch=%u\n", end, read32(s.scratch, 8));
+    printCpStatus("probe");
+    return false;
+}
+
+/* The board restart hook NativeAdrenoSubmit::recover installs (NativeAdrenoSubmit.h:22): stop the CP,
+ * drain the bus, optionally cold-boot the GMU when GX is off, re-run hw_init/SQE/ring programming, call
+ * ring->restart(completed) between the reset and CP init as the contract requires, then bring the CP up,
+ * leave secure mode if it was left before, and probe it. Only a completed probe reports success; recover
+ * poisons the ring on any error. Runs under the publish lock (publishGpu installs it before the hangcheck
+ * starts), so no extra lock. */
+extern "C" IOReturn native_adreno620_cp_restart(void *cookie, NativeAdrenoRing *ring, uint32_t completed)
+{
+    (void)cookie;
+    if (!gState || !ring) return kIOReturnNotReady;
+    CpState &s = *gState;
+    printf("PICASSO_GPU restart: begin completed=%u gx=%08x\n", completed, gmuRead(kGmuGxPwrStatus));
+    uint32_t ack[2] = {};
+    (void)ring->drainBus(ack);
+    (void)ring->busHalt(false, 2000);
+    gpuWrite(A620_CP_SQE_CNTL, 0);
+    barrier();
+    const bool cold = (gmuRead(kGmuGxPwrStatus) & kGxOffBits) != 0;
+    if (cold) {
+        if (native_adreno620_gmu_restart()) return kIOReturnIOError;
+        if (gmuRead(kGmuGxPwrStatus) & kGxOffBits) return kIOReturnIOError;
+    }
+    if (!hardwareInit() || !uploadSqe() || !programCp()) return kIOReturnIOError;
+    /* Contract point: the ring is reset between the GPU reset and the CP init. */
+    IOReturn status = ring->restart(completed);
+    if (status) return status;
+    s.next = 0;
+    s.sequence = completed;
+    gpuWrite(A620_CP_SQE_CNTL, 1);
+    barrier();
+    if (!cpInit()) return kIOReturnIOError;
+    uint32_t zap = 1;
+    if (!(PE_parse_boot_argn("sheng-gpu-zap", &zap, static_cast<int>(sizeof zap)) && !zap)) {
+        /* The probe below is the authority: a CP that is already non-secure may still refuse/ignore the
+         * packet, while a secure-only CP answers the probe and renders protected-only (the pre-existing
+         * bring-up limitation, reported by the secure-mode line rather than failing the restart). */
+        if (!leaveSecureMode()) printf("PICASSO_GPU restart: secure-mode packet failed; probing anyway\n");
+    }
+    if (!restartProbe()) return kIOReturnTimeout;
+    /* The CP consumed the init/probe words; resync leaves the ring's next write at its read pointer
+     * without wiping the fence page, so clients can submit immediately after the replay. */
+    status = ring->resync(completed);
+    if (status) return status;
+    s.next = ring->writePointer();
+    s.sequence = completed;
+    if (cold) native_adreno620_gmu_release_gpu_set();
+    printf("PICASSO_GPU restart: ok completed=%u next=%u\n", completed, s.next);
+    return kIOReturnSuccess;
+}
+
 /* Ring callbacks for the production NativeAdrenoRing: the same GPU window and
  * GMU fence status the boot stage uses. The cache callbacks are no-ops because
  * every CPU access to the ring and memptrs goes through the uncached aliases
@@ -1701,6 +1790,9 @@ bool publishGpu()
         printf("PICASSO_GPU cp: submit attach failed %08x\n", unsigned(attached));
         return false;
     }
+    /* The hangcheck may start as soon as the submit object is published: install the board restart before
+     * native_adreno_publish below. It is safe to install again on a second publish attempt. */
+    native_adreno_set_restart(native_adreno620_cp_restart, nullptr);
     static NativeAdrenoAbiDeviceInfo info;
     info = {};
     info.chip_id = 0x06020001u;               /* the ADT's qcom,chipid for this GPU */

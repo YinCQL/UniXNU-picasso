@@ -53,6 +53,10 @@ static void peekFetch(const NativeAdrenoVm *vm,uint64_t fetch,volatile uint32_t 
 }
 static uint32_t stall_fence,stall_timeouts,stall_stage;   /* stage: 0 none yet, 1 write pointer given again, 2 translations dropped, 3 bus drained */
 static uint64_t stall_began_us,stall_last_us;   /* the fence's first and latest timed-out wait */
+/* sheng hangcheck counters, exported beside native_adreno_recovery: [0] polls, [1] the fence at the last poll,
+ * [2] the completed fence now, [3] progress retries, [4] FNV hash of the six CP-state words, [5] polls that
+ * could not take g.lock at once (the thread is starved), [6] polls on the same fence, [7] the last poll time. */
+extern "C" {extern volatile uint32_t native_adreno_hangcheck[8];}
 /* What the stall handler may do for a fence pending 50 ms: sheng-gpu-unstick bit 0 drops the client's translations,
  * bit 1 gives the write pointer again, bit 2 drains the bus at the second stage. 7 is the previous behaviour. */
 static uint32_t unstickMask()
@@ -1034,8 +1038,34 @@ IOReturn NativeAdrenoSubmit::hangCheck(bool *hung)
     NativeAdrenoRing *const r=ringOfFence(last)?ringOfFence(last):ring(0);
     uint32_t fence=0;
     if(r->observeFence(last,nullptr,0,&fence)==NativeAdrenoRingFencePoisoned)return poison();
-    if(fence!=hang_fence_) {hang_fence_=fence;progress_retries_=0;return kIOReturnSuccess;}
-    if(fence>=last || madeProgress())return kIOReturnSuccess;
+    native_adreno_hangcheck[2]=fence;
+    /* On a device clock, only the completed fence counts as progress. A stalled CP still moves ROQ/prefetch
+     * words, so msm's three-retry rule could reset the counter forever (the stall handler measures the same
+     * difference). Host tests have no clock and keep the original retry rule. */
+    const uint64_t now=clock_now_?clock_now_(clock_cookie_):0;
+    if(fence!=hang_fence_) {
+        hang_fence_=fence;progress_retries_=0;hang_since_us_=now;
+        native_adreno_hangcheck[1]=fence;native_adreno_hangcheck[3]=0;native_adreno_hangcheck[6]=0;
+        return kIOReturnSuccess;
+    }
+    if(fence>=last) {hang_since_us_=0;return kIOReturnSuccess;}
+    if(now) {
+        if(!hang_since_us_)hang_since_us_=now;
+        if(native_adreno_hangcheck[6]!=0xffffffffu)++native_adreno_hangcheck[6];
+        if(now-hang_since_us_>=HangTimeoutUs) {
+            progress_retries_=0;hang_since_us_=0;++stats_.hangs;*hung=true;
+            native_adreno_hangcheck[3]=0;
+            return kIOReturnSuccess;
+        }
+        return kIOReturnSuccess;
+    }
+    {
+        uint32_t state[6]={};uint32_t hash=2166136261u;
+        if(!ring(0)->progressState(state))for(unsigned i=0;i<6;++i)hash=(hash^state[i])*16777619u;
+        native_adreno_hangcheck[4]=hash;
+    }
+    if(madeProgress())return kIOReturnSuccess;
+    native_adreno_hangcheck[3]=progress_retries_;
     progress_retries_=0;++stats_.hangs;*hung=true;
     return kIOReturnSuccess;
 }
@@ -1104,7 +1134,7 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
     IOReturn status=restart(cookie,ring(0),hung);
     out->status=status;
     if(status) {native_adreno_recover_trace[0]=2;native_adreno_recover_trace[1]=uint32_t(status);return poison();}
-    poisoned_=false;hang_fence_=hung;progress_retries_=0;
+    poisoned_=false;hang_fence_=hung;progress_retries_=0;hang_since_us_=0;
     if(guilty) {status=release(*guilty);if(status)return status;}
     /* The GPU is idle after the restart's CP init: the CPU installs the kernel table, and each replayed job switches to its own. */
     if(table_mode_) {
@@ -1132,7 +1162,11 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
         if(status) {native_adreno_recover_trace[0]=5;native_adreno_recover_trace[1]=uint32_t(status);return poison();}
         ring(0)->useContext(job?job->context:0);
         uint32_t value=0;
-        status=preemption()?ring(0)->submitFramed(run?job->words:&nop,run?job->word_count:1,next,&value):
+        /* The A6xx fence profile is unframed: submitFramed() answers Unsupported on a6xx, so a framed replay
+         * would poison the first replayed job. Plain submit() numbers seqno_+1, and the restart above set
+         * seqno_=hung, so the loop's `next` is exactly what each submission issues. */
+        status=a6xx_?ring(0)->submit(run?job->words:&nop,run?job->word_count:1,&value):
+            preemption()?ring(0)->submitFramed(run?job->words:&nop,run?job->word_count:1,next,&value):
             ring(0)->submitFramed(run?job->words:&nop,run?job->word_count:1,&value);
         if(status || value!=next) {native_adreno_recover_trace[0]=6;native_adreno_recover_trace[1]=status?uint32_t(status):value;return poison();}
         if(job) {

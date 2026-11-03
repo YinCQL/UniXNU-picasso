@@ -592,6 +592,18 @@ extern "C" int native_adreno620_sqe_firmware(const uint8_t **bytes, size_t *leng
     return 0;
 }
 
+extern "C" int native_adreno620_gmu_firmware(const uint8_t **gmu, size_t *gmu_bytes,
+    const uint8_t **sqe, size_t *sqe_bytes)
+{
+    if (!gmu || !gmu_bytes || !sqe || !sqe_bytes) return -1;
+    if (!gFirmwareGmu || !gFirmwareGmuBytes || !gFirmwareSqe || !gFirmwareSqeBytes) return -1;
+    *gmu = gFirmwareGmu;
+    *gmu_bytes = gFirmwareGmuBytes;
+    *sqe = gFirmwareSqe;
+    *sqe_bytes = gFirmwareSqeBytes;
+    return 0;
+}
+
 extern "C" int native_adreno620_zap_firmware(const uint8_t **mdt,
     size_t *mdt_bytes, const uint8_t *segments[3], size_t segment_bytes[3])
 {
