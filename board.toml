@@ -220,8 +220,8 @@ kernel_args = [
   # every other message. Set it back to 1 only when the UFS transport itself is
   # the question.
   "native-ufs-diagnostics=0",
-  # Use the 8 GiB packed Data seed and back changed pages with the reserved
-  # NativeUfs store window at the end of userdata.
+  # Request the optional NativeUfs store window for changed Data pages.
+  # The generated APFS seed has 512 MiB logical capacity.
   "sheng-data-persist=2",
   # Diagnostic bring-up isolation: the original watchdogd's service checks do
   # not complete on this kernel yet. Disable only its launch job for this boot.
@@ -293,7 +293,6 @@ kernel_args = [
   # without a system scanout made the lock screen flip to the log page and back,
   # which also disturbed the CDC log the host reads.
   "boot-progress=2",
-  "sheng-build-tag=picasso-smp",
   "boot-ui-focus=chronod",
   "boot-ui-focus2=SpringBoard",
   "boot-ui-focus3=backboardd",
@@ -301,12 +300,12 @@ kernel_args = [
   "boot-ui-follow=1",
   # Owned offline HID source (ShengHidInput). offline-hid-input=1 lets the probe
   # attach a virtual keyboard through the ORIGINAL IOHIDDevice ABI;
-  # offline-hid-home=1 is the device-creation gate, and the auto-home series
-  # posts Home reports from 120 s after the probe, every 60 s, eight times, so
-  # the lock screen is unlocked whenever it appears. No touch driver is needed
-  # for this path.
+  # offline-hid-home=1 is the device-creation gate. This board requests the
+  # synthetic swipes below; automatic Home reports need offline-hid-auto-home.
   "offline-hid-input=1",
   "offline-hid-home=1",
+  # Expose the combined digitizer and register its sink for startup swipes.
+  "sheng-touch-hid=1",
   # The synthetic bottom-edge swipe that unlocks this iPad identity; auto-home did
   # not leave the lock screen. One gesture every 20 s from t=540 s covers the window
   # in which SpringBoard takes the panel.
@@ -403,7 +402,7 @@ ipad_identity = true
 # VerifiedRoot window identity check independently binds this UUID to the
 # owner-signed image before the block device is published.
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
-# Keep the existing 256 MiB contiguous kernel window request. It is separate
+# Keep the existing 768 MiB contiguous kernel window request. It is separate
 # from the original FAT ramdisk mapping above. Packed Data does not expand it:
 # only resident seed/write pages consume RAM, and peak use needs device testing.
 owned_memory_size = "0x30000000"

@@ -261,8 +261,9 @@ void native_hid_input_probe(void) {
                     unsigned split=0;
                     unsigned swipes=0;
                     PE_parse_boot_argn("sheng-touch-split",&split,sizeof(split));
+                    PE_parse_boot_argn("sheng-touch-hid",&touchHid,sizeof(touchHid));
                     const bool swipeWanted=PE_parse_boot_argn("offline-hid-swipe",&swipes,sizeof(swipes)) && swipes;
-                    const bool splitWanted=split==1 && PE_parse_boot_argn("sheng-touch-hid",&touchHid,sizeof(touchHid)) && touchHid==1;
+                    const bool splitWanted=split==1 && touchHid==1;
                     bool touchReady=false;
                     if(started && splitWanted) {
                         // Separate digitizer service (primary usage Digitizer/Touch Screen, Built-In).
@@ -274,11 +275,15 @@ void native_hid_input_probe(void) {
                         // The classic IOHIDEventDriver opens the combined keyboard device, and a second
                         // IOHIDResource child never matched it on picasso. The digitizer therefore lives
                         // in the same device (sheng-touch-hid=1), which registered the sink in start().
-                        touchReady=true;
+                        touchReady=touchHid==1 && native_touch_sink_ready();
                     }
+                    touchReady=touchReady && native_touch_sink_ready();
                     if(touchReady && swipeWanted) {
                         printf("PICASSO_HID swipe armed sink=%d count=%u\n",native_touch_sink_ready(),swipes);
                         swipeTotal=swipes;swipeSent=0;swipeDue=1;   // first gesture on the next monitor pass
+                    } else if(swipeWanted) {
+                        printf("PICASSO_HID swipe unavailable started=%u digitizer=%u sink=%d\n",
+                            started?1:0,touchHid==1?1:0,native_touch_sink_ready());
                     }
                     // The offline devices live for this bounded boot. Its
                     // service attachment and timer remain genuine live objects.

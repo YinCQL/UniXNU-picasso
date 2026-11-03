@@ -117,18 +117,18 @@ def main():
     short_raw = out / 'short.cdr'
     short_raw.write_bytes(raw_bytes[:-1])
     rejected('raw size mismatch', lambda: data.inspect_packed(packed, short_raw))
-    empty_data = out / 'empty256.dbrdisk'
-    empty_data.write_bytes(struct.pack('<8sIIQQ', b'DBRDISK1', 1, page, data.DATA_BYTES, 0))
+    empty_data = out / 'empty512.dbrdisk'
+    empty_data.write_bytes(struct.pack('<8sIIQQ', b'DBRDISK1', 1, page, 512 * 1024**2, 0))
 
     def verify_sparse():
         result = data.inspect_packed(empty_data)
         digest = hashlib.sha256()
-        for _ in range(256):
+        for _ in range(512):
             digest.update(bytes(1024**2))
         assert result['logical_bytes'] == data.DATA_BYTES
         assert result['raw_sha256'] == digest.hexdigest()
 
-    passes('256 MiB logical empty disk hashes without dense allocation', verify_sparse)
+    passes('512 MiB logical empty disk hashes without dense allocation', verify_sparse)
 
     identity = '10203040-5060-7080-9010-203040506070'
     config = ('# preserve this comment\nCONFIG_XNU_NATIVE_RAM_BLOCK=y\n'
