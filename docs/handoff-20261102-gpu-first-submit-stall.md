@@ -1458,3 +1458,19 @@ Client side (read-only reference copies):
   30 s (`PICASSO_GPU submits live <n>`). Its growth (or not) decides whether the compositor's
   per-frame path is our GPU or a CPU/display-copy path. Image
   `out/wf132/picasso/boot/wf132.img`; log `out/wf132-runs/run1.log`.
+- **wf133: the GPU renders (Turnip smoke passes) and the lock screen is up.** Two decodes settle
+  the goal. First, the plugin's own report lines (streamed through the driver's text channel)
+  read `T s0 r0 v1024 c1024 g512/0` — stage 0, vkResult 0, 1024 words verified, 1024 compute
+  words, exactly 512 triangle-colour pixels and 0 that are neither — and
+  `S fc0ffee42 deadbeef deadbeef k1000 1600 1bfd rffff0000 ffff000 ffff000`, the read-back
+  fill/compute/render samples. The pass condition in `NativeTurnipSmoke.h` is
+  `verified==1024 && computeWords==1024 && renderOther==0 && 480<=renderTriangle<=544`: a real
+  Vulkan compute + triangle render on this A620 through our driver, with the host reading the
+  rendered pixel colours back. Second, the lock screen stays up with the kick-driven vsync:
+  `submit=10 accept=10 transfer=10 retire=10`, `reject=0`, `transfer_fail=0`.
+- **What the lock screen's frames are not.** The GPU submit counter stays at 3 while the display
+  presents frames 4–10 (`submits live 1…6` unchanged): the per-present path is not generating
+  Adreno command streams, i.e. the UI re-presents a rendered surface instead of re-rendering
+  through the plugin each frame. The path to GPU-rendering every UI frame is in the
+  compositor/plugin (CoreAnimation render-server) side, not in the kernel GPU driver — the
+  driver, the accelerator, the timestamp and the Turnip queue all work end to end.
