@@ -908,3 +908,11 @@ Client side (read-only reference copies):
   from `out/picasso/kernel/kernel.macho`; the previous kernel is kept at
   `build/kernel-wf92-471840b5.macho` (sha `471840b5…`). Image `out/wf93/picasso/boot/wf93.img`,
   log `out/wf93-runs/run1.log`.
+- **wf93 first attempt (kernel `79eaad56…`) aborted at GPU init — firmware embed trap.** The
+  rebuild did not set `ADRENO620_FW_DIR`, so `scripts/build-adreno-picasso-firmware.py` embedded
+  `/tmp/picasso-gpu-fw/a650_sqe.fw` (31460 bytes, the vendor 0x087 image), which matches neither
+  pinned SQE; the probe printed `PICASSO_GPU firmware: SQE image is neither pinned a630 nor a650`
+  and stopped at `stage=3`. The build must run with
+  `export ADRENO620_FW_DIR=$PWD/build/picasso-gpu-fw` (that directory's `a650_sqe.fw` is the
+  pinned 31964-byte v0x112 image). The kernel was rebuilt again with the variable set; its hash and
+  the wf94 image/log are below.
