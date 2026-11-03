@@ -124,6 +124,10 @@ jobs:
           mkdir -p out/picasso/logs
           python3 ./unixnu ipsw fetch OS Cryptex1,SystemOS StaticTrustCache Cryptex1,SystemTrustCache 2>&1 | tee out/picasso/logs/actions-ipsw.log
           python3 scripts/prepare-original-trust.py --tree "$UNIXNU_TREE" --inputs "out/ipsw/$PICASSO_IPSW_BUILD" --output out/picasso/original-static-system.bundle 2>&1 | tee out/picasso/logs/actions-trust.log
+          python3 scripts/prepare-picasso-ui-trust.py --original out/picasso/original-static-system.bundle \
+            --library out/picasso/libpicasso-sb.dylib --output out/picasso/ui-trust.bundle \
+            2>&1 | tee out/picasso/logs/actions-ui-trust.log
+          cp out/picasso/ui-trust.json out/picasso/logs/ui-trust.json
 
       - name: Verify native macOS root disks against the signed policy
         if: ${{ !inputs.fast }}
@@ -161,7 +165,7 @@ jobs:
         run: |
           python3 ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
           mkdir -p out/picasso/logs
-          python3 ./unixnu build kernel payload -j 3 --skip-setup --trust-cache out/picasso/original-static-system.bundle --data-ramdisk out/picasso/ram-data/data.dbrdisk 2>&1 | tee out/picasso/logs/actions-build.log
+          python3 ./unixnu build kernel payload -j 3 --skip-setup --trust-cache out/picasso/ui-trust.bundle --data-ramdisk out/picasso/ram-data/data.dbrdisk 2>&1 | tee out/picasso/logs/actions-build.log
           ccache -sv || true
           # Which options and inputs ccache refuses (the stats only count them).
           grep -hE "unsupported|Multiple input|multiple source" "$RUNNER_TEMP/ccache.log" 2>/dev/null | sed -E 's/^\[[^]]*\] //' | sort | uniq -c | sort -rn | head -20 || true

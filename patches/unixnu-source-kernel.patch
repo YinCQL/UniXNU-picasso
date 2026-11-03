@@ -4099,7 +4099,25 @@ new file mode 100644
 diff --git a/scripts/unixnu/payload.py b/scripts/unixnu/payload.py
 --- a/scripts/unixnu/payload.py
 +++ b/scripts/unixnu/payload.py
-@@ -161,6 +161,8 @@
+@@ -103,7 +103,16 @@
+         if not trust.is_file():
+             raise Error(f'trust cache not found: {trust}')
+         if allowed and not owner_trust and sha256_file(trust) not in allowed:
+-            raise Error(f'{trust} is not one of the trust caches this board accepts (board.toml [payload] trust_cache_sha256)')
++            library = spec.get('owned_trust_library')
++            if not library:
++                raise Error(f'{trust} is not one of the trust caches this board accepts (board.toml [payload] trust_cache_sha256)')
++            import sys
++            sys.path.insert(0, str(ctx.device / 'scripts'))
++            from picasso_ui_trust import accepted_payload_bundle
++            try:
++                accepted_payload_bundle(trust.read_bytes(), library, ctx.device)
++            except (ValueError, OSError) as error:
++                raise Error(f'UI trust bundle rejected: {error}') from error
+     data = expand(args.data_ramdisk) if getattr(args, 'data_ramdisk', None) else None
+     if data and not data.is_file():
+         raise Error(f'Data ramdisk not found: {data}')
+@@ -161,6 +170,8 @@
          command.append('--gpu-addon')
      if adt.get('ipad_identity'):
          command.append('--ipad-identity')
@@ -4772,12 +4790,12 @@ diff --git a/patches/xnu/zzzzzz-picasso-springboard-inject.patch b/patches/xnu/z
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzzz-picasso-springboard-inject.patch
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,183 @@
 +diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +index 8bba078..49d986d 100644
 +--- a/bsd/kern/kern_exec.c
 ++++ b/bsd/kern/kern_exec.c
-+@@ -5823,10 +5823,101 @@ bad:
++@@ -5823,10 +5823,111 @@ bad:
 +  * Note:	The argument and environment vectors are user space pointers
 +  *		to arrays of user space pointers.
 +  */
@@ -4863,10 +4881,20 @@ new file mode 100644
 ++	char name[32] = "?";
 ++	proc_name(proc_selfpid(), name, sizeof(name));
 ++	printf("PICASSO_SBINJECT library ran: ack read by pid=%d name=%s\n", proc_selfpid(), name);
+++	if (arg2 > 0 && picasso_dyld_inject_target(current_proc())) {
+++		const char *phase = arg2 == 1 ? "installed" : arg2 == 2 ? "used" : "unavailable";
+++		printf("PICASSO_SBINJECT metrics=%s pid=%d name=%s\n", phase, proc_selfpid(), name);
+++	}
 ++	return SYSCTL_OUT(req, &value, sizeof(value));
 ++}
 ++SYSCTL_PROC(_kern, OID_AUTO, picasso_inject_ack, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
 ++    0, 0, picasso_inject_ack_sysctl, "I", "picasso: prints the reader's pid to confirm injection");
+++SYSCTL_PROC(_kern, OID_AUTO, picasso_metrics_installed, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+++    0, 1, picasso_inject_ack_sysctl, "I", "picasso: reports status bar metrics installed");
+++SYSCTL_PROC(_kern, OID_AUTO, picasso_metrics_used, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+++    0, 2, picasso_inject_ack_sysctl, "I", "picasso: reports status bar metrics used");
+++SYSCTL_PROC(_kern, OID_AUTO, picasso_metrics_unavailable, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+++    0, 3, picasso_inject_ack_sysctl, "I", "picasso: reports status bar metrics unavailable");
 ++#endif
 ++
 + __attribute__((noinline))
@@ -4879,7 +4907,7 @@ new file mode 100644
 + 	int error = 0;
 + 	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
 + 	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
-+@@ -5996,6 +6087,22 @@ exec_extract_strings(struct image_params *imgp)
++@@ -5996,5 +6087,21 @@ exec_extract_strings(struct image_params *imgp)
 + 		imgp->ip_envc++;
 + 	}
 +
@@ -4936,7 +4964,7 @@ new file mode 100644
 + int
 + __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
 + {
-+@@ -1614,6 +1638,9 @@
++@@ -1614,4 +1638,7 @@
 + 	}
 +
 + done:
@@ -5058,3 +5086,88 @@ new file mode 100644
 + 	boot_progress_user_abort(state, esr, fault_addr);
 + 	if (user_fault_in_self_restrict_mode(thread) &&
 + 	    task_is_jit_exception_fatal(get_threadtask(thread))) {
+diff --git a/patches/xnu/zzzzzz-picasso-zva-fallback.patch b/patches/xnu/zzzzzz-picasso-zva-fallback.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/zzzzzz-picasso-zva-fallback.patch
+@@ -0,0 +1,80 @@
++--- a/osfmk/arm64/sleh.c
+++++ b/osfmk/arm64/sleh.c
++@@ -1499,3 +1499,65 @@
+++/* PICASSO_ZVA_BEGIN: 20H392 zero-fill fallback for the non-Apple port. */
+++#if defined(BCM2837) && (DEVELOPMENT || DEBUG)
+++static void
+++picasso_zva_observe(uint64_t address, uint64_t pc, uint64_t target)
+++{
+++    static unsigned reports;
+++    unsigned ticket = __atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED);
+++    if (ticket >= 16) return;
+++    uint64_t saved, par, midr, dczid, mair, sctlr;
+++    boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
+++    unsigned cpu = cpu_number();
+++    __asm__ volatile("mrs %0, par_el1\n\tat s1e0w, %6\n\tisb\n\t"
+++        "mrs %1, par_el1\n\tmrs %2, midr_el1\n\tmrs %3, dczid_el0\n\t"
+++        "mrs %4, mair_el1\n\tmrs %5, sctlr_el1\n\tmsr par_el1, %0"
+++        : "=&r"(saved), "=&r"(par), "=&r"(midr), "=&r"(dczid), "=&r"(mair), "=&r"(sctlr)
+++        : "r"(address) : "memory");
+++    ml_set_interrupts_enabled(interrupts);
+++    printf("PICASSO_ZVA fallback=%u pid=%d cpu=%u address=%llx pc=%llx target=%llx PAR=%llx MIDR=%llx DCZID=%llx MAIR=%llx SCTLR=%llx\n",
+++        ticket + 1, proc_selfpid(), cpu, (unsigned long long)address,
+++        (unsigned long long)pc, (unsigned long long)target, (unsigned long long)par,
+++        (unsigned long long)midr, (unsigned long long)dczid,
+++        (unsigned long long)mair, (unsigned long long)sctlr);
+++}
+++
+++static bool
+++picasso_user_zva(arm_saved_state_t *state, uint32_t esr, uint64_t far, uint32_t slide)
+++{
+++    /* __platform_bzero+0x44: DC ZVA is allowed to fault independently of the
+++     * stores that precede it. Use libsystem_platform's existing 64-byte STNP
+++     * loop, which consumes precisely the same x1/x2/x3 state and has the same
+++     * tail and return. No instruction is skipped and no memory is written by
+++     * the kernel. Ordinary stores still raise normal VM/protection exceptions.
+++     * This is a bounded workaround, not evidence that the mapping is Device:
+++     * the first 16 recoveries record the actual core and PAR memory attributes.
+++     */
+++    if (esr != 0x92000061U || !is_saved_state64(state) ||
+++        !PSR64_IS_USER64(get_saved_state_cpsr(state))) return false;
+++    uint64_t pc = get_saved_state_pc(state), address = get_saved_state_reg(state, 3);
+++    if (pc < slide || pc - slide != 0x1d1b021f4ULL ||
+++        get_saved_state_reg(state, 1) != 0 || !get_saved_state_reg(state, 2) ||
+++        (address & 63) || far != address) return false;
+++    char name[32] = {0};
+++    proc_name(proc_selfpid(), name, sizeof(name));
+++    if (strcmp(name, "backboardd") && strcmp(name, "SpringBoard") &&
+++        strcmp(name, "Preferences") && strcmp(name, "mediaserverd")) return false;
+++    static const uint32_t zva[] = {0xd50b7423, 0x91010063, 0xf1010042, 0x54ffffa8};
+++    static const uint32_t stores[] = {
+++        0xa8000461, 0xa8010461, 0xa8020461, 0xa8030461,
+++        0x91010063, 0xf1010042, 0x54ffff48, 0x8b020063,
+++        0xa8000461, 0xa8010461, 0xa8020461, 0xa8030461, 0xd65f03c0
+++    };
+++    uint32_t code[sizeof(stores) / sizeof(stores[0])] = {0};
+++    if (copyin((user_addr_t)pc, code, sizeof(zva)) || memcmp(code, zva, sizeof(zva))) return false;
+++    uint64_t target = pc + 0x78;
+++    if (copyin((user_addr_t)target, code, sizeof(stores)) || memcmp(code, stores, sizeof(stores))) return false;
+++    picasso_zva_observe(address, pc, target);
+++    set_saved_state_pc(state, target);
+++    return true;
+++}
+++#endif
+++/* PICASSO_ZVA_END */
+++
++ static int
++ handle_alignment_fault_from_user(arm_saved_state_t *state, kern_return_t *vmfr)
++ {
++@@ -1609,6 +1671,11 @@
++ 		kern_return_t vmfkr = KERN_SUCCESS;
++ 		thread->machine.recover_esr = 0;
++ 		thread->machine.recover_far = 0;
+++#if defined(BCM2837) && (DEVELOPMENT || DEBUG)
+++		if (picasso_user_zva(state, esr, fault_addr, current_task()->task_shared_region_slide)) {
+++			thread_exception_return();
+++		}
+++#endif
++ 		int result = handle_alignment_fault_from_user(state, &vmfkr);
++ 		if (result == 0) {
++ 			/* Successfully emulated, or instruction

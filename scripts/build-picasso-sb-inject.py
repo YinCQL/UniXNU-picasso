@@ -4,9 +4,9 @@
   build-picasso-sb-inject.py SOURCE.m OUTPUT.dylib
 
 Builds an arm64 iOS dynamic library with the runner's iPhoneOS SDK and ad-hoc
-signs it (codesign -s -) so dyld will map it. The kernel inserts it into
-SpringBoard (boot-arg picasso_inject_sb); AMFI accepts the ad-hoc signature only
-because the board also boots amfi_allow_any_signature=1.
+signs it (codesign -s -). prepare-picasso-ui-trust.py qualifies its signed code
+pages and adds its exact CDHash to the owner trust module. The kernel inserts
+it into SpringBoard (boot-arg picasso_inject_sb).
 
 SOURCE is the library's single Objective-C source. The default source supplies
 the Picasso status bar metric. picasso_inject_apps=1 also inserts it into
@@ -33,7 +33,7 @@ def main():
                    '-framework', 'UIKit', '-O2',
                    '-o', str(output), str(source)]
     subprocess.run(compile_cmd, check=True)
-    # Ad-hoc signature: the bytes AMFI needs present; amfi_allow_any_signature skips validating them.
+    # The payload's scoped UI trust module must match this final signature.
     subprocess.run(['codesign', '--force', '--sign', '-', str(output)], check=True)
     identity = subprocess.check_output(['codesign', '-dvvv', str(output)], stderr=subprocess.STDOUT).decode()
     print(f'picasso: built {output.name} ({output.stat().st_size} bytes)')

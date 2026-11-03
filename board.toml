@@ -293,6 +293,8 @@ kernel_args = [
 panic_screen = false
 # Pin the original static and System trust-cache bundle passed through the ADT.
 trust_cache_sha256 = ["eb1475f643f45a974ebd40596f6e2b1cdf40205d2ca3c6094d774886099399c3"]
+# An extended bundle must retain both pinned modules and trust exactly this signed library.
+owned_trust_library = "out/picasso/libpicasso-sb.dylib"
 
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"

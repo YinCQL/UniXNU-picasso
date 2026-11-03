@@ -17,8 +17,15 @@ typedef CGFloat (*PicassoMetric)(id, SEL);
 static PicassoEdgeInsets original_edge_insets;
 static PicassoMetric original_height, original_baseline;
 
-// DevicesOverlay.apk: 34.259979 px top padding / current 3x scale.
-static const CGFloat picasso_top_padding = 11.42;
+static void picasso_ack(const char *name)
+{
+    int value = 0;
+    size_t size = sizeof(value);
+    (void)sysctlbyname(name, &value, &size, NULL, 0);
+}
+
+// DevicesOverlay.apk: 34.259979 px / 3, plus the requested 2 pt downward shift.
+static const CGFloat picasso_top_padding = 13.42;
 
 static CGFloat picasso_statusbar_offset(CGSize size)
 {
@@ -32,12 +39,15 @@ static CGFloat picasso_statusbar_offset(CGSize size)
 
 static NSDirectionalEdgeInsets picasso_edge_insets(id receiver, SEL selector)
 {
+    static unsigned acknowledged;
+    if (!__atomic_exchange_n(&acknowledged, 1, __ATOMIC_RELAXED))
+        picasso_ack("kern.picasso_metrics_used");
     NSDirectionalEdgeInsets insets = original_edge_insets(receiver, selector);
-    // 26.729980 panel pixels puts the clock slightly inside the rounded corner.
-    insets.leading = 8.91;
+    // Vendor 26.729980 px / 3, plus the requested 2 pt clock shift to the right.
+    insets.leading = 10.91;
     // Pad's native trailing margin is 5 pt; the previous LegacyPhone margin
-    // was 5.5 pt. Keep that origin before applying the requested extra shift.
-    insets.trailing += 0.5 + picasso_statusbar_offset(UIScreen.mainScreen.bounds.size);
+    // was 5.5 pt. Keep that origin and move the battery another 4 pt left.
+    insets.trailing += 4.5 + picasso_statusbar_offset(UIScreen.mainScreen.bounds.size);
     return insets;
 }
 
@@ -62,7 +72,7 @@ static BOOL picasso_metric_compatible(Method method, const char *expected)
 
 static BOOL picasso_install_statusbar(void)
 {
-    Class provider = objc_getClass("_UIStatusBarVisualProvider_Pad");
+    Class provider = objc_getClass("_UIStatusBarVisualProvider_Pad_ForcedNoCell");
     Method method = class_getClassMethod(provider, @selector(edgeInsets));
     Method height = class_getClassMethod(provider, @selector(height));
     Method baseline = class_getClassMethod(provider, @selector(baselineOffset));
@@ -87,13 +97,12 @@ __attribute__((constructor))
 static void picasso_sb_probe(void)
 {
     BOOL installed = picasso_install_statusbar();
-    int value = 0;
-    size_t size = sizeof(value);
     // Either logging path can be denied by a process sandbox. A kernel exec
     // environment message alone does not establish that this constructor ran.
-    sysctlbyname("kern.picasso_inject_ack", &value, &size, NULL, 0);
+    picasso_ack("kern.picasso_inject_ack");
+    picasso_ack(installed ? "kern.picasso_metrics_installed" : "kern.picasso_metrics_unavailable");
 
-    const char *line = installed ? "PICASSO_SBINJECT statusbar metrics installed (left 8.91 pt, down 11.42 pt, battery shift 14.5 mm)\n"
+    const char *line = installed ? "PICASSO_SBINJECT statusbar metrics installed (left 10.91 pt, down 13.42 pt, battery shift 14.5 mm + 4 pt)\n"
                                  : "PICASSO_SBINJECT statusbar metric unavailable\n";
     int fd = open("/dev/console", O_WRONLY);
     if (fd >= 0) {

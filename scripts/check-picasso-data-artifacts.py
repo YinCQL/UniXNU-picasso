@@ -223,6 +223,12 @@ def check(work, tree, output):
     require(digest(files / 'kernel.macho') == digest(kernel), 'FAT kernel bytes mismatch')
     require(digest(files / 'kernel.macho.trustcache') == payload_report['trust_cache_sha256'],
             'FAT trust cache bytes mismatch')
+    from picasso_ui_trust import accepted_payload_bundle
+    ui_trust = accepted_payload_bundle((files / 'kernel.macho.trustcache').read_bytes(),
+                                      spec['owned_trust_library'], ROOT)
+    require(setup_settings and setup_settings['injected_library'] and
+            setup_settings['injected_library']['sha256'] == ui_trust['library']['sha256'],
+            'Trusted UI library differs from the actual Data seed')
     entries = tomllib.loads((directory / 'unixnu.toml').read_text())['entry']
     entry = next(e for e in entries if e['id'] == 'xnu')
     require(entry['initrd'] == 'Payloads/scratch-data.img', 'Loader lacks Data initrd')
@@ -242,6 +248,7 @@ def check(work, tree, output):
                   content_bytes=content, content_budget_bytes=payload.stat().st_size * 95 // 100,
                   kernel_sha256=digest(kernel), storage_imports=imports['imports'],
                   owned_memory_request_bytes=owned,
+                  ui_trust=ui_trust,
                   offline_launch_policy=policy,
                   payload_packed=payload_packed, payload_seed_transformation=transformation,
                   payload_offline_launch_policy=payload_policy, payload_setup_settings=setup_settings,

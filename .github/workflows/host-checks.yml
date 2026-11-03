@@ -25,7 +25,7 @@ concurrency:
 
 jobs:
   checks:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
       run:
@@ -41,10 +41,12 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Build the Picasso UIKit status bar library
+      # Compose performs the real iPhoneOS SDK build, codesign and exact CDHash
+      # validation. Host regressions need only Linux clang and structural fixtures.
+      - name: Install host compilers
         run: |
-          python3 scripts/build-picasso-sb-inject.py \
-            package/picasso-springboard/picasso-sb-probe.m out/picasso/libpicasso-sb.dylib
+          sudo apt-get update
+          sudo apt-get install -y clang lld
 
       - name: Prepare the isolated upstream source
         run: |
@@ -52,9 +54,20 @@ jobs:
           echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
           mkdir -p out/picasso/logs
 
+      - name: Check exact status bar library trust
+        run: |
+          python3 scripts/check-picasso-ui-trust.py --output out/picasso/host-checks/ui-trust
+          cp out/picasso/host-checks/ui-trust/results.json out/picasso/logs/ui-trust-host.json
+
       - name: Check PR13 GPU firmware and staged probe
         if: github.ref_name == 'feat/ios16-gpu'
         run: make -C drivers/NativeAdrenoPicasso/Test test CC=clang CXX=clang++
+
+      - name: Check bounded DC ZVA fallback
+        if: github.ref_name == 'feat/ios16-gpu'
+        run: |
+          python3 scripts/check-picasso-zva.py --output out/picasso/host-checks/zva
+          cp out/picasso/host-checks/zva/results.json out/picasso/logs/zva-host.json
 
       - name: Check PR13 WLAN firmware and handshake
         if: github.ref_name == 'feat/ios16-gpu'
