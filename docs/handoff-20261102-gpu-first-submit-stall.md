@@ -1063,6 +1063,30 @@ Client side (read-only reference copies):
   So the pinned linux-firmware `a650_sqe.fw` 0x112 does not accept this opcode on this a620 CP, and
   `SECVID_TRUST_CNTL` stays 1. (Stock KGSL sends this packet only after the zap has loaded; with no
   zap it writes the register instead, which this port measured as a bus hang in wf80.)
+- **Official-source facts now pinned for this part (downstream msm-4.19 KGSL at
+  `kernel/msm` commit `a1e88665ac80`, and the 2026 mainline Adreno 620 series).**
+  - `adreno_gpu_core_a620`: family A620, `sqefw_name = "a650_sqe.fw"`, `gmufw_name =
+    "a650_gmu.bin"`, `zap_name = "a620_zap"`, `gmem_size = SZ_512K`, `veto_fal10 = true`,
+    `hang_detect_cycles = 0x3ffff`, `disable_tseskip = true` (PC_DBG_ECO_CNTL bit 9),
+    `protected_regs = a620_protected_regs`, `vbif = a650_gbif_regs`. The port already matches all of
+    these.
+  - `adreno_has_sptprac_gdsc()` is true only for a630/a615: **a620 does not power SPTPRAC from the
+    CPU**, and `a6xx_gmu_gfx_rail_on()` (BOOT_SLUMBER) is gated on `ADRENO_QUIRK_HFI_USE_REG` (DT
+    quirk). For every non-a630/a615 target the OOB mapping is `set = BIT(30 - req*2)`,
+    `ack = BIT(31 - req)`, `clear = BIT(31 - req*2)`, i.e. GPU_SET = request 30 / ack 31, which is
+    exactly what `gxPowerOn()` does.
+  - KGSL's `adreno_set_unsecured_mode()`: **if the zap loaded, switch via `CP_SET_SECURE_MODE(0)`
+    (`cp_secure_mode`, opcode `0x66`, one payload dword) and spin for idle; if not, write
+    `RBBM_SECVID_TRUST_CONTROL = 0` from the CPU.** Mainline's zap loader (`adreno_zap_shader_load`,
+    `GPU_PAS_ID = 13`) loads `a620_zap.mbn` into the `qcom,zap-shader` reserved region with
+    `qcom_mdt_load` + `qcom_scm_pas_auth_and_reset`, then sends the same packet. This platform
+    therefore expects the zap: the CPU register write hangs (wf80), and the CP packet was rejected
+    with `CP_OPCODE_ERROR` by the pinned SQE (wf100).
+  - The 2026 mainline A620 series (Ishu Brar, v4) confirms A620 is an A650 derivative on SM7250
+    (SD765/765G/768G), reuses the a650 SQE/GMU firmware, needs the PDC sequencer programmed in the
+    driver (xo/mx/cx from cmd-db; the port already does this) and its own BCM bandwidth table, and
+    uses `gmu_cgc_mode = 0x00020202` (the pinned catalog still says `0x00020200`; the port follows
+    the catalog). It was validated with working Vulkan on a OnePlus Nord.
 - **wf101: run the device's own SQE instead of the pinned linux-firmware one.** The device's
   firmware partition ships a **different** `a650_sqe.fw` (version 0x087, 31460 bytes, CRC32
   `0x59c1d422`) than the pinned image (0x112, 31964 bytes), and the stock Android KMD runs 0x087 on
