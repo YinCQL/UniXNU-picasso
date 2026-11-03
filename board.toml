@@ -179,7 +179,7 @@ volume = "PICASSOESP"
 size_mib = 60
 loader = "firmware"
 title = "Boot"
-dram_size = "0x80000000"
+dram_size = "0x180000000"
 # serial=3 was dead weight here and could stall early boot: pe_serial.c only
 # registers PI3_UART, APPLE_UART, DOCKCHANNEL_UART and VMAPPLE_UART. SM7250 is a
 # Qualcomm GENI UART, so serial_init() returns 0 and PE_kputc falls back to
@@ -407,9 +407,12 @@ ipad_identity = true
 # VerifiedRoot window identity check independently binds this UUID to the
 # owner-signed image before the block device is published.
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
-# Keep the existing 256 MiB contiguous kernel window request. It is separate
-# from the original FAT ramdisk mapping above. Packed Data does not expand it:
-# only resident seed/write pages consume RAM, and peak use needs device testing.
-owned_memory_size = "0x30000000"
+# XNU manages one contiguous physical range, so ask for the whole run the
+# firmware publishes from 0xC0000000 to the 8 GiB address-space top (the 1 GiB
+# and 4 GiB device-tree banks, 5 GiB). Device DH-B (wf141) measured 4.95 GiB of
+# managed RAM this way, up from 768 MiB; DarwinBoot clamps the request to the
+# largest free run if the memory map is smaller. Keep the packed Data seed:
+# it is sparse, so its logical 8 GiB costs only the pages actually written.
+owned_memory_size = "0x140000000"
 cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
 unique_chip_id = "required"

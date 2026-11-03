@@ -1,0 +1,21 @@
+diff --git a/Platforms/Xiaomi/picassoPkg/Drivers/PicassoBootMemoryDxe/PicassoBootMemoryDxe.c b/Platforms/Xiaomi/picassoPkg/Drivers/PicassoBootMemoryDxe/PicassoBootMemoryDxe.c
+index 95118b1..02e1725 100644
+--- a/Platforms/Xiaomi/picassoPkg/Drivers/PicassoBootMemoryDxe/PicassoBootMemoryDxe.c
++++ b/Platforms/Xiaomi/picassoPkg/Drivers/PicassoBootMemoryDxe/PicassoBootMemoryDxe.c
+@@ -30,8 +30,14 @@
+ 
+ #define MAX_RANGES        64
+ #define MIN_PIECE_SIZE    SIZE_16MB
+-#define ADD_LIMIT         SIZE_1GB
+-#define ADD_BELOW         SIZE_4GB     // stay inside what the MMU setup maps
++// Publish every DRAM range the device tree describes. The old 1 GiB cap and the
++// 4 GiB ceiling were bring-up limits for a 768 MiB loader window; on a 6 GiB
++// device they hide the 1 GiB bank at 0xC0000000 and the 4 GiB bank above 4 GiB.
++// CpuDxe maps each added range on demand (SetMemorySpaceAttributes), and XNU
++// maps whatever contiguous run the loader hands it, so the full DRAM can be
++// described here. Reserved-memory nodes are still subtracted below.
++#define ADD_LIMIT         (8ULL * SIZE_1GB)
++#define ADD_BELOW         (64ULL * SIZE_1GB)
+ 
+ typedef struct {
+   UINT64  Base;

@@ -1484,3 +1484,182 @@ Client side (read-only reference copies):
   proven capable of rendering (Turnip smoke passes with pixel read-back), but the on-screen UI
   is not GPU-rendered yet — that is compositor/render-server work (CoreAnimation ⇄ plugin
   device), not kernel-driver work.
+- **wf134: a virtual bottom-edge swipe, to make the render path visible.** wf133 leaves one
+  question open: the lock screen presents without new Adreno submissions, so the next test
+  changes what the UI draws and watches whether the change is GPU work. The tree already has a
+  synthetic swipe producer (`package/HidInputProbe.cpp`: `native_hid_swipe_tick`, armed by
+  `offline-hid-swipe=<n>`) that publishes one finger through the HID digitizer seqlock, starting
+  at y=20100 (within the bottom-edge band) and moving up over 25 frames, repeated every 20 s.
+  It needs the digitizer enabled in the same offline HID device so `NativeHidInput::start()`
+  registers the touch sink: added `sheng-touch-hid=1 offline-hid-swipe=16`; `boot-progress=2`
+  was removed to keep the command line at 992/1000 bytes. No kernel change (the provider is
+  already linked; `_native_hid_swipe_tick` in the kernel). Expected signatures: the swipe's own
+  `PICASSO_HID swipe <n> moved=1 reports=<n> edge=<begun>/<at edge>` lines prove the gesture
+  reached IOHIDEventDriver with the edge bit; then compare `PICASSO_DISPLAY_STATE submit=`
+  (does the screen change?) with `PICASSO_GPU submits live ... submissions=` (was the change
+  rendered by the A620?). Image `out/wf134/picasso/boot/wf134.img`, log
+  `out/wf134-runs/run1.log`.
+- **wf134 correction: never drop `boot-progress=2` to save command-line bytes.** It is not
+  just the on-screen console: `boot_progress_init()` sets `enabled`, and `boot_progress_start()`
+  returns early when it is off, which means the boot monitor loop never runs — and that loop is
+  the only caller of `native_hid_input_probe()` (offline HID attach at `offline-hid-start`) and
+  `native_novatek_touch_probe()`. wf134 therefore had to be abandoned before its swipe phase;
+  the image is not a valid test. `boot-progress=2` stays in every later image.
+- **wf135: the real finger-touch driver, not a virtual swipe.** The Novatek NT36672C driver is
+  already linked into this kernel and was proven end-to-end in wf116
+  (`out/wf116-runs/run1.log:2025-2041`): `thread start stage=4 sub=5 notlmm=0`, `read tlmm ok
+  00000001 00000001 00000001 irq=000000e2`, `stage2 gpll0=d810003d running=1`, `stage3
+  sclk=5000000Hz ... rc=0 hw=20102864/20104800`, `fw in=139264 ... parts=15`, `fwinfo rc=0
+  ver=20 18x36 max=1080x2400`, `sram ok=1/1/1 rst=06 crc=04 g=58e87d07/b1eaa281
+  r=58e87d07/b1eaa281`, `stage4 loop irq=1`. It only needs the sink registered by the HID
+  digitizer, i.e. `sheng-touch-hid=1` on the offline HID device. The args were dropped from
+  wf126 on only to fit the 1000-byte command line; that was a mistake. wf135 restores
+  `sheng-touch-hid=1 sheng-touch=4 sheng-touch-start=60` and pays for them by deleting two
+  unparsed args (`picasso_usb_hold=0` — default 0; `picasso_usb_control_ms=15000` — the name does
+  not appear in `kernel.macho`'s strings), leaving `boot-progress=2` in place: 974/1000 bytes.
+  Expected signatures once a finger touches the panel: `PICASSO_NVT report contacts=1 first`
+  and `PICASSO_NVT point id=1 x=... y=...` from the driver, `PICASSO_HID` reports from the
+  digitizer, then `PICASSO_DISPLAY_STATE submit=` growth and `PICASSO_GPU submits live`
+  growth to answer the render-path question with finger-driven content changes.
+  Image `out/wf135/picasso/boot/wf135.img`, log `out/wf135-runs/run1.log`.
+- **wf136: attach the digitizer before the HID consumers start.** Requirement (user): touch must
+  work as soon as the lock screen is visible. Measured boot order in wf135: SpringBoard's first
+  sync sample lands just after the grid frame at `now_ns=98.3 s` (`out/wf135-runs/run1.log:2258`
+  grid, `:2287` SpringBoard), the lock screen presents by ~300 s, and our offline HID device was
+  attached at 480 s — after backboardd/SpringBoard were already running. Official/community
+  behaviour is the opposite: the digitizer (AppleMultitouchDevice/IOHIDEventDriver) is present in
+  the IORegistry from kernel boot, IOHIDEventDriver matches during IOKit matching, and backboardd
+  connects to it when it starts; the community iOS-simulator HID work records the boot-order race
+  explicitly (a touch service that flips state around backboardd start connects then disconnects,
+  repaired only by restarting backboardd). Our kernel-side equivalent is to create the offline
+  HID device before userland's HID setup: `offline-hid-start=60` (the probe's built-in early-userland
+  default; the UFS root is mounted by ~48 s, and the touch probe already runs at 60 s). Single
+  variable vs wf135. Pass criteria: `PICASSO_HID probe at 60s`, `stage=3 resource=1 load=0`,
+  `event driver ready` all before SpringBoard's first sync sample, and the lock screen accepting
+  finger input on first appearance (no 480 s wait). Failure mode to watch: `resource=0` or
+  non-zero `load` at 60 s (kext/IOHIDResource not ready yet) — then the probe is latched and a
+  retry in the monitor loop is the next change. Image `out/wf136/picasso/boot/wf136.img` (973/1000
+  bytes), log `out/wf136-runs/run1.log`.
+- **wf136 result: the digitizer is up at 60 s and finger-driven presents still do not submit GPU work.**
+  Early attach worked on the first try: `PICASSO_HID probe at 60s`, `stage=3 resource=1 load=0
+  meta=0 object=fffffff2f57c85a0`, then `PICASSO_NVT ... stage4 loop irq=1` and `PICASSO_HID event
+  driver ready` (`out/wf136-runs/run1.log:1992-2067`), all well before SpringBoard's first sync
+  sample (line 2257) and the lock screen (~400 s). A real finger then produced contacts
+  (`:5773-5780`, `point id=1 x=8170 y=23860` → `x=7430 y=22430`, i.e. a bottom-edge upward
+  gesture) and the display counter moved `submit=11 → 14` in the same window (`now_ns` 411 s →
+  421 s), but `PICASSO_GPU submits live` stayed at `submissions=3`. So finger input reaches the UI
+  as soon as the lock screen is up, and the present path for that input is still not the A620.
+  The remaining gap is the CoreAnimation/backboardd render path, not input or driver bring-up.
+- **Root cause of "laggy, not GPU-rendered" UI: the image ships the wf85 test plugin, which never
+  publishes a device.** `UniXNU/drivers/NativeMetal/NativeAdrenoMetalPlugin.mm:51` had
+  `static bool requested() { return false; }` with the comment "wf85: test build ... runs
+  adrenoUserTest() and the Turnip smoke test". Every process that loads the plugin — including
+  backboardd — therefore skips `publish::deviceForPort()`, returns nil, and CoreAnimation keeps
+  the software renderer. This exactly matches the wf136 measurements: three total Adreno submits
+  (the smoke test's fill/compute/render), finger-driven presents `submit=11→14` with
+  `submissions=3` unchanged, and a visibly laggy UI. The addon blob itself already carried
+  `addons/NativeAdrenoMetal.publish` (`1\n`) and `addons/NativeAdrenoMetal.clients` (`*\n`), so
+  only the compile-time override was blocking the production path.
+- **wf137: production plugin (publish path restored) + the wf136 early digitizer.** `requested()`
+  now checks `requestedPath("NativeAdrenoMetal.publish", ...)` again; rebuilt with
+  `scripts/build-adreno-metal-plugin.py` (bundle CDHash `4b286b17d93be4cf5f470d0fe53a54009a8420c7`),
+  `scripts/make-owner-trust-bundle.py` (trust `fbaf7c86ff751211f4ea6ce061f3b2de6d12e93acda339d41f263ffabf41bedd`),
+  `scripts/make-gpu-addon.py --publish --clients '*'` → `build/ngpu-addon-wf137.bin`
+  (10 files, 12126568 bytes). Payload/image otherwise identical to wf136 (973/1000 bytes,
+  `offline-hid-start=60`, `sheng-touch=4 sheng-touch-hid=1 sheng-touch-start=60`,
+  `boot-progress=2`). Pass criteria: backboardd's plugin open returns a device (no `T s…` smoke
+  line), and the per-present GPU submit counter grows with `PICASSO_DISPLAY_STATE submit=`
+  instead of staying flat. Image `out/wf137/picasso/boot/wf137.img`, log
+  `out/wf137-runs/run1.log`.
+- **wf137 result: the render server renders the UI on the A620 (milestone).** With the production
+  plugin, backboardd's device is published (`PUB tex x0 s2/0 p0 f80 43 23 25 55 105`, then the
+  `ST` status lines) and the kernel's submit counter moves for the first time under UI load:
+  `PICASSO_GPU submits final: submissions=12 ibs=27 max=5` (wf136 with the test plugin:
+  `submissions=1 ibs=1`; the difference is 11 submissions / 26 IBs of CoreAnimation work). The
+  bridge's own counters agree and keep growing: `c5/0 d5 p26 x7 R11 D10 F5 M2531 C0 B2`
+  (5 commits, 0 failures, 5 completed, 26 pipelines, 11 render passes, 10 draws, 5 full-screen
+  passes) and the display presents continue (`submit=6` at ~219 s). The two non-fatal problems
+  reported are the QuartzCore `default.metallib` binary archive (AGX-specific, rejected with
+  InvalidFile — the bridge recompiles from Metal IR, which is where the 26 pipelines come from)
+  and the scanout hand-off (`P2 ee00002c7`, mode refused because the kernel offers frames only
+  with `sheng-fb-gpu=1`; presentation therefore stays on the display driver's CPU copy).
+  So the input-to-GPU path is now: Novatek touch (60 s attach) → IOHIDEventDriver → backboardd →
+  CARenderServer → metal2vulkan/Turnip → Adreno 620 ring. Remaining display work is the GPU
+  scanout hand-off, not rendering. Log `out/wf137-runs/run1.log`.
+- **wf137 instability traced to mediaserverd, not the render server.** The two crash lines the
+  user saw on the panel are `PICASSO_SERVICE sample=1 pid=29 name=mediaserverd exit_signal=6
+  namespace=2 code=6` (`out/wf137-runs/run1.log:3351`) and the same for pid=112 (`:5579`), both
+  right after mediaserverd opened the plugin (`opens=3/4`, `5/6`): the Adreno bridge aborts in
+  every process the addon's `NativeAdrenoMetal.clients="*"` admits, because each process builds
+  its own device/runtime. That is not the design's intent — the comment in
+  `NativeAdrenoMetalPlugin.mm` says only the render server owns the GPU and other processes are
+  opt-in by name. After each abort the service group is SIGKILLed (`exit_signal=9` for
+  powerd/mediaserverd/audiomxd/SpringBoard/backboardd at :5808-5817 and :6569-6578, ~140 s
+  apart), which is why the lock screen never appears in wf137 even though the bridge rendered
+  (12 submissions / 27 IBs before the first reboot).
+- **wf138: only backboardd gets a device.** Single change vs wf137:
+  `make-gpu-addon.py --publish --clients backboardd` (`build/ngpu-addon-wf138.bin`,
+  `addons/NativeAdrenoMetal.clients` = `backboardd\n`). The plugin binary is unchanged
+  (publish path restored, CDHash `4b286b17…`), payload/image otherwise identical to wf137
+  (973/1000 bytes, 60 s digitizer). Pass criteria: no mediaserverd SIGABRT, no service-group
+  SIGKILL storm, the lock screen appears with `PICASSO_GPU submits` growing together with
+  `PICASSO_DISPLAY_STATE submit=`. Image `out/wf138/picasso/boot/wf138.img`, log
+  `out/wf138-runs/run1.log`.
+- **wf138 result: clients=backboardd removes the crash loop but not the UI stall.** No service exit
+  was recorded in the whole run (`PICASSO_SERVICE` count 0; wf137 had mediaserverd SIGABRT twice
+  and two rounds of five-process SIGKILL), and the render server still produced
+  `submissions=11 ibs=27` with bridge `c5/0 d5 p26 R11 D10 F5`. But the display stayed on the
+  boot page (`submit=5`, last submit at 181.7 s; ~470 s of run time) and the big cores sat at
+  99–100 %, with the bridge's counters frozen since ~240 s. The device opened at ~120 s; the
+  primer starts 90 s later (~210 s) and then translates every .metallib of the OS volume,
+  which matches the stall point. Log `out/wf138-runs/run1.log`.
+- **wf139: shader priming becomes opt-in.** Single change vs wf138: `PrimeShaders.h` returns
+  immediately when the plugin has no `addons/NativeAdrenoMetal.primelist` beside it (this addon
+  ships none), instead of scanning and translating the whole OS volume 90 s after device open
+  and holding the translator the render server needs. Plugin rebuilt (CDHash
+  `7db12641bf4fb2b3f8d33da1da07a99ceb078f0e`), trust `af58da1b…`, addon
+  `build/ngpu-addon-wf139.bin` (publish, clients=backboardd). Payload/image otherwise identical
+  to wf138. Pass criteria: bridge counters keep advancing past c5/d5 without a multi-minute
+  freeze, presents resume with the lock screen, and `PICASSO_GPU submits` grows with them.
+  Image `out/wf139/picasso/boot/wf139.img`, log `out/wf139-runs/run1.log`.
+- **wf139 result: the render server gets past the stall and draws the lock screen with the GPU.**
+  With the primer opt-in gate, the bridge advanced past the frozen `c5/d5` of wf138 and kept
+  going: `c7/0 d7 p51 x7 R23 D82 F9`, then `c8/0 d8 p51 x7 R34 D149 F12` (8 commits, all
+  completed, 51 pipelines, 34 render passes, 149 draws, 12 full-screen passes). The kernel's
+  submit counter follows: `submissions=14 ibs=81 max=26 many=2` (two submits carried more than 16
+  IBs; the earlier boots never exceeded one). The grid sampler shows the boot logo (rows 10–12)
+  disappear and content appear at the top rows 3–4 (the clock band) and the bottom rows 20–23,
+  i.e. the lock-screen layout, with `submit=8` presents by ~520 s and no service exit storm.
+  So the earlier freeze was the shader primer competing with the render server's own
+  translation work; without it the render server completes its pipeline set and composites.
+  Log `out/wf139-runs/run1.log`. Remaining work: the first boot is still slow (the render
+  server translates the UI's pipelines on demand, ~98 pipelines per the cache-export note), the
+  display presents still go through the CPU copy (~65 ms per present), and the pipeline cache
+  export/import path is what should make later boots fast.
+
+- **wf140: the rebuilt firmware is behaviour-neutral under the old window request.** Two source
+  changes ride along in the firmware volume (saved as `patches/firmware/*.patch` because both live
+  outside this repository): DarwinBoot now clamps a window request down to the largest contiguous
+  conventional run (`AllocateWindow` takes `UINT64 *WindowSize` and a request larger than the run is
+  sized down with a `DARWINBOOT: window ... clamped ...` print instead of refusing to boot), and
+  `PicassoBootMemoryDxe` publishes every DRAM bank the device tree describes instead of the bring-up
+  caps `ADD_LIMIT = 1 GiB` / `ADD_BELOW = 4 GiB`. The payload is otherwise identical to wf139
+  (768 MiB request, 2 GiB `dram-size`, same addon/trust/Data seed). Result:
+  `vm_page_bootstrap: 172116 free pages, 24492 wired pages` — exactly wf139 — and
+  `NATIVE_OWNER_DATA done stage=4 error=0 readonly=0`, no panic. The shared Mu-Silicium checkout
+  also carried an unrelated uncommitted ResetRuntimeDxe/DSC change; it is part of this FD and did
+  not affect the boot. Image `out/wf140/picasso/boot/wf140.img`, log `out/wf140-runs/run1.log`.
+- **wf141: the 6 GiB device now gives XNU 4.95 GiB of managed RAM.** Single change vs wf140:
+  payload ADT `dram-size=0x180000000` (6 GiB) and `darwinboot-memory-size=0x140000000` (5 GiB, the
+  0xC0000000..0x200000000 run made of the 1 GiB and 4 GiB device-tree banks). The firmware adds both
+  banks; DarwinBoot's first fit places the window at 0xC0000000, and the kernel manages
+  1,296,896 4 KiB pages + 42,274 wired = **4.95 GiB** (`vm_page_bootstrap: 1254622 free pages,
+  42274 wired pages`), up from 768 MiB. The page size stays the port's native 4 KiB: the source
+  overlay pins `PAGE_SHIFT_CONST = ARM_PGSHIFT` for non-Apple 4K builds, so crossing 1 GiB does not
+  switch the kernel to 16 KiB pages. Data mounts
+  (`NATIVE_OWNER_DATA done stage=4 error=0 readonly=0`), SpringBoard starts, no panic and no
+  service kill, and the GPU path keeps growing (`PICASSO_GPU text: ST0 c4/0 d4 p41 x7 R21 D60 F7`,
+  `submits live 5: submissions=13 ibs=79 max=25 many=2`). The lower 972 MiB bank cannot join the
+  window because it is not contiguous with 0xC0000000. Image
+  `out/wf141/picasso/boot/wf141.img`, log `out/wf141-runs/run1.log`. `board.toml` now defaults to
+  `dram_size=0x180000000` and `owned_memory_size=0x140000000`.
