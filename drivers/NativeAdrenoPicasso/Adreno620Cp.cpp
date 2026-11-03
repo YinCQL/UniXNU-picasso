@@ -1199,15 +1199,22 @@ extern "C" int native_adreno620_cp_start(void)
     }
 
     if (!cpInit()) return -1;
-    /* wf100: mainline's CP_SET_SECURE_MODE(0), the zap-path counterpart of the
-     * no-zap SECVID_TRUST_CNTL write. The GPU powers on in secure mode; leaving
-     * it there is the one measured difference from a rendering-clean target. */
+    /* mainline's CP_SET_SECURE_MODE(0), the zap-path counterpart of the no-zap
+     * SECVID_TRUST_CNTL write. The GPU powers on in secure mode; leaving it there
+     * is the one measured difference from a rendering-clean target. wf100 sent it
+     * unconditionally and the pinned SQE answered CP_OPCODE_ERROR; the packet is
+     * therefore gated on sheng-gpu-secure-mode=1 so the SQE image can be the
+     * single variable it is measured against. */
     {
-        const uint32_t trustBefore = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
-        const bool left = leaveSecureMode();
-        const uint32_t trustAfter = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
-        printf("PICASSO_GPU cp: secure mode left=%d trust %08x -> %08x\n",
-            int(left), trustBefore, trustAfter);
+        uint32_t secureMode = 0;
+        if (PE_parse_boot_argn("sheng-gpu-secure-mode", &secureMode,
+                static_cast<int>(sizeof secureMode)) && secureMode) {
+            const uint32_t trustBefore = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
+            const bool left = leaveSecureMode();
+            const uint32_t trustAfter = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
+            printf("PICASSO_GPU cp: secure mode left=%d trust %08x -> %08x\n",
+                int(left), trustBefore, trustAfter);
+        }
     }
     uint32_t fence = 0;
     if (!submitNoop(&fence)) return -1;

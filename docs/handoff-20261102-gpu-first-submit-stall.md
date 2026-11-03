@@ -1052,3 +1052,29 @@ Client side (read-only reference copies):
   mandatory. Kernel `3e13b81b94a005f87df310ddbc6897a22a1f03dfb4a468348402f9ad62938b0e` (rebuilt with
   `ADRENO620_FW_DIR`); image `out/wf100/picasso/boot/wf100.img`, same addon as wf98; log
   `out/wf100-runs/run1.log`.
+- **wf100 result: the pinned SQE rejects `CP_SET_SECURE_MODE` with `CP_OPCODE_ERROR`; the GPU never
+  leaves secure mode.** Serial: `CP_SET_SECURE_MODE(0) submitted wptr=11`, `idle rptr=11`,
+  `secure mode left=1 trust 00000001 -> 00000001`, then `fence timeout wanted=1 have=0`,
+  `fence rptr=20 wptr=20 status=00800005 status3=00000000 int=00800200 fault=00000000 cpint=1
+  sqe_stat=000000a2`. RBBM_INT_0_STATUS `0x00800200` is `CP_HW_ERROR` (bit 9) + `RBBM_HANG_DETECT`
+  (bit 23), and CP_INTERRUPT_STATUS `0x1` is **CP_OPCODE_ERROR**. The packet header/opcode
+  (`0x66` with one payload dword) matches both mainline `OUT_PKT7(CP_SET_SECURE_MODE, 1)` and the
+  vendor `cp_secure_mode()`, and the CP advanced its read pointer over the packet before erroring.
+  So the pinned linux-firmware `a650_sqe.fw` 0x112 does not accept this opcode on this a620 CP, and
+  `SECVID_TRUST_CNTL` stays 1. (Stock KGSL sends this packet only after the zap has loaded; with no
+  zap it writes the register instead, which this port measured as a bus hang in wf80.)
+- **wf101: run the device's own SQE instead of the pinned linux-firmware one.** The device's
+  firmware partition ships a **different** `a650_sqe.fw` (version 0x087, 31460 bytes, CRC32
+  `0x59c1d422`) than the pinned image (0x112, 31964 bytes), and the stock Android KMD runs 0x087 on
+  this exact CP. A firmware/CP generation mismatch is a first-class suspect for "simple CP packets
+  execute while draws and blits dispatch nothing" and for the `CP_OPCODE_ERROR` above. The build now
+  embeds the vendor image (`ADRENO620_FW_DIR/a650_sqe.fw`; the pinned 0x112 file is preserved as
+  `a650_sqe_pinned_0x112.fw`), `kSqeAlt` pins it by size/CRC/SHA-256, and the alternate's version
+  floor drops to 0x080 (the 0x095 floor is mainline's a650 security-fix floor, not a CP
+  compatibility floor; the boot args already carry `sheng-gpu-allow-old-sqe=1`). The
+  `CP_SET_SECURE_MODE` packet is now gated on `sheng-gpu-secure-mode=1` so the SQE is the only
+  variable: wf101 runs without it (does the smoke write memory with the device's own SQE?), and a
+  follow-up boot of the same image with the flag re-tests the secure-mode packet against the SQE.
+  Kernel `5b89210f2765d825a2f5dbf6e4c148d061566fba0d4a11c9c05b749390a7fa42` (embedded SQE size
+  31460 confirmed in `out/picasso/tree/build/adreno-picasso/adreno620_embedded_firmware.c`); image
+  `out/wf101/picasso/boot/wf101.img`, same addon as wf98; log `out/wf101-runs/run1.log`.

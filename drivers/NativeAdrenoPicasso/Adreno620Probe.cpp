@@ -340,7 +340,11 @@ int opGmuFirmware(void *, uint32_t *crc32, uint32_t *bytes)
             adreno620::sqeAlternate()->bytes,
             adreno620::sqeAlternate()->crc32)) {
         expectedSqe = adreno620::sqeAlternate();
-        minimumVersion = 0x095u;   /* a6xx_gpu.c for a650_sqe.fw */
+        /* wf101: the device's own a650_sqe build is 0x087; mainline's 0x095 floor
+         * is a security-fix floor for a650 phones, not a CP-compatibility one.
+         * The image is pinned by size/CRC/SHA-256 above, and the boot args already
+         * carry sheng-gpu-allow-old-sqe=1 for this bring-up measurement. */
+        minimumVersion = 0x080u;
     }
     if (!expectedSqe) {
         printf("PICASSO_GPU firmware: SQE image is neither pinned a630 nor a650\n");
