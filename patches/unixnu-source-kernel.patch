@@ -4950,15 +4950,15 @@ diff --git a/patches/xnu/zzzzzz-picasso-user-abort.patch b/patches/xnu/zzzzzz-pi
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzzz-picasso-user-abort.patch
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,107 @@
 +diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 +--- a/bsd/kern/kern_exit.c
 ++++ b/bsd/kern/kern_exit.c
-+@@ -1379,6 +1379,40 @@
++@@ -1379,6 +1379,81 @@
 + }
 + #endif
 +
-++/* PICASSO_USER_ABORT_BEGIN: failed EL0 access faults only, register-only output. */
+++/* PICASSO_USER_ABORT_BEGIN: bounded final EL0 access-fault diagnostics. */
 ++#if __arm64__ && (DEVELOPMENT || DEBUG)
 ++void picasso_user_abort(void *, uint32_t, uint64_t, int, uint32_t, uint64_t);
 ++void
@@ -4975,8 +4975,18 @@ new file mode 100644
 ++    else if (!strcmp(p->p_name, "backboardd")) service = 2;
 ++    else if (!strcmp(p->p_name, "Preferences")) service = 3;
 ++    else return;
-++    static unsigned reports[4];
-++    unsigned ticket = picasso_pid1_trace_ticket(&reports[service], 8);
+++    /* One report per process generation: worker faults from one crashing
+++     * decoder must not exhaust all eight reports before SpringBoard restarts. */
+++    static uint64_t generations[4][8];
+++    uint64_t generation = proc_uniqueid(p);
+++    if (!generation) return;
+++    unsigned ticket = 0;
+++    for (unsigned i = 0; i < 8; ++i) {
+++        uint64_t empty = 0;
+++        if (__atomic_compare_exchange_n(&generations[service][i], &empty, generation, false,
+++            __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { ticket = i + 1; break; }
+++        if (empty == generation) return;
+++    }
 ++    if (!ticket) return;
 ++    printf("PICASSO_ABORT sample=%u pid=%d name=%.31s thread=%llu code=%x ESR=%x FAR=%llx PC=%llx LR=%llx SP=%llx FP=%llx main_header=%llx cache_slide=%x\n",
 ++        ticket, proc_getpid(p), p->p_name, (unsigned long long)thread_tid(current_thread()), error, esr,
@@ -4988,6 +4998,37 @@ new file mode 100644
 ++        (unsigned long long)get_saved_state_reg(state, 2), (unsigned long long)get_saved_state_reg(state, 3),
 ++        (unsigned long long)get_saved_state_reg(state, 19), (unsigned long long)get_saved_state_reg(state, 20),
 ++        (unsigned long long)get_saved_state_reg(state, 21));
+++    printf("PICASSO_ABORT x22=%llx x23=%llx x24=%llx x25=%llx x26=%llx x27=%llx x28=%llx\n",
+++        (unsigned long long)get_saved_state_reg(state, 22), (unsigned long long)get_saved_state_reg(state, 23),
+++        (unsigned long long)get_saved_state_reg(state, 24), (unsigned long long)get_saved_state_reg(state, 25),
+++        (unsigned long long)get_saved_state_reg(state, 26), (unsigned long long)get_saved_state_reg(state, 27),
+++        (unsigned long long)get_saved_state_reg(state, 28));
+++    /* Failed access is already final. copyin uses the current task and fails
+++     * safely; no remote-task walk, texture writes or suppression of the fault. */
+++    uint64_t frame = get_saved_state_fp(state);
+++    for (unsigned depth = 0; depth < 6 && frame; ++depth) {
+++        uint64_t pair[2] = {0};
+++        if (frame & 15) break;
+++        int copied = copyin((user_addr_t)frame, pair, sizeof(pair));
+++        printf("PICASSO_ABORT stack depth=%u fp=%llx next=%llx lr=%llx copy_error=%d\n",
+++            depth, (unsigned long long)frame, (unsigned long long)pair[0],
+++            (unsigned long long)pair[1], copied);
+++        if (copied || !pair[0] || pair[0] <= frame || pair[0] - frame > 1048576) break;
+++        frame = pair[0];
+++    }
+++    /* Qualified 20H392 libate DecodeRow+0x84 reads an ASTC block at x28.
+++     * Capture only its fixed-size descriptor, never compressed image bytes. */
+++    if (get_saved_state_pc(state) - shared_cache_slide == 0x1d3c3da4cULL) {
+++        uint64_t data[15] = {0};
+++        int copied = copyin((user_addr_t)get_saved_state_reg(state, 19), data, sizeof(data));
+++        if (copied) bzero(data, sizeof(data));
+++        printf("PICASSO_ASTC descriptor copy_error=%d dst=%llx src=%llx size=%llx/%llx block=%llx\n",
+++            copied, (unsigned long long)data[3], (unsigned long long)data[4],
+++            (unsigned long long)data[6], (unsigned long long)data[7], (unsigned long long)data[8]);
+++        printf("PICASSO_ASTC strides texel=%llx/%llx block=%llx/%llx\n",
+++            (unsigned long long)data[11], (unsigned long long)data[12],
+++            (unsigned long long)data[13], (unsigned long long)data[14]);
+++    }
 ++}
 ++#endif
 ++/* PICASSO_USER_ABORT_END */

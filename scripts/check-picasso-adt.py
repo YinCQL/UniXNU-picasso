@@ -107,6 +107,13 @@ def main():
         cpu_nodes = [node for path, node in nodes.items() if path.startswith('/cpus/')]
         assert len(cpu_nodes) == (1 if name == 'minimal' else len(adt['cpu_regs'].split(',')))
         assert all(node['timebase-frequency'] == struct.pack('<I', 19200000) for node in cpu_nodes)
+        for cpu in cpu_nodes:
+            reg, = struct.unpack('<Q', cpu['reg'])
+            assert cpu['compatible'] == (b'arm,cortex-a55\0' if reg < 0x600 else b'arm,cortex-a76\0')
+            assert cpu['cluster-type'] == (b'E\0' if reg < 0x600 else b'P\0')
+        if name != 'minimal':
+            assert [cpu['cluster-type'] for cpu in cpu_nodes].count(b'E\0') == 6
+            assert [cpu['cluster-type'] for cpu in cpu_nodes].count(b'P\0') == 2
         results.append({'case': name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
                         'timer_intid': 19, 'cpu_nodes': len(cpu_nodes),
                         'owned_memory_request_bytes': owned})
@@ -137,7 +144,7 @@ def main():
               'generator_sha256': hashlib.sha256(args.generator.read_bytes()).hexdigest(),
               'cases': results, 'rejected_memory_handoffs': rejected}
     (out / 'results.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
-    print('PASS: picasso ADT memory request, timer INTID, encoding, GIC layout and CPU timebase')
+    print('PASS: picasso ADT memory request, timer INTID, GIC layout and A55/E + A76/P topology')
 
 
 if __name__ == '__main__':

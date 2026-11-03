@@ -23,6 +23,7 @@ size = 0x200000
 [boot_image_kernel]
 kernel_compression = "gzip"
 append_dtb         = true
+dtb                = "picasso-topology.dtb"
 
 #
 # Android Boot Image Configs

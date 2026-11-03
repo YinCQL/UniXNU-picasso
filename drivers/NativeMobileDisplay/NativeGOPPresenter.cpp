@@ -87,7 +87,9 @@ bool NativeGOPPresenter::start(IOService *provider) {
        video.v_rowBytes<video.v_width*4 || video.v_rowBytes>UINT64_MAX/video.v_height)return false;
     // The hand-off presenter is attached away from the display subsystem's node (the original display code enumerates that node's children),
     // so the framebuffer memory comes from the node it names instead of its provider.
-    mapping=(memorySource?memorySource:provider)->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
+    // Match NativeLegacyDisplay's noncached write-combining view of the same
+    // physical scanout. Mixing device and normal-memory aliases is unsafe.
+    mapping=(memorySource?memorySource:provider)->mapDeviceMemoryWithIndex(0,kIOMapWriteCombineCache);
     if(!mapping || !mapping->getVirtualAddress() || mapping->getPhysicalAddress()!=video.v_baseAddr ||
        mapping->getLength()!=video.v_rowBytes*video.v_height)return false;
     gate=IOLockAlloc();if(!gate)return false;
@@ -169,7 +171,12 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     memory->release();
     IOLockLock(gate);
     if(!map || !map->getVirtualAddress() || !swap.offered || swap.sequence!=sequence) {
-        IOLockUnlock(gate);OSSafeReleaseNULL(map);__atomic_fetch_add(&native_gop_gpu_failures,1,__ATOMIC_RELAXED);return kIOReturnNoMemory;
+        const bool outstanding=swap.offered && swap.sequence==sequence;
+        IOLockUnlock(gate);OSSafeReleaseNULL(map);
+        // A failed import must release this delivered offer and tell the
+        // display to copy its still-owned surface. Otherwise it waits forever.
+        if(outstanding)completeSwap(sequence,kIOReturnNoMemory);
+        return kIOReturnNoMemory;
     }
     swap.map=map;
     out->sequence=sequence;out->address=map->getVirtualAddress();out->bytes=map->getLength();out->stride=stride;
@@ -307,5 +314,8 @@ IOReturn NativeGOPClient::clientMemoryForType(UInt32 type,IOOptionBits *options,
     // Type 1: the scanout itself, writable, for the GPU to write; only in GPU mode, where no CPU copy exists.
     if(type==NGP_MEMORY_SCANOUT_RW && !controller->gpuMode)return kIOReturnUnsupported;
     *memory=controller->mapping->getMemoryDescriptor();if(!*memory)return kIOReturnNoMemory;
-    (*memory)->retain();if(type!=NGP_MEMORY_SCANOUT_RW)*options|=kIOMapReadOnly;return kIOReturnSuccess;
+    (*memory)->retain();
+    *options=(*options & ~kIOMapCacheMask)|kIOMapWriteCombineCache;
+    if(type!=NGP_MEMORY_SCANOUT_RW)*options|=kIOMapReadOnly;
+    return kIOReturnSuccess;
 }

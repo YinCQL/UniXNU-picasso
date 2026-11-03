@@ -516,7 +516,7 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
         IOMemoryDescriptor *scanout=native_gop_handoff_memory();
         if(!scanout)return kIOReturnNotReady;
         *memory=scanout;                        /* already retained for the caller */
-        *options=kIOMapAnywhere|kIOMapInhibitCache;   /* firmware framebuffer: device memory, never cached by the CPU */
+        *options=kIOMapAnywhere|kIOMapWriteCombineCache; /* same noncached scanout attributes as the display */
         return kIOReturnSuccess;
     }
     if(type==NativeAdrenoMailboxType) {

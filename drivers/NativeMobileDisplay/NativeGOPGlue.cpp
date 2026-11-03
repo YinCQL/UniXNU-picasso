@@ -32,7 +32,7 @@ static void gridSampleThread(void *, wait_result_t)
         gridPhysical, gridBytes, kIODirectionIn);
     if (!descriptor) { printf("PICASSO_GRID: descriptor failed\n"); return; }
     IOMemoryMap *map = descriptor->createMappingInTask(kernel_task, 0,
-        kIOMapAnywhere | kIOMapInhibitCache);
+        kIOMapAnywhere | kIOMapWriteCombineCache);
     descriptor->release();
     if (!map) { printf("PICASSO_GRID: mapping failed\n"); return; }
     volatile const uint8_t *fb = reinterpret_cast<volatile const uint8_t *>(

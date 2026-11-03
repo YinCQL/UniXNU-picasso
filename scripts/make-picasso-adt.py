@@ -159,13 +159,16 @@ def main():
     except ValueError:
         parser.error('--cpu-regs must be integers')
     if (not cpu_regs or cpu_regs[0] != 0 or len(set(cpu_regs)) != len(cpu_regs) or len(cpu_regs) > 8
-            or any(reg < 0 or reg > 0xffff or reg & 0xff for reg in cpu_regs)):
-        parser.error('--cpu-regs: up to eight distinct Affinity1-numbered cores, boot CPU 0 first')
+            or any(reg < 0 or reg > 0x700 or reg & 0xff for reg in cpu_regs)):
+        parser.error('--cpu-regs: distinct SM7250 cores 0x000..0x700, boot CPU 0 first')
     cpus = [node('cpu%d' % index, [('state', b'running\0' if index == 0 else b'waiting\0'),
                                    # /cpus is #address-cells = 2 (as in the device DT), so
                                    # the MPIDR affinity goes out as a 64-bit cell.
                                    ('reg', struct.pack('<Q', reg)),
-                                   ('device_type', b'cpu\0'), ('compatible', b'arm,cortex-a76\0'),
+                                   ('device_type', b'cpu\0'),
+                                   # SM7250 CPU identity follows MPIDR, even for a reordered subset.
+                                   ('compatible', b'arm,cortex-a55\0' if reg < 0x600 else b'arm,cortex-a76\0'),
+                                   ('cluster-type', b'E\0' if reg < 0x600 else b'P\0'),
                                    ('timebase-frequency', struct.pack('<I', TIMEBASE))])
             for index, reg in enumerate(cpu_regs)]
     # The guide requires a matching root model, target and product family.

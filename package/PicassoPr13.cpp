@@ -19,8 +19,9 @@ volatile uint32_t native_legacy_gpu_fallbacks, native_legacy_gpu_last_status;
 volatile uint64_t native_legacy_early_retires, native_legacy_early_failures;
 void native_legacy_swap_stage(unsigned stage) { (void)stage; }
 void native_legacy_gpu_fallback_observed(int status) {
-    __atomic_add_fetch(&native_legacy_gpu_fallbacks, 1, __ATOMIC_RELAXED);
+    const uint32_t count=__atomic_add_fetch(&native_legacy_gpu_fallbacks, 1, __ATOMIC_RELAXED);
     __atomic_store_n(&native_legacy_gpu_last_status, uint32_t(status), __ATOMIC_RELAXED);
+    if(count<=8)IOLog("PICASSO_GPU copy failed count=%u status=%x; retry CPU\n",count,unsigned(status));
 }
 }
 

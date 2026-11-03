@@ -41,7 +41,6 @@ extern "C" void native_legacy_retirement_observed(IOService *);
 extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
 extern "C" void native_legacy_swap_stage(unsigned stage);
 extern "C" void native_legacy_gpu_fallback_observed(int status);
-extern "C" {extern volatile uint64_t native_legacy_early_retires,native_legacy_early_failures;}
 extern "C" void native_legacy_retirement_failed(IOService *);
 // Display refresh tick (boot-arg sheng-vsync=<Hz>, 0 or absent: off). The original family sends the compositor's vsync message (type 5)
 // through native_legacy_vsync_notify, the unchanged original sender, but only a platform subclass calls it from the panel's vblank and
@@ -102,12 +101,11 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         }
         copyShadowValid=true;return stored;
     }
-    // The frame currently owned by the GPU client (valid until its completion),
-    // and whether that swap already retired when the client took it.
+    // Keep the original swap and IOSurface owned until GPU completion. Merely
+    // retaining the descriptor does not stop the producer reusing its pixels.
     const OriginalLegacySwapRequest *gpuRequest=nullptr;
     uint64_t gpuLength=0;
     bool gpuBypass=false;
-    bool gpuRetired=false;
     // Preserve every accepted request until the original family retires it.
     // A full table rejects the new request without evicting a live entry.
     const OriginalLegacySwapRequest *validated[8]={};
@@ -187,22 +185,22 @@ public:
     // the framebuffer's work loop, where the queue and the vsync clients live.
     void gpuComplete(int status) {
         struct Args {NativeLegacyDisplay *display;int status;};
-        Args *args=(Args *)IOMalloc(sizeof(Args));
-        if(!args){finishGpuSwap(status);return;}
-        args->display=this;args->status=status;
+        Args args={this,status};
         IOWorkLoop *loop=getWorkLoop();
         auto action=[](OSObject *,void *a0,void *,void *,void *)->IOReturn {
-            Args *a=(Args *)a0;a->display->finishGpuSwap(a->status);IOFree(a,sizeof(Args));return kIOReturnSuccess;
+            Args *a=(Args *)a0;a->display->finishGpuSwap(a->status);return kIOReturnSuccess;
         };
-        if(loop && loop->runAction(action,this,args)==kIOReturnSuccess)return;
-        IOFree(args,sizeof(Args));
-        finishGpuSwap(status);
+        // runAction is synchronous: the stack arguments stay live until the
+        // framebuffer gate is acquired. Never mutate the swap queue ungated
+        // on an allocation failure or a teardown callback.
+        if(loop && loop->runAction(action,this,&args)==kIOReturnSuccess)return;
+        native_legacy_retirement_failed(this);
     }
     void free() override {stopVsync();resetCopyShadow();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
         stopVsync();
         resetCopyShadow();
-        transferred=false;gpuRequest=nullptr;gpuRetired=false;for(auto &entry: validated)entry=nullptr;
+        transferred=false;gpuRequest=nullptr;for(auto &entry: validated)entry=nullptr;
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
     }
@@ -378,13 +376,8 @@ public:
             // differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
             copyShadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
-            // Retire as soon as the client owns the frame (the presenter retains
-            // it); the next frame waits for the copy because transferred stays
-            // set until finishGpuSwap.
-            unsigned early=1;PE_parse_boot_argn("sheng-early-retire",&early,sizeof early);
-            if(early==1 && retireSwap(request,true)) {
-                gpuRetired=true;native_legacy_early_retires=native_legacy_early_retires+1;
-            }
+            // The completion callback retires only after the consumer has
+            // finished reading. Failed imports/copies retry this request on CPU.
             return;
         }
         IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
@@ -500,12 +493,6 @@ public:
         const OriginalLegacySwapRequest *request=gpuRequest;
         if(!request)return;
         gpuRequest=nullptr;
-        if(gpuRetired) {
-            gpuRetired=false;
-            if(status==0)native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
-            else {native_legacy_early_failures=native_legacy_early_failures+1;native_legacy_gpu_fallback_observed(status);gpuBypass=true;}
-            transferred=false;kickSwapQueue();return;
-        }
         if(status==0) {
             native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
             finishTransfer(request,true);return;
