@@ -952,3 +952,42 @@ Client side (read-only reference copies):
   `ee0a9247f36775b10dec02eaa4627c3d6f5b82bfb5b840cba82ef74f08bfb2ed`; image
   `out/wf96/picasso/boot/wf96.img`, log `out/wf96-runs/run1.log` (kernel unchanged from wf95,
   `1f63e127…`).
+- **wf96 result: the marker and the render-mode condition work.** `PICASSO_GPU text: C s600df00d
+  cc0debeef`: the `CP_MEM_WRITE` inside `CP_COND_REG_EXEC(MODE=RENDER_MODE, SYSMEM)` ran, and so did
+  the unconditional one after it. Turnip's sysmem draw sections are therefore not skipped by the
+  render-mode condition; the failure is inside the draw state or the 3D blocks. The smoke's own
+  `T` line did not appear before this capture ended — but neither did the `W` watchdog sample that
+  `runWatched` streams at 15 s, and `Y turnip` is printed by the same goroutine that streams them,
+  so the capture ended less than 15 s after the smoke started (the boot now reaches the plugin very
+  late: `Y turnip` at line 3485 of 6055). This is a capture-window artifact, not a hang; later
+  runs use a 900 s window.
+- **wf97: do client type-4 register writes take effect?** `runTest()` appends two type-4 writes and
+  two `CP_REG_TO_MEM` (type 7, proven to run) readback packets: `CP_SCRATCH(0)` at `0x883` =
+  `0xfedcba98` → target word 6, and `RBBM_GPR0_CNTL` at `0x018` = `0xc0def00d` → target word 7.
+  Turnip programs every 3D state register with type-4 packets; if the readbacks do not return the
+  written values, its state never reaches the hardware. `C s<w4> c<w5> a<w6> b<w7>` now streams all
+  four. Plugin CDHash `a759da5278a7f60a7297551d8cee5c8ee175aee8`, trust
+  `76117c6c11ffa7f23c121e2de0719aafe695077d4822192720383cfdf6c505a1`, addon
+  `97302de806da…`; image `out/wf97/picasso/boot/wf97.img`, log `out/wf97-runs/run1.log` (kernel
+  unchanged, `1f63e127…`).
+- **wf97 result: the GPR0 write is itself a CP_PROTECT violation; the experiment aborted.** Serial:
+  `text: C s0 c0 a0 b0`, then 3 s later `stall: fence=3 pending=3014471 us`, and
+  `stall cpregs: cpint=10 hwfault=0 protect=600018`. `CP_PROTECT_STATUS=0x600018` decodes per
+  a6xx.xml as ADDR=`0x18`, READ=0, CP_HALTED=1, ACCESS_VIOLATION=1 — exactly our type-4 write to
+  `RBBM_GPR0_CNTL`, which lies in the first `a650_protect` entry `A6XX_PROTECT_RDONLY(0x00000,
+  0x04ff)` (writes forbidden, reads allowed). `kCpProtectCntl = 0xB` sets `ACCESS_PROT_EN |
+  ACCESS_FAULT_ON_VIOL_EN`, so the violation halts the CP and the submission's fence never retires.
+  The `C` values are not measurements: `WaitFence` failed, `runTest()` returned before the
+  readbacks, and `adrenoUserTest()` streams the zeroed `gCond*` statics right after `report()`.
+  No `Y …` line follows and the smoke never starts. Evidence kept: the CP_PROTECT table is live
+  and enforced for client submissions, and `CP_SCRATCH(0)=0x883` sits in the unprotected hole
+  between `NORDWR(0x800,0x82)` and `NORDWR(0x8a0,0x8)` — the fault address proves the CP reached
+  the GPR0 write *after* the scratch write without a fault.
+- **wf98: scratch-only type-4 write/readback (one variable changed).** The GPR0 write is removed;
+  the `CP_SCRATCH(0)` write and both readbacks stay (reading `0x018` is allowed by RDONLY and is
+  the read-direction control). `a=fedcba98` means client type-4 register writes reach the hardware
+  and Turnip's state programming is not a silent no-op; `a=0` means type-4 writes are dropped
+  without a fault. Image `out/wf98/picasso/boot/wf98.img`, kernel `1f63e127…`, addon
+  `7a4a10b3f025fb8bb32bc7c7d4d1ed8ccc990c540bbb65654f18351026faf21f`, trust
+  `25cfd9ab6dacdf3b848c2f60a3623f0f81bcd02a295349979eb250ca3a9f4b3a`; log
+  `out/wf98-runs/run1.log` (900 s capture window).
