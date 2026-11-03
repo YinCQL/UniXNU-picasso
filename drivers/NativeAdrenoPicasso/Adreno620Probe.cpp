@@ -592,6 +592,20 @@ extern "C" int native_adreno620_sqe_firmware(const uint8_t **bytes, size_t *leng
     return 0;
 }
 
+extern "C" int native_adreno620_zap_firmware(const uint8_t **mdt,
+    size_t *mdt_bytes, const uint8_t *segments[3], size_t segment_bytes[3])
+{
+    if (!mdt || !mdt_bytes || !segments || !segment_bytes) return -1;
+    if (!gFirmwareZapMdt || !gFirmwareZapMdtBytes) return -1;
+    *mdt = gFirmwareZapMdt;
+    *mdt_bytes = gFirmwareZapMdtBytes;
+    for (unsigned index = 0; index < 3; ++index) {
+        segments[index] = gFirmwareZapSegment[index];
+        segment_bytes[index] = gFirmwareZapSegmentBytes[index];
+    }
+    return 0;
+}
+
 extern "C" void native_adreno_probe(void)
 {
     uint32_t stage = 0;

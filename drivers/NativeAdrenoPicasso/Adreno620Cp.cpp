@@ -22,6 +22,7 @@
  * obtained by mapping their physical extents, with cache maintenance by
  * physical address around every hand-off, exactly like Adreno620Gmu.cpp.
  * Nothing here frees or remaps a buffer the GPU may still read. */
+#include "Adreno620Firmware.h"
 #include "Adreno620Probe.h"
 #include "Adreno620ProbeCore.h"
 #include "NativeAdrenoABI.h"
@@ -35,6 +36,7 @@
 #include "NativeAdrenoUserClient.h"
 #include "AdrenoPM4.h"
 #include <IOKit/IODeviceMemory.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -47,6 +49,7 @@
 #include <kern/thread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 /* The driver's client-BO reader falls back to a board DRAM reader when a BO has no kernel mapping (system BOs). This port had none
  * installed, so a stall's IB dump was all 0xdeadbeef. Reads one word through a temporary kernel mapping of its page. */
@@ -347,9 +350,10 @@ bool packet(uint32_t *words, size_t capacity, size_t at, uint32_t opcode,
  * loaded through TZ and the CP is switched out of secure mode. Loading that zap needs the
  * Qualcomm PAS SCM calls; this helper is the conduit those calls will use. It is the same
  * instruction the platform's PSCI driver uses (drivers/ArmCpu/ArmCpu.cpp). */
-struct ScmReply { uint32_t a0, a1, a2, a3; };
+struct ScmReply { uint32_t a0, a1, a2, a3; uint64_t a6; };
 ScmReply scmSipCall(uint32_t function, uint32_t arginfo, uint64_t arg0,
-    uint64_t arg1 = 0, uint64_t arg2 = 0, uint64_t arg3 = 0)
+    uint64_t arg1 = 0, uint64_t arg2 = 0, uint64_t arg3 = 0,
+    uint64_t arg6 = 0)
 {
     register uint64_t x0 __asm__("x0") = function;
     register uint64_t x1 __asm__("x1") = arginfo;
@@ -357,11 +361,21 @@ ScmReply scmSipCall(uint32_t function, uint32_t arginfo, uint64_t arg0,
     register uint64_t x3 __asm__("x3") = arg1;
     register uint64_t x4 __asm__("x4") = arg2;
     register uint64_t x5 __asm__("x5") = arg3;
-    __asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
+    /* x6 is the ARM_SMCCC_QUIRK_QCOM_A6 in/out register. Linux initialises it
+     * to zero, passes it as the 7th SMC argument, and — after the call — stores
+     * the value the firmware left in it as the session id of an interrupted
+     * secure call: "the retry must pass back the session ID ... calls hang on
+     * retry without it" (82bcd087 + Sricharan R's follow-up). wf106-wf109
+     * hung exactly there: the first PAS call returns 1 (INTERRUPTED) and our
+     * retry, with x6 forced back to 0, wedged the PIL session. */
+    register uint64_t x6 __asm__("x6") = arg6;
+    register uint64_t x7 __asm__("x7") = 0;
+    __asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3),
+        "+r"(x6), "+r"(x7)
         : "r"(x4), "r"(x5)
-        : "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16",
+        : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16",
           "x17", "memory");
-    return ScmReply{uint32_t(x0), uint32_t(x1), uint32_t(x2), uint32_t(x3)};
+    return ScmReply{uint32_t(x0), uint32_t(x1), uint32_t(x2), uint32_t(x3), x6};
 }
 
 void scmProbe()
@@ -388,6 +402,38 @@ void scmProbe()
         init.a0, init.a1, init.a2, init.a3);
     printf("PICASSO_GPU scm: is-call-avail memsetup a0=%08x a1=%08x; auth %08x/%08x\n",
         setup.a0, setup.a1, reset.a0, reset.a1);
+    /* wf107: the PAS calls in loadZap() are STD (blocking) SMCs, as
+     * qcom_scm-smc.c sends every non-atomic call. This one is the same
+     * read-only SVC_INFO query over STD instead of FAST: if it answers, the
+     * STD path above EL1 works and a PAS hang is specific to the PIL service;
+     * if it does not, no PAS call can ever return. */
+    const uint32_t availStd = (kSmc64 | (kSipOwner << kOwnerShift) |
+        (kSvcInfo << 8) | kIsCallAvail);
+    printf("PICASSO_GPU scm: calling std is-call-avail\n");
+    const ScmReply stdInfo = scmSipCall(availStd, 1, selector);
+    printf("PICASSO_GPU scm: std is-call-avail a0=%08x a1=%08x\n",
+        stdInfo.a0, stdInfo.a1);
+    /* wf110: does the PIL service answer at all for this platform? PAS_IS_SUPPORTED (SVC_PIL 0x02,
+     * cmd 0x07, ARGS(1) = pas id) reads no memory and touches no GPU state. If it answers for the
+     * GPU's pas id 0x0d, the PIL service is live and the wf106-wf109 hang is specific to
+     * PAS_INIT_IMAGE's metadata handling; if it hangs too, the PIL service is not usable from this
+     * boot environment at all. Pas id 1 (modem on this platform) is the control. */
+    {
+        constexpr uint32_t kStdSipSmc64 = 0x40000000u | 0x02000000u;
+        printf("PICASSO_GPU scm: calling pas-supported(13)\n");
+        const ScmReply gpu = scmSipCall(kStdSipSmc64 | (0x02u << 8) | 0x07u,
+            0x01u, 0x0du);
+        printf("PICASSO_GPU scm: pas-supported(13) a0=%08x a1=%08x\n", gpu.a0, gpu.a1);
+        printf("PICASSO_GPU scm: calling pas-supported(1)\n");
+        const ScmReply modem = scmSipCall(kStdSipSmc64 | (0x02u << 8) | 0x07u,
+            0x01u, 0x01u);
+        printf("PICASSO_GPU scm: pas-supported(1) a0=%08x a1=%08x\n", modem.a0, modem.a1);
+    }
+    /* wf115 measured what happens when the AP touches the crypto engine while
+     * its NoC path has no vote: the qcrypto@1de0000 register read took an
+     * SError ("Unhandled implementation specific error") and killed the boot.
+     * The liveness read therefore belongs after rpmhVoteCryptoPath() (wf116),
+     * never before the vote, and it is not part of this read-only probe. */
 }
 
 void printCpStatus(const char *where)
@@ -675,6 +721,744 @@ bool leaveSecureMode()
     }
     printf("PICASSO_GPU cp: CP_SET_SECURE_MODE(0) idle rptr=%u\n", gpuRead(A620_CP_RB_RPTR));
     return true;
+}
+
+/* wf116: the crypto path's RPMh votes. The vendor cannot run PAS_INIT_IMAGE or
+ * PAS_AUTH_AND_RESET until it has voted the crypto engine's NoC path:
+ * subsys-pil-tz.c scm_pas_enable_bw() registers an msm_bus client with
+ * src = MSM_BUS_MASTER_CRYPTO_CORE_0 (0x7d), dst = EBI (0x200) and 393.6 MB/s,
+ * and calls it around every PAS call, because TZ authenticates the image on the
+ * qcrypto engine, whose NoC master port is clock-gated by the BCM machinery
+ * until that vote exists. wf115 measured the same gating from the AP side: a
+ * read of qcrypto@1de0000 took an SError. The path in this device's bus
+ * topology (mas_qxm_crypto -> slv_qns_a2noc_snoc -> mas_qnm_aggre2_noc ->
+ * slv_qns_gemnoc_sf -> mas_qnm_snoc_sf -> slv_qns_llcc -> mas_llcc_mc ->
+ * slv_ebi) names the BCMs CE0, SN6, SN0, SH0, MC0 and ACV; slv_qhs_crypto0_cfg
+ * (the register window whose read faulted) names CN0. The downstream bus
+ * driver sends these as BCM_TCS_CMD(commit, valid, vote_x, vote_y) commands in
+ * the apps RSC's active TCS group, with the vote clamped to the 14-bit field
+ * and the VCD's last command carrying commit (msm_bus_fabric_rpmh.c
+ * tcs_cmd_gen/tcs_cmd_list_gen, msm_bus_arb_rpmh.c bcm_update_bus_req).
+ * Register layout and offsets are rpmh-rsc.c's v2.7/v3.0 tables, chosen by the
+ * DRV_ID major version; the TCS block offset is the DT's qcom,tcs-offset; the
+ * ACTIVE group is first in qcom,tcs-config <2 2 ...> (type ACTIVE = 2, count 2).
+ * Addresses and per-BCM aux data (unit, width, VCD) come from the AOP command
+ * DB, read the same way as drivers/soc/qcom/cmd-db.c. */
+constexpr uint64_t kAppsRscDrv2Base = 0x18220000u;   /* DT reg drv-2 (qcom,drv-id 2) */
+constexpr uint64_t kAppsRscBytes = 0x10000u;
+constexpr uint64_t kRscTcsOffset = 0xd00u;           /* DT qcom,tcs-offset */
+constexpr uint64_t kRpmhCmdDbBase = 0x80860000u;     /* DT cmd-db memory region */
+constexpr uint64_t kRpmhCmdDbBytes = 0x20000u;
+constexpr uint32_t kRscAmcModeEnable = 1u << 16;
+constexpr uint32_t kRscAmcModeTrigger = 1u << 24;
+constexpr uint32_t kRscCmdMsgidWrite = 8u | (1u << 8) | (1u << 16);  /* LEN|RESP|WRITE */
+constexpr uint32_t kRscCmdStatusCompl = 1u << 16;
+constexpr uint32_t kBcmVoteMax = 0x3fffu;            /* BCM_TCS_CMD_VOTE_MASK */
+constexpr uint32_t kBcmAcvApps = 0x8;                /* BCM_TCS_CMD_ACV_APPS */
+
+struct RscLayout {
+    uint32_t tcsStride, cmdStride, irqStatus, irqClear, waitForCmpl, control,
+        status, cmdEnable, cmdMsgid, cmdAddr, cmdData, cmdStatus;
+};
+
+RscLayout rscLayout(uint32_t drvId)
+{
+    /* rpmh-rsc.c rpmh_rsc_reg_offset_ver_3_0 / ver_2_7. */
+    if (((drvId >> 16) & 0xffu) >= 3u)
+        return RscLayout{672, 24, 0x04, 0x08, 0x20, 0x24, 0x28, 0x2c, 0x34, 0x38, 0x3c, 0x40};
+    return RscLayout{672, 20, 0x04, 0x08, 0x10, 0x14, 0x18, 0x1c, 0x30, 0x34, 0x38, 0x3c};
+}
+
+uint16_t rpmhLe16(const volatile uint8_t *p)
+{
+    return uint16_t(p[0] | (p[1] << 8));
+}
+
+uint32_t rpmhLe32(const volatile uint8_t *p)
+{
+    return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) |
+        (uint32_t(p[3]) << 24);
+}
+
+struct CmdDbBcm {
+    uint32_t address, unit;
+    uint16_t width;
+    uint8_t vcd;
+    bool found;
+};
+
+/* cmd_db_read_addr() + cmd_db_read_aux_data(struct bcm_db). */
+CmdDbBcm cmdDbBcmLookup(const Mapping &db, const char *name)
+{
+    CmdDbBcm out = {};
+    if (!db.base || db.bytes < 144 || rpmhLe32(db.base + 4) != 0x0c0330dbu)
+        return out;
+    uint8_t query[8] = {};
+    for (unsigned i = 0; i < 8 && name[i]; ++i) query[i] = uint8_t(name[i]);
+    for (unsigned resource = 0; resource < 8; ++resource) {
+        const volatile uint8_t *slave = db.base + 8 + resource * 16;
+        if (!rpmhLe16(slave)) break;
+        const uint64_t headers = 144u + rpmhLe16(slave + 2);
+        const uint64_t data = 144u + rpmhLe16(slave + 4);
+        const unsigned count = rpmhLe16(slave + 6);
+        for (unsigned entry = 0; entry < count; ++entry) {
+            const uint64_t at = headers + uint64_t(entry) * 24;
+            if (at + 24 > db.bytes) return out;
+            bool match = true;
+            for (unsigned byte = 0; byte < 8; ++byte)
+                if (db.base[at + byte] != query[byte]) { match = false; break; }
+            if (!match) continue;
+            out.address = rpmhLe32(db.base + at + 16);
+            const unsigned auxLength = rpmhLe16(db.base + at + 20);
+            const uint64_t aux = data + rpmhLe16(db.base + at + 22);
+            if (auxLength >= 8 && aux + 8 <= db.bytes) {
+                out.unit = rpmhLe32(db.base + aux);
+                out.width = rpmhLe16(db.base + aux + 4);
+                out.vcd = db.base[aux + 6];
+            }
+            out.found = out.address != 0;
+            return out;
+        }
+    }
+    return out;
+}
+
+/* Votes the crypto path's BCMs through the apps RSC's active TCSs. Returns the
+ * number of BCMs voted. Every wait is bounded: a stuck RSC must not stop the
+ * boot, and the PAS result is what the caller measures. */
+unsigned rpmhVoteCryptoPath()
+{
+    Mapping rsc = {};
+    Mapping db = {};
+    if (!mapPhysical(kAppsRscDrv2Base, kAppsRscBytes, rsc)) {
+        printf("PICASSO_GPU rpmh: RSC at %08x did not map\n",
+            uint32_t(kAppsRscDrv2Base));
+        return 0;
+    }
+    const bool dbMapped = mapPhysical(kRpmhCmdDbBase, kRpmhCmdDbBytes, db);
+    if (!dbMapped)
+        printf("PICASSO_GPU rpmh: cmd-db at %08x did not map\n",
+            uint32_t(kRpmhCmdDbBase));
+
+    const uint32_t drvId = read32(rsc, 0);
+    const RscLayout layout = rscLayout(drvId);
+    const uint64_t tcsBase = kRscTcsOffset;
+    const uint32_t irqEnable = read32(rsc, tcsBase + 0x00);
+    printf("PICASSO_GPU rpmh: drv-id=%08x tcs-stride=%u cmd-stride=%u irq-enable=%08x\n",
+        drvId, layout.tcsStride, layout.cmdStride, irqEnable);
+
+    /* The TX-done line is a GIC SPI this kernel has no handler for. Mask only
+     * the two TCSs this vote uses for the duration of the vote and restore the
+     * register afterwards; IRQ_STATUS still records completion. */
+    write32(rsc, tcsBase + 0x00, irqEnable & ~3u);
+    barrier();
+
+    struct Vote {
+        const char *name;
+        bool acv;
+    };
+    const Vote votes[] = {
+        {"CE0", false}, {"SN6", false}, {"SN0", false}, {"SH0", false},
+        {"MC0", false}, {"ACV", true}, {"CN0", false},
+    };
+
+    auto waitIdle = [&](uint64_t tcsAt) {
+        uint32_t status = 0;
+        for (unsigned spin = 0; spin < 200; ++spin) {
+            status = read32(rsc, tcsAt + layout.status);
+            if (status) break;
+            IODelay(10);
+        }
+        return status;
+    };
+
+    auto sendBcm = [&](unsigned tcs, uint32_t address, uint32_t data) {
+        const uint64_t tcsAt = tcsBase + uint64_t(layout.tcsStride) * tcs;
+        waitIdle(tcsAt);
+        /* __tcs_set_trigger(false): clear the AMC trigger, then the mode. */
+        uint32_t control = read32(rsc, tcsAt + layout.control);
+        control &= ~kRscAmcModeTrigger;
+        write32(rsc, tcsAt + layout.control, control);
+        control &= ~kRscAmcModeEnable;
+        write32(rsc, tcsAt + layout.control, control);
+        write32(rsc, tcsAt + layout.cmdEnable, 0);
+        barrier();
+        write32(rsc, tcsAt + layout.cmdMsgid, kRscCmdMsgidWrite);
+        write32(rsc, tcsAt + layout.cmdAddr, address);
+        write32(rsc, tcsAt + layout.cmdData, data);
+        write32(rsc, tcsAt + layout.cmdEnable, 1u);
+        barrier();
+        /* __tcs_set_trigger(true), with the synchronous readbacks rpmh-rsc.c
+         * relies on between the mode enable and the trigger. */
+        write32(rsc, tcsAt + layout.control, kRscAmcModeEnable);
+        (void)read32(rsc, tcsAt + layout.control);
+        write32(rsc, tcsAt + layout.control, kRscAmcModeEnable | kRscAmcModeTrigger);
+        (void)read32(rsc, tcsAt + layout.control);
+        uint32_t irqStatus = 0, status = 0, cmdStatus = 0;
+        unsigned spins = 0;
+        for (; spins < 500; ++spins) {
+            irqStatus = read32(rsc, tcsBase + layout.irqStatus);
+            status = read32(rsc, tcsAt + layout.status);
+            cmdStatus = read32(rsc, tcsAt + layout.cmdStatus);
+            if ((irqStatus & (1u << tcs)) || (cmdStatus & kRscCmdStatusCompl))
+                break;
+            IODelay(10);
+        }
+        write32(rsc, tcsBase + layout.irqClear, 1u << tcs);
+        write32(rsc, tcsAt + layout.cmdEnable, 0);
+        control = read32(rsc, tcsAt + layout.control);
+        control &= ~kRscAmcModeTrigger;
+        write32(rsc, tcsAt + layout.control, control);
+        control &= ~kRscAmcModeEnable;
+        write32(rsc, tcsAt + layout.control, control);
+        barrier();
+        const bool done = (irqStatus & (1u << tcs)) ||
+            (cmdStatus & kRscCmdStatusCompl);
+        printf("PICASSO_GPU rpmh: tcs=%u irq=%08x status=%08x cmd-status=%08x "
+               "spins=%u\n", tcs, irqStatus, status, cmdStatus, spins);
+        return done;
+    };
+
+    unsigned voted = 0;
+    for (unsigned index = 0; index < sizeof(votes) / sizeof(votes[0]); ++index) {
+        const CmdDbBcm bcm = cmdDbBcmLookup(db, votes[index].name);
+        if (!bcm.found) {
+            printf("PICASSO_GPU rpmh: cmd-db has no %s\n", votes[index].name);
+            continue;
+        }
+        /* Downstream clamps any bandwidth vote to the 14-bit field; ACV is not a
+         * bandwidth vote but a VCD bitmask (bcm_update_acv_req). */
+        const uint32_t data = votes[index].acv
+            ? ((1u << 30) | (1u << 29) | kBcmAcvApps)
+            : ((1u << 30) | (1u << 29) | (kBcmVoteMax << 14) | kBcmVoteMax);
+        const unsigned tcs = index & 1u;
+        const bool done = sendBcm(tcs, bcm.address, data);
+        printf("PICASSO_GPU rpmh: %s addr=%x unit=%u width=%u vcd=%u data=%08x tcs=%u done=%d\n",
+            votes[index].name, bcm.address, bcm.unit, unsigned(bcm.width),
+            unsigned(bcm.vcd), data, tcs, int(done));
+        ++voted;
+    }
+    write32(rsc, tcsBase + 0x00, irqEnable);
+    barrier();
+    if (dbMapped && db.keep) db.keep->release();
+    if (rsc.keep) rsc.keep->release();
+    printf("PICASSO_GPU rpmh: crypto path voted %u/%u\n", voted,
+        unsigned(sizeof(votes) / sizeof(votes[0])));
+    return voted;
+}
+
+/* wf119: the probe thread blocks inside EL3 once the interrupted PAS session is
+ * resumed, but the rest of the machine keeps running. This helper runs on
+ * another CPU and dumps the TZ/hypervisor log ring (DT qcom,tz-log@146ab720,
+ * "hyplog-enabled", address and size in the u32 at +0x410/+0x414, the layout of
+ * the vendor tz_log driver) so whatever QTEE logged around the stall reaches
+ * the console. */
+void dumpTextRuns(const char *tag, const Mapping &m, uint64_t offset,
+    uint64_t bytes, unsigned maxLines)
+{
+    char line[97];
+    unsigned length = 0, lines = 0;
+    for (uint64_t i = offset; i < offset + bytes && i < m.bytes; ++i) {
+        const uint8_t byte = m.base[i];
+        if (byte >= 0x20 && byte < 0x7f) {
+            if (length < sizeof line - 1) line[length++] = char(byte);
+            continue;
+        }
+        if (length >= 8) {
+            line[length] = 0;
+            printf("PICASSO_GPU %s: %s\n", tag, line);
+            if (++lines >= maxLines) return;
+        }
+        length = 0;
+    }
+    if (length >= 8 && lines < maxLines) {
+        line[length] = 0;
+        printf("PICASSO_GPU %s: %s\n", tag, line);
+    }
+}
+
+/* wf120: the TZ log is binary (wf119 found no printable runs in either ring),
+ * so dump the raw bytes as 64-character windows with non-printables as '.'.
+ * That keeps magic words and ring headers visible without depending on a
+ * format this project has not confirmed. */
+void dumpBytes(const char *tag, const Mapping &m, uint64_t offset,
+    uint64_t bytes)
+{
+    char line[65];
+    const uint64_t end = offset + bytes;
+    for (uint64_t at = offset; at < end && at < m.bytes; at += 64) {
+        unsigned n = 0;
+        for (unsigned i = 0; i < 64 && at + i < end && at + i < m.bytes; ++i) {
+            const uint8_t byte = m.base[at + i];
+            line[n++] = (byte >= 0x20 && byte < 0x7f) ? char(byte) : '.';
+        }
+        line[n] = 0;
+        printf("PICASSO_GPU %s: %s\n", tag, line);
+    }
+}
+
+void tzLogDump()
+{
+    Mapping base = {};
+    if (!mapPhysical(UINT64_C(0x146ab720), 0x3000, base)) {
+        printf("PICASSO_GPU tzlog: base map failed\n");
+        return;
+    }
+    const uint32_t address = read32(base, 0x410);
+    const uint32_t size = read32(base, 0x414);
+    printf("PICASSO_GPU tzlog: hyplog address=%08x size=%08x magic=%08x "
+           "%08x %08x\n", address, size, read32(base, 0x0), read32(base, 0x4),
+        read32(base, 0x400));
+    dumpTextRuns("tzlog", base, 0, 0x3000, 12);
+    dumpBytes("tzlog-raw", base, 0, 0x100);
+    if (base.keep) base.keep->release();
+    if (!address || address == 0xffffffffu) return;
+    const uint64_t page = address & ~UINT64_C(0xfff);
+    const uint64_t offset = address - page;
+    uint64_t bytes = size ? size : 0x4000;
+    if (bytes > 0x40000) bytes = 0x40000;
+    Mapping hyp = {};
+    if (!mapPhysical(page, bytes + offset, hyp)) {
+        printf("PICASSO_GPU tzlog: hyplog map failed pa=%08x\n", address);
+        return;
+    }
+    /* The ring keeps its newest text at the end for this firmware; the head
+     * is dumped as well because a wrap splits the newest lines. */
+    dumpTextRuns("hyplog-head", hyp, offset, bytes < 0x800 ? bytes : 0x800, 8);
+    dumpBytes("hyplog-raw", hyp, offset, bytes < 0x200 ? bytes : 0x200);
+    if (bytes > 0x400)
+        dumpBytes("hyplog-tail", hyp, offset + bytes - 0x400, 0x400);
+    if (hyp.keep) hyp.keep->release();
+}
+
+void tzLogThread(void *, wait_result_t)
+{
+    IOSleep(5000);
+    tzLogDump();
+    IOSleep(15000);
+    tzLogDump();
+}
+
+/* wf104: the zap shader. Mainline hw_init() loads it right after a6xx_cp_init()
+ * and then sends CP_SET_SECURE_MODE(0) (a6xx_gpu.c); adreno_zap_shader_load()
+ * runs the MDT through the QCOM PAS calls. The two pieces:
+ *   - metadata: qcom_mdt_read_metadata()'s blob, ELF header + program headers
+ *     followed by the hash segment with no padding. For this split .mdt that
+ *     is the whole file: phdrs[0].p_filesz 0x94 + phdrs[1].p_filesz 0x1a38 =
+ *     0x1acc = 6860 bytes. It goes to PAS_INIT_IMAGE from a physically
+ *     contiguous 4K-aligned buffer (qcom_scm_pas_init_image turns memory
+ *     protection on for it).
+ *   - region: qcom_mdt_get_size() over loadable segments only (the hash
+ *     segment is type 2 and never loadable). The single PT_LOAD is
+ *     a620_zap.b02: p_paddr 0x5000, filesz=memsz=0x68c, so the span is
+ *     ALIGN(0x568c) - 0x5000 = 0x1000 and qcom_mdt_load_no_init() copies it to
+ *     region + (p_paddr - min_paddr) = offset 0.
+ * The region is the one the device tree reserves for exactly this: pil_gpu_mem
+ * "pil_gpu_region@8bc15400", no-map, size 0x2000, with qcom,kgsl-hyp carrying
+ * pas-id 0x0d and firmware-name a620_zap. PAS_AUTH_AND_RESET then starts the
+ * zap, after which the CP accepts CP_SET_SECURE_MODE(0).
+ * SMC transport: qcom_scm-smc.c fills x0=CALL_VAL(type, SMC_64, OWNER_SIP,
+ * fnid), x1=arginfo, x2..=args; PAS runs as STD_CALL, and x0==1 means
+ * QCOM_SCM_INTERRUPTED (retry), as __scm_smc_do_quirk does. */
+bool loadZap()
+{
+    /* wf116: vote the crypto engine's NoC path before TZ runs PAS, the way
+     * subsys-pil-tz.c's scm_pas_enable_bw() does around every PAS call. */
+    rpmhVoteCryptoPath();
+
+    /* wf117: the interrupted-SMC quirk requires the normal world to take the
+     * interrupt that ended the secure call before the session is resumed.
+     * Record DAIF at the SMC boundary, and (behind sheng-gpu-ce=1) probe the CE
+     * registers the vote above is meant to un-gate: wf115 faulted on exactly
+     * this read before any vote existed. */
+    {
+        uint64_t daif = 0;
+        __asm__ volatile("mrs %0, daif" : "=r"(daif));
+        printf("PICASSO_GPU zap: daif=%llx before pas\n",
+            static_cast<unsigned long long>(daif));
+    }
+    {
+        uint32_t probe = 0;
+        if (PE_parse_boot_argn("sheng-gpu-ce", &probe, sizeof probe) && probe) {
+            Mapping ce = {};
+            if (mapPhysical(UINT64_C(0x1de0000), 0x20000, ce)) {
+                printf("PICASSO_GPU ce: version=%08x status=%08x engines=%08x\n",
+                    read32(ce, 0x1A000), read32(ce, 0x1A100),
+                    read32(ce, 0x1A108));
+                if (ce.keep) ce.keep->release();
+            } else {
+                printf("PICASSO_GPU ce: map failed\n");
+            }
+        }
+    }
+
+    constexpr uint32_t kPasSvc = 0x02;
+    constexpr uint32_t kPasInitImageCmd = 0x01;
+    constexpr uint32_t kPasMemSetupCmd = 0x02;
+    constexpr uint32_t kPasAuthAndResetCmd = 0x05;
+    constexpr uint32_t kArgInfoInitImage = 0x82;    /* QCOM_SCM_ARGS(2, VAL, RW) */
+    constexpr uint32_t kArgInfoMemSetup = 0x03;     /* QCOM_SCM_ARGS(3) */
+    constexpr uint32_t kArgInfoAuth = 0x01;         /* QCOM_SCM_ARGS(1) */
+    constexpr uint32_t kScmSipStd = 0x42000000u;    /* STD_CALL | SMC_64 | OWNER_SIP */
+    constexpr uint32_t kGpuPasId = 0x0d;
+    constexpr size_t kRegionCapacity = 0x2000;
+    constexpr uint32_t kMdtTypeMask = 0x7000000u;
+    constexpr uint32_t kMdtTypeHash = 0x2000000u;
+
+    const uint8_t *mdt = nullptr;
+    size_t mdtBytes = 0;
+    const uint8_t *segments[3] = {};
+    size_t segmentBytes[3] = {};
+    if (native_adreno620_zap_firmware(&mdt, &mdtBytes, segments,
+            segmentBytes) != 0) {
+        printf("PICASSO_GPU zap: no firmware staged\n");
+        return false;
+    }
+    Adreno620MdtImage image{};
+    const Adreno620FwStatus parsed = Adreno620MdtParse(mdt, mdtBytes,
+        segments, segmentBytes, 3, &image);
+    if (parsed != Adreno620FwOk || !image.segments) {
+        printf("PICASSO_GPU zap: mdt parse status=%d\n", int(parsed));
+        return false;
+    }
+
+    /* qcom_mdt_read_metadata(): phdrs[0].p_filesz + the hash segment. */
+    if (image.segment[0].filesz > mdtBytes) {
+        printf("PICASSO_GPU zap: mdt header exceeds file\n");
+        return false;
+    }
+    unsigned hashIndex = 0;
+    for (unsigned index = 1; index < image.segments; ++index) {
+        if ((image.segment[index].flags & kMdtTypeMask) == kMdtTypeHash) {
+            hashIndex = index;
+            break;
+        }
+    }
+    if (!hashIndex) {
+        printf("PICASSO_GPU zap: mdt has no hash segment\n");
+        return false;
+    }
+    const size_t metadataBytes = size_t(image.segment[0].filesz +
+        image.segment[hashIndex].filesz);
+    if (metadataBytes > mdtBytes) {
+        printf("PICASSO_GPU zap: metadata exceeds mdt bytes=%x\n",
+            uint32_t(mdtBytes));
+        return false;
+    }
+
+    /* qcom_mdt_get_size() over the loadable segments. */
+    uint64_t minAddress = UINT64_MAX, maxAddress = 0;
+    for (unsigned index = 0; index < image.segments; ++index) {
+        const Adreno620MdtSegment &segment = image.segment[index];
+        if (!segment.loadable) continue;
+        if (segment.vaddr < minAddress) minAddress = segment.vaddr;
+        const uint64_t end = (segment.vaddr + segment.memsz +
+            UINT64_C(0xfff)) & ~UINT64_C(0xfff);
+        if (end > maxAddress) maxAddress = end;
+    }
+    if (minAddress >= maxAddress || maxAddress - minAddress > kRegionCapacity) {
+        printf("PICASSO_GPU zap: loadable span invalid min=%x max=%x\n",
+            uint32_t(minAddress), uint32_t(maxAddress));
+        return false;
+    }
+    const size_t regionBytes = size_t(maxAddress - minAddress);
+
+    /* Metadata: physically contiguous, 4K aligned, and — like the vendor
+     * pil_init_image_trusted() — written through a strongly ordered (uncached)
+     * mapping. The vendor asks dma_alloc_attrs for DMA_ATTR_STRONGLY_ORDERED
+     * before the very same PAS_INIT_IMAGE call; TZ enables memory protection
+     * over this blob during the call, so a cacheable alias is the remaining
+     * difference from stock. XNU's kIOMapInhibitCache makes the pages IO
+     * (uncached) for every mapping, and the bytes are written through that
+     * mapping with byte stores (device memory rejects DC ZVA and unaligned
+     * STP, wf104/wf105). */
+    const IOOptionBits options = static_cast<IOOptionBits>(kIODirectionInOut) |
+        static_cast<IOOptionBits>(kIOMemoryMapperNone) |
+        static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous);
+    IOBufferMemoryDescriptor *metadata =
+        IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, options,
+            metadataBytes, UINT64_C(0xfffff000));
+    if (!metadata) {
+        printf("PICASSO_GPU zap: metadata allocation failed bytes=%x\n",
+            uint32_t(metadataBytes));
+        return false;
+    }
+    if (metadata->prepare() != kIOReturnSuccess) {
+        metadata->release();
+        printf("PICASSO_GPU zap: metadata prepare failed\n");
+        return false;
+    }
+    IOByteCount metadataLength = 0;
+    const uint64_t metadataPhys = metadata->getPhysicalSegment(0,
+        &metadataLength, kIOMemoryMapperNone);
+    IOMemoryMap *metadataMap = metadata->map(kIOMapAnywhere | kIOMapInhibitCache);
+    uint8_t *metadataImage = metadataMap ? reinterpret_cast<uint8_t *>(
+        static_cast<uintptr_t>(metadataMap->getAddress())) : nullptr;
+    if (!metadataImage || !metadataPhys || metadataLength < metadataBytes) {
+        if (metadataMap) metadataMap->release();
+        metadata->complete();
+        metadata->release();
+        printf("PICASSO_GPU zap: metadata mapping unavailable\n");
+        return false;
+    }
+    for (size_t index = 0; index < metadataBytes; ++index)
+        metadataImage[index] = mdt[index];
+    __asm__ volatile("dsb sy" ::: "memory");
+    printf("PICASSO_GPU zap: metadata bytes=%x phys=%08x/%08x first=%08x\n",
+        uint32_t(metadataBytes), uint32_t(metadataPhys),
+        uint32_t(metadataPhys >> 32),
+        *reinterpret_cast<volatile const uint32_t *>(metadataImage));
+    /* wf108: can the secure world read this buffer at all? qcom_scm_io_readl()
+     * (SVC_IO 0x05 / IO_READ 0x01, ARGS(1) = physical address, value in a1) is
+     * an atomic FAST call, so it cannot wait on the PIL service. If it returns
+     * the ELF magic the metadata memory is reachable from TZ and a PAS hang is
+     * specific to PIL; if it hangs too, TZ cannot read our DRAM at all. */
+    {
+        constexpr uint32_t kSvcIo = 0x05u, kIoRead = 0x01u;
+        constexpr uint32_t kFastSipSmc64 = 0x80000000u | 0x40000000u | 0x02000000u;
+        const uint64_t ioSelector = (uint64_t(2) << 24) |
+            uint64_t((kSvcIo << 8) | kIoRead);
+        const ScmReply available = scmSipCall(kFastSipSmc64 | (0x06u << 8) | 0x01u,
+            0x01u, ioSelector);
+        printf("PICASSO_GPU zap: svc-io available a0=%08x a1=%08x\n",
+            available.a0, available.a1);
+        if (!available.a0 && available.a1) {
+            printf("PICASSO_GPU zap: calling svc-io read phys=%08x\n",
+                uint32_t(metadataPhys));
+            const ScmReply ioRead = scmSipCall(kFastSipSmc64 | (kSvcIo << 8) |
+                kIoRead, 0x01u, metadataPhys);
+            printf("PICASSO_GPU zap: svc-io read a0=%08x a1=%08x want=464c457f\n",
+                ioRead.a0, ioRead.a1);
+        }
+    }
+
+    /* wf121: the segment region must satisfy the PT_LOAD's p_align.
+     * The zap's single loadable segment has p_align 0x100000, and the vendor's
+     * pil_setup_region()/pil_alloc_region() allocates the relocatable region
+     * with that alignment (peripheral-loader.c). wf120 proved the DT's
+     * pil_gpu_mem carveout at 0x8bc15400 — only 0x400-aligned — is rejected by
+     * PAS_MEM_SETUP with 0xffcfffba, so allocate a physically contiguous
+     * 1 MiB-aligned buffer and stage the segments there (uncached, byte
+     * stores, exactly as before). */
+    const IOOptionBits regionOptions =
+        static_cast<IOOptionBits>(kIODirectionInOut) |
+        static_cast<IOOptionBits>(kIOMemoryMapperNone) |
+        static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous);
+    IOBufferMemoryDescriptor *regionBuffer =
+        IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+            regionOptions, regionBytes, UINT64_C(0xfffffffffff00000));
+    if (!regionBuffer || regionBuffer->prepare() != kIOReturnSuccess) {
+        if (regionBuffer) regionBuffer->release();
+        metadataMap->release();
+        metadata->complete();
+        metadata->release();
+        printf("PICASSO_GPU zap: region allocation failed\n");
+        return false;
+    }
+    IOByteCount regionLength = 0;
+    const uint64_t regionPhys = regionBuffer->getPhysicalSegment(0,
+        &regionLength, kIOMemoryMapperNone);
+    IOMemoryMap *regionMap = regionBuffer->map(kIOMapAnywhere | kIOMapInhibitCache);
+    if (!regionMap || !regionPhys || regionLength < regionBytes) {
+        if (regionMap) regionMap->release();
+        regionBuffer->complete();
+        regionBuffer->release();
+        metadataMap->release();
+        metadata->complete();
+        metadata->release();
+        printf("PICASSO_GPU zap: region mapping failed\n");
+        return false;
+    }
+    uint8_t *region = reinterpret_cast<uint8_t *>(
+        static_cast<uintptr_t>(regionMap->getAddress()));
+    printf("PICASSO_GPU zap: region phys=%08x/%08x span=%x va=%08x/%08x\n",
+        uint32_t(regionPhys), uint32_t(regionPhys >> 32),
+        uint32_t(regionBytes),
+        uint32_t(reinterpret_cast<uintptr_t>(region)),
+        uint32_t(uint64_t(reinterpret_cast<uintptr_t>(region)) >> 32));
+    /* No bzero()/memcpy() here: XNU's bzero uses DC ZVA and its memcpy ends
+     * with unaligned 16-byte stores, and both fault on the kIOMapInhibitCache
+     * (device-memory) mapping — measured in wf104 (DC ZVA) and wf105 (STP at a
+     * non-16-aligned address). Byte stores are always aligned for device
+     * memory. The reserved region is no-map and private to PIL; upstream
+     * zeroes only a segment's memsz-filesz tail, as the loop below does. */
+    bool copied = true;
+    for (unsigned index = 0; index < image.segments; ++index) {
+        const Adreno620MdtSegment &segment = image.segment[index];
+        if (!segment.loadable) continue;
+        const uint64_t offset = segment.vaddr - minAddress;
+        if (!segment.data || segment.bytes < segment.filesz ||
+            offset + segment.memsz > regionBytes) {
+            copied = false;
+            break;
+        }
+        for (uint64_t byte = 0; byte < segment.memsz; ++byte) {
+            const uint8_t value = byte < segment.filesz ? segment.data[byte] : 0;
+            *reinterpret_cast<volatile uint8_t *>(region + offset + byte) = value;
+        }
+        printf("PICASSO_GPU zap: segment %u offset=%x filesz=%x memsz=%x\n",
+            index, uint32_t(offset), uint32_t(segment.filesz),
+            uint32_t(segment.memsz));
+    }
+    /* The region mapping is device memory (no cache lines), so the stores above
+     * are already in DRAM; the DSB orders them before TZ reads the region. */
+    __asm__ volatile("dsb sy" ::: "memory");
+    if (!copied) {
+        regionMap->release();
+        regionBuffer->complete();
+        regionBuffer->release();
+        metadataMap->release();
+        metadata->complete();
+        metadata->release();
+        printf("PICASSO_GPU zap: segment outside region\n");
+        return false;
+    }
+
+    /* A Qualcomm STD SMC may return before the operation completes:
+     * QCOM_SCM_INTERRUPTED (a0 = 1) plus a session id in x6. The retry must
+     * carry that session id and x0 = 1 — exactly arm_smccc_smc_quirk() and
+     * qcom_scm-smc.c's `if (res->a0 == QCOM_SCM_INTERRUPTED) a0 = res->a0`
+     * (commit 82bcd087 and Sricharan R's follow-up; without x6 "calls hang on
+     * retry"). wf112 measured this first-hand: PAS_INIT returned a0=1, and the
+     * old retry, which re-zeroed x6, wedged the PIL session (wf106-wf109). */
+    /* wf119: which interrupt ends the secure call? The interrupted-SMC protocol
+     * exists so the normal world can take a pending IRQ before resuming the
+     * session; the resume then hangs, so record what is pending at that moment.
+     * wf118 (both runs) reset the board ~15 s after the first PAS call without
+     * printing anything after it; the wf118 dump read ICC_HPPIR0_EL1, a
+     * Secure-group register that can trap to EL3 from Non-secure EL1 and wedge
+     * the very monitor whose session is suspended. This version prints first
+     * and reads only NS-safe state: ICC_HPPIR1/RPR/CTLR, and the distributor's
+     * pending/enable/group bits for SPI 272 (the crypto BAM, DT qcrypto
+     * interrupts = <0 0x110 4>; bank 8, bit 16 in each GICD bitmap). */
+    auto dumpGic = [] {
+        printf("PICASSO_GPU gic: enter\n");
+        uint64_t hppir1 = 0, rpr = 0, ctlr = 0, daif = 0;
+        __asm__ volatile("mrs %0, icc_hppir1_el1" : "=r"(hppir1));
+        __asm__ volatile("mrs %0, icc_rpr_el1" : "=r"(rpr));
+        __asm__ volatile("mrs %0, icc_ctlr_el1" : "=r"(ctlr));
+        __asm__ volatile("mrs %0, daif" : "=r"(daif));
+        printf("PICASSO_GPU gic: daif=%llx hppir1=%llx rpr=%llx ctlr=%llx\n",
+            static_cast<unsigned long long>(daif),
+            static_cast<unsigned long long>(hppir1),
+            static_cast<unsigned long long>(rpr),
+            static_cast<unsigned long long>(ctlr));
+        Mapping gic = {};
+        if (!mapPhysical(UINT64_C(0x17a00000), 0x10000, gic)) {
+            printf("PICASSO_GPU gic: distributor map failed\n");
+            return;
+        }
+        printf("PICASSO_GPU gic: dist ctlr=%08x typer=%08x pend8=%08x "
+               "en8=%08x grp8=%08x cfg272=%08x\n",
+            read32(gic, 0x00), read32(gic, 0x04), read32(gic, 0x2a0),
+            read32(gic, 0x120), read32(gic, 0x1a0), read32(gic, 0xc44));
+        if (gic.keep) gic.keep->release();
+    };
+    auto pasCall = [&dumpGic](uint32_t function, uint32_t arginfo, uint64_t arg0,
+        uint64_t arg1, uint64_t arg2, bool maskFirst) {
+        uint64_t begin = 0, end = 0;
+        uint64_t pmr = 0, daif = 0;
+        if (maskFirst) {
+            /* wf120: hold back Non-secure interrupt delivery for the first
+             * attempt only (PMR=0 masks the CPU interface; DAIF.I masks the
+             * PSTATE). The retry below always runs unmasked, because the
+             * interrupted-call protocol requires the normal world to take the
+             * pending interrupt before resuming the secure session. */
+            __asm__ volatile("mrs %0, icc_pmr_el1" : "=r"(pmr));
+            __asm__ volatile("mrs %0, daif" : "=r"(daif));
+            __asm__ volatile("msr daifset, #2" ::: "memory");
+            __asm__ volatile("msr icc_pmr_el1, %0" :: "r"(UINT64_C(0)) : "memory");
+            __asm__ volatile("isb" ::: "memory");
+        }
+        __asm__ volatile("mrs %0, cntvct_el0" : "=r"(begin));
+        ScmReply reply = scmSipCall(function, arginfo, arg0, arg1, arg2);
+        __asm__ volatile("mrs %0, cntvct_el0" : "=r"(end));
+        if (maskFirst) {
+            __asm__ volatile("msr icc_pmr_el1, %0" :: "r"(pmr) : "memory");
+            __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+            __asm__ volatile("isb" ::: "memory");
+        }
+        printf("PICASSO_GPU zap: call mask=%d a0=%08x a1=%08x ticks=%llu\n",
+            int(maskFirst), reply.a0, reply.a1,
+            static_cast<unsigned long long>(end - begin));
+        for (unsigned attempt = 1; reply.a0 == 1u && attempt < 64; ++attempt) {
+            printf("PICASSO_GPU zap: interrupted session=%08x/%08x attempt=%u\n",
+                uint32_t(reply.a6), uint32_t(reply.a6 >> 32), attempt);
+            if (attempt == 1)
+                dumpGic();
+            reply = scmSipCall(1u, arginfo, arg0, arg1, arg2, reply.a6);
+        }
+        return reply;
+    };
+    /* wf119: dump the TZ log from another core while this thread sits in EL3. */
+    {
+        uint32_t tzlog = 0;
+        if (PE_parse_boot_argn("sheng-gpu-tzlog", &tzlog, sizeof tzlog) && tzlog) {
+            thread_t thread = nullptr;
+            if (kernel_thread_start(tzLogThread, nullptr, &thread) == KERN_SUCCESS)
+                thread_deallocate(thread);
+            else
+                printf("PICASSO_GPU tzlog: thread failed\n");
+        }
+    }
+    /* wf114: the full PAS session with the metadata at the 4K-aligned carveout
+     * address (reserved_pil 0x8bc17400 + 0xC00, inside the 0x3e8c00-byte
+     * region). wf112 measured the first INIT returning QCOM_SCM_INTERRUPTED
+     * here; with the session-id retry in place, this separates "TZ stalls on the
+     * AP's DMA memory/XPU" (the carveout completes) from "TZ stalls in the
+     * authentication itself" (it hangs here too). */
+    constexpr uint64_t kAltMetadataPhysical = UINT64_C(0x8bc18000);
+    IOMemoryDescriptor *altDescriptor = IOMemoryDescriptor::withPhysicalAddress(
+        kAltMetadataPhysical, (metadataBytes + 0xfffu) & ~UINT64_C(0xfff),
+        kIODirectionInOut);
+    IOMemoryMap *altMap = altDescriptor ? altDescriptor->createMappingInTask(
+        kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+    if (altDescriptor) altDescriptor->release();
+    ScmReply init{};
+    bool ok = false;
+    if (altMap) {
+        uint8_t *alt = reinterpret_cast<uint8_t *>(
+            static_cast<uintptr_t>(altMap->getAddress()));
+        for (size_t index = 0; index < metadataBytes; ++index)
+            alt[index] = mdt[index];
+        __asm__ volatile("dsb sy" ::: "memory");
+        printf("PICASSO_GPU zap: calling pas init at carveout phys=%08x\n",
+            uint32_t(kAltMetadataPhysical));
+        init = pasCall(kScmSipStd | (kPasSvc << 8) | kPasInitImageCmd,
+            kArgInfoInitImage, kGpuPasId, kAltMetadataPhysical, 0, true);
+        printf("PICASSO_GPU zap: pas init a0=%08x a1=%08x a2=%08x a3=%08x\n",
+            init.a0, init.a1, init.a2, init.a3);
+        ok = init.a0 == 0 && init.a1 == 0;
+    }
+    ScmReply setup{};
+    ScmReply auth{};
+    if (ok) {
+        printf("PICASSO_GPU zap: calling pas mem-setup region=%08x span=%x\n",
+            uint32_t(regionPhys), uint32_t(regionBytes));
+        setup = pasCall(kScmSipStd | (kPasSvc << 8) | kPasMemSetupCmd,
+            kArgInfoMemSetup, kGpuPasId, regionPhys, regionBytes, true);
+        printf("PICASSO_GPU zap: pas mem-setup a0=%08x a1=%08x\n",
+            setup.a0, setup.a1);
+        ok = setup.a0 == 0 && setup.a1 == 0;
+    }
+    if (ok) {
+        printf("PICASSO_GPU zap: calling pas auth-and-reset\n");
+        auth = pasCall(kScmSipStd | (kPasSvc << 8) | kPasAuthAndResetCmd,
+            kArgInfoAuth, kGpuPasId, 0, 0, true);
+        printf("PICASSO_GPU zap: pas auth-and-reset a0=%08x a1=%08x\n",
+            auth.a0, auth.a1);
+        ok = auth.a0 == 0 && auth.a1 == 0;
+    }
+
+    regionMap->release();
+    regionBuffer->complete();
+    regionBuffer->release();
+    if (altMap) altMap->release();
+    metadataMap->release();
+    metadata->complete();
+    metadata->release();
+    printf("PICASSO_GPU zap: loaded=%d\n", int(ok));
+    return ok;
 }
 
 /* A one-dword IB of CP_NOP in the scratch page, ended by an A6XX
@@ -1251,22 +2035,25 @@ extern "C" int native_adreno620_cp_start(void)
     }
 
     if (!cpInit()) return -1;
-    /* mainline's CP_SET_SECURE_MODE(0), the zap-path counterpart of the no-zap
-     * SECVID_TRUST_CNTL write. The GPU powers on in secure mode; leaving it there
-     * is the one measured difference from a rendering-clean target. wf100 sent it
-     * unconditionally and the pinned SQE answered CP_OPCODE_ERROR; the packet is
-     * therefore gated on sheng-gpu-secure-mode=1 so the SQE image can be the
-     * single variable it is measured against. */
-    {
-        uint32_t secureMode = 0;
-        if (PE_parse_boot_argn("sheng-gpu-secure-mode", &secureMode,
-                static_cast<int>(sizeof secureMode)) && secureMode) {
-            const uint32_t trustBefore = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
-            const bool left = leaveSecureMode();
-            const uint32_t trustAfter = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
-            printf("PICASSO_GPU cp: secure mode left=%d trust %08x -> %08x\n",
-                int(left), trustBefore, trustAfter);
-        }
+    /* mainline hw_init(): load the zap through TZ, then switch the CP out of
+     * secure mode. The GPU powers on in secure mode and there "can only render
+     * to protected buffers" (freedreno zap documentation) — the measured
+     * signature of every submit so far. wf100 sent CP_SET_SECURE_MODE(0)
+     * without a zap and the SQE answered CP_OPCODE_ERROR, so the packet is only
+     * sent once the zap has authenticated. sheng-gpu-zap=0 keeps the old path
+     * for a controlled comparison. */
+    uint32_t zapEnabled = 1;
+    if (PE_parse_boot_argn("sheng-gpu-zap", &zapEnabled,
+            static_cast<int>(sizeof zapEnabled)) && !zapEnabled) {
+        printf("PICASSO_GPU zap: disabled by boot arg\n");
+    } else if (!loadZap()) {
+        printf("PICASSO_GPU zap: not loaded; keeping secure mode\n");
+    } else {
+        const uint32_t trustBefore = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
+        const bool left = leaveSecureMode();
+        const uint32_t trustAfter = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
+        printf("PICASSO_GPU cp: secure mode left=%d trust %08x -> %08x\n",
+            int(left), trustBefore, trustAfter);
     }
     uint32_t fence = 0;
     if (!submitNoop(&fence)) return -1;

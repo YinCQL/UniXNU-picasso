@@ -36,6 +36,12 @@ void native_adreno_set_firmware(const struct native_adreno620_firmware *firmware
  * Returns -1 when no firmware was staged. */
 int native_adreno620_sqe_firmware(const uint8_t **bytes, size_t *length);
 
+/* The zap image the probe validated: the .mdt container (ELF header, program headers and the hash
+ * segment, exactly qcom_mdt_read_metadata's metadata) plus the three split payloads. Missing
+ * entries are left NULL. Returns -1 when no zap was staged. */
+int native_adreno620_zap_firmware(const uint8_t **mdt, size_t *mdt_bytes,
+    const uint8_t *segments[3], size_t segment_bytes[3]);
+
 /* Releases the GMU GPU_SET out-of-band request (HOST2GMU_INTR_SET bit 31) once the CP is running, the last
  * step of mainline hw_init after the CP ring has been initialized. No-op before the GMU has been booted. */
 void native_adreno620_gmu_release_gpu_set(void);
