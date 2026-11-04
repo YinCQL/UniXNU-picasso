@@ -7711,10 +7711,37 @@ index 8f9d3cf70b69f223c210dabf42e8aa1adbcbca7d..4660d770ac9a7ebdab44040ff5c457df
 +    build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf
  fi
 diff --git a/scripts/linux/setup-toolchain.py b/scripts/linux/setup-toolchain.py
-index 2bbb6edeed91d725594b8c3a498686aca5c9781d..250315fc1dec7e15cf9baea91fca2285335beaa8 100755
+index 2bbb6edeed91d725594b8c3a498686aca5c9781d..b4cbf6a918a3b74d377153ae2e4fe96ad3e5b2b5 100755
 --- a/scripts/linux/setup-toolchain.py
 +++ b/scripts/linux/setup-toolchain.py
-@@ -204,30 +204,30 @@ def host_tools(llvm_config=None):
+@@ -123,21 +123,24 @@ exec "{clang}" \\
+ 
+ def run(command, cwd=None, env=None, input=None):
+     command = [str(part) for part in command]
+     print('+ ' + ' '.join(command), flush=True)
+     return subprocess.run(command, cwd=cwd, env=env, input=input, check=True, text=True,
+                           stdout=subprocess.PIPE if input is not None else None).stdout
+ 
+ 
+-def git_checkout(directory, url, ref):
++def git_checkout(directory, url, ref, paths=None):
+     """One commit (or tag) of a repository, without its history."""
+     directory.mkdir(parents=True, exist_ok=True)
+     run(['git', 'init', '-q', directory])
+-    run(['git', '-C', directory, 'fetch', '-q', '--depth', '1', url, ref])
++    if paths:
++        run(['git', '-C', directory, 'sparse-checkout', 'set', '--cone', *paths])
++    run(['git', '-C', directory, 'fetch', '-q', '--depth', '1',
++         *(['--filter=blob:none'] if paths else []), url, ref])
+     run(['git', '-C', directory, 'checkout', '-q', '--force', 'FETCH_HEAD'])
+ 
+ 
+ def has_xnu_builtins(command, env=None):
+     out = run([*command, '-E', '-'], env=env, input=XNU_BUILTIN_CHECK)
+     return any(line.strip() == 'ok' for line in out.splitlines())
+ 
+ 
+@@ -204,30 +207,32 @@ def host_tools(llvm_config=None):
      supports_warning = subprocess.run([cc, '-Werror=unknown-warning-option', warning, '-x', 'c',
                                         '-fsyntax-only', '-'], input='', text=True, capture_output=True).returncode == 0
      return argparse.Namespace(config=str(config), cc=cc, cxx=cxx, libdir=libdir,
@@ -7729,11 +7756,15 @@ index 2bbb6edeed91d725594b8c3a498686aca5c9781d..250315fc1dec7e15cf9baea91fca2285
 -    if not clang.exists():
 +    if not clang.exists() or not (prefix / 'llvm/bin/llvm-objcopy').exists():
          src = work / 'llvm-project'
-         git_checkout(src, 'https://github.com/llvm/llvm-project', LLVM_COMMIT)
+-        git_checkout(src, 'https://github.com/llvm/llvm-project', LLVM_COMMIT)
++        git_checkout(src, 'https://github.com/llvm/llvm-project', LLVM_COMMIT,
++                     paths=('llvm', 'clang', 'cmake', 'third-party'))
          run(['git', '-C', src, 'apply', HERE / 'llvm-xnu-builtin-type.patch'])
          run(['cmake', '-G', 'Ninja', '-S', src / 'llvm', '-B', src / 'build',
               '-DLLVM_ENABLE_PROJECTS=clang', '-DLLVM_TARGETS_TO_BUILD=AArch64',
-              '-DCMAKE_BUILD_TYPE=Release', '-DLLVM_ENABLE_ASSERTIONS=ON',
+-             '-DCMAKE_BUILD_TYPE=Release', '-DLLVM_ENABLE_ASSERTIONS=ON',
++             '-DCMAKE_BUILD_TYPE=Release', '-DLLVM_ENABLE_ASSERTIONS=OFF',
++             '-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG', '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG',
               '-DLLVM_INCLUDE_TESTS=OFF', '-DLLVM_INCLUDE_EXAMPLES=OFF', '-DLLVM_INCLUDE_BENCHMARKS=OFF',
               '-DCLANG_ENABLE_STATIC_ANALYZER=OFF', '-DCLANG_ENABLE_ARCMT=OFF', '-DLLVM_PARALLEL_LINK_JOBS=1',
               f'-DCMAKE_C_COMPILER={host.cc}', f'-DCMAKE_CXX_COMPILER={host.cxx}',
@@ -7748,7 +7779,44 @@ index 2bbb6edeed91d725594b8c3a498686aca5c9781d..250315fc1dec7e15cf9baea91fca2285
  
  def shims(clt, xctoolchain, clang):
      (clt / 'bin').mkdir(parents=True, exist_ok=True)
-@@ -377,17 +377,17 @@ def main(argv=None):
+@@ -340,16 +345,17 @@ def lzfse(prefix, work):
+ 
+ 
+ def main(argv=None):
+     parser = argparse.ArgumentParser(description='Install the UniXNU toolchain on a glibc Linux host.')
+     parser.add_argument('prefix', nargs='?', default=os.environ.get('UNIXNU_TOOLCHAIN', '/opt/unixnu-linux'))
+     parser.add_argument('--package-manager', choices=('auto', *PACKAGES, 'none'), default='auto')
+     parser.add_argument('--print-packages', action='store_true', help='print package commands and exit')
+     parser.add_argument('--check', action='store_true', help='check installed host tools and libraries without installing')
++    parser.add_argument('--host-only', action='store_true', help='install and check host dependencies without building the toolchain')
+     parser.add_argument('--llvm-config', help='llvm-config for the host Clang/libclang installation; or LLVM_CONFIG')
+     parser.add_argument('-j', '--jobs', type=int, default=os.cpu_count() or 4)
+     args = parser.parse_args(argv)
+     if args.print_packages:
+         for command in package_commands(package_manager(args.package_manager)):
+             print(shlex.join(command))
+         return
+     if platform.system() != 'Linux':
+@@ -359,17 +365,17 @@ def main(argv=None):
+     if args.jobs < 1:
+         parser.error('--jobs must be positive')
+     if not args.check:
+         if os.geteuid():
+             parser.error('installation requires root; use --check to inspect host dependencies')
+         for command in package_commands(package_manager(args.package_manager)):
+             run(command, env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
+     host = host_tools(args.llvm_config)
+-    if args.check:
++    if args.check or args.host_only:
+         print(f'host dependencies ready: {host.cc}, {host.config}')
+         return
+     prefix = Path(args.prefix).expanduser().resolve()
+     clt, xctoolchain = prefix / 'CommandLineTools/usr', prefix / 'XcodeDefault.xctoolchain/usr'
+     include = clt.parent / 'SDKs/MacOSX.sdk/usr/include'
+     jobs = args.jobs
+     prefix.mkdir(parents=True, exist_ok=True)
+     # The llvm-project build tree takes several GB: build on disk ($TMPDIR, else /var/tmp), not in a tmpfs /tmp.
+@@ -377,17 +383,17 @@ def main(argv=None):
          work = Path(tmp)
          clang = llvm(prefix, work, jobs, host)
          shims(clt, xctoolchain, clang)

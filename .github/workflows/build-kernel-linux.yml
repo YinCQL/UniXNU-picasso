@@ -5,21 +5,30 @@ name: Build Picasso Kernel (Linux)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [test/pr17]
+    paths: [.github/workflows/build-kernel-linux.yml]
 
 permissions:
   contents: read
 
 concurrency:
-  group: picasso-linux-kernel-${{ github.ref }}
+  group: picasso-linux-kernel-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  register_workflow:
+    name: Register the Linux workflow on the test branch
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo 'Linux workflow registered. Select test/pr17 for a manual kernel build.'
+
   kernel_linux:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-    env:
-      UNIXNU_TOOLCHAIN: /opt/unixnu-linux
-      UNIXNU_LLVM_BIN: /opt/unixnu-linux/llvm/bin
     defaults:
       run:
         shell: bash
@@ -40,13 +49,50 @@ jobs:
           mkdir -p out/picasso/logs
           TREE=$(python3 ./unixnu --prepare)
           echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
+          echo "UNIXNU_TOOLCHAIN=$RUNNER_TEMP/unixnu-linux" >> "$GITHUB_ENV"
+          echo "UNIXNU_LLVM_BIN=$RUNNER_TEMP/unixnu-linux/llvm/bin" >> "$GITHUB_ENV"
 
-      - name: Install the Linux Mach-O kernel toolchain
+      - name: Install Linux host dependencies and identify the toolchain
+        id: toolchain_key
         run: |
-          sudo python3 "$UNIXNU_TREE/scripts/linux/setup-toolchain.py" "$UNIXNU_TOOLCHAIN" \
+          sudo python3 "$UNIXNU_TREE/scripts/linux/setup-toolchain.py" --host-only \
+            2>&1 | tee out/picasso/logs/linux-host-tools.log
+          HOST_LLVM=$(llvm-config --version --bindir --libdir)
+          python3 - "$UNIXNU_TREE" "$UNIXNU_TOOLCHAIN" "$HOST_LLVM" <<'PY'
+          import hashlib, os, sys
+          from pathlib import Path
+          root = Path(sys.argv[1]) / 'scripts/linux'
+          digest = hashlib.sha256()
+          for value in sys.argv[2:]:
+              digest.update(value.encode() + b'\0')
+          for path in sorted(root.rglob('*')):
+              if path.is_file() and '__pycache__' not in path.parts:
+                  digest.update(path.relative_to(root).as_posix().encode() + b'\0')
+                  digest.update(path.read_bytes() + b'\0')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('digest=' + digest.hexdigest() + '\n')
+          PY
+
+      - name: Restore the installed Linux Mach-O toolchain
+        id: toolchain_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.UNIXNU_TOOLCHAIN }}
+          key: unixnu-toolchain-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-${{ steps.toolchain_key.outputs.digest }}
+
+      - name: Install or validate the Linux Mach-O kernel toolchain
+        run: |
+          sudo python3 "$UNIXNU_TREE/scripts/linux/setup-toolchain.py" "$UNIXNU_TOOLCHAIN" --package-manager none \
             2>&1 | tee out/picasso/logs/linux-toolchain.log
           echo "$UNIXNU_LLVM_BIN" >> "$GITHUB_PATH"
           test -x "$UNIXNU_LLVM_BIN/llvm-objcopy"
+
+      - name: Save the installed toolchain before compiling the kernel
+        if: steps.toolchain_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.UNIXNU_TOOLCHAIN }}
+          key: ${{ steps.toolchain_cache.outputs.cache-primary-key }}
 
       - name: Prepare authenticated stock touch firmware
         run: |
