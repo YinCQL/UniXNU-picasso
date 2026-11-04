@@ -84,7 +84,7 @@ def inspect_objects(objects):
         spec.loader.exec_module(module)
         return module
     platform = load(ROOT / 'scripts/build-picasso-pmgr.py')
-    native = load(ROOT / 'kits/NativePrelink/native_prelink.py')
+    native = load(ROOT / 'kits/XnuPrelink/native_prelink.py')
     reports = {}
     for obj in objects:
         _, sections, symbols = platform.inspect_object(obj, native)

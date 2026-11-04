@@ -34,7 +34,7 @@ fi
 # Patch order matters, and later patches overlap earlier contexts. A reverse
 # check cannot tell "already applied" from "applied and then extended", so
 # persist the exact patch-chain identity and replay only onto a clean cache.
-PATCH_FILES=("$ROOT"/patches/xnu/*.patch "$ROOT"/kits/NativePrelink/patches/*.patch)
+PATCH_FILES=("$ROOT"/patches/xnu/*.patch "$ROOT"/kits/XnuPrelink/patches/*.patch)
 PATCH_FINGERPRINT=$(
   {
     for PATCH in "${PATCH_FILES[@]}"; do

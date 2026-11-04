@@ -3,7 +3,7 @@
 
 No SDK, device writes, network fetches or builds. --upstream and --xnu are Git
 checkouts with the pinned commits available. --prelink-patches is the patches/
-directory of kits/NativePrelink at the commit in upstream's tree. --output must
+directory of kits/XnuPrelink at the commit in upstream's tree. --output must
 not exist; all generated files are kept there for inspection.
 """
 import argparse
@@ -91,7 +91,7 @@ def main():
     prelink = sorted(a.prelink_patches.resolve().glob('*.patch'))
     if not prelink:
         raise RuntimeError('No prelink patches; refusing an incomplete replay')
-    installed = tree / 'kits/NativePrelink/patches'
+    installed = tree / 'kits/XnuPrelink/patches'
     installed.mkdir(parents=True, exist_ok=True)
     for patch in prelink:
         (installed / patch.name).write_bytes(patch.read_bytes().replace(b'\r\n', b'\n'))

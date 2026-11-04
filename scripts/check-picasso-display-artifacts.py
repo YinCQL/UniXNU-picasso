@@ -20,7 +20,7 @@ def check(tree, work, kernelcache, output):
     builder = load(tree / 'scripts/build-picasso-display.py')
     platform = load(tree / 'scripts/build-picasso-pmgr.py')
     aes = load(tree / 'scripts/build-picasso-aes.py')
-    native = load(tree / 'kits/NativePrelink/native_prelink.py')
+    native = load(tree / 'kits/XnuPrelink/native_prelink.py')
     directory = tree / 'build/native-legacy-display'
     build = json.loads((directory / 'build-report.json').read_text())
     board = tomllib.loads((Path(__file__).resolve().parents[1] / 'board.toml').read_text(encoding='utf-8'))

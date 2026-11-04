@@ -228,7 +228,7 @@ def build_profile(board):
 
 def main():
     platform = load(ROOT / 'scripts/build-picasso-pmgr.py')
-    native = load(ROOT / 'kits/NativePrelink/native_prelink.py')
+    native = load(ROOT / 'kits/XnuPrelink/native_prelink.py')
     device = Path(os.environ['UNIXNU_DEVICE']).resolve()
     board = tomllib.loads((device / 'board.toml').read_text())
     profile = build_profile(board)

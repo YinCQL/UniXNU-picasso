@@ -105,12 +105,20 @@ def main():
     source = payload_file.read_text()
     parsed = ast.parse(source)
     function = next(n for n in parsed.body if isinstance(n, ast.FunctionDef) and n.name == 'build')
-    begin = next(i for i, n in enumerate(function.body) if isinstance(n, ast.Assign)
+    # The current builder nests legacy ADT generation in the format1 branch.
+    # Inspect that actual branch while retaining support for the earlier layout.
+    statements = function.body
+    format_branches = [n for n in function.body if isinstance(n, ast.If)
+                       and ast.unparse(n.test) == 'ctx.schema_version == 2']
+    if format_branches:
+        assert len(format_branches) == 1 and format_branches[0].orelse
+        statements = format_branches[0].orelse
+    begin = next(i for i, n in enumerate(statements) if isinstance(n, ast.Assign)
                  and any(isinstance(v, ast.Name) and v.id == 'command' for v in n.targets)
                  and isinstance(n.value, ast.List))
-    end = next(i for i, n in enumerate(function.body) if i > begin and isinstance(n, ast.For)
+    end = next(i for i, n in enumerate(statements) if i > begin and isinstance(n, ast.For)
                and isinstance(n.target, ast.Name) and n.target.id == 'fixup')
-    command_code = compile(ast.Module(body=function.body[begin:end], type_ignores=[]), str(payload_file), 'exec')
+    command_code = compile(ast.Module(body=statements[begin:end], type_ignores=[]), str(payload_file), 'exec')
     cases = []
     for name, identity, packed in [('iphone', 'iphone', False), ('iphone-data', 'iphone', True),
                                    ('ipad-compatibility', 'ipad', False)]:

@@ -177,7 +177,7 @@ def verify_kernel(native, original, kernel, plan, audit, aliases, slots):
 
 def main():
     platform = load(ROOT / 'scripts/build-picasso-pmgr.py')
-    native = load(ROOT / 'kits/NativePrelink/native_prelink.py')
+    native = load(ROOT / 'kits/XnuPrelink/native_prelink.py')
     device = Path(os.environ['UNIXNU_DEVICE'])
     board = tomllib.loads((device / 'board.toml').read_text(encoding='utf-8'))
     original = Path(os.environ['UNIXNU_KERNELCACHE']).read_bytes()

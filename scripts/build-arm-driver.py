@@ -351,9 +351,9 @@ def main():
     out_map = {
         'ArmCpu': ('armcpu', 'ArmCpu', 'ArmCpu.cpp', []),
         'ArmDTPlatform': ('armdt-platform', 'ArmDTPlatform', 'ArmDTPlatform.cpp', []),
-        'NativeRamBlock': ('native-ram-block', 'NativeRamBlock', 'NativeRamBlock.cpp', [
+        'NativeRamBlock': ('native-ram-block', 'RamBlock', 'NativeRamBlock.cpp', [
             '-I', str(ROOT / 'build/storage-abi/include'),
-            '-I', str(ROOT / 'drivers/NativeRamBlock'),
+            '-I', str(ROOT / 'drivers/RamBlock'),
         ]),
         'NativeUfs': ('native-ufs', 'NativeUfs', 'NativeUfs.cpp', [
             '-I', str(ROOT / 'build/storage-abi/include'),

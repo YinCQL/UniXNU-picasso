@@ -62,10 +62,18 @@ def prepare(device=DEVICE, source=None):
                 if local and (source / path / '.git').exists():
                     git('config', key.removesuffix('.path') + '.url', source / path, cwd=tree)
             git('-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', '--recursive', cwd=tree)
+            # Keep declared source identities when cloning submodules from a local cache.
+            # The component resolver uses origin URLs to qualify legacy aliases.
+            for entry in entries.splitlines():
+                key, path = entry.split(maxsplit=1)
+                url = subprocess.check_output(
+                    ['git', 'config', '-f', '.gitmodules', '--get', key.removesuffix('.path') + '.url'],
+                    cwd=tree, text=True).strip()
+                git('remote', 'set-url', 'origin', url, cwd=tree / path)
         git('apply', '--check', patch, cwd=tree)
         git('apply', patch, cwd=tree)
-        git('apply', '--check', ram_block_patch, cwd=tree / 'drivers/NativeRamBlock')
-        git('apply', ram_block_patch, cwd=tree / 'drivers/NativeRamBlock')
+        git('apply', '--check', ram_block_patch, cwd=tree / 'drivers/RamBlock')
+        git('apply', ram_block_patch, cwd=tree / 'drivers/RamBlock')
         embedded_usb_patch = tree / 'patches/xnu/zzz-picasso-usb-console.patch'
         if not embedded_usb_patch.is_file():
             raise FileNotFoundError(f'{embedded_usb_patch} missing from source patch')

@@ -212,10 +212,10 @@ def main():
         # Run the entire production builder. Only the input sources/compile record
         # are synthetic assembler schemas; xcrun ar maps to the installed llvm-ar.
         tree = out / 'tree'
-        for part in ('scripts', 'kits/NativePrelink', 'kits/picasso'):
+        for part in ('scripts', 'kits/XnuPrelink', 'kits/picasso'):
             (tree / part).mkdir(parents=True)
         shutil.copy2(ROOT / 'scripts/prepare-picasso-watchdog-bindings.py', tree / 'scripts')
-        shutil.copy2(args.native_prelink_dir / 'native_prelink.py', tree / 'kits/NativePrelink')
+        shutil.copy2(args.native_prelink_dir / 'native_prelink.py', tree / 'kits/XnuPrelink')
         (tree / 'board.toml').write_text('[kernel.prelink]\nslide="-0x1000000"\nkernelcache_sha256="' +
                                        binding.ORIGINAL_SHA256 + '"\n')
         (tree / 'kits/picasso/PicassoWatchdog.cpp').write_text(schema)

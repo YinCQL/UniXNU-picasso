@@ -9,7 +9,7 @@ import sys
 
 # Artifact checks run from the device checkout, while the ABI parser lives in
 # the assembled tree containing this builder.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'kits/NativePrelink'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'kits/XnuPrelink'))
 from picasso_original_abi import OriginalReference, qualify_hid
 
 OWNED = [0, 1, 7, 14, 86, 87, 111, 171, 173, 180]

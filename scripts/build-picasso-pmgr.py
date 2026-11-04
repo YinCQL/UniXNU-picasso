@@ -247,7 +247,7 @@ def main():
         spec.loader.exec_module(binding)
         require(prelink['kernelcache_sha256'] == binding.ORIGINAL_SHA256,
                 'Board kernelcache identity differs from the audited watchdog original')
-        native_dir = ROOT / 'kits/NativePrelink'
+        native_dir = ROOT / 'kits/XnuPrelink'
         bindings = binding.validate(kernelcache, int(prelink['slide'], 0), native_dir)
         native = binding.load_native_prelink(native_dir)
         write_json(out / 'watchdog-bindings.json', bindings)

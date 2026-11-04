@@ -161,7 +161,7 @@ def main():
     parser.add_argument('--slide', type=lambda value: int(value, 0), required=True)
     parser.add_argument('--early-security-init', action='append', default=[])
     args = parser.parse_args()
-    sys.path.insert(0, str(ROOT / 'kits/NativePrelink'))
+    sys.path.insert(0, str(ROOT / 'kits/XnuPrelink'))
     import native_prelink
     import emit_prelink
     build(native_prelink, emit_prelink, args)

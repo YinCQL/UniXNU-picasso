@@ -19,7 +19,7 @@ def main():
     aes = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(aes)
     platform = aes.load(ROOT / 'scripts/build-picasso-pmgr.py')
-    native = aes.load(args.tree / 'kits/NativePrelink/native_prelink.py')
+    native = aes.load(args.tree / 'kits/XnuPrelink/native_prelink.py')
     original = args.kernelcache.read_bytes()
     aliases, slots, _ = aes.qualify_original(native, original,
         (args.tree / 'scripts/data/native-aes-original-bindings.S').read_bytes(), aes.SLIDE)

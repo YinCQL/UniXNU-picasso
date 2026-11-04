@@ -337,7 +337,7 @@ def main():
     parser.add_argument('--kernelcache', required=True, type=Path)
     parser.add_argument('--slide', required=True, type=lambda value: int(value, 0),
                         help='Actual board.toml prelink slide; use --slide=-0x1000000')
-    parser.add_argument('--native-prelink-dir', type=Path, default=ROOT / 'kits/NativePrelink',
+    parser.add_argument('--native-prelink-dir', type=Path, default=ROOT / 'kits/XnuPrelink',
                         help='Directory containing the actual NativePrelink native_prelink.py')
     parser.add_argument('--output-dir', required=True, type=Path)
     parser.add_argument('--object', type=Path,
