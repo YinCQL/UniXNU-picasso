@@ -50,9 +50,10 @@ if os.environ.get('SB_INJECT') == '1' or os.environ.get('TRIM_ARGS') == '1':
     if os.environ.get('KEEP_V') != '1':
         removed += ["-v"]
 for t in removed:
+    # board.toml is shared with the other Picasso branches; a trimmed entry may already be gone.
     line='  "'+t+'",\n'
-    assert line in s, t
-    s=s.replace(line,'',1)
+    if line in s:
+        s=s.replace(line,'',1)
 assert 'size_mib = 60\n' in s
 s=s.replace('size_mib = 60\n','size_mib = 88\n',1)
 import re

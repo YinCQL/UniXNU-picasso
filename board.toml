@@ -312,9 +312,7 @@ kernel_args = [
   "offline-hid-input=1",
   "offline-hid-home=1",
   # Expose the combined digitizer and register its sink for startup swipes.
-  "sheng-touch-hid=1",
   # Start the firmware-backed physical panel once the digitizer sink exists.
-  "sheng-touch=4",
   # The synthetic bottom-edge swipe that unlocks this iPad identity; auto-home did
   # not leave the lock screen. One gesture every 20 s from t=540 s covers the window
   # in which SpringBoard takes the panel.
