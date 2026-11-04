@@ -1,0 +1,274 @@
+diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
+index 100d5d7..0e048e0 100644
+--- a/bsd/dev/picasso_usb.c
++++ b/bsd/dev/picasso_usb.c
+@@ -382,6 +382,7 @@ static struct {
+ 	bool        hang_pending;
+ 	bool        start_kext_pending;
+ 	unsigned    ps_pending;
++	bool        save_ls_pending;
+ 	bool        register_pending;
+ 	int         publish_pending;
+ 	bool        watchdog;
+@@ -2453,6 +2454,9 @@ ud_process_command(void)
+ 		/* Deferred: the process list takes task and ledger locks, and ud_process_command()
+ 		 * runs under the poll lock, whose holder also drains the USB console. */
+ 		ud.ps_pending = processSamples;
++	} else if (ud_command_is(ud.cmd, "save-ls")) {
++		printf("PICASSO CDC: save-ls requested; exporting after the lock\n");
++		ud.save_ls_pending = true;
+ 	} else if (ud_command_is(ud.cmd, "panic-test")) {
+ 		printf("PICASSO CDC: panic-test requested; emitting marker now\n");
+ 		/*
+@@ -2658,6 +2662,11 @@ ud_poll_serialized(void)
+ 		extern void picasso_live_process_list(unsigned);
+ 		picasso_live_process_list(sample);
+ 	}
++	if (ud.save_ls_pending && !ud.panic_mode) {
++		ud.save_ls_pending = false;
++		extern int picasso_ls_export(void);
++		printf("PICASSO_LSP export files=%d\n", picasso_ls_export());
++	}
+ 	if (ud.register_pending && !ud.panic_mode) {
+ 		ud.register_pending = false;
+ 		extern kern_return_t native_register_display_and_report(void)
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 5272b82..be2492c 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8345,6 +8345,221 @@ done:
+ 	if (path) kfree_data(path, 256);
+ }
+ 
++/* Persistent LaunchServices cache (PCLSD001 blob in a Data file).
++ * The lsd rebuild does not survive a reboot by itself: the Data volume starts from the
++ * seed every boot. Data writes do survive, though, because NativeRamBlock replays changed
++ * pages from the persistent store window (sheng-data-persist=2), so a file under
++ * /private/var is enough. The export command (CDC "save-ls") copies the rebuilt
++ * com.apple.LaunchServices-* files into that file; the next boot restores them before the
++ * drop would run, so lsd does not rescan every application.
++ *
++ * The raw store window is deliberately not used: it belongs to the Data overlay, which
++ * opens it before this code runs and keeps its own page layout there (wf258: writing the
++ * blob at relative block 0 stepped on that layout). */
++#define PICASSO_LSP_MAGIC "PCLSD001"
++#define PICASSO_LSP_MAX   (16U << 20)
++#define PICASSO_LSP_PATH  "/private/var/db/.picasso-ls-cache"
++
++static uint32_t
++picasso_lsp_hash(const uint8_t *data, size_t length)
++{
++	uint32_t hash = 2166136261u;
++	for (size_t i = 0; i < length; ++i) {
++		hash ^= data[i];
++		hash *= 16777619u;
++	}
++	return hash;
++}
++
++/* Reads a whole file. A NULL buffer only reports the size (capacity is still checked),
++ * so the restore path can size its allocation from the blob instead of always taking
++ * the 16 MiB maximum. */
++static int
++picasso_lsp_read_file(const char *path, uint8_t *buffer, uint64_t capacity, uint64_t *size, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	int error = vnode_open(path, FREAD | O_NOFOLLOW, 0, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_data_size, 0);
++	error = vnode_getattr(vp, &va, ctx);
++	if (!error) {
++		*size = (uint64_t)va.va_data_size;
++		if (*size > capacity) {
++			error = EFBIG;
++		}
++	}
++	int resid = 0;
++	if (!error && buffer && *size) {
++		error = vn_rdwr(UIO_READ, vp, (caddr_t)buffer, (int)*size, 0, UIO_SYSSPACE,
++		    IO_NOAUTH, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (!error && resid) {
++			error = EIO;
++		}
++	}
++	vnode_close(vp, FREAD, ctx);
++	return error;
++}
++
++static int
++picasso_lsp_restore(proc_t p, user_addr_t scratch)
++{
++	uint8_t *blob = NULL;
++	uint64_t total = 0;
++	int restored = 0;
++	vfs_context_t ctx = vfs_context_current();
++	(void)p;
++	(void)scratch;
++	if (picasso_lsp_read_file(PICASSO_LSP_PATH, NULL, PICASSO_LSP_MAX, &total, ctx) ||
++	    total < 32 || total > PICASSO_LSP_MAX) {
++		return 0;
++	}
++	blob = kalloc_data((size_t)total, Z_WAITOK | Z_ZERO);
++	if (!blob) {
++		return 0;
++	}
++	uint64_t read_size = 0;
++	if (picasso_lsp_read_file(PICASSO_LSP_PATH, blob, total, &read_size, ctx) ||
++	    read_size != total || memcmp(blob, PICASSO_LSP_MAGIC, 8)) {
++		goto done;
++	}
++	uint32_t version = 0, count = 0, crc = 0;
++	memcpy(&version, blob + 8, 4);
++	memcpy(&count, blob + 12, 4);
++	memcpy(&crc, blob + 24, 4);
++	if (version != 1 || !count || count > 64 ||
++	    picasso_lsp_hash(blob + 32, (size_t)(total - 32)) != crc) {
++		printf("PICASSO_LSP restore=bad-blob\n");
++		goto done;
++	}
++	uint64_t at = 32;
++	for (uint32_t i = 0; i < count; ++i) {
++		uint32_t path_bytes = 0, mode = 0, data_bytes = 0;
++		if (total - at < 12) {
++			break;
++		}
++		memcpy(&path_bytes, blob + at, 4);
++		memcpy(&mode, blob + at + 4, 4);
++		memcpy(&data_bytes, blob + at + 8, 4);
++		at += 12;
++		if (path_bytes < 2 || path_bytes > 255 || total - at < path_bytes ||
++		    total - at - path_bytes < data_bytes) {
++			break;
++		}
++		const char *path = (const char *)(blob + at);
++		if (path[0] != '/' || path[path_bytes - 1]) {
++			break;
++		}
++		at += path_bytes;
++		/* native_gpu_addon_write returns 0 on a write, -1 when the file already
++		 * matched; both mean the cache is in place. */
++		const int werr = native_gpu_addon_write(path, blob + at, data_bytes, mode & 0777, ctx);
++		if (werr == 0 || werr == -1) {
++			++restored;
++		} else {
++			printf("PICASSO_LSP restore=write-failed err=%d path=%s\n", werr, path);
++		}
++		at += data_bytes;
++	}
++done:
++	if (blob) {
++		kfree_data(blob, (size_t)total);
++	}
++	return restored;
++}
++
++int
++picasso_ls_export(void)
++{
++	static const char *const parents[] = {
++		"/private/var/mobile/Containers/Data/InternalDaemon",
++		"/private/var/containers/Data/InternalDaemon",
++		"/private/var/containers/Data/System"
++	};
++	static const char prefix[] = "com.apple.LaunchServices-";
++	char (*containers)[64] = kalloc_data(128 * 64, Z_WAITOK);
++	char (*files)[8][64] = kalloc_data(8 * 64, Z_WAITOK);
++	char *path = kalloc_data(256, Z_WAITOK);
++	uint8_t *blob = NULL;
++	uint32_t count = 0;
++	uint64_t at = 32;
++	vfs_context_t ctx = vfs_context_current();
++	if (!containers || !files || !path) {
++		goto done;
++	}
++	blob = kalloc_data(PICASSO_LSP_MAX, Z_WAITOK | Z_ZERO);
++	if (!blob) {
++		goto done;
++	}
++	for (size_t k = 0; k < sizeof(parents) / sizeof(parents[0]); ++k) {
++		unsigned container_count = 0;
++		if (native_picasso_ls_names(parents[k], "", containers, 128, &container_count)) {
++			continue;
++		}
++		for (unsigned i = 0; i < container_count; ++i) {
++			snprintf(path, 256, "%s/%s/Library/Caches", parents[k], containers[i]);
++			unsigned file_count = 0;
++			if (native_picasso_ls_names(path, prefix, *files, 8, &file_count)) {
++				continue;
++			}
++			for (unsigned j = 0; j < file_count; ++j) {
++				uint64_t file_bytes = 0;
++				char full[320];
++				snprintf(full, sizeof full, "%s/%s", path, (*files)[j]);
++				const size_t path_bytes = strlen(full) + 1;
++				if (at + 12 + path_bytes > PICASSO_LSP_MAX) {
++					goto finish;
++				}
++				memcpy(blob + at + 12, full, path_bytes);
++				if (picasso_lsp_read_file(full, blob + at + 12 + path_bytes,
++				    PICASSO_LSP_MAX - (at + 12 + path_bytes), &file_bytes, ctx)) {
++					continue;
++				}
++				memcpy(blob + at, &(uint32_t){ (uint32_t)path_bytes }, 4);
++				memcpy(blob + at + 4, &(uint32_t){ 0644 }, 4);
++				memcpy(blob + at + 8, &(uint32_t){ (uint32_t)file_bytes }, 4);
++				at += 12 + path_bytes + file_bytes;
++				++count;
++			}
++		}
++	}
++finish:
++	if (!count) {
++		goto done;
++	}
++	uint32_t version = 1, header_count = count, crc = picasso_lsp_hash(blob + 32, (size_t)(at - 32));
++	memcpy(blob, PICASSO_LSP_MAGIC, 8);
++	memcpy(blob + 8, &version, 4);
++	memcpy(blob + 12, &header_count, 4);
++	memcpy(blob + 16, &at, 8);
++	memcpy(blob + 24, &crc, 4);
++	const int werr = native_gpu_addon_write(PICASSO_LSP_PATH, blob, at, 0644, ctx);
++	if (werr != 0 && werr != -1) {
++		printf("PICASSO_LSP export=write-failed err=%d bytes=%llu\n", werr, (unsigned long long)at);
++		count = 0;
++		goto done;
++	}
++	printf("PICASSO_LSP export files=%u bytes=%llu path=%s\n",
++	    count, (unsigned long long)at, PICASSO_LSP_PATH);
++done:
++	if (blob) {
++		kfree_data(blob, PICASSO_LSP_MAX);
++	}
++	if (containers) {
++		kfree_data(containers, 128 * 64);
++	}
++	if (files) {
++		kfree_data(files, 8 * 64);
++	}
++	if (path) {
++		kfree_data(path, 256);
++	}
++	return (int)count;
++}
++
+ static void
+ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+ {
+@@ -8420,7 +8635,12 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+ 		if (PE_parse_boot_argn("picasso-ls-rebuild", &rebuild, sizeof(rebuild)) && rebuild == 1) {
+ 			if (native_picasso_apps_stage == 5 && !native_picasso_apps_status &&
+ 			    found == 0xfff && resolved == 0xfff) {
+-				native_picasso_ls_store_drop(p, scratch);
++				const int restored = picasso_lsp_restore(p, scratch);
++				if (restored > 0) {
++					printf("PICASSO_LS_REBUILD restored=%d\n", restored);
++				} else {
++					native_picasso_ls_store_drop(p, scratch);
++				}
+ 			} else {
+ 				printf("PICASSO_LS_REBUILD skipped stage=%d status=%d found=%03x fileid=%03x\n",
+ 				    native_picasso_apps_stage, native_picasso_apps_status, found, resolved);

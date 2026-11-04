@@ -39,6 +39,7 @@ def prepare(device=DEVICE, source=None):
     quiet_boot_patch = device / 'patches/picasso-quiet-boot-xnu.patch'
     quiet_boot2_patch = device / 'patches/picasso-quiet-boot2-xnu.patch'
     defer_ps_patch = device / 'patches/picasso-defer-ps-xnu.patch'
+    ls_persist_patch = device / 'patches/picasso-ls-persist-xnu.patch'
     fingerprint = hashlib.sha256(patch.read_bytes() + b'\0' + usb_patch.read_bytes() +
                                  b'\0' + cpu_idle_patch.read_bytes() +
                                  b'\0' + topology_patch.read_bytes() +
@@ -60,7 +61,8 @@ def prepare(device=DEVICE, source=None):
                                  b'\0' + cpu_usage_patch.read_bytes() +
                                  b'\0' + quiet_boot_patch.read_bytes() +
                                  b'\0' + quiet_boot2_patch.read_bytes() +
-                                 b'\0' + defer_ps_patch.read_bytes()).hexdigest()
+                                 b'\0' + defer_ps_patch.read_bytes() +
+                                 b'\0' + ls_persist_patch.read_bytes()).hexdigest()
     cache = device / '.cache'
     target = cache / f'upstream-{revision[:12]}-{fingerprint[:12]}'
     if target.is_dir():
@@ -179,6 +181,10 @@ def prepare(device=DEVICE, source=None):
         # handler: a long command under that lock stalls the USB drain and the watchdog pet.
         (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-defer-ps.patch').write_bytes(
             defer_ps_patch.read_bytes())
+        # Persist the rebuilt LaunchServices store as a Data file and restore it before the drop
+        # on the next boot (NativeRamBlock's overlay carries the write across reboots).
+        (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-ls-persist.patch').write_bytes(
+            ls_persist_patch.read_bytes())
         tree.rename(target)
     return target
 
