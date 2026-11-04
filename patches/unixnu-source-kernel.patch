@@ -5843,7 +5843,17 @@ new file mode 100644
 diff --git a/scripts/unixnu/payload.py b/scripts/unixnu/payload.py
 --- a/scripts/unixnu/payload.py
 +++ b/scripts/unixnu/payload.py
-@@ -124,7 +124,16 @@
+@@ -87,7 +87,8 @@
+ def skip_setup_seed(ctx, base, tool_path, tool_args=()):
+     """A copy of the Data seed whose preferences mark Setup (the Hello pages) as done; cached by the hash of the base and the
+     tool's extra arguments (board.toml [payload] skip_setup_args)."""
+-    tool('hdiutil')
++    if os.name != 'posix' or os.uname().sysname != 'Linux':
++        tool('hdiutil')
+     out = paths(ctx)[0]
+     out.mkdir(parents=True, exist_ok=True)
+     key = sha256_file(base)[:12] + (('-' + hashlib.sha256(' '.join(tool_args).encode()).hexdigest()[:8]) if tool_args else '')
+@@ -124,7 +125,16 @@
          if not trust.is_file():
              raise Error(f'trust cache not found: {trust}')
          if allowed and not owner_trust and sha256_file(trust) not in allowed:
@@ -5861,7 +5871,7 @@ diff --git a/scripts/unixnu/payload.py b/scripts/unixnu/payload.py
      data = expand(args.data_ramdisk) if getattr(args, 'data_ramdisk', None) else None
      check_data_input(ctx, data)
      if data and not data.is_file():
-@@ -210,6 +219,8 @@
+@@ -210,6 +220,8 @@
              command.append('--gpu-addon')
          if adt.get('ipad_identity'):
              command.append('--ipad-identity')

@@ -32,8 +32,9 @@ def prepare(device=DEVICE, source=None):
     overlays = [device / ('patches/picasso-' + name + '-xnu.patch')
                 for name in LATE_OVERLAYS]
     ram_block_patch = device / 'patches/picasso-native-ram-block-mode1-guard.patch'
+    linux_patch = device / 'patches/picasso-linux-toolchain-v1.patch'
     fingerprint = hashlib.sha256(b'\0'.join(
-        p.read_bytes() for p in [patch, usb_patch, ram_block_patch, *overlays])).hexdigest()
+        p.read_bytes() for p in [patch, usb_patch, ram_block_patch, linux_patch, *overlays])).hexdigest()
     cache = device / '.cache'
     target = cache / f'upstream-{revision[:12]}-{fingerprint[:12]}'
     if target.is_dir():
@@ -72,6 +73,8 @@ def prepare(device=DEVICE, source=None):
                 git('remote', 'set-url', 'origin', url, cwd=tree / path)
         git('apply', '--check', patch, cwd=tree)
         git('apply', patch, cwd=tree)
+        git('apply', '--check', linux_patch, cwd=tree)
+        git('apply', linux_patch, cwd=tree)
         git('apply', '--check', ram_block_patch, cwd=tree / 'drivers/RamBlock')
         git('apply', ram_block_patch, cwd=tree / 'drivers/RamBlock')
         embedded_usb_patch = tree / 'patches/xnu/zzz-picasso-usb-console.patch'

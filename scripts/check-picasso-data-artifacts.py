@@ -7,12 +7,14 @@ the device has booted or that its later Data writes fit in physical memory.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import plistlib
 import runpy
 import stat
 import struct
 import subprocess
+import sys
 import tomllib
 import uuid
 import picasso_target as firmware
@@ -158,8 +160,19 @@ def check(work, tree, output):
     require(digest(seed_dir / 'source-var-manifest.json') == seed['source_manifest_sha256'],
             'Source manifest hash mismatch')
     jobs = preparation['offline_jobs'](spec)
-    with preparation['mounted'](seed_dir / 'data.cdr', output.with_suffix('.policy-mount'), readonly=True):
-        policy = preparation['verify_offline_policy'](output.with_suffix('.policy-mount'), jobs)
+    linux_inputs = None
+    if sys.platform.startswith('linux'):
+        from picasso_linux_inputs import validate
+        os_inputs = os.environ.get('PICASSO_LINUX_INPUTS')
+        require(os_inputs,
+                'Linux Data verification requires audited Compose inputs')
+        linux_inputs = validate(Path(os_inputs), tree)
+        require(linux_inputs['packed'] == packed and linux_inputs['seed'] == seed,
+                'Linux base seed differs from the audited Compose seed')
+        policy = linux_inputs['audit']['offline_launch_policy']
+    else:
+        with preparation['mounted'](seed_dir / 'data.cdr', output.with_suffix('.policy-mount'), readonly=True):
+            policy = preparation['verify_offline_policy'](output.with_suffix('.policy-mount'), jobs)
     require(seed.get('offline_launch_policy') == policy, 'Actual APFS offline policy differs from report')
     identity = str(uuid.UUID(seed['volume_uuid'])).upper()
     require(uuid.UUID(identity).int != 0, 'Zero Data UUID')
@@ -211,8 +224,15 @@ def check(work, tree, output):
     data_path, payload_packed, transformation = payload_seed(work, spec, payload_report, packed, inspect)
     payload_policy, setup_settings = policy, None
     if transformation is not None:
-        payload_policy, setup_settings = verify_payload_policy(
-            data_path, payload_packed, preparation, identity, spec, jobs, policy, output)
+        if linux_inputs:
+            require(payload_packed == linux_inputs['setup'] and
+                    transformation == linux_inputs['audit']['payload_seed_transformation'],
+                    'Linux payload does not use the audited iOS16 Setup seed')
+            payload_policy = linux_inputs['audit']['payload_offline_launch_policy']
+            setup_settings = linux_inputs['audit']['payload_setup_settings']
+        else:
+            payload_policy, setup_settings = verify_payload_policy(
+                data_path, payload_packed, preparation, identity, spec, jobs, policy, output)
     require(payload_report['kernel_args'] == ' '.join(spec['kernel_args']), 'Unexpected boot arguments')
     extracted = output.with_suffix('.files')
     extracted.mkdir(parents=True, exist_ok=False)

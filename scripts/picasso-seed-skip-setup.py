@@ -43,6 +43,10 @@ def consume_statusbar_provider(arguments):
 
 
 def main():
+    if sys.platform.startswith('linux'):
+        from picasso_linux_inputs import stage_setup
+        stage_setup(Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3:], HERE.parent)
+        return
     statusbar_provider = consume_statusbar_provider(sys.argv)
     inject_lib = None
     if '--inject-lib' in sys.argv:

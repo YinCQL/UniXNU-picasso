@@ -1,0 +1,74 @@
+diff --git a/scripts/linux/setup-toolchain.py b/scripts/linux/setup-toolchain.py
+--- a/scripts/linux/setup-toolchain.py
++++ b/scripts/linux/setup-toolchain.py
+@@ -128,11 +128,14 @@
+                           stdout=subprocess.PIPE if input is not None else None).stdout
+ 
+ 
+-def git_checkout(directory, url, ref):
++def git_checkout(directory, url, ref, paths=None):
+     """One commit (or tag) of a repository, without its history."""
+     directory.mkdir(parents=True, exist_ok=True)
+     run(['git', 'init', '-q', directory])
+-    run(['git', '-C', directory, 'fetch', '-q', '--depth', '1', url, ref])
++    if paths:
++        run(['git', '-C', directory, 'sparse-checkout', 'set', '--cone', *paths])
++    run(['git', '-C', directory, 'fetch', '-q', '--depth', '1',
++         *(['--filter=blob:none'] if paths else []), url, ref])
+     run(['git', '-C', directory, 'checkout', '-q', '--force', 'FETCH_HEAD'])
+ 
+ 
+@@ -209,20 +212,22 @@
+ 
+ 
+ def llvm(prefix, work, jobs, host):
+-    """clang with llvm-xnu-builtin-type.patch, for AArch64 only."""
++    """AArch64 clang with XNU builtins and llvm-objcopy's Mach-O symbol editing."""
+     clang = prefix / 'llvm/bin/clang'
+-    if not clang.exists():
++    if not clang.exists() or not (prefix / 'llvm/bin/llvm-objcopy').exists():
+         src = work / 'llvm-project'
+-        git_checkout(src, 'https://github.com/llvm/llvm-project', LLVM_COMMIT)
++        git_checkout(src, 'https://github.com/llvm/llvm-project', LLVM_COMMIT,
++                     paths=('llvm', 'clang', 'cmake', 'third-party', 'libc'))
+         run(['git', '-C', src, 'apply', HERE / 'llvm-xnu-builtin-type.patch'])
+         run(['cmake', '-G', 'Ninja', '-S', src / 'llvm', '-B', src / 'build',
+              '-DLLVM_ENABLE_PROJECTS=clang', '-DLLVM_TARGETS_TO_BUILD=AArch64',
+-             '-DCMAKE_BUILD_TYPE=Release', '-DLLVM_ENABLE_ASSERTIONS=ON',
++             '-DCMAKE_BUILD_TYPE=Release', '-DLLVM_ENABLE_ASSERTIONS=OFF',
++             '-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG', '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG',
+              '-DLLVM_INCLUDE_TESTS=OFF', '-DLLVM_INCLUDE_EXAMPLES=OFF', '-DLLVM_INCLUDE_BENCHMARKS=OFF',
+              '-DCLANG_ENABLE_STATIC_ANALYZER=OFF', '-DCLANG_ENABLE_ARCMT=OFF', '-DLLVM_PARALLEL_LINK_JOBS=1',
+              f'-DCMAKE_C_COMPILER={host.cc}', f'-DCMAKE_CXX_COMPILER={host.cxx}',
+              f'-DCMAKE_INSTALL_PREFIX={prefix / "llvm"}'])
+-        run(['ninja', '-C', src / 'build', f'-j{jobs}', 'install-clang', 'install-clang-resource-headers'])
++        run(['ninja', '-C', src / 'build', f'-j{jobs}', 'install-clang', 'install-clang-resource-headers', 'install-llvm-objcopy'])
+         shutil.rmtree(src)
+     if not has_xnu_builtins([clang, '-target', 'arm64e-apple-macos26.0']):
+         sys.exit(f'{clang} has no __builtin_xnu_type_summary')
+@@ -345,6 +350,7 @@
+     parser.add_argument('--package-manager', choices=('auto', *PACKAGES, 'none'), default='auto')
+     parser.add_argument('--print-packages', action='store_true', help='print package commands and exit')
+     parser.add_argument('--check', action='store_true', help='check installed host tools and libraries without installing')
++    parser.add_argument('--host-only', action='store_true', help='install and check host dependencies without building the toolchain')
+     parser.add_argument('--llvm-config', help='llvm-config for the host Clang/libclang installation; or LLVM_CONFIG')
+     parser.add_argument('-j', '--jobs', type=int, default=os.cpu_count() or 4)
+     args = parser.parse_args(argv)
+@@ -364,7 +370,7 @@
+         for command in package_commands(package_manager(args.package_manager)):
+             run(command, env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
+     host = host_tools(args.llvm_config)
+-    if args.check:
++    if args.check or args.host_only:
+         print(f'host dependencies ready: {host.cc}, {host.config}')
+         return
+     prefix = Path(args.prefix).expanduser().resolve()
+@@ -382,7 +388,7 @@
+         iig(xctoolchain, work, host)
+         host_cc(clt, include, host)
+         lzfse(prefix, work)
+-    for tool in (clt / 'bin/ld', clt / 'bin/libtool', clt / 'libexec/migcom', xctoolchain / 'bin/iig',
++    for tool in (prefix / 'llvm/bin/llvm-objcopy', clt / 'bin/ld', clt / 'bin/libtool', clt / 'libexec/migcom', xctoolchain / 'bin/iig',
+                  clt / 'bin/xnu-host-cc', prefix / 'bin/lzfse'):
+         if not tool.exists():
+             sys.exit(f'{tool} missing')

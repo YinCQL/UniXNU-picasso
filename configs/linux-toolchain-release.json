@@ -1,0 +1,10 @@
+{
+  "archive": "picasso-linux-toolchain-ubuntu24-x86_64.tar.gz",
+  "archive_sha256": "3edb9443018d55ea210662abd9a345df6558d3c0b8db30fcead0db9302671a63",
+  "manifest": "linux-toolchain-manifest.json",
+  "manifest_sha256": "414979f4a625a6125bbe38a3c9585c37adb5849298fa94d59ea5c2d4d7aec4d9",
+  "recipe_sha256": "d00ef83603ebea719af8f050f08bd16d6671faa11699ae8d3885d5c0c1e94921",
+  "repository": "YinCQL/UniXNU-picasso",
+  "schema": "picasso-linux-toolchain-v1",
+  "tag": "picasso-linux-toolchain-v1-ubuntu24-x86_64"
+}

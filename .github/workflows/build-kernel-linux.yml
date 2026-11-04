@@ -1,0 +1,198 @@
+name: Build Picasso Kernel (Linux)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: picasso-linux-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  kernel_linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+        working-directory: device
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check iPhone X inputs and retained kernel backend
+        run: |
+          python3 scripts/check-picasso-target.py --require-build-inputs \
+            --output out/picasso/logs/target-readiness.json --github-env "$GITHUB_ENV"
+          test -s uefi/SILICIUM_UEFI.fd
+          test -s uefi/mu-silicium/Resources/DTBs/picasso-topology.dtb
+
+      - name: Prepare the pinned source and configuration
+        run: |
+          TREE=$(python3 ./unixnu --prepare)
+          echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
+          echo "UNIXNU_TOOLCHAIN=$RUNNER_TEMP/unixnu-linux" >> "$GITHUB_ENV"
+          echo "UNIXNU_LLVM_BIN=$RUNNER_TEMP/unixnu-linux/llvm/bin" >> "$GITHUB_ENV"
+          echo "PICASSO_LINUX_INPUTS=$PWD/out/picasso/linux-inputs" >> "$GITHUB_ENV"
+          python3 ./unixnu defconfig picasso_defconfig
+
+      - name: Identify the compatible iOS16 Compose inputs
+        id: inputs_key
+        run: |
+          KEY=$(python3 scripts/picasso_linux_inputs.py key --tree "$UNIXNU_TREE")
+          echo "digest=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the audited iOS16 Data seeds and signed UI library
+        id: inputs_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: device/out/picasso/linux-inputs
+          key: picasso-ios16-linux-inputs-v1-${{ steps.inputs_key.outputs.digest }}
+
+      - name: Validate or import matching macOS Compose inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/picasso_linux_inputs.py reuse --tree "$UNIXNU_TREE" \
+            2>&1 | tee out/picasso/logs/linux-compose-inputs.log
+
+      - name: Cache the verified inputs before compiling
+        if: steps.inputs_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: device/out/picasso/linux-inputs
+          key: ${{ steps.inputs_cache.outputs.cache-primary-key }}
+
+      - name: Install Linux host dependencies
+        run: |
+          sudo python3 "$UNIXNU_TREE/scripts/linux/setup-toolchain.py" --host-only \
+            2>&1 | tee out/picasso/logs/linux-host-tools.log
+
+      - name: Install the fixed Linux toolchain Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/linux-toolchain-release.py download \
+            --pin configs/linux-toolchain-release.json --output "$RUNNER_TEMP/picasso-toolchain-release"
+          sudo python3 scripts/linux-toolchain-release.py install --tree "$UNIXNU_TREE" \
+            --bundle "$RUNNER_TEMP/picasso-toolchain-release" --pin configs/linux-toolchain-release.json \
+            2>&1 | tee out/picasso/logs/linux-toolchain.log
+          echo "$UNIXNU_LLVM_BIN" >> "$GITHUB_PATH"
+          test -x "$UNIXNU_LLVM_BIN/llvm-objcopy"
+
+      - name: Prepare authenticated stock touch firmware
+        run: |
+          python3 scripts/fetch-picasso-touch-firmware.py --output out/picasso/novatek/firmware.bin
+          echo "NOVATEK_TOUCH_FW=$PWD/out/picasso/novatek/firmware.bin" >> "$GITHUB_ENV"
+
+      - name: Fetch the original iPhone trust caches
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 ./unixnu ipsw fetch StaticTrustCache Cryptex1,SystemTrustCache \
+            2>&1 | tee out/picasso/logs/linux-ipsw.log
+          python3 scripts/prepare-original-trust.py --tree "$UNIXNU_TREE" \
+            --inputs "out/ipsw/$PICASSO_IPSW_BUILD" --output out/picasso/original-static-system.bundle
+          python3 scripts/prepare-picasso-ui-trust.py --original out/picasso/original-static-system.bundle \
+            --library out/picasso/libpicasso-sb.dylib --output out/picasso/ui-trust.bundle
+          cp out/picasso/ui-trust.json out/picasso/logs/ui-trust.json
+
+      - name: Prepare the separate Darwin 23 donor
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/prepare-picasso-kernelcache.py --tree "$UNIXNU_TREE" \
+            --output "out/ipsw/$PICASSO_BACKEND_BUILD" \
+            2>&1 | tee out/picasso/logs/linux-kernel-donor.log
+          cp "out/ipsw/$PICASSO_BACKEND_BUILD/report.json" out/picasso/logs/kernel-donor.json
+          echo "UNIXNU_KERNELCACHE=$PWD/out/ipsw/$PICASSO_BACKEND_BUILD/kernelcache.decompressed" >> "$GITHUB_ENV"
+
+      - name: Build and prelink the iOS16 kernel and FAT payload
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          UNIXNU_UNIQUE_CHIP_ID: "41a551c0dec0de01"
+        run: |
+          python3 ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
+          python3 ./unixnu build kernel payload -j "$(nproc)" --skip-setup \
+            --trust-cache out/picasso/ui-trust.bundle --data-ramdisk out/picasso/ram-data/data.dbrdisk \
+            2>&1 | tee out/picasso/logs/linux-build.log
+          test -s out/picasso/kernel/kernel.macho
+          test -s out/picasso/payload/payload.img
+          sha256sum out/picasso/kernel/kernel.macho > out/picasso/kernel/SHA256SUMS
+
+      - name: Verify compiled Data UUID, seed and FAT handoff
+        run: |
+          python3 scripts/check-picasso-data-artifacts.py --tree out/picasso/tree --work out/picasso \
+            --output out/picasso/logs/data-artifacts.json
+          python3 scripts/check-picasso-display-policy.py \
+            --adt out/picasso/logs/data-artifacts.files/EFI/UniXNU/Payloads/kernel.macho.adt \
+            --output out/picasso/host-checks/display-policy-payload
+
+      - name: Check iOS16 ports, framebuffer adapters and microtime
+        run: |
+          python3 scripts/check-picasso-mach-ports.py --xnu out/picasso/tree/.cache/xnu-work --output out/picasso/host-checks/mach-ports
+          python3 scripts/check-picasso-fb-method-trace.py --xnu out/picasso/tree/.cache/xnu-work --output out/picasso/host-checks/fb-method-trace
+          python3 scripts/check-picasso-ios16-surface-abi.py --xnu out/picasso/tree/.cache/xnu-work --output out/picasso/host-checks/ios16-surface-abi
+          python3 scripts/check-picasso-microtime.py --xnu out/picasso/tree/.cache/xnu-work --output out/picasso/host-checks/microtime
+
+      - name: Verify AES, watchdog and CPU GOP against the original donor
+        run: |
+          python3 scripts/check-picasso-aes-artifacts.py --tree out/picasso/tree --work out/picasso \
+            --kernelcache "$UNIXNU_KERNELCACHE" --output out/picasso/logs/aes-artifacts.json
+          python3 scripts/check-picasso-watchdog-policy.py --verify --kernelcache "$UNIXNU_KERNELCACHE" \
+            --candidate out/picasso/kernel/kernel.macho --native-prelink-dir "$UNIXNU_TREE/kits/XnuPrelink" \
+            --output out/picasso/logs/watchdog-policy.json
+          python3 scripts/check-picasso-display-artifacts.py --tree out/picasso/tree --work out/picasso \
+            --kernelcache "$UNIXNU_KERNELCACHE" --output out/picasso/logs/display-artifacts.json
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          kernel = Path('out/picasso/kernel/kernel.macho')
+          plan = json.loads(kernel.with_suffix('.json').read_text())
+          if hashlib.sha256(kernel.read_bytes()).hexdigest() != plan['candidate_sha256']:
+              raise SystemExit('Prelink report does not match kernel.macho')
+          for component in ('com.apple.security.sandbox', 'com.apple.kext.AppleMatch', 'com.apple.iokit.IOSurface'):
+              if component not in plan['components']:
+                  raise SystemExit(f'Missing required original component: {component}')
+              start = plan['module_entrypoints'][component]['start_va']
+              if not any(e['module'] == component and e['segment'] == '__TEXT_EXEC'
+                         and e['va'] <= start < e['va'] + e['size'] for e in plan['extents']):
+                  raise SystemExit(f'Missing executable module entry: {component}')
+          PY
+
+      - name: Compose and verify boot.img
+        run: |
+          python3 ./unixnu bootimg --uefi "$PWD/uefi/mu-silicium" --fd "$PWD/uefi/SILICIUM_UEFI.fd" \
+            --dtb "$PWD/uefi/mu-silicium/Resources/DTBs/picasso-topology.dtb" \
+            --ramdisk "$PWD/out/picasso/payload/payload.img" -o "$PWD/out/picasso/boot/boot.img" \
+            2>&1 | tee out/picasso/logs/linux-bootimg.log
+          test -s out/picasso/boot/boot.img
+          sha256sum out/picasso/boot/boot.img out/picasso/payload/payload.img > out/picasso/boot/SHA256SUMS
+
+      - name: Upload boot image, kernel, payload and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: picasso-linux-bootimg-${{ github.run_number }}
+          include-hidden-files: true
+          path: |
+            device/out/picasso/boot/
+            device/out/picasso/kernel/
+            device/out/picasso/payload/
+            device/out/picasso/logs/
+            device/out/picasso/host-checks/**/*.json
+            device/out/picasso/linux-inputs/
+            device/out/picasso/ram-data/*.json
+            device/out/picasso/ram-data/data.dbrdisk
+            device/out/picasso/.config
+          if-no-files-found: warn
+          retention-days: 7

@@ -252,6 +252,10 @@ jobs:
               print(f'Prelink includes {component}, start={start:#x}')
           PY
 
+      - name: Export audited iOS16 inputs for Linux builds
+        run: |
+          python3 scripts/picasso_linux_inputs.py export --tree "$UNIXNU_TREE"
+
       - name: Compose boot image (BootShim + repo FD + payload as ramdisk)
         run: |
           python3 ./unixnu bootimg \
@@ -295,6 +299,7 @@ jobs:
             device/out/picasso/tree/build/xnu/**/vfs_syscalls.cpo.json
             device/out/picasso/ram-data/*.json
             device/out/picasso/ram-data/data.dbrdisk
+            device/out/picasso/linux-inputs/
             device/out/picasso/.config
           if-no-files-found: warn
           retention-days: 7
