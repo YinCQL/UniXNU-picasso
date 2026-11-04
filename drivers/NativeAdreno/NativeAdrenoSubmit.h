@@ -87,6 +87,10 @@ private:
     } jobs_;
     /* msm hangcheck state: the fence seen at the last check, the progress retries spent on it and the CP state then (a6xx_progress). */
     uint32_t hang_fence_=0,progress_retries_=0,last_cp_[6]{};
+    /* On a device clock only the completed fence counts as progress: a stalled CP still moves ROQ/prefetch words,
+     * so msm's three-retry rule could mask a hang forever. This is when the observed fence last changed. */
+    uint64_t hang_since_us_=0;
+    enum : uint64_t {HangTimeoutUs=1000000};
     bool madeProgress();
     NativeAdrenoVm *vm_=nullptr;   /* the default VM: the kernel's table, installed at bring-up */
     /* Page table switching between processes: mode 0 none (one table for everything), 1 the CPU writes TTBR0 while the GPU is idle,

@@ -1,0 +1,57 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -107,6 +107,45 @@
+ #include <sys/sysctl.h>
+ #include <sys/persona.h>
+ #include <sys/reason.h>
++
++/*
++ * sheng: the identity change must not be undone by the answers MobileGestalt cached while the device tree still
++ * described an iPad. The cache plist is keyed by build + platform UUID, but the two preference files are not, and
++ * SpringBoard re-reads them on later respawns. Delete all three right after the writable Data volume is mounted and
++ * before the first userland process runs, so the next answers can only come from the current device tree.
++ */
++static void
++picasso_clear_mobilegestalt_cache(void)
++{
++	static const char * const paths[] = {
++		"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
++		"/private/var/mobile/Library/Preferences/com.apple.MobileGestalt.plist",
++		"/private/var/mobile/Library/Preferences/com.apple.mobilegestalt.plist",
++	};
++	vfs_context_t ctx = vfs_context_create(NULL);
++	for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
++		struct nameidata nd;
++		NDINIT(&nd, DELETE, OP_UNLINK, LOCKPARENT, UIO_SYSSPACE, CAST_USER_ADDR_T(paths[i]), ctx);
++		int error = namei(&nd);
++		if (error) {
++			continue;
++		}
++		vnode_t dvp = nd.ni_dvp;
++		vnode_t vp = nd.ni_vp;
++		if (vp && vp->v_type != VDIR) {
++			error = VNOP_REMOVE(dvp, vp, &nd.ni_cnd, 0, ctx);
++			if (error == 0) {
++				printf("PICASSO_GESTALT removed %s\n", paths[i]);
++			}
++		}
++		nameidone(&nd);
++		vnode_put(dvp);
++		if (vp) {
++			vnode_put(vp);
++		}
++	}
++	vfs_context_rele(ctx);
++}
+ #if SYSV_SHM
+ #include <sys/shm_internal.h>           /* shmexec() */
+ #endif
+@@ -8192,6 +8231,8 @@
+ 		 * root; /private/var is writable now, so ask the VM swapfile thread to retry. */
+ 		extern void vm_swap_retry_create(void);
+ 		vm_swap_retry_create();
++		/* sheng: the Data volume is writable now; drop the MobileGestalt answers cached under the old identity. */
++		picasso_clear_mobilegestalt_cache();
+ 	}
+ 	{
+ 		int policy_error = picasso_boot_watchdog_policy(p, scratch_addr);

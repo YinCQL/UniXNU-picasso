@@ -198,6 +198,10 @@ public:
      * next submission gets fence completed + 1 and starts with a context entry; no table switch is pending (the caller installs one).
      * Clears poison. The CP must be halted or reset. */
     IOReturn restart(uint32_t completed);
+    /* After the board has re-initialised the CP directly (cp restart's cpInit and probe wrote at ring offset 0):
+     * take the CP's read pointer as the next write position without wiping the ring or the fence page, so the
+     * next client submission does not look like a full ring. Also clears the framed-submission reset flag. */
+    IOReturn resync(uint32_t completed);
     /* The same for a secondary ring, after the GPU restart programmed the first one: no register is written, the ring is emptied and
      * its numbering continues at `completed`; its write pointer waits for the switch that brings the CP back. */
     IOReturn restartSecondary(uint32_t completed);

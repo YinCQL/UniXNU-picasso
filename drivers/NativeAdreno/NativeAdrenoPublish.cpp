@@ -204,6 +204,11 @@ struct Published {
 /* GPU hangs (msm hangcheck, NativeAdrenoSubmit::hangCheck) and restarts: [0] hangs, [1] restarts, [2] failed restarts, [3] the last hung
  * fence, [4] the last restart's IOReturn, [5] submissions replayed so far, [6] hangs with a guilty job, [7] hangs of the kernel's own VM. */
 extern "C" {volatile uint32_t native_adreno_recovery[8];}
+/* NativeAdrenoSubmit::hangCheck's own view: [0] polls, [1] the fence at the last poll, [2] the completed fence now,
+ * [3] progress retries, [4] CP-state hash, [5] polls that could not take g.lock at once, [6] polls on the same fence,
+ * [7] the last poll time in microseconds. A starved thread shows [5] rising while [0] stalls; a false-progress CP
+ * shows [2] unchanged while [3] moves. */
+extern "C" {volatile uint32_t native_adreno_hangcheck[8];}
 /* SMMU context faults ended before a restart (NativeAdrenoGpuContext::endFault): [0] how many, then the last one's FSR, FAR lo, FAR hi,
  * FSYNR0. A latched FSR fails every later table operation's proof of the bank, so a restart that left it would poison the tables. */
 extern "C" {volatile uint32_t native_adreno_recovery_fault[5];}
@@ -218,9 +223,15 @@ extern "C" void native_adreno_set_restart(NativeAdrenoRestart restart,void *cook
  * GPU through the board's hook and replays the other submissions (recover_worker). Without a hook a hang is only counted. */
 static void nativeAdrenoHangcheck(void *,wait_result_t)
 {
+    uint32_t printed_fence=~0u,printed_second=~0u;
     for(;;) {
         IOSleep(500);
-        IOLockLock(g.lock);
+        native_adreno_hangcheck[0]=native_adreno_hangcheck[0]+1;
+        /* A plain IOLockLock hides whether the 500 ms thread is starved of g.lock by the wait/stall path;
+         * count the polls that had to wait instead. */
+        if(!IOLockTryLock(g.lock)) {native_adreno_hangcheck[5]=native_adreno_hangcheck[5]+1;IOLockLock(g.lock);}
+        const uint64_t poll_now=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
+        native_adreno_hangcheck[7]=uint32_t(poll_now);
         bool hung=false;
         if(g.submit && !g.submit->hangCheck(&hung) && hung) {
             native_adreno_recovery[0]=native_adreno_recovery[0]+1;
@@ -273,6 +284,19 @@ static void nativeAdrenoHangcheck(void *,wait_result_t)
                         g.ring?g.ring->readPointer():0, g.ring?g.ring->writePointer():0);
                 }
             }
+        }
+        /* Once per stuck second: whether the thread is starved ([5] rising while [0] stalls) or sees a
+         * completed fence that never moves ([2] stable, [3]/[6] climbing). */
+        {
+            const uint32_t f=native_adreno_hangcheck[2];
+            const uint32_t second=poll_now?uint32_t(poll_now/1000000):native_adreno_hangcheck[0]/2;
+            if(!hung && f && f==printed_fence && second!=printed_second) {
+                printed_second=second;
+                printf("PICASSO_GPU hangcheck: polls=%u fence=%u hang_fence=%u retries=%u state=%x trylock=%u same=%u\n",
+                    native_adreno_hangcheck[0],f,native_adreno_hangcheck[1],native_adreno_hangcheck[3],
+                    native_adreno_hangcheck[4],native_adreno_hangcheck[5],native_adreno_hangcheck[6]);
+            }
+            printed_fence=f;
         }
         IOLockUnlock(g.lock);
     }
@@ -973,9 +997,10 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
             if(value==0x7fff || value==0x7ffe) {
                 /* Diagnostic (wf83): mirror each completed plugin text line to the console, so a boot log carries the
                  * userspace test's result even though the periodic report runs only once. Bounded: the render server
-                 * rewrites report2 every ten seconds, so cap the number of lines. */
+                 * rewrites report2 every ten seconds, so cap the number of lines. wf238: enough lines for the scanout
+                 * serve loop's periodic PF lines (the self-test consumes most of the old 64-line budget). */
                 static unsigned lines;
-                if(line[0] && lines++<64) printf("PICASSO_GPU text: %s\n", line);
+                if(line[0] && lines++<256) printf("PICASSO_GPU text: %s\n", line);
                 line=value==0x7fff?native_adreno_metal_diag.report2:native_adreno_metal_diag.report;
                 /* A line from a process other than the render server goes to that process's own row (native_adreno_client_text): the render server
                  * rewrites report2 every ten seconds, so the reason another process's device failed would be gone from it. */

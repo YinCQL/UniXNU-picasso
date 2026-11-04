@@ -5,6 +5,7 @@
 #include "NativeLegacyRequest.h"
 #include "PicassoGop.h"
 #include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
@@ -16,6 +17,8 @@
 extern "C" __attribute__((noreturn)) void native_legacy_backend_guard(unsigned,void *,void *);
 extern "C" IOService *native_legacy_display_allocate(void);
 extern "C" bool native_legacy_gop_mapping_observed(IOService *,IOMemoryMap *,uint32_t,uint32_t);
+// The mode height userland sees; the panel can be taller (1080x2340 mode over a 1080x2400 panel).
+extern "C" uint32_t native_legacy_display_mode_height(uint32_t panelHeight);
 extern "C" void native_legacy_registration_observed(IOService *);
 extern "C" void native_legacy_client_enter(task_t,uint32_t);
 extern "C" void native_legacy_client_observed(IOReturn,IOUserClient *);
@@ -36,7 +39,9 @@ extern "C" void native_legacy_retirement_observed(IOService *);
 // to the privileged GPU client instead of being copied. The presenter's offer
 // either takes the frame or refuses it, in which case this file keeps the CPU
 // path unchanged. A failed GPU copy falls back for the rest of the kick.
-extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height,uint32_t destY);
+// Take back a swap the GPU client still owns for this display (presenter side; used when the display stops).
+extern "C" void native_gop_gpu_abandon_display(void *display);
 extern "C" void native_legacy_swap_stage(unsigned stage);
 extern "C" void native_legacy_gpu_fallback_observed(int status);
 extern "C" {extern volatile uint64_t native_legacy_early_retires,native_legacy_early_failures;}
@@ -54,6 +59,10 @@ extern "C" uint64_t mach_continuous_time(void);
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
+    // The GOP panel's geometry. getDisplayDimensions() reports the mode (a
+    // shorter 2340-row phone canvas when the ADT asks for it), so every panel
+    // store and bounds check uses these instead.
+    uint32_t panelWidth=0,panelHeight=0;
     // Previous frame for native_legacy_copy_diff (rows packed at width*4, same bytes as one GOP frame). The client always
     // sends a full-frame dirty rect, so the only reusable dirty information is this shadow; IPC-backed dirty rects are a no-op here.
     void *copyShadow=nullptr;
@@ -65,12 +74,19 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool primary=false;
     bool logicalPM=false;
     bool transferred=false;
+    /* kickSwapQueue is entered from three different threads: the compositor's own submission (its client thread
+     * through the family), the GPU completion (scheduled onto this display's work loop), and the refresh tick
+     * below. A plain bool was not enough to serialize them: two kicks could see kicking==false at the same time
+     * and run kickOnce concurrently (wf242 stopped with a queued frame that no kick ever transferred). A recursive
+     * lock serializes real kicks and still lets finishTransfer's nested call from inside kickOnce only set rekick. */
+    IORecursiveLock *kickLock=nullptr;
     // The frame currently owned by the GPU client (valid until its completion),
     // and whether that swap already retired when the client took it.
     const OriginalLegacySwapRequest *gpuRequest=nullptr;
     uint64_t gpuLength=0;
     bool gpuBypass=false;
     bool gpuRetired=false;
+    uint64_t gpuStartTick=0;
     // Preserve every accepted request until the original family retires it.
     // A full table rejects the new request without evicting a live entry.
     const OriginalLegacySwapRequest *validated[8]={};
@@ -120,12 +136,33 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         const uint64_t now=mach_absolute_time();
         native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);
         native_legacy_vsync_observed(1,vsyncHz);
+        /* The GOP has no vblank interrupt, so this tick is the display's only periodic heartbeat. A frame the GPU
+         * client took could lose its completion, and a validated frame's kick could be swallowed between the
+         * compositor's submission and the completion thread; either way the compositor then waits for a
+         * retirement that never comes and never submits again (wf242: submit stopped at 896, the tick kept
+         * running, no flip timeout, nothing else ever kicked). Pump the queue about once a second while either
+         * latch says there is work, so the display recovers without another submission. */
+        static unsigned tickSeq,latchPrints;
+        if(vsyncHz && (++tickSeq%vsyncHz)==0) {
+            bool waiting=false;
+            for(auto entry: validated)if(entry){waiting=true;break;}
+            uint64_t held=0;
+            if(transferred && gpuStartTick)absolutetime_to_nanoseconds(mach_absolute_time()-gpuStartTick,&held);
+            if(transferred || waiting) {
+                if(latchPrints<12 && transferred && held>=1000000000ull) {
+                    ++latchPrints;
+                    printf("PICASSO_DISPLAY gpu latch held_ms=%llu pending=%u recovered by tick\n",
+                        (unsigned long long)(held/1000000),unsigned(waiting));
+                }
+                kickSwapQueue();
+            }
+        }
         vsyncNext+=vsyncInterval;
         if(vsyncNext<=now){vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}
         vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
     }
     void startVsync() {
-        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        unsigned hz=60;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
         if(!hz || hz>240 || !primary || !bootMapping || vsyncTimer)return;
         IOWorkLoop *loop=getWorkLoop();
         if(!loop)return;
@@ -146,26 +183,31 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         OSSafeReleaseNULL(vsyncTimer);vsyncArmed=false;
     }
 public:
-    // Called by the GPU client's completion (any thread): the swap finishes on
-    // the framebuffer's work loop, where the queue and the vsync clients live.
+    // Called by the GPU client's completion (any thread): the swap finishes on the framebuffer's work loop, the
+    // loop the swap queue and the vsync clients live on. The family's command gate is not reachable from this
+    // subclass, so the state transitions are made idempotent instead: every path out of finishGpuSwap clears
+    // transferred (a latch left set with gpuRequest cleared stopped every later kick and froze the compositor).
     void gpuComplete(int status) {
         struct Args {NativeLegacyDisplay *display;int status;};
         Args *args=(Args *)IOMalloc(sizeof(Args));
         if(!args){finishGpuSwap(status);return;}
         args->display=this;args->status=status;
-        IOWorkLoop *loop=getWorkLoop();
         auto action=[](OSObject *,void *a0,void *,void *,void *)->IOReturn {
             Args *a=(Args *)a0;a->display->finishGpuSwap(a->status);IOFree(a,sizeof(Args));return kIOReturnSuccess;
         };
+        IOWorkLoop *loop=getWorkLoop();
         if(loop && loop->runAction(action,this,args)==kIOReturnSuccess)return;
         IOFree(args,sizeof(Args));
         finishGpuSwap(status);
     }
-    void free() override {stopVsync();releaseCopyShadow();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+    void free() override {stopVsync();releaseCopyShadow();if(kickLock){IORecursiveLockFree(kickLock);kickLock=nullptr;}if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
+        // The GPU client may still own a frame; take it back before the display goes away, or its later completion
+        // would reach a stopped (and freed) display.
+        native_gop_gpu_abandon_display(this);
         stopVsync();
         releaseCopyShadow();
-        transferred=false;gpuRequest=nullptr;gpuRetired=false;for(auto &entry: validated)entry=nullptr;
+        transferred=false;gpuRequest=nullptr;gpuRetired=false;gpuStartTick=0;for(auto &entry: validated)entry=nullptr;
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
     }
@@ -185,10 +227,11 @@ public:
     }
     bool startDisplay(IOService *provider) {
         if(!IOMobileFramebufferLegacy::start(provider))return false;
+        if(!kickLock)kickLock=IORecursiveLockAlloc();
         if(primary && bootMapping)announcePoweredByFirmware();
-        unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
+        unsigned enabled=1;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
         if(!enabled)return true;
-        unsigned phase=0;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));
+        unsigned phase=4;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));
         if(enabled!=1 || phase!=4 || !provider || !bootMapping || !primary) {
             native_legacy_pm_observed(1,kIOReturnNotReady,0);IOMobileFramebufferLegacy::stop(provider);return false;
         }
@@ -247,6 +290,12 @@ public:
     // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
     bool kicking=false,rekick=false;
     void kickSwapQueue() override {
+        if(!kickLock){kickSwapLocked();return;}
+        IORecursiveLockLock(kickLock);
+        kickSwapLocked();
+        IORecursiveLockUnlock(kickLock);
+    }
+    void kickSwapLocked() {
         /* wf131: whether the compositor's queued swap ever reaches the kick, and whether a
          * vsync client is registered at that moment. wf132: the kick also establishes that a
          * display client exists, which is what the tick needs to run. */
@@ -264,7 +313,17 @@ public:
         kicking=false;
     }
     void kickOnce() {
-        unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
+        // The GPU client owns one frame until it completes it; the presenter's flip timeout normally takes a
+        // stalled frame back. If that timer was never created (no work loop) or the completion never reached this
+        // driver, do not wait forever: take the frame back here and use the CPU path for this kick.
+        if(transferred && gpuStartTick) {
+            uint64_t held=0;absolutetime_to_nanoseconds(mach_absolute_time()-gpuStartTick,&held);
+            if(held>=1500000000ull) {
+                gpuRequest=nullptr;gpuLength=0;gpuRetired=false;transferred=false;gpuBypass=true;gpuStartTick=0;
+                native_legacy_gpu_fallback_observed(kIOReturnTimeout);
+            }
+        }
+        unsigned enabled=1;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
         if(!request || !isValidated(request))return;
@@ -279,7 +338,8 @@ public:
         if(!surface) {
             // Validated blank swap (all layers disabled over black): solid-fill the actual GOP.
             PE_Video blank={};
-            uint32_t bw=0,bh=0;getDisplayDimensions(&bw,&bh);
+            uint32_t bw=panelWidth,bh=panelHeight;
+            if(!bw || !bh)getDisplayDimensions(&bw,&bh);
             uint64_t blankLength=(uint64_t)bw*bh*4;
             if(PE_current_console(&blank) || blank.v_baseAddr!=bootMapping->getPhysicalAddress() ||
                blank.v_width!=bw || blank.v_height!=bh || blank.v_depth!=32 || blank.v_rotate ||
@@ -302,12 +362,21 @@ public:
         if(!surface->metaCast("IOSurface"))return;
         IOMemoryDescriptor *memory=native_legacy_surface_descriptor(surface);
         PE_Video video={};
-        uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
+        uint32_t width=panelWidth,height=panelHeight;
+        if(!width || !height)getDisplayDimensions(&width,&height);
         uint64_t length=(uint64_t)width*height*4;
         uint64_t sourceStride=native_legacy_surface_stride(surface);
         uint64_t allocation=native_legacy_surface_allocation(surface);
-        if(!memory || !memory->metaCast("IOMemoryDescriptor") || !native_legacy_surface_bounds(width,height,sourceStride,allocation,memory->getLength()) ||
-           native_legacy_surface_width(surface)<width || native_legacy_surface_height(surface)<height ||
+        const uint32_t sourceWidth=native_legacy_surface_width(surface);
+        const uint32_t sourceHeight=native_legacy_surface_height(surface);
+        /* A phone canvas is shorter than the panel: 2340 rows of artwork over a 2400-row panel. Accept it, put it in
+         * the middle and fill the bars with black instead of rejecting the swap (a rejected swap never completes and
+         * the render server stops presenting). The GPU copy path keeps the exact-geometry fast path. */
+        const bool letterbox=sourceWidth>=width && sourceHeight && sourceHeight<=height;
+        if(!memory || !memory->metaCast("IOMemoryDescriptor") ||
+           (sourceHeight<=height ? !native_legacy_surface_bounds(width,sourceHeight,sourceStride,allocation,memory->getLength())
+                                 : 1) ||
+           !letterbox ||
            !picasso_gop_format(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) ||
            PE_current_console(&video) || video.v_baseAddr!=bootMapping->getPhysicalAddress() ||
            video.v_width!=width || video.v_height!=height || video.v_depth!=32 || video.v_rotate ||
@@ -320,11 +389,16 @@ public:
         if(!gpuBypass) {
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
         }
-        if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
+        /* The phone canvas is shorter than the panel: hand the GPU the source height and the top-bar row
+         * offset and let the presenter fill both bars, instead of copying 10 MB per frame on the CPU. */
+        const uint32_t gpuBarRows=sourceHeight<height?(height-sourceHeight>=60?60:height-sourceHeight):0;
+        if(!gpuBypass && sourceHeight<=height && sourceWidth>=width &&
+           native_legacy_gpu_offer(this,memory,sourceStride,width,sourceHeight,gpuBarRows)) {
             // The GPU writes the scanout memory behind the CPU's back: the
             // differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
             copyShadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
+            gpuStartTick=mach_absolute_time();
             // Retire as soon as the client owns the frame (the presenter retains
             // it); the next frame waits for the copy because transferred stays
             // set until finishGpuSwap.
@@ -338,9 +412,12 @@ public:
         if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
         }
-        if(!native_legacy_copy_layout(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+        // The phone mode leaves 60 rows below the panel's 2400. Keep all of them at the top: the status bar then
+        // starts 60 px down, clearing the top-right camera, and the UI canvas ends at the physical bottom edge.
+        const uint32_t barRows=height>sourceHeight?(height-sourceHeight>=60?60:height-sourceHeight):0;
+        if(!letterbox || !native_legacy_copy_layout(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
             bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
-            source->getLength(),sourceStride,width,height)) {
+            source->getLength(),sourceStride,width,sourceHeight)) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
         }
         // Inspect the first four frames and a sparse periodic sample after
@@ -349,7 +426,7 @@ public:
         if(scanBudget || (frameCount%600)==0) {
             if(scanBudget)--scanBudget;
             uint64_t scan[5];
-            if(native_legacy_frame_scan(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,scan))
+            if(native_legacy_frame_scan(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,sourceHeight,scan))
                 native_legacy_frame_observed(0,scan[0],scan[1],scan[2],scan[3],scan[4]);
         }
         /* offline-legacy-bench=2: on the first real frame, time reads of the swap's own source memory through the
@@ -402,12 +479,12 @@ public:
         // unsupported geometry or an allocation failure, and invalidate the shadow whenever the plain path or a blank ran.
         uint64_t stored=length;
         int copied=0;
-        if(!copyShadow || copyShadowBytes<length) {
+        if(!letterbox && (!copyShadow || copyShadowBytes<length)) {
             releaseCopyShadow();
             copyShadow=IOMalloc(length);
             if(copyShadow)copyShadowBytes=length;
         }
-        if(copyShadow) {
+        if(!letterbox && copyShadow) {
             const uint64_t diff=native_legacy_copy_diff(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                 bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
                 source->getLength(),sourceStride,width,height,copyShadow,copyShadowValid?1:0);
@@ -416,11 +493,21 @@ public:
         }
         if(!copied) {
             stored=length;
-            if(!native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
-                bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
-                source->getLength(),sourceStride,width,height)) {
+            volatile unsigned char *panel=(volatile unsigned char *)bootMapping->getVirtualAddress();
+            if(!native_legacy_copy_pixels((volatile void *)(panel+(uint64_t)barRows*video.v_rowBytes),
+                bootMapping->getLength()-(uint64_t)barRows*video.v_rowBytes,video.v_rowBytes,
+                reinterpret_cast<const void *>(source->getVirtualAddress()),
+                source->getLength(),sourceStride,width,sourceHeight)) {
                 OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
             }
+            if(barRows) {
+                (void)native_legacy_fill_pixels((volatile void *)panel,bootMapping->getLength(),
+                    video.v_rowBytes,width,barRows,0xff000000U);
+                const uint64_t bottom=(uint64_t)(barRows+sourceHeight)*video.v_rowBytes;
+                (void)native_legacy_fill_pixels((volatile void *)(panel+bottom),
+                    bootMapping->getLength()-bottom,video.v_rowBytes,width,height-sourceHeight-barRows,0xff000000U);
+            }
+            if(letterbox)copyShadowValid=false;
         }
         __asm__ volatile("dsb sy" ::: "memory");
         {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
@@ -430,7 +517,7 @@ public:
     }
     // Hands the pending head to the unchanged family after the CPU copy.
     bool retireSwap(const OriginalLegacySwapRequest *request,bool force=false) {
-        unsigned retire=0,cpuPresent=0;
+        unsigned retire=0,cpuPresent=1;
         PE_parse_boot_argn("offline-legacy-retire",&retire,sizeof(retire));
         PE_parse_boot_argn("offline-legacy-cpu-present",&cpuPresent,sizeof(cpuPresent));
         if(!(retire==1 || cpuPresent==1 || force))return false;
@@ -444,7 +531,9 @@ public:
     void finishTransfer(const OriginalLegacySwapRequest *request,bool force=false) {
         // Only after the real copy and store barrier: select the actual pending head and let the unchanged family release it and wake
         // waiters. This reports memory scanout completion, not a panel vblank or hardware fence.
-        if(!retireSwap(request,force)){native_legacy_retirement_failed(this);return;}
+        // A failed retirement must still clear the latch: the request stays validated and may retire later, but a
+        // latch left set here stopped every later kick (the compositor then never offered another frame).
+        if(!retireSwap(request,force)){native_legacy_retirement_failed(this);transferred=false;return;}
         // The unchanged family has retired this generation and released its current reference. Permit the next independently validated
         // single pending frame. Keep the latch set while completion can reenter this method, and whenever retirement remains disabled.
         transferred=false;
@@ -455,7 +544,8 @@ public:
     // CPU copy for the next kick.
     void finishGpuSwap(int status) {
         const OriginalLegacySwapRequest *request=gpuRequest;
-        if(!request)return;
+        gpuStartTick=0;
+        if(!request) {transferred=false;kickSwapQueue();return;}
         gpuRequest=nullptr;
         if(gpuRetired) {
             gpuRetired=false;
@@ -484,28 +574,35 @@ public:
         auto bytes=reinterpret_cast<const unsigned char *>(request);
         auto word=[&](unsigned offset){uint32_t value=0;memcpy(&value,bytes+offset,4);return value;};
         OSObject *surface=nullptr;unsigned reason=1;bool accepted=false;
-        unsigned enabled=0;PE_parse_boot_argn("offline-legacy-validate",&enabled,sizeof(enabled));
+        unsigned enabled=1;PE_parse_boot_argn("offline-legacy-validate",&enabled,sizeof(enabled));
         if(enabled==1 && logicalPM && primary && bootMapping && request) {
             reason=2;OSObject *surfaces[4]={};memcpy(surfaces,bytes+2624,sizeof(surfaces));surface=surfaces[0];
-            uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
+            uint32_t width=panelWidth,height=panelHeight;
+            if(!width || !height)getDisplayDimensions(&width,&height);
+            /* A phone canvas (1080x2340 over a 1080x2400 panel) names its own smaller height in the swap; accept it
+             * when it is at most the panel's and both rectangles cover exactly that canvas. The copy path centres it
+             * and fills the bars. */
+            const uint32_t requestWidth=word(816),requestHeight=word(820);
+            const bool phoneCanvas=requestWidth==width && requestHeight>height/2 && requestHeight<=height;
+            const uint32_t canvasWidth=phoneCanvas?requestWidth:width,canvasHeight=phoneCanvas?requestHeight:height;
             if(surface && surface->metaCast("IOSurface") && !surfaces[1] && !surfaces[2] && !surfaces[3] &&
                native_legacy_single_layer_state(word(792),word(796),word(800))) {
                 reason=3;bool rectangles=true;
                 const unsigned rectOffsets[]={17,81};
                 for(unsigned offset: rectOffsets) {
                     uint32_t rect[4]={};memcpy(rect,bytes+offset,sizeof(rect));
-                    rectangles=rectangles && rect[0]==0 && rect[1]==0 && rect[2]==width && rect[3]==height;
+                    rectangles=rectangles && rect[0]==0 && rect[1]==0 && rect[2]==canvasWidth && rect[3]==canvasHeight;
                 }
                 bool options=true;for(unsigned offset=804;offset<=812;offset+=4)options=options && word(offset)==0;
-                if(width && height && rectangles && options && word(816)==width && word(820)==height) {
+                if(width && height && rectangles && options && requestWidth==canvasWidth && requestHeight==canvasHeight) {
                     reason=4;
                     IOMemoryDescriptor *memory=native_legacy_surface_descriptor(surface);
                     // A surface larger than the display (rows or lines padded to the GPU's alignment) is accepted: only the visible rectangle,
-                    // which the request's rectangles already name as the whole display, is copied.
-                    if(native_legacy_surface_width(surface)>=width && native_legacy_surface_height(surface)>=height &&
+                    // which the request's rectangles already name as the whole canvas, is copied.
+                    if(native_legacy_surface_width(surface)>=canvasWidth && native_legacy_surface_height(surface)>=canvasHeight &&
                        picasso_gop_format(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) &&
                        memory && memory->metaCast("IOMemoryDescriptor") &&
-                       native_legacy_surface_bounds(width,height,native_legacy_surface_stride(surface),
+                       native_legacy_surface_bounds(canvasWidth,canvasHeight,native_legacy_surface_stride(surface),
                            native_legacy_surface_allocation(surface),memory->getLength())) {
                         reason=0;accepted=true;
                     } else {
@@ -554,7 +651,7 @@ public:
         native_legacy_client_observed(status,status==kIOReturnSuccess && client?*client:nullptr);return status;
     }
     bool startHardware() override {
-        unsigned enabled=0;
+        unsigned enabled=1;
         PE_parse_boot_argn("offline-legacy-gop",&enabled,sizeof(enabled));
         if(enabled!=1)return false;
         PE_Video video={};IOService *provider=getProvider();
@@ -569,12 +666,16 @@ public:
         bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                    mapping->getLength()==video.v_rowBytes*video.v_height;
         if(valid) {
-            installBootDimensions((uint32_t)video.v_width,(uint32_t)video.v_height);
+            panelWidth=(uint32_t)video.v_width;panelHeight=(uint32_t)video.v_height;
+            const uint32_t modeHeight=native_legacy_display_mode_height(panelHeight);
+            installBootDimensions(panelWidth,modeHeight);
             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
-            valid=width==video.v_width && height==video.v_height;
+            valid=width==panelWidth && height==modeHeight;
             if(valid) {
                 OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=true; // Text/graphics is console policy, not display identity.
-                valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
+                // The observer validates the GOP mapping against the panel, not the mode: the panel is still
+                // 2400 rows when userland is told the mode is a 2340-row phone canvas.
+                valid=native_legacy_gop_mapping_observed(this,bootMapping,panelWidth,panelHeight);
                 /* offline-legacy-bench=1: measure the three sides of a frame copy once, through this exact mapping.
                  * The 10.4 MB frame copy costs ~130 ms here (PICASSO_DISPLAY event=10); these one-megabyte timings
                  * separate destination stores, destination reads and a cached-to-cached memcpy. */

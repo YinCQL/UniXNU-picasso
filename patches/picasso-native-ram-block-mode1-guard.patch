@@ -1,0 +1,48 @@
+diff --git a/NativeRamBlock.cpp b/NativeRamBlock.cpp
+index 4b96ff8..86189e1 100644
+--- a/NativeRamBlock.cpp
++++ b/NativeRamBlock.cpp
+@@ -89,6 +89,8 @@ public:
+       const char *why = "";
+       native_data_persist_pages = pages;
+       native_data_persist_gpt = native_ufs_store_gpt_check();
++      IOLog("PICASSO_DATASTORE geometry mode=%u pages=%llu windowBlocks=%llu gpt=%u\n",
++            mode, pages, persist::windowBlocks(pages), native_data_persist_gpt);
+       if (!native_ufs_store_open(persist::windowBlocks(pages), &first, &why)) {
+         native_data_persist_state = 4;
+         IOLog("NativeRamBlock: persistent store refused: %s\n", why);
+@@ -101,6 +103,8 @@ public:
+         persist::Open result = overlayBits && stage ? overlay.open(ops, pages, seedHash, mode == 1, overlayBits, discardRequested())
+                                                           : persist::Open::Failed;
+         native_data_persist_header = static_cast<uint32_t>(overlay.header);
++        IOLog("PICASSO_DATASTORE overlay first=%llu windowBlocks=%llu open=%d header=%d present=%llu\n",
++              first, persist::windowBlocks(pages), static_cast<int>(result), overlay.header, overlay.present);
+         if (result == persist::Open::Failed) {
+           native_data_persist_state = 4;
+           overlay.active = false;
+@@ -113,6 +117,12 @@ public:
+           // Resumed read-write: nothing is copied into RAM. The window answers for every page whose bit is set.
+           direct = true;
+           native_data_persist_state = 2;
++        } else if (isBig) {
++          // A disk above 2 GiB is served by the direct (store-backed) path alone (see start()); the Loader below
++          // indexes sparse.pages, which this disk does not have. A read-only probe keeps the seed and stays volatile.
++          native_data_persist_state = 4;
++          overlay.active = false;
++          IOLog("PICASSO_DATASTORE mode=%u isBig=1: no RAM-resident resume, volatile disk\n", mode);
+         } else {
+           struct Loader {
+             NativeRamBlock *self;
+@@ -139,6 +149,12 @@ public:
+             overlay.active = false;
+           }
+         }
++        if (isBig && mode != 2) {
++          // The direct path is the only one that can serve this disk; never leave the overlay active over a
++          // null sparse page table (a fresh read-only open reaches here).
++          overlay.active = false;
++          native_data_persist_state = 4;
++        }
+         native_data_persist_present = overlay.present;
+         native_data_persist_gpt_after = native_ufs_store_gpt_check();
+       }

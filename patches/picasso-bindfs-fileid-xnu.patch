@@ -1,0 +1,106 @@
+Backport the bindfs file-ID implementation from UniXNU-sheng.
+Source: UniXNU/UniXNU-sheng@965460a9ac1715636c769634fd0d69f58b2bd0f9
+File: patches/xnu-12377/zzzz-sheng-ipados27-bringup.patch
+Only the bind_vfsops.c diff is carried here; no iPadOS 27 ABI changes.
+
+diff --git a/bsd/miscfs/bindfs/bind_vfsops.c b/bsd/miscfs/bindfs/bind_vfsops.c
+--- a/bsd/miscfs/bindfs/bind_vfsops.c
++++ b/bsd/miscfs/bindfs/bind_vfsops.c
+@@ -222,6 +222,8 @@ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, v
+ 	vfs_setfsprivate(mp, xmp);
+ 	vfs_getnewfsid(mp);
+ 	vfs_setlocklocal(mp);
++	/* Paths from file IDs (fsgetpath, volfs): mount_lookupby_volfsid only finds a mount that says it can. See bindfs_vget. */
++	mp->mnt_kern_flag |= MNTK_PATH_FROM_ID;
+ 
+ 	/* fill in the stat block */
+ 	sp = vfs_statfs(mp);
+@@ -413,13 +415,10 @@ bindfs_vfs_getattr(struct mount * mp, struct vfs_attr * vfap, vfs_context_t ctx)
+ 	if (bindfs_vfs_getlowerattr(vnode_mount(bind_mp->bindm_lowerrootvp), &vfa, ctx) == 0) {
+ 		if (VFSATTR_IS_SUPPORTED(&vfa, f_capabilities)) {
+ 			memcpy(&capabilities, &vfa.f_capabilities, sizeof(capabilities));
+-			/* don't support vget */
+-			capabilities.capabilities[VOL_CAPABILITIES_FORMAT] &= ~(VOL_CAP_FMT_PERSISTENTOBJECTIDS | VOL_CAP_FMT_PATH_FROM_ID);
+-
++			/* File IDs are the lower file system's and bindfs_vget resolves them, so its persistent object IDs and paths
++			 * from IDs are kept (CoreFoundation gives no file ID, which LaunchServices records bundles by, without them). */
+ 			capabilities.capabilities[VOL_CAPABILITIES_FORMAT] |= VOL_CAP_FMT_HIDDEN_FILES; /* Always support UF_HIDDEN */
+ 
+-			capabilities.valid[VOL_CAPABILITIES_FORMAT] &= ~(VOL_CAP_FMT_PERSISTENTOBJECTIDS | VOL_CAP_FMT_PATH_FROM_ID);
+-
+ 			capabilities.valid[VOL_CAPABILITIES_FORMAT] |= VOL_CAP_FMT_HIDDEN_FILES; /* Always support UF_HIDDEN */
+ 
+ 			/* dont' support interfaces that only make sense on a writable file system
+@@ -539,6 +538,64 @@ bindfs_vfs_start(__unused struct mount * mp, __unused int flags, __unused vfs_co
+ 	return 0;
+ }
+ 
++/*
++ * Lookup by file ID (fsgetpath, volfs paths). LaunchServices records a bundle's files by volume and file ID and resolves them
++ * back through fsgetpath; without a vfs_vget every bundle seen through a bind mount came back unresolvable, so it was registered
++ * with no platform and its plug-ins with no extension point (a widget extension then looks "restricted" to chronod). bindfs
++ * reports the lower file system's file IDs, so: get the lower vnode, take its path relative to the bound root, and look that
++ * path up from our root -- the vnode returned is ours, named and parented under the mount point, as build_path needs. An ID
++ * outside the bound tree is not found.
++ */
++static int
++bindfs_vget(struct mount * mp, ino64_t ino, struct vnode ** vpp, vfs_context_t ctx)
++{
++	struct bind_mount * bindm = MOUNTTOBINDMOUNT(mp);
++	vnode_t lowervp = NULLVP;
++	char * lowerpath = NULL;
++	char * rootpath = NULL;
++	const char * relative = NULL;
++	size_t rootlen;
++	int len, error;
++
++	*vpp = NULLVP;
++	if (bindm == NULL || bindm->bindm_rootvp == NULLVP || bindm->bindm_lowerrootvp == NULLVP) {
++		return ENOTSUP;
++	}
++	error = VFS_VGET(vnode_mount(bindm->bindm_lowerrootvp), ino, &lowervp, ctx);
++	if (error) {
++		return error;
++	}
++	if (lowervp == bindm->bindm_lowerrootvp) {
++		vnode_put(lowervp);
++		error = vnode_get(bindm->bindm_rootvp);
++		if (error == 0) {
++			*vpp = bindm->bindm_rootvp;
++		}
++		return error;
++	}
++	lowerpath = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_NOFAIL);
++	rootpath = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_NOFAIL);
++	len = MAXPATHLEN;
++	error = vn_getpath(lowervp, lowerpath, &len);
++	vnode_put(lowervp);
++	if (error == 0) {
++		len = MAXPATHLEN;
++		error = vn_getpath(bindm->bindm_lowerrootvp, rootpath, &len);
++	}
++	if (error == 0) {
++		rootlen = strlen(rootpath);
++		if (rootlen == 1 && rootpath[0] == '/') {
++			relative = lowerpath + 1;
++		} else if (strncmp(lowerpath, rootpath, rootlen) == 0 && lowerpath[rootlen] == '/') {
++			relative = lowerpath + rootlen + 1;
++		}
++		error = relative && *relative ? vnode_lookupat(relative, VNODE_LOOKUP_NOFOLLOW, vpp, ctx, bindm->bindm_rootvp) : ENOENT;
++	}
++	kfree_data(lowerpath, MAXPATHLEN);
++	kfree_data(rootpath, MAXPATHLEN);
++	return error;
++}
++
+ extern const struct vnodeopv_desc bindfs_vnodeop_opv_desc;
+ 
+ const struct vnodeopv_desc * bindfs_vnodeopv_descs[] = {
+@@ -552,6 +609,7 @@ struct vfsops bindfs_vfsops = {
+ 	.vfs_root               = bindfs_root,
+ 	.vfs_getattr            = bindfs_vfs_getattr,
+ 	.vfs_sync               = bindfs_sync,
++	.vfs_vget               = bindfs_vget,
+ 	.vfs_init               = bindfs_init,
+ 	.vfs_sysctl             = NULL,
+ 	.vfs_setattr            = NULL,

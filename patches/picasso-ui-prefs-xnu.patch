@@ -1,0 +1,269 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7399,6 +7399,10 @@
+ volatile int native_gpu_addon2_status = -1;
+ volatile int native_gpu_addon3_stage = 0;
+ volatile int native_gpu_addon3_status = -1;
++volatile int native_gpu_addon4_stage = 0;
++volatile int native_gpu_addon4_status = -1;
++volatile int native_gpu_addon5_stage = 0;
++volatile int native_gpu_addon5_status = -1;
+ static void
+ native_gpu_addon_mount(proc_t p, user_addr_t scratch, user_addr_t offset, const char *source, size_t source_size,
+     const char *point, size_t point_size, const char *visible, const char *own, volatile int *stage, volatile int *status)
+@@ -7691,14 +7695,37 @@
+ 	    "/System/Library/LaunchDaemons/org.blu-sharky.adrenoprobed.plist", &native_gpu_addon2_stage, &native_gpu_addon2_status);
+ 	/* The default iPadOS 17 wallpaper's layered animation with PNG images in place of its HEIC ones (no hardware HEVC decoder here).
+ 	 * The overlay carries the animation's documents and the PNG images; the sealed assets directory stays visible below it. */
+-	static const char wallpaper_source[] = "/private/var/ngpu/wallpaper",
+-	    wallpaper_point[] = "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/"
++	uint32_t picassoExtras = 7;
++	PE_parse_boot_argn("sheng-ui-extras", &picassoExtras, sizeof(picassoExtras));
++	static const char wallpaper_source[] = "/private/var/ngpu/wallpaper";
++	if (picassoExtras & 4) {
++	static const char wallpaper_point[] = "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/"
+ 	    "7570.iPadOS_17_Flat-1024w-1366h@2x~ipad.wallpaper/7570.iPadOS_17_Flat_Background-1024w-1366h@2x~ipad.ca";
+ 	native_gpu_addon_mount(p, scratch, 0x800, wallpaper_source, sizeof(wallpaper_source), wallpaper_point, sizeof(wallpaper_point),
+ 	    "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17_Flat-1024w-1366h@2x~ipad.wallpaper/"
+ 	    "7570.iPadOS_17_Flat_Background-1024w-1366h@2x~ipad.ca/assets/J120.HEIC",
+ 	    "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17_Flat-1024w-1366h@2x~ipad.wallpaper/"
+ 	    "7570.iPadOS_17_Flat_Background-1024w-1366h@2x~ipad.ca/J120.png", &native_gpu_addon3_stage, &native_gpu_addon3_status);
++	}
++	if (picassoExtras & 2) {
++	/* The same PNG animation over the two other 7570 variants: the phone screen's logical class matches
++	 * none of the ~ipad names, so PosterBoard may pick any of the three once class product matching is
++	 * bypassed. Each mount is independent; a missing variant only records its status. */
++	static const char wallpaper1024_point[] = "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/"
++	    "7570.iPadOS_17-1024w-1366h@2x~ipad.wallpaper/7570.iPadOS_17_Background-1024w-1366h@2x~ipad.ca",
++	    wallpaper834_point[] = "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/"
++	    "7570.iPadOS_17-834w-1112h@2x~ipad.wallpaper/7570.iPadOS_17_Background-834w-1112h@2x~ipad.ca";
++	native_gpu_addon_mount(p, scratch, 0xa00, wallpaper_source, sizeof(wallpaper_source), wallpaper1024_point, sizeof(wallpaper1024_point),
++	    "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17-1024w-1366h@2x~ipad.wallpaper/"
++	    "7570.iPadOS_17_Background-1024w-1366h@2x~ipad.ca/assets/Background Light.HEIC",
++	    "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17-1024w-1366h@2x~ipad.wallpaper/"
++	    "7570.iPadOS_17_Background-1024w-1366h@2x~ipad.ca/J120.png", &native_gpu_addon4_stage, &native_gpu_addon4_status);
++	native_gpu_addon_mount(p, scratch, 0xe00, wallpaper_source, sizeof(wallpaper_source), wallpaper834_point, sizeof(wallpaper834_point),
++	    "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17-834w-1112h@2x~ipad.wallpaper/"
++	    "7570.iPadOS_17_Background-834w-1112h@2x~ipad.ca/assets/Background Light.HEIC",
++	    "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17-834w-1112h@2x~ipad.wallpaper/"
++	    "7570.iPadOS_17_Background-834w-1112h@2x~ipad.ca/J120.png", &native_gpu_addon5_stage, &native_gpu_addon5_status);
++	}
+ }
+ 
+ /* The deletable system apps (Weather, Notes, Calendar, ...) ship in the OS volume's /private/var/staged_system_apps. A restore copies
+@@ -8008,7 +8035,201 @@
+ 	vnode_put(vp);
+ }
+ 
++#if DEVELOPMENT || DEBUG
++/* The Data seed identity keys the persistent store; writing preferences into the seed would discard the store's
++ * LaunchServices database and make the next boot rebuild it. Write the same bytes from the kernel instead, after
++ * the Data mount and before launchd, and leave the seed (and its store) untouched. 501:501 is mobile, the owner
++ * cfprefsd and SpringBoard expect. The SpringBoard inject library arrives in the GPU addon (the addon installer
++ * writes /private/var/ngpu/libpicasso-sb.dylib); copy it to paths SpringBoard's sandbox can read. */
++static const uint8_t native_picasso_ui_prefs_plist[] = {
++	0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, 0xd2, 0x01, 0x02, 0x03,
++	0x04, 0x5f, 0x10, 0x12, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x42, 0x61,
++	0x72, 0x48, 0x69, 0x64, 0x65, 0x73, 0x44, 0x61, 0x74, 0x65, 0x5f, 0x10,
++	0x22, 0x55, 0x49, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x42, 0x61, 0x72,
++	0x56, 0x69, 0x73, 0x75, 0x61, 0x6c, 0x50, 0x72, 0x6f, 0x76, 0x69, 0x64,
++	0x65, 0x72, 0x43, 0x6c, 0x61, 0x73, 0x73, 0x4e, 0x61, 0x6d, 0x65, 0x09,
++	0x5f, 0x10, 0x2b, 0x5f, 0x55, 0x49, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73,
++	0x42, 0x61, 0x72, 0x56, 0x69, 0x73, 0x75, 0x61, 0x6c, 0x50, 0x72, 0x6f,
++	0x76, 0x69, 0x64, 0x65, 0x72, 0x5f, 0x50, 0x61, 0x64, 0x5f, 0x46, 0x6f,
++	0x72, 0x63, 0x65, 0x64, 0x4e, 0x6f, 0x43, 0x65, 0x6c, 0x6c, 0x08, 0x0d,
++	0x22, 0x47, 0x48, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x76,
++};
+ static int
++native_picasso_ui_pref_write(const char *path)
++{
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	int error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, 0644, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	int resid = 0;
++	error = vn_rdwr(UIO_WRITE, vp, (caddr_t)native_picasso_ui_prefs_plist,
++	    (int)sizeof(native_picasso_ui_prefs_plist), 0, UIO_SYSSPACE, IO_NOAUTH | IO_UNIT,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	if (!error && resid) {
++		error = EIO;
++	}
++	if (!error) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_mode, 0644);
++		VATTR_SET(&va, va_uid, 501);
++		VATTR_SET(&va, va_gid, 501);
++		error = vnode_setattr(vp, &va, ctx);
++	}
++	if (!error) {
++		error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++	}
++	int close_error = vnode_close(vp, FWRITE, ctx);
++	return error ? error : close_error;
++}
++static int
++native_picasso_mkdir(proc_t p, user_addr_t scratch, const char *path)
++{
++	struct mkdir_args request = {.path = scratch + 0xb00, .mode = 0755};
++	int32_t result = 0;
++	int error = copyout(path, request.path, strlen(path) + 1);
++	if (!error) {
++		error = mkdir(p, &request, &result);
++	}
++	if (error && error != EEXIST) {
++		return error;
++	}
++	vnode_t vp = NULLVP;
++	error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, vfs_context_current());
++	if (!error) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_uid, 501);
++		VATTR_SET(&va, va_gid, 501);
++		error = vnode_setattr(vp, &va, vfs_context_current());
++		vnode_put(vp);
++	}
++	return error;
++}
++static int
++native_picasso_copy_file(const char *source_path, const char *dest_path)
++{
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t src = NULLVP, dst = NULLVP;
++	int error = vnode_open(source_path, O_RDONLY | O_NOFOLLOW, 0, 0, &src, ctx);
++	if (error) {
++		return error;
++	}
++	error = vnode_open(dest_path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, 0755, 0, &dst, ctx);
++	if (error) {
++		vnode_close(src, FREAD, ctx);
++		return error;
++	}
++	void *buffer = kalloc_data(65536, Z_WAITOK);
++	if (!buffer) {
++		error = ENOMEM;
++		goto done;
++	}
++	off_t at = 0;
++	for (;;) {
++		int resid = 0;
++		error = vn_rdwr(UIO_READ, src, (caddr_t)buffer, 65536, at, UIO_SYSSPACE, IO_NOAUTH,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		int length = 65536 - resid;
++		if (error || !length) {
++			break;
++		}
++		error = vn_rdwr(UIO_WRITE, dst, (caddr_t)buffer, length, at, UIO_SYSSPACE,
++		    IO_NOAUTH | IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (!error && resid) {
++			error = EIO;
++		}
++		if (error) {
++			break;
++		}
++		at += length;
++	}
++	kfree_data(buffer, 65536);
++	if (!error) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_mode, 0755);
++		VATTR_SET(&va, va_uid, 501);
++		VATTR_SET(&va, va_gid, 501);
++		error = vnode_setattr(dst, &va, ctx);
++	}
++	if (!error) {
++		error = VNOP_FSYNC(dst, MNT_WAIT, ctx);
++	}
++done:
++	{
++		int close_error = vnode_close(dst, FWRITE, ctx);
++		if (!error) error = close_error;
++	}
++	{
++		int close_error = vnode_close(src, FREAD, ctx);
++		if (!error) error = close_error;
++	}
++	return error;
++}
++static void
++native_picasso_ui_prefs(proc_t p, user_addr_t scratch)
++{
++	int mobile_dir = native_picasso_mkdir(p, scratch, "/private/var/mobile/Library/picasso");
++	int var_dir = native_picasso_mkdir(p, scratch, "/private/var/picasso");
++	int mobile = mobile_dir ? mobile_dir : native_picasso_copy_file("/private/var/ngpu/libpicasso-sb.dylib",
++	    "/private/var/mobile/Library/picasso/libpicasso-sb.dylib");
++	int var = var_dir ? var_dir : native_picasso_copy_file("/private/var/ngpu/libpicasso-sb.dylib",
++	    "/private/var/picasso/libpicasso-sb.dylib");
++	int plist_mobile = native_picasso_ui_pref_write("/private/var/mobile/Library/Preferences/com.apple.UIKit.plist");
++	int plist_system = native_picasso_ui_pref_write("/private/var/preferences/com.apple.UIKit.plist");
++	printf("PICASSO_UI_PREFS provider=Pad_ForcedNoCell plist=%d/%d dylib=%d/%d\n",
++	    plist_mobile, plist_system, mobile, var);
++}
++#endif
++static volatile int native_picasso_apps_stage = 0, native_picasso_apps_status = -1;
++/* The 29 separable iOS apps live in the OS volume's private/var/staged_system_apps and are absent from the
++ * iPad root's /Applications. The owner copy above puts them on Data; a union of that directory over the sealed
++ * /Applications adds their bundles to the path LaunchServices scans at boot. */
++/* The staged News app's widget stack (NewsFeed -> SiriUtilities -> PegasusAPI) force-unwraps the main
++ * CADisplay that this port's FrontBoardServices monitor cannot provide: with News.app visible over
++ * /Applications, SpringBoard traps there shortly after it starts (wf178, wf179, wf181). Keep the bundle
++ * in the staged directory, out of the union, until the display side can satisfy that code. */
++static void
++native_picasso_hide_unusable_app(proc_t p, user_addr_t scratch)
++{
++	static const char from[] = "/private/var/staged_system_apps/News.app";
++	static const char to[] = "/private/var/staged_system_apps/News.app.hidden";
++	struct rename_args request = {.from = scratch + 0xc00, .to = scratch + 0xd00};
++	int32_t result = 0;
++	int error = copyout(from, request.from, sizeof(from));
++	if (!error) {
++		error = copyout(to, request.to, sizeof(to));
++	}
++	if (!error) {
++		error = rename(p, &request, &result);
++	}
++	if (error && error != ENOENT) {
++		printf("PICASSO_APPS_HIDE app=News error=%d\n", error);
++	}
++}
++static void
++native_picasso_apps_mount(proc_t p, user_addr_t scratch)
++{
++	static const char source[] = "/private/var/staged_system_apps";
++	static const char point[] = "/Applications";
++	uint32_t picassoExtras = 7;
++	PE_parse_boot_argn("sheng-ui-extras", &picassoExtras, sizeof(picassoExtras));
++	if (!(picassoExtras & 1)) {
++		printf("PICASSO_APPS_MOUNT skipped extras=%u\n", picassoExtras);
++		return;
++	}
++	native_picasso_hide_unusable_app(p, scratch);
++	native_gpu_addon_mount(p, scratch, 0xc00, source, sizeof(source), point, sizeof(point),
++	    "/Applications/Camera.app/Info.plist", "/Applications/MobileMail.app/Info.plist",
++	    &native_picasso_apps_stage, &native_picasso_apps_status);
++	printf("PICASSO_APPS_MOUNT stage=%d status=%d\n", native_picasso_apps_stage, native_picasso_apps_status);
++}
++static int
+ native_owner_data_prepare(proc_t p, user_addr_t scratch)
+ {
+ 	uint64_t base = 0, size = 0;
+@@ -8076,7 +8297,13 @@
+ 	    strcmp(vfs_statfs(data_mount)->f_fstypename, "apfs")) error = EINVAL;
+ 	if (!error) native_owner_data_stage = 4;
+ 	if (!error) native_gpu_addon_prepare(p, scratch);
++#if DEVELOPMENT || DEBUG
++	if (!error) native_picasso_ui_prefs(p, scratch);
++#endif
+ 	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
++#if DEVELOPMENT || DEBUG
++	if (!error) native_picasso_apps_mount(p, scratch);
++#endif
+ done:
+ 	if (data_root) vnode_put(data_root);
+ 	native_owner_data_status = error;

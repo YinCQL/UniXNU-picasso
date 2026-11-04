@@ -1,0 +1,90 @@
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -163,7 +163,7 @@
+ 
+ static void handle_breakpoint(arm_saved_state_t *, uint32_t) __dead2;
+ #if DEVELOPMENT || DEBUG
+-extern void picasso_user_breakpoint(void *, uint32_t, uint32_t, uint64_t);
++extern void picasso_user_breakpoint(void *, uint32_t, uint64_t, uint32_t, uint64_t);
+ #endif
+ 
+ typedef void (*abort_inspector_t)(uint32_t, fault_status_t *, vm_prot_t *);
+@@ -1234,7 +1234,7 @@
+ 	mach_msg_type_number_t     numcodes  = 2;
+ 
+ #if DEVELOPMENT || DEBUG
+-	picasso_user_breakpoint(state, esr, current_task()->task_shared_region_slide,
++	picasso_user_breakpoint(state, esr, 0, current_task()->task_shared_region_slide,
+ 	    current_task()->mach_header_vm_address);
+ #endif
+ 	boot_progress_user_breakpoint(state, esr);
+@@ -1681,6 +1681,10 @@
+ 	}
+ #endif /* __has_feature(ptrauth_calls) */
+ 
++#if DEVELOPMENT || DEBUG
++	picasso_user_breakpoint(state, esr, (uint64_t)fault_addr,
++	    current_task()->task_shared_region_slide, current_task()->mach_header_vm_address);
++#endif
+ 	boot_progress_user_abort(state, esr, fault_addr);
+ 	if (user_fault_in_self_restrict_mode(thread) &&
+ 	    task_is_jit_exception_fatal(get_threadtask(thread))) {
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1563,14 +1563,14 @@
+ 	unsigned valid;
+ 	int pid, pidversion;
+ 	task_t task;
+-	uint64_t uniqueid, tid, pc, lr, sp, fp, esr, slide, main_header, x[29];
++	uint64_t uniqueid, tid, pc, lr, sp, fp, esr, slide, main_header, far, x[29];
+ };
+ static struct picasso_user_fault picasso_faults[8];
+ static unsigned picasso_fault_lock, picasso_fault_next, picasso_fault_filled;
+ 
+-void picasso_user_breakpoint(void *, uint32_t, uint32_t, uint64_t);
++void picasso_user_breakpoint(void *, uint32_t, uint64_t, uint32_t, uint64_t);
+ void
+-picasso_user_breakpoint(void *saved, uint32_t esr, uint32_t shared_cache_slide, uint64_t main_header)
++picasso_user_breakpoint(void *saved, uint32_t esr, uint64_t far, uint32_t shared_cache_slide, uint64_t main_header)
+ {
+ 	arm_saved_state_t *state = saved;
+ 	proc_t p = current_proc();
+@@ -1589,6 +1589,7 @@
+ 	f->sp = get_saved_state_sp(state);
+ 	f->fp = get_saved_state_fp(state);
+ 	f->esr = esr;
++	f->far = far;
+ 	/* The ARM64 caller reads these cached values without taking task locks. */
+ 	f->slide = shared_cache_slide;
+ 	f->main_header = main_header;
+@@ -1626,7 +1627,8 @@
+ 	unsigned reason = p->p_exit_reason ? p->p_exit_reason->osr_namespace : 0;
+ 	uint64_t code = p->p_exit_reason ? p->p_exit_reason->osr_code : 0;
+ 	if (p == current_proc() && proc_task(p) == current_task() &&
+-	    WIFSIGNALED(rv) && reason == OS_REASON_SIGNAL && code == SIGTRAP) {
++	    WIFSIGNALED(rv) && reason == OS_REASON_SIGNAL &&
++	    (code == SIGTRAP || code == SIGBUS || code == SIGSEGV)) {
+ 		record = "busy";
+ 		if (!__atomic_exchange_n(&picasso_fault_lock, 1, __ATOMIC_ACQUIRE)) {
+ 			record = "missing";
+@@ -1637,7 +1639,7 @@
+ 				    candidate->uniqueid == uniqueid && candidate->task == current_task() && candidate->tid == tid) {
+ 					f = *candidate;
+ 					candidate->valid = 0;
+-					record = "breakpoint-snapshot";
++					record = code == SIGTRAP ? "breakpoint-snapshot" : "data-abort-snapshot";
+ 					break;
+ 				}
+ 			}
+@@ -1651,9 +1653,9 @@
+ 	    kind, ticket, proc_getpid(p), process_name, (unsigned long long)uniqueid, (unsigned long long)tid,
+ 	    WTERMSIG(rv), reason, (unsigned long long)code, record);
+ 	if (!f.valid) return;
+-	printf("PICASSO_EL0 PC=%llx LR=%llx SP=%llx FP=%llx ESR=%llx main_header=%llx cache_slide=%llx\n",
++	printf("PICASSO_EL0 PC=%llx LR=%llx SP=%llx FP=%llx ESR=%llx FAR=%llx main_header=%llx cache_slide=%llx\n",
+ 	    (unsigned long long)f.pc, (unsigned long long)f.lr, (unsigned long long)f.sp,
+-	    (unsigned long long)f.fp, (unsigned long long)f.esr,
++	    (unsigned long long)f.fp, (unsigned long long)f.esr, (unsigned long long)f.far,
+ 	    (unsigned long long)f.main_header, (unsigned long long)f.slide);
+ 	printf("PICASSO_EL0 x0=%llx x1=%llx x2=%llx x3=%llx x19=%llx x20=%llx x21=%llx x22=%llx x23=%llx\n",
+ 	    (unsigned long long)f.x[0], (unsigned long long)f.x[1], (unsigned long long)f.x[2],

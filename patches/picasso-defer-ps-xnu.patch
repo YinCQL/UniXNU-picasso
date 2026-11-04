@@ -1,0 +1,34 @@
+diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
+--- a/bsd/dev/picasso_usb.c
++++ b/bsd/dev/picasso_usb.c
+@@ -381,6 +381,7 @@
+ 	bool        reset_pending;
+ 	bool        hang_pending;
+ 	bool        start_kext_pending;
++	unsigned    ps_pending;
+ 	bool        register_pending;
+ 	int         publish_pending;
+ 	bool        watchdog;
+@@ -2325,6 +2326,8 @@
+ 		    os_atomic_load(&pur_dropped, relaxed));
+ 	} else if (ud_command_is(ud.cmd, "ps")) {
+ 		printf("PICASSO CDC: process list sample=%u\n", ++processSamples);
+-		picasso_live_process_list(processSamples);
++		/* Deferred: the process list takes task and ledger locks, and ud_process_command()
++		 * runs under the poll lock, whose holder also drains the USB console. */
++		ud.ps_pending = processSamples;
+ 	} else if (ud_command_is(ud.cmd, "panic-test")) {
+ 		printf("PICASSO CDC: panic-test requested; emitting marker now\n");
+@@ -2508,6 +2510,12 @@
+ 			printf("PICASSO CDC: start-graphics helper unavailable\n");
+ 		}
+ 	}
++	if (ud.ps_pending && !ud.panic_mode) {
++		unsigned sample = ud.ps_pending;
++		ud.ps_pending = 0;
++		extern void picasso_live_process_list(unsigned);
++		picasso_live_process_list(sample);
++	}
+ 	if (ud.register_pending && !ud.panic_mode) {
+ 		ud.register_pending = false;
+ 		extern kern_return_t native_register_display_and_report(void)

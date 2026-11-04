@@ -14,7 +14,7 @@
 
 extern "C" IOService *native_gop_presenter_create(void);
 extern "C" bool native_gop_gpu_offer(IOService *, void *, IOMemoryDescriptor *,
-    uint64_t, uint32_t, uint32_t);
+    uint64_t, uint32_t, uint32_t, uint32_t);
 
 static IOService *gGopPresenter;
 
@@ -35,7 +35,7 @@ extern "C" bool native_gop_glue_start(IOService *nub) {
 }
 
 extern "C" bool native_legacy_gpu_offer(void *display, IOMemoryDescriptor *memory,
-    uint64_t stride, uint32_t width, uint32_t height) {
+    uint64_t stride, uint32_t width, uint32_t height, uint32_t destY) {
     return gGopPresenter &&
-        native_gop_gpu_offer(gGopPresenter, display, memory, stride, width, height);
+        native_gop_gpu_offer(gGopPresenter, display, memory, stride, width, height, destY);
 }

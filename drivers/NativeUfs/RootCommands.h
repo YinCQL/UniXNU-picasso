@@ -379,8 +379,9 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
 // The only place this driver writes. At most two windows of 4096-byte LBAs on LUN 0 (the Data store and the diagnostic log),
 // each opened once by its integration after it has proved that the window lies inside the userdata partition and clear of the
 // root image; every write is checked against them again here, so nothing outside them can be written even if a caller is wrong.
-static bool gStoreOpen = false, gLogOpen = false;
+static bool gStoreOpen = false, gLogOpen = false, gAuxOpen = false;
 static uint64_t gStoreFirst = 0, gStoreBlocks = 0, gLogFirst = 0, gLogBlocks = 0;
+static uint64_t gAuxFirst = 0, gAuxBlocks = 0;
 
 static bool hostLogOpen (uint64_t first, uint64_t blocks)
 {
@@ -395,7 +396,21 @@ static bool hostLogOpen (uint64_t first, uint64_t blocks)
 static bool hostInWindow (uint64_t lba, uint32_t blocks)
 {
   if (gStoreOpen && lba >= gStoreFirst && lba - gStoreFirst < gStoreBlocks && blocks <= gStoreBlocks - (lba - gStoreFirst)) return true;
+  if (gAuxOpen && lba >= gAuxFirst && lba - gAuxFirst < gAuxBlocks && blocks <= gAuxBlocks - (lba - gAuxFirst)) return true;
   return gLogOpen && lba >= gLogFirst && lba - gLogFirst < gLogBlocks && blocks <= gLogBlocks - (lba - gLogFirst);
+}
+
+// A small board-owned window just below the Data store (the LSP blob and the pipeline cache). It is a third
+// window so its writes stay out of the overlay's page slots and out of the log/export window.
+static bool hostAuxOpen (uint64_t first, uint64_t blocks)
+{
+  if (gAuxOpen || !blocks || first > 0xffffffffULL || blocks > 0xffffffffULL - first) return false;
+  if (gStoreOpen && first < gStoreFirst + gStoreBlocks && gStoreFirst < first + blocks) return false;
+  if (gLogOpen && first < gLogFirst + gLogBlocks && gLogFirst < first + blocks) return false;
+  gAuxFirst = first;
+  gAuxBlocks = blocks;
+  gAuxOpen = true;
+  return true;
 }
 
 static bool hostStoreOpen (uint64_t first, uint64_t blocks)

@@ -15,7 +15,7 @@ import termios
 import time
 
 
-COMMANDS = ('help', 'status', 'uistate', 'panic-test', 'reset-test',
+COMMANDS = ('help', 'status', 'ps', 'snapshot', 'uistate', 'panic-test', 'reset-test',
             'start-graphics', 'register-display', 'publish-display',
             'publish-display-start', 'hang-test', 'reboot-fastboot')
 

@@ -1,0 +1,185 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5865,10 +5865,116 @@
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++#if DEVELOPMENT || DEBUG
++/*
++ * Picasso bring-up: boot-arg picasso_inject_sb=PATH starts SpringBoard and
++ * PosterBoard with DYLD_INSERT_LIBRARIES=PATH so dyld loads our library into
++ * them. launchd refuses
++ * DYLD_ variables from a job, so the kernel adds this one (after HackiOS's
++ * kern.exec_inject). picasso_inject_apps=1 extends the same metric to apps.
++ */
++/* Only main executables of application bundles receive UIKit metrics.
++ * Canonical vnode paths exclude app extensions, framework helpers and daemons. */
++static bool
++picasso_statusbar_app_path(const char *path)
++{
++	const char *bundle = NULL;
++	if (!strncmp(path, "/Applications/", 14)) bundle = path + 14;
++	else if (!strncmp(path, "/System/Applications/", 21)) bundle = path + 21;
++	else {
++		const char *containers = "/private/var/containers/Bundle/Application/";
++		size_t prefix = strlen(containers);
++		if (strncmp(path, containers, prefix)) return false;
++		const char *uuid = path + prefix;
++		const char *slash = strchr(uuid, '/');
++		if (!slash || slash - uuid != 36) return false;
++		bundle = slash + 1;
++	}
++	const char *slash = strchr(bundle, '/');
++	if (!slash || slash - bundle <= 4 || strncmp(slash - 4, ".app", 4) ||
++	    !slash[1] || strchr(slash + 1, '/')) return false;
++	return true;
++}
++
++/* The UI processes that need the board's UIKit/WallpaperKit adjustments. */
++static bool
++picasso_inject_program(const char *name, size_t length)
++{
++	static const char springboard[] = "SpringBoard";
++	static const char posterboard[] = "PosterBoard";
++	return (length == sizeof(springboard) - 1 &&
++	    !strncmp(name, springboard, sizeof(springboard) - 1)) ||
++	    (length == sizeof(posterboard) - 1 &&
++	    !strncmp(name, posterboard, sizeof(posterboard) - 1));
++}
++
++static bool
++picasso_springboard_inject_env(struct image_params *imgp, char *env, size_t size)
++{
++	char path[200];
++	if (imgp->ip_ndp == NULL) return false;
++	if (!picasso_inject_program(imgp->ip_ndp->ni_cnd.cn_nameptr, imgp->ip_ndp->ni_cnd.cn_namelen)) {
++		int applications = 0;
++		if (!PE_parse_boot_argn("picasso_inject_apps", &applications, sizeof(applications)) ||
++		    applications != 1 || imgp->ip_vp == NULL) return false;
++		char executable[MAXPATHLEN];
++		int length = sizeof(executable);
++		if (vn_getpath(imgp->ip_vp, executable, &length) ||
++		    !picasso_statusbar_app_path(executable)) return false;
++	}
++	int enabled = 0;
++	static const char default_library[] = "/private/var/mobile/Library/picasso/libpicasso-sb.dylib";
++	if (PE_parse_boot_argn("picasso_inject_sb", &enabled, sizeof(enabled)) && enabled == 1) {
++		snprintf(path, sizeof(path), "%s", default_library);
++	} else if (!PE_parse_boot_argn("picasso_inject_sb", path, sizeof(path)) || path[0] != '/') {
++		return false;
++	}
++	snprintf(env, size, "DYLD_INSERT_LIBRARIES=%s", path);
++	printf("PICASSO_INJECT %.*s started with %s\n",
++	    (int)imgp->ip_ndp->ni_cnd.cn_namelen, imgp->ip_ndp->ni_cnd.cn_nameptr, env);
++	return true;
++}
++
++/* Keep dyld path-variable policy local to the executables that receive the
++ * board's explicit injection. The executing process keeps its text vnode alive. */
++bool
++picasso_dyld_inject_target(proc_t p)
++{
++	char library[200];
++	int enabled = 0;
++	if (p != current_proc()) return false;
++	if (!(PE_parse_boot_argn("picasso_inject_sb", &enabled, sizeof(enabled)) && enabled == 1) &&
++	    (!PE_parse_boot_argn("picasso_inject_sb", library, sizeof(library)) || library[0] != '/')) return false;
++	if (picasso_inject_program(p->p_name, strlen(p->p_name))) return true;
++	int applications = 0;
++	if (!PE_parse_boot_argn("picasso_inject_apps", &applications, sizeof(applications)) ||
++	    applications != 1 || p->p_textvp == NULL) return false;
++	char executable[MAXPATHLEN];
++	int length = sizeof(executable);
++	return !vn_getpath(p->p_textvp, executable, &length) && picasso_statusbar_app_path(executable);
++}
++
++/* Read-only load acknowledgement. Some sandboxes may deny this read;
++ * only a captured acknowledgement establishes that the library constructor ran. */
++static int
++picasso_inject_ack_sysctl SYSCTL_HANDLER_ARGS
++{
++	int value = 1;
++	char name[32] = "?";
++	proc_name(proc_selfpid(), name, sizeof(name));
++	printf("PICASSO_SBINJECT library ran: ack read by pid=%d name=%s\n", proc_selfpid(), name);
++	return SYSCTL_OUT(req, &value, sizeof(value));
++}
++SYSCTL_PROC(_kern, OID_AUTO, picasso_inject_ack, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, picasso_inject_ack_sysctl, "I", "picasso: prints the reader's pid to confirm injection");
++#endif
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+ {
++#if DEVELOPMENT || DEBUG
++	char picasso_inject[256];
++#endif
+ 	int error = 0;
+ 	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
+ 	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
+@@ -6038,6 +6144,22 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if DEVELOPMENT || DEBUG
++	/* One more variable for the selected UI executable. */
++	if (picasso_springboard_inject_env(imgp, picasso_inject, sizeof(picasso_inject))) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(picasso_inject), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+--- a/security/mac_base.c
++++ b/security/mac_base.c
+@@ -1560,6 +1560,30 @@
+  *                !0                      Not success
+  *
+  */
++#if DEVELOPMENT || DEBUG
++extern bool picasso_dyld_inject_target(proc_t);
++/* 20H392 amfi_check_dyld_policy_self uses AMFI call 90 with two uint64_t
++ * words: input flags and a user pointer to output flags. Keep the MAC policy's
++ * decision/error; only allow DYLD path variables for the board-selected UI. */
++static void
++picasso_dyld_path_policy(proc_t p, int call, const char *policy, user_addr_t arg, int error)
++{
++	if (error || call != 90 || strcmp(policy, "AMFI") || !picasso_dyld_inject_target(p)) return;
++	uint64_t request[2], flags = 0, original = 0;
++	int result = copyin(arg, request, sizeof(request));
++	if (!result) result = copyin((user_addr_t)request[1], &flags, sizeof(flags));
++	if (!result) {
++		original = flags;
++		flags |= 1ULL << 1; /* AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS only. */
++		result = copyout(&flags, (user_addr_t)request[1], sizeof(flags));
++	}
++	static unsigned reports;
++	if (__atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED) < 16)
++		printf("PICASSO_INJECT dyld policy pid=%d old=%llx new=%llx result=%d\n",
++		    proc_getpid(p), (unsigned long long)original, (unsigned long long)flags, result);
++}
++#endif
++
+ int
+ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
+ {
+@@ -1614,6 +1638,9 @@
+ 	}
+ 
+ done:
++#if DEVELOPMENT || DEBUG
++	picasso_dyld_path_policy(p, uap->call, target, uap->arg, error);
++#endif
+ 	return error;
+ }
+ 
