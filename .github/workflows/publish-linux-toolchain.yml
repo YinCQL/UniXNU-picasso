@@ -8,6 +8,10 @@ on:
         default: picasso-linux-toolchain-v1-ubuntu24-x86_64
         required: true
         type: string
+      build_if_missing:
+        description: Build the toolchain once if no compatible cache exists
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -27,7 +31,7 @@ jobs:
   package:
     if: github.ref_name != 'main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 360
     outputs:
       manifest_sha256: ${{ steps.package.outputs.manifest_sha256 }}
       tag: ${{ steps.package.outputs.tag }}
@@ -57,7 +61,12 @@ jobs:
         with:
           path: /home/runner/work/_temp/unixnu-linux
           key: ${{ steps.identity.outputs.key }}
-          fail-on-cache-miss: true
+          fail-on-cache-miss: ${{ !inputs.build_if_missing }}
+      - name: Build a new toolchain version only when explicitly requested
+        if: steps.cache.outputs.cache-hit != 'true' && inputs.build_if_missing
+        run: |
+          sudo python3 "$UNIXNU_TREE/scripts/linux/setup-toolchain.py" \
+            /home/runner/work/_temp/unixnu-linux --package-manager none -j "$(nproc)"
       - name: Qualify and package the toolchain with licenses and provenance
         id: package
         env:
