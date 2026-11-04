@@ -138,7 +138,7 @@ def main():
     artifact_spec = importlib.util.spec_from_file_location('data_artifacts', ROOT / 'scripts/check-picasso-data-artifacts.py')
     artifact = importlib.util.module_from_spec(artifact_spec); artifact_spec.loader.exec_module(artifact)
     class ReachedPolicyMount(Exception): pass
-    def artifact_source_case(name, launchd_sha, os_sha, error=None):
+    def artifact_source_case(name, launchd_sha, os_sha, error=None, host='darwin'):
         work = out / name
         seed_dir = work / 'ram-data'; seed_dir.mkdir(parents=True)
         (seed_dir / 'data.dbrdisk').write_bytes(empty_data.read_bytes())
@@ -155,7 +155,11 @@ def main():
             assert readonly is True
             raise ReachedPolicyMount()
         preparation = dict(vars(data), mounted=stop_at_mount)
-        with mock.patch.object(artifact.runpy, 'run_path', return_value=preparation) as run_path:
+        # This fixture models the native macOS audit boundary on every host.
+        # Linux production builds instead require a separately audited Compose bundle.
+        with mock.patch.object(artifact.runpy, 'run_path', return_value=preparation) as run_path, \
+             mock.patch.object(artifact.sys, 'platform', host), \
+             mock.patch.dict(os.environ, {'PICASSO_LINUX_INPUTS': ''}):
             try: artifact.check(work, work / 'tree', output)
             except ReachedPolicyMount: assert error is None
             except ValueError as failure:
@@ -170,6 +174,8 @@ def main():
     artifact_source_case('artifact rejects old launchd', old_launchd, data.OS_SHA256, 'launchd')
     artifact_source_case('artifact rejects old OS', data.LAUNCHD_SHA256, old_os, 'OS image')
     artifact_source_case('artifact rejects old OS and launchd', old_launchd, old_os, 'launchd')
+    artifact_source_case('Linux artifact rejects missing Compose inputs', data.LAUNCHD_SHA256,
+                         data.OS_SHA256, 'requires audited Compose inputs', host='linux')
 
     payload = {'offline_disabled_jobs': ['com.apple.CommCenter'],
                'adt': {'packed_data_ramdisk': True}}
