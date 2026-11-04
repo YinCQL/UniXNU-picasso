@@ -6,7 +6,6 @@ original constructor, destructor and metaclass addresses from build/gpu-analysis
 import hashlib
 import json
 from pathlib import Path
-import platform
 import struct
 import subprocess
 import sys
@@ -72,8 +71,13 @@ while i < len(args):
 cmd += ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-c99-designator',
         '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion', '-Wno-overloaded-virtual',
         '-I', str(ROOT / '.cache/xnu-work/osfmk')]
-if platform.system() == 'Darwin':
-    cmd.append('-Wno-unnecessary-virtual-specifier')
+# The exported XNU OSSymbol header declares virtual methods in a final class.
+# Both Apple clang and the pinned Linux clang diagnose this harmless declaration.
+warning = '-Wno-unnecessary-virtual-specifier'
+if subprocess.run([cmd[0], '-Werror=unknown-warning-option', warning,
+                   '-x', 'c++', '-fsyntax-only', '-'], input='', text=True,
+                  capture_output=True).returncode == 0:
+    cmd.append(warning)
 subprocess.run(cmd, cwd=record['directory'], check=True)
 
 raw = obj.read_bytes()

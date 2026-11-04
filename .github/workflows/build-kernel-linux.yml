@@ -1,7 +1,7 @@
 name: Build Picasso Kernel (Linux)
 
-# Builds and prelinks kernel.macho from the pinned upstream and device sources.
-# APFS Data preparation, UIKit libraries and boot.img composition are separate steps.
+# Builds the kernel, FAT payload and boot.img on Linux. Reuses an audited APFS
+# Data seed from a successful macOS Compose run, then caches that seed separately.
 
 on:
   workflow_dispatch:
@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: picasso-linux-kernel-${{ github.event_name }}-${{ github.ref }}
@@ -51,6 +52,12 @@ jobs:
           echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
           echo "UNIXNU_TOOLCHAIN=$RUNNER_TEMP/unixnu-linux" >> "$GITHUB_ENV"
           echo "UNIXNU_LLVM_BIN=$RUNNER_TEMP/unixnu-linux/llvm/bin" >> "$GITHUB_ENV"
+
+      - name: Identify the compatible packed APFS Data seed
+        id: data_seed_key
+        run: |
+          KEY=$(python3 scripts/reuse-picasso-ram-data.py --tree "$UNIXNU_TREE" --cache-key)
+          echo "digest=$KEY" >> "$GITHUB_OUTPUT"
 
       - name: Install Linux host dependencies and identify the toolchain
         id: toolchain_key
@@ -99,33 +106,117 @@ jobs:
           python3 scripts/fetch-picasso-touch-firmware.py --output out/picasso/novatek/firmware.bin
           echo "NOVATEK_TOUCH_FW=$PWD/out/picasso/novatek/firmware.bin" >> "$GITHUB_ENV"
 
-      - name: Fetch the pinned kernelcache and check the original class ABI
+      - name: Fetch the pinned kernelcache and original trust caches
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 ./unixnu defconfig picasso_defconfig
-          python3 ./unixnu ipsw fetch KernelCache 2>&1 | tee out/picasso/logs/linux-ipsw.log
+          python3 ./unixnu ipsw fetch KernelCache StaticTrustCache Cryptex1,SystemTrustCache \
+            2>&1 | tee out/picasso/logs/linux-ipsw.log
           echo "UNIXNU_KERNELCACHE=$PWD/out/ipsw/21H461/kernelcache.decompressed" >> "$GITHUB_ENV"
+          python3 scripts/prepare-original-trust.py --tree "$UNIXNU_TREE" --inputs out/ipsw/21H461 \
+            --output out/picasso/original-static-system.bundle \
+            2>&1 | tee out/picasso/logs/linux-trust.log
           python3 scripts/check-picasso-original-abi.py \
             --kernelcache out/ipsw/21H461/kernelcache.decompressed \
             --native-prelink-dir "$UNIXNU_TREE/kits/XnuPrelink" \
             --output out/picasso/logs/original-abi.json
 
-      - name: Build and prelink the Picasso kernel
+      - name: Restore the compatible audited Data seed
+        id: data_seed_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            device/out/picasso/ram-data/data.dbrdisk
+            device/out/picasso/ram-data/seed.json
+            device/out/picasso/ram-data/source-var-manifest.json
+            device/out/picasso/ram-data/reuse.json
+          key: picasso-apfs-data-v1-${{ steps.data_seed_key.outputs.digest }}
+
+      - name: Validate or import the Data seed and select its kernel UUID
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/reuse-picasso-ram-data.py --tree "$UNIXNU_TREE" \
+            --output out/picasso/ram-data --config out/picasso/.config \
+            2>&1 | tee out/picasso/logs/linux-data-seed.log
+
+      - name: Cache the verified seed before compiling the kernel
+        if: steps.data_seed_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            device/out/picasso/ram-data/data.dbrdisk
+            device/out/picasso/ram-data/seed.json
+            device/out/picasso/ram-data/source-var-manifest.json
+            device/out/picasso/ram-data/reuse.json
+          key: ${{ steps.data_seed_cache.outputs.cache-primary-key }}
+
+      - name: Build and prelink the Picasso kernel and FAT payload
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          UNIXNU_UNIQUE_CHIP_ID: "41a551c0dec0de01"
         run: |
           python3 ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
-          python3 ./unixnu build kernel -j "$(nproc)" 2>&1 | tee out/picasso/logs/linux-build.log
+          python3 ./unixnu build kernel payload -j "$(nproc)" \
+            --trust-cache out/picasso/original-static-system.bundle \
+            --data-ramdisk out/picasso/ram-data/data.dbrdisk \
+            2>&1 | tee out/picasso/logs/linux-build.log
           test -s out/picasso/kernel/kernel.macho
+          test -s out/picasso/payload/payload.img
           sha256sum out/picasso/kernel/kernel.macho > out/picasso/kernel/SHA256SUMS
 
-      - name: Upload the prelinked kernel and build reports
+      - name: Verify Data UUID, payload handoff, AES and watchdog policy
+        run: |
+          python3 scripts/check-picasso-data-artifacts.py --tree out/picasso/tree --work out/picasso \
+            --output out/picasso/logs/data-artifacts.json
+          python3 scripts/check-picasso-aes-artifacts.py --tree out/picasso/tree --work out/picasso \
+            --kernelcache "$UNIXNU_KERNELCACHE" --output out/picasso/logs/aes-artifacts.json
+          python3 scripts/check-picasso-watchdog-policy.py --verify \
+            --kernelcache "$UNIXNU_KERNELCACHE" --candidate out/picasso/kernel/kernel.macho \
+            --native-prelink-dir "$UNIXNU_TREE/kits/XnuPrelink" \
+            --output out/picasso/logs/watchdog-policy.json
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          kernel = Path('out/picasso/kernel/kernel.macho')
+          plan = json.loads(kernel.with_suffix('.json').read_text())
+          if hashlib.sha256(kernel.read_bytes()).hexdigest() != plan['candidate_sha256']:
+              raise SystemExit('Prelink report does not match kernel.macho')
+          for component in ('com.apple.security.sandbox', 'com.apple.kext.AppleMatch', 'com.apple.iokit.IOSurface'):
+              if component not in plan['components']:
+                  raise SystemExit(f'Missing required original component: {component}')
+              start = plan['module_entrypoints'][component]['start_va']
+              if not any(e['module'] == component and e['segment'] == '__TEXT_EXEC'
+                         and e['va'] <= start < e['va'] + e['size'] for e in plan['extents']):
+                  raise SystemExit(f'Missing executable module entry: {component}')
+          PY
+
+      - name: Compose and verify boot.img from BootShim, repo FD and payload
+        run: |
+          python3 ./unixnu bootimg \
+            --uefi "$PWD/uefi/mu-silicium" --fd "$PWD/uefi/SILICIUM_UEFI.fd" \
+            --dtb "$PWD/uefi/mu-silicium/Resources/DTBs/picasso.dtb" \
+            --ramdisk "$PWD/out/picasso/payload/payload.img" \
+            -o "$PWD/out/picasso/boot/boot.img" \
+            2>&1 | tee out/picasso/logs/linux-bootimg.log
+          test -s out/picasso/boot/boot.img
+          sha256sum out/picasso/boot/boot.img out/picasso/payload/payload.img \
+            > out/picasso/boot/SHA256SUMS
+
+      - name: Upload boot image, kernel, payload and build reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: picasso-linux-kernel-${{ github.run_number }}
+          name: picasso-linux-bootimg-${{ github.run_number }}
+          include-hidden-files: true
           path: |
+            device/out/picasso/boot/
             device/out/picasso/kernel/
+            device/out/picasso/payload/
             device/out/picasso/logs/
+            device/out/picasso/ram-data/*.json
+            device/out/picasso/ram-data/data.dbrdisk
+            device/out/picasso/.config
           if-no-files-found: warn
+          retention-days: 7
