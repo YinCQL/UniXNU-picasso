@@ -116,7 +116,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
-          python3 ./unixnu build kernel -j 2 2>&1 | tee out/picasso/logs/linux-build.log
+          python3 ./unixnu build kernel -j "$(nproc)" 2>&1 | tee out/picasso/logs/linux-build.log
           test -s out/picasso/kernel/kernel.macho
           sha256sum out/picasso/kernel/kernel.macho > out/picasso/kernel/SHA256SUMS
 
