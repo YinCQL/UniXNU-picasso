@@ -72,6 +72,8 @@ public:
     static IOReturn handoffCall(uint32_t op,task_t task,const void *in,size_t inSize,void *out,size_t outSize);
     static IOMemoryDescriptor *handoffMemory();
     bool offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height,uint32_t destY);
+    // Take back the swap this display owns (the display is stopping; its completion must not reach it).
+    void abandonDisplay(void *display);
 private:
     IOReturn transfer(task_t,const NGPPresent &,NGPTransfer *);
 public:
@@ -195,6 +197,9 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     gpuClient=true;
     while(online && (!swap.offered || swap.delivered)) {
         if(IOLockSleepDeadline(gate,&swap,deadline,THREAD_ABORTSAFE)!=THREAD_AWAKENED) {
+            // Nobody is waiting for a frame after this return: refuse offers until the client waits again, so a
+            // frame is not accepted for a client that has gone away.
+            gpuClient=false;
             IOLockUnlock(gate);
             uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-began,&ns);
             native_gop_wait_stats[1]=native_gop_wait_stats[1]+1;native_gop_wait_stats[3]=ns;
@@ -281,6 +286,26 @@ void NativeGOPPresenter::abandonSwap() {
     OSSafeReleaseNULL(done.map);if(done.memory)done.memory->release();
     __atomic_fetch_add(&native_gop_gpu_abandoned,1,__ATOMIC_RELAXED);
     native_legacy_gpu_complete(done.display,kIOReturnAborted);
+}
+// The display named in the outstanding swap is going away. Take the frame back without calling it: its
+// completion would reach a stopped (and freed) display.
+void NativeGOPPresenter::abandonDisplay(void *display) {
+    if(!gate)return;
+    bool mine=false;
+    IOLockLock(gate);
+    if(swap.offered && swap.display==display) {
+        mine=true;gpuClient=false;cancelWatchdog();
+        auto done=swap;swap={};
+        IOLockUnlock(gate);
+        OSSafeReleaseNULL(done.map);if(done.memory)done.memory->release();
+        __atomic_fetch_add(&native_gop_gpu_abandoned,1,__ATOMIC_RELAXED);
+        return;
+    }
+    IOLockUnlock(gate);
+    (void)mine;
+}
+extern "C" void native_gop_gpu_abandon_display(void *display) {
+    if(NativeGOPPresenter *p=gHandoff)p->abandonDisplay(display);
 }
 extern "C" void native_gop_presenter_set_source(IOService *presenter,IOService *nub) {
     if(NativeGOPPresenter *p=OSDynamicCast(NativeGOPPresenter,presenter))p->setMemorySource(nub);

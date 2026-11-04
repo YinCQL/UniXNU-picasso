@@ -39,6 +39,8 @@ extern "C" void native_legacy_retirement_observed(IOService *);
 // either takes the frame or refuses it, in which case this file keeps the CPU
 // path unchanged. A failed GPU copy falls back for the rest of the kick.
 extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height,uint32_t destY);
+// Take back a swap the GPU client still owns for this display (presenter side; used when the display stops).
+extern "C" void native_gop_gpu_abandon_display(void *display);
 extern "C" void native_legacy_swap_stage(unsigned stage);
 extern "C" void native_legacy_gpu_fallback_observed(int status);
 extern "C" {extern volatile uint64_t native_legacy_early_retires,native_legacy_early_failures;}
@@ -153,23 +155,28 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         OSSafeReleaseNULL(vsyncTimer);vsyncArmed=false;
     }
 public:
-    // Called by the GPU client's completion (any thread): the swap finishes on
-    // the framebuffer's work loop, where the queue and the vsync clients live.
+    // Called by the GPU client's completion (any thread): the swap finishes on the framebuffer's work loop, the
+    // loop the swap queue and the vsync clients live on. The family's command gate is not reachable from this
+    // subclass, so the state transitions are made idempotent instead: every path out of finishGpuSwap clears
+    // transferred (a latch left set with gpuRequest cleared stopped every later kick and froze the compositor).
     void gpuComplete(int status) {
         struct Args {NativeLegacyDisplay *display;int status;};
         Args *args=(Args *)IOMalloc(sizeof(Args));
         if(!args){finishGpuSwap(status);return;}
         args->display=this;args->status=status;
-        IOWorkLoop *loop=getWorkLoop();
         auto action=[](OSObject *,void *a0,void *,void *,void *)->IOReturn {
             Args *a=(Args *)a0;a->display->finishGpuSwap(a->status);IOFree(a,sizeof(Args));return kIOReturnSuccess;
         };
+        IOWorkLoop *loop=getWorkLoop();
         if(loop && loop->runAction(action,this,args)==kIOReturnSuccess)return;
         IOFree(args,sizeof(Args));
         finishGpuSwap(status);
     }
     void free() override {stopVsync();releaseCopyShadow();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
+        // The GPU client may still own a frame; take it back before the display goes away, or its later completion
+        // would reach a stopped (and freed) display.
+        native_gop_gpu_abandon_display(this);
         stopVsync();
         releaseCopyShadow();
         transferred=false;gpuRequest=nullptr;gpuRetired=false;gpuStartTick=0;for(auto &entry: validated)entry=nullptr;
@@ -489,7 +496,9 @@ public:
     void finishTransfer(const OriginalLegacySwapRequest *request,bool force=false) {
         // Only after the real copy and store barrier: select the actual pending head and let the unchanged family release it and wake
         // waiters. This reports memory scanout completion, not a panel vblank or hardware fence.
-        if(!retireSwap(request,force)){native_legacy_retirement_failed(this);return;}
+        // A failed retirement must still clear the latch: the request stays validated and may retire later, but a
+        // latch left set here stopped every later kick (the compositor then never offered another frame).
+        if(!retireSwap(request,force)){native_legacy_retirement_failed(this);transferred=false;return;}
         // The unchanged family has retired this generation and released its current reference. Permit the next independently validated
         // single pending frame. Keep the latch set while completion can reenter this method, and whenever retirement remains disabled.
         transferred=false;
@@ -501,7 +510,7 @@ public:
     void finishGpuSwap(int status) {
         const OriginalLegacySwapRequest *request=gpuRequest;
         gpuStartTick=0;
-        if(!request)return;
+        if(!request) {transferred=false;return;}
         gpuRequest=nullptr;
         if(gpuRetired) {
             gpuRetired=false;

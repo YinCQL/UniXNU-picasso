@@ -418,3 +418,31 @@ Do not carry its "App normal" conclusion forward.
   before returning; the vk_sync path, which holds no device mutex, keeps the condition-variable wait. wf239 = wf238
   kernel (4f54815b) + wf238 plugin instrumentation + the fixed Turnip. Acceptance: no freeze past 987 s of uptime,
   `submit` keeps advancing, `PF` failures 0, and the `WD` sampler stays silent.
+- **Settings: blank row icons and a slow first launch (investigation, wf241/wf242)**: the user reports that the
+  system-row icons (Wi-Fi, Bluetooth, General, ...) draw as blank placeholders and that Settings takes long to
+  open, on both the phone and the iPad layout. Evidence gathered so far:
+  * `iconservicesagent` is not dead: wf237 has 93 traced XPC links to it, 77 already established, 12 lost
+    (on-demand `EnablePressuredExit` churn). It never opens the GPU plugin, so the published-client allow-list
+    is not involved.
+  * The icons are SF Symbols, not bundle assets: Preferences.app's Assets.car holds only the app icon,
+    Preferences.framework's holds passcode/monogram pieces, PreferencesUI.framework's holds SilentIcon/SoundIcon
+    and similar. `CoreGlyphs.bundle/Assets.car` (98 MB) has `wifi`, `gearshape`, `bell`, `display`,
+    `accessibility`, ... all **universal** idiom with bitmap scales 1/2/3 plus a vector glyph, so iPad asset
+    thinning cannot explain the blanks (and the user confirms the iPad layout shows them too).
+  * Therefore the failure is in runtime symbol lookup/rasterization, not in the resources. wf241 adds a probe to
+    the root daemon (`adrenoprobed`, which now really compiles as Objective-C++ — the build had put
+    `-x objective-c++` after the source, so it had been built as C++) that prints to `/dev/console`:
+    `PICASSO_ICON car bytes=.. map=.. magic=..` for the CoreGlyphs catalog, `PICASSO_ICON system wifi=ok|nil`,
+    `cgimage=..`, and `pixels opaque=.. colored=..` after drawing the symbol into a 32x32 bitmap. One boot with
+    that image answers whether symbol rendering works at all; the Settings launch time can then be compared with
+    the frame path (`PF` lines) to separate app-side CPU rendering from compositing.
+- **GPU audit fixes (wf242)**: a read-only audit of the kernel GPU path found one race that reproduces the wf237
+  freeze signature without any Turnip involvement: `finishGpuSwap` runs on the work-loop action while the swap
+  queue runs from the external-method path, and an interleaving could leave `transferred` set with
+  `gpuRequest` cleared, after which every kick returned early. The family's command gate is not reachable from
+  the subclass, so the transitions are now idempotent instead: every path out of `finishGpuSwap`/`finishTransfer`
+  clears `transferred`, `waitSwap` clears `gpuClient` on every return that is not a delivery, and the display's
+  `stop()` takes back a frame the presenter still owns (it must not complete into a freed display). The audit's
+  remaining findings (fence waits under the global device lock with no pacing, sticky poison with an unreachable
+  restart, SMC probes inside the restart under the lock, TTBR0 switch without the ring's idle check, the
+  stranded-ring job fabricated as completed, VM teardown leaks) are recorded here as the next GPU-stability round.
