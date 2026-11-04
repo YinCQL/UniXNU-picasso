@@ -5,6 +5,7 @@
 #include "NativeLegacyRequest.h"
 #include "PicassoGop.h"
 #include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
@@ -73,6 +74,12 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool primary=false;
     bool logicalPM=false;
     bool transferred=false;
+    /* kickSwapQueue is entered from three different threads: the compositor's own submission (its client thread
+     * through the family), the GPU completion (scheduled onto this display's work loop), and the refresh tick
+     * below. A plain bool was not enough to serialize them: two kicks could see kicking==false at the same time
+     * and run kickOnce concurrently (wf242 stopped with a queued frame that no kick ever transferred). A recursive
+     * lock serializes real kicks and still lets finishTransfer's nested call from inside kickOnce only set rekick. */
+    IORecursiveLock *kickLock=nullptr;
     // The frame currently owned by the GPU client (valid until its completion),
     // and whether that swap already retired when the client took it.
     const OriginalLegacySwapRequest *gpuRequest=nullptr;
@@ -129,6 +136,27 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         const uint64_t now=mach_absolute_time();
         native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);
         native_legacy_vsync_observed(1,vsyncHz);
+        /* The GOP has no vblank interrupt, so this tick is the display's only periodic heartbeat. A frame the GPU
+         * client took could lose its completion, and a validated frame's kick could be swallowed between the
+         * compositor's submission and the completion thread; either way the compositor then waits for a
+         * retirement that never comes and never submits again (wf242: submit stopped at 896, the tick kept
+         * running, no flip timeout, nothing else ever kicked). Pump the queue about once a second while either
+         * latch says there is work, so the display recovers without another submission. */
+        static unsigned tickSeq,latchPrints;
+        if(vsyncHz && (++tickSeq%vsyncHz)==0) {
+            bool waiting=false;
+            for(auto entry: validated)if(entry){waiting=true;break;}
+            uint64_t held=0;
+            if(transferred && gpuStartTick)absolutetime_to_nanoseconds(mach_absolute_time()-gpuStartTick,&held);
+            if(transferred || waiting) {
+                if(latchPrints<12 && transferred && held>=1000000000ull) {
+                    ++latchPrints;
+                    printf("PICASSO_DISPLAY gpu latch held_ms=%llu pending=%u recovered by tick\n",
+                        (unsigned long long)(held/1000000),unsigned(waiting));
+                }
+                kickSwapQueue();
+            }
+        }
         vsyncNext+=vsyncInterval;
         if(vsyncNext<=now){vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}
         vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
@@ -172,7 +200,7 @@ public:
         IOFree(args,sizeof(Args));
         finishGpuSwap(status);
     }
-    void free() override {stopVsync();releaseCopyShadow();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+    void free() override {stopVsync();releaseCopyShadow();if(kickLock){IORecursiveLockFree(kickLock);kickLock=nullptr;}if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
         // The GPU client may still own a frame; take it back before the display goes away, or its later completion
         // would reach a stopped (and freed) display.
@@ -199,6 +227,7 @@ public:
     }
     bool startDisplay(IOService *provider) {
         if(!IOMobileFramebufferLegacy::start(provider))return false;
+        if(!kickLock)kickLock=IORecursiveLockAlloc();
         if(primary && bootMapping)announcePoweredByFirmware();
         unsigned enabled=1;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
         if(!enabled)return true;
@@ -261,6 +290,12 @@ public:
     // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
     bool kicking=false,rekick=false;
     void kickSwapQueue() override {
+        if(!kickLock){kickSwapLocked();return;}
+        IORecursiveLockLock(kickLock);
+        kickSwapLocked();
+        IORecursiveLockUnlock(kickLock);
+    }
+    void kickSwapLocked() {
         /* wf131: whether the compositor's queued swap ever reaches the kick, and whether a
          * vsync client is registered at that moment. wf132: the kick also establishes that a
          * display client exists, which is what the tick needs to run. */
@@ -510,7 +545,7 @@ public:
     void finishGpuSwap(int status) {
         const OriginalLegacySwapRequest *request=gpuRequest;
         gpuStartTick=0;
-        if(!request) {transferred=false;return;}
+        if(!request) {transferred=false;kickSwapQueue();return;}
         gpuRequest=nullptr;
         if(gpuRetired) {
             gpuRetired=false;

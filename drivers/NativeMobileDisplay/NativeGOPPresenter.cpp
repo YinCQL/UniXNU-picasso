@@ -47,6 +47,11 @@ class NativeGOPPresenter : public IOService {
      * swap queue: the display's single-outstanding latch never cleared, so no later frame was ever offered. */
     static constexpr uint32_t SwapTimeoutMs=500;
     IOTimerEventSource *watchdog=nullptr;
+    /* A service without a provider work loop had no timer at all: wf242 ran 894 offerings, then the display's own
+     * 1.5 s fallback (not this 500 ms timeout) took stalled frames back three times (abandoned stayed 0), and the
+     * completion after such a fallback found no outstanding swap. Give the timer a loop of its own if the registry
+     * offered none. */
+    IOWorkLoop *ownLoop=nullptr;
     uint64_t swapSince=0;
     unsigned watchdogPrints=0;
     /* The scanout has one serving client: the first task that waits owns it (the render server starts serving long
@@ -120,10 +125,13 @@ bool NativeGOPPresenter::start(IOService *provider) {
     gate=IOLockAlloc();if(!gate)return false;
     {unsigned v=0;PE_parse_boot_argn("sheng-fb-gpu",&v,sizeof v);gpuMode=(v==1);}
     // The flip timeout runs on this service's work loop; a device without one keeps serving without it.
-    if(IOWorkLoop *loop=getWorkLoop()) {
+    IOWorkLoop *loop=getWorkLoop();
+    if(!loop && (ownLoop=IOWorkLoop::workLoop()))loop=ownLoop;
+    if(loop) {
         watchdog=IOTimerEventSource::timerEventSource(this,&NativeGOPPresenter::watchdogFired);
         if(!watchdog || loop->addEventSource(watchdog)!=kIOReturnSuccess)OSSafeReleaseNULL(watchdog);
     }
+    printf("PICASSO_DISPLAY gpu watchdog loop=%p own=%d timer=%p\n",loop,int(ownLoop!=nullptr),watchdog);
     mode={NGP_VERSION,NGP_BGRX8888,video.v_width,video.v_height,video.v_rowBytes,mapping->getLength()};
     native_gop_physical=mapping->getPhysicalAddress();native_gop_virtual=mapping->getVirtualAddress();
     online=true;native_gop_ready=1;if(gpuMode)gHandoff=this;registerService();return true;
@@ -132,15 +140,18 @@ void NativeGOPPresenter::stop(IOService *provider) {
     if(gHandoff==this)gHandoff=nullptr;
     if(watchdog) {
         watchdog->cancelTimeout();
-        if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(watchdog);
+        IOWorkLoop *loop=getWorkLoop();
+        if(!loop)loop=ownLoop;
+        if(loop)loop->removeEventSource(watchdog);
         OSSafeReleaseNULL(watchdog);
     }
+    OSSafeReleaseNULL(ownLoop);
     if(gate)IOLockLock(gate);online=false;native_gop_ready=0;if(gate){IOLockWakeup(gate,&swap,false);IOLockUnlock(gate);}
     abandonSwap();
     IOService::stop(provider);
 }
 void NativeGOPPresenter::free() {
-    OSSafeReleaseNULL(mapping);if(gate){IOLockFree(gate);gate=nullptr;}IOService::free();
+    OSSafeReleaseNULL(mapping);if(gate){IOLockFree(gate);gate=nullptr;}OSSafeReleaseNULL(ownLoop);IOService::free();
 }
 IOReturn NativeGOPPresenter::transfer(task_t task,const NGPPresent &q,NGPTransfer *result) {
     if(gpuMode)return kIOReturnUnsupported;   // in GPU mode no CPU copy exists, not even on request
