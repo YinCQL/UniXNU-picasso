@@ -261,15 +261,13 @@ def build_adreno(record: dict):
 
     # Integrate staged AGXAccelerator via build-native-adreno-accelerator.py
     accel_script = ROOT / 'scripts/build-native-adreno-accelerator.py'
-    if accel_script.exists():
-        env = os.environ.copy()
-        if 'DEVELOPER_DIR' not in env and Path('/Applications/Xcode.app/Contents/Developer').is_dir():
-            env['DEVELOPER_DIR'] = '/Applications/Xcode.app/Contents/Developer'
-        res = subprocess.run([sys.executable, str(accel_script)], cwd=str(ROOT), env=env, capture_output=True, text=True)
-        if res.returncode != 0:
-            print(f'Warning: build-native-adreno-accelerator.py failed:\n{res.stderr}')
-        else:
-            print('NativeAdreno: integrated staged AGXAccelerator and original IOAcceleratorES imports')
+    if not accel_script.is_file():
+        raise SystemExit(f'{accel_script} missing; Picasso requires the staged accelerator archive')
+    env = os.environ.copy()
+    if 'DEVELOPER_DIR' not in env and Path('/Applications/Xcode.app/Contents/Developer').is_dir():
+        env['DEVELOPER_DIR'] = '/Applications/Xcode.app/Contents/Developer'
+    subprocess.run([sys.executable, str(accel_script)], cwd=str(ROOT), env=env, check=True)
+    print('NativeAdreno: integrated staged AGXAccelerator and original IOAcceleratorES imports')
 
 
 def build_adreno_picasso(record: dict):
