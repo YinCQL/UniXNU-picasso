@@ -25,11 +25,11 @@ RECORD = ROOT / (
     "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/"
     "iokit/DEVELOPMENT/IOPlatformExpert.cpo.json"
 )
-CANDIDATE = ROOT / "build/native-prelink/native-owner-mobile-graphics-candidate.macho"
 AUDIT_JSON = ROOT / "build/display-analysis/mobile-graphics-legacy-abi.json"
 
 sys.path.insert(0, str(ROOT / "kits/NativePrelink"))
 from native_prelink import backed_offset, exports, macho  # noqa: E402
+from picasso_original_abi import load_reference, qualify_legacy
 
 
 def run(command, **kwargs):
@@ -255,13 +255,8 @@ def object_symbols_and_vtable(object_path):
     return raw, image, symbols, compiled
 
 
-def validate_original_code(candidate, audit):
-    raw = candidate.read_bytes()
-    image = macho(raw)
-
-    def read(address, length):
-        offset = backed_offset(image["segments"], address, length, len(raw))
-        return raw[offset : offset + length]
+def validate_original_code(reference, audit):
+    read = reference.read
 
     for name, address, field, wide in (
         ("descriptor", 0xFFFFFFF004B9EAD0, 48, True),
@@ -307,7 +302,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
-    require(CANDIDATE.is_file(), f"missing original candidate: {CANDIDATE}")
+    reference = load_reference()
+    audit = qualify_legacy(reference)
+    validate_original_code(reference, audit)
+    AUDIT_JSON.parent.mkdir(parents=True, exist_ok=True)
+    AUDIT_JSON.write_text(json.dumps(audit, indent=2) + "\n", encoding="utf-8")
     # `unixnu tree` refreshes scripts/, but the remaining inputs are linked
     # sources. Copy the driver/header here so a build from the assembled tree
     # never compiles a stale .cache checkout.
@@ -321,22 +320,12 @@ def main():
     shutil.copy2(DRIVER / "NativeGOPWire.h", OUT / "NativeGOPWire.h")
     shutil.copy2(DRIVER / "NativeGOPGlue.cpp", OUT / "NativeGOPGlue.cpp")
 
-    run(
-        [sys.executable, ROOT / "scripts/audit-mobile-graphics-legacy.py"],
-        cwd=ROOT,
-    )
-    audit = json.loads(AUDIT_JSON.read_text())
-    require(
-        audit["candidate_sha256"] == sha256(CANDIDATE),
-        "Audit and original candidate hashes differ",
-    )
     require(
         audit["legacy_virtual_entries"] == 358
         and audit["legacy_instance_bytes"] == 0x18A0
         and audit["abstract_slots"] == [211, 213, 245, 246, 306, 307, 337, 338, 345],
         "Unexpected original Legacy ABI",
     )
-    validate_original_code(CANDIDATE, audit)
 
     generated_header = generate_abi_header(audit)
     source = OUT / "NativeLegacyDisplay.cpp"
@@ -344,28 +333,9 @@ def main():
     compile_source(source, obj, [])
     raw, image, symbols, compiled = object_symbols_and_vtable(obj)
 
-    # The archive builders run before the final kernel link. Resolve the
-    # original-family addresses from the audited prelink candidate instead of
-    # requiring an output kernel that does not exist yet.
-    candidate_report = json.loads(CANDIDATE.with_suffix(".json").read_text())
-    graphics_data_const = next(
-        extent
-        for extent in candidate_report["extents"]
-        if extent["module"] == "com.apple.iokit.IOMobileGraphicsFamily"
-        and extent["segment"] == "__DATA_CONST"
-    )
-    require(
-        graphics_data_const["va"] == 0xFFFFFFF005F33840,
-        "Unexpected IOMobileGraphicsFamily candidate layout",
-    )
-    # These are addresses in the fixed, hash-qualified original candidate. They
-    # are independent of later native watchdog/AES additions to kernel text.
+    # The original components retain the board's fixed slide. Their bindings
+    # come from the hash-qualified original, before the final native link.
     legacy_gmeta = 0xFFFFFFF006B35940
-    require(
-        candidate_report["candidate_sha256"]
-        == "c13e0530d7514a69cca343d9abbaeaa303a9b9ec5b6fefb2f3bc1de6a6d50fbf",
-        "Unexpected original mobile-graphics candidate",
-    )
     bindings = {
         "__ZN25IOMobileFramebufferLegacyC2EPK11OSMetaClass":
             0xFFFFFFF0057865CC,
@@ -549,7 +519,7 @@ def main():
         source,
         DRIVER / "NativeLegacyRequest.h",
         generated_header,
-        ROOT / "scripts/audit-mobile-graphics-legacy.py",
+        ROOT / "scripts/picasso_original_abi.py",
         AUDIT_JSON,
         support_source,
         DRIVER / "PicassoGop.h",
@@ -572,7 +542,8 @@ def main():
         "inherited_native_slots": inherited,
         "virtual_entries": 358,
         "abstract_slots": audit["abstract_slots"],
-        "candidate_sha256": sha256(CANDIDATE),
+        "original_sha256": audit["original_sha256"],
+        "original_slide": audit["slide"],
         "object_sha256": sha256(obj),
         "late_object_sha256": sha256(late),
         "keystore_object_sha256": sha256(keystore_object),

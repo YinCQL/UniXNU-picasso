@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build the owned offline HID source (ShengHidInput) and its kernel probe.
 
-The device object is qualified against the ORIGINAL IOHIDDevice vtable in this
-board's prelink candidate (scripts/build-native-hid-input.py): the instruction
+The device object is qualified against the ORIGINAL IOHIDDevice vtable in the
+hash-pinned kernelcache (scripts/build-native-hid-input.py): the instruction
 identity, the 207-slot vtable and the C2/D2 bindings must match the pinned
 IOHIDFamily, so the ABI header is generated, never hand-written. The probe
 (package/HidInputProbe.cpp) owns the kext load and the device attach.
@@ -19,8 +19,6 @@ if not (ROOT / 'build/xnu').is_dir() and (ROOT / 'out/picasso/tree/build/xnu').i
     ROOT = ROOT / 'out/picasso/tree'
 
 RECORD = 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'
-CANDIDATE_DIR = ROOT / 'build/native-prelink'
-CANDIDATE = 'native-owner-ufs-cpu-desktop-hid-candidate'
 HID_OUT = ROOT / 'build/native-hid-input'
 OUT = ROOT / 'build/sheng-hid-input'
 OUT.mkdir(parents=True, exist_ok=True)
@@ -58,24 +56,12 @@ def compile_cpp(record_path, source, obj):
         '-Wno-deprecated-enum-enum-conversion', '-Wno-unnecessary-virtual-specifier',
         '-Wno-unknown-warning-option', '-Wno-missing-designated-field-initializers',
         '-I', str(ROOT / '.cache/xnu-work/osfmk'), '-I', str(source.parent),
+        '-I', str(ROOT / 'drivers/NativeNovatekTouch'),
     ])
     # The recorded command starts with -include meta_features.h, which lives in
     # the record's own build directory.
     run(command, cwd=info['directory'])
 
-
-# The qualification runs against the prelink candidate of the previous kernel
-# build (the two-pass pattern the boot-progress archive already uses). Stage the
-# device's own output when build/native-prelink is empty.
-CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
-candidate = CANDIDATE_DIR / (CANDIDATE + '.macho')
-if not candidate.is_file():
-    previous = ROOT.parent / 'kernel'
-    source, plan = previous / 'kernel.macho', previous / 'kernel.json'
-    if not (source.is_file() and plan.is_file()):
-        raise SystemExit(f'no HID prelink candidate: build the kernel once first ({source})')
-    candidate.write_bytes(source.read_bytes())
-    candidate.with_suffix('.json').write_bytes(plan.read_bytes())
 
 # The ABI header and the qualified objects come from the reviewable builder.
 run(['python3', ROOT / 'scripts/build-native-hid-input.py'])
