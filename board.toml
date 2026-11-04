@@ -238,6 +238,11 @@ kernel_args = [
   # These two args make every payload rescan /Applications and stage the app bundles.
   "picasso-ls-rebuild=1",
   "sheng-staged-apps=1",
+  # The boot-diagnostic overlay (live banner, crash/exit rows, touch overlay) must not paint over the
+  # system UI: it repaints after every swap, so the desktop and the diagnostic page visibly alternate,
+  # and each pass is about a million uncached stores that make the scanout hand-off wait. The same rows
+  # still go to the UFS log. 0 switches every on-screen diagnostic painter off once the OS owns the display.
+  "sheng-banner=0",
   # Diagnostic bring-up isolation: the original watchdogd's service checks do
   # not complete on this kernel yet. Disable only its launch job for this boot.
   "sheng-disable-watchdogd=1",

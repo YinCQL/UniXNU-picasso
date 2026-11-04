@@ -546,6 +546,13 @@ static void refresh(unsigned now) {
     memset(display.previous,0xff,sizeof(display.previous));
     for(unsigned i=0;i<48;++i) display.previous[i][BP_COLS-1]=0;
     bp_clear(&display);
+  } else if (boot_progress_display_owned && !display.bound) {
+    // A validated scanout yielded the panel (prepare_scanout), and the resume window (if any) has not
+    // elapsed: the OS owns the screen now. Without this gate the page kept repainting over the live UI
+    // every time its counters changed (and wholesale every 15 s), which the user sees as the diagnostic
+    // window flickering on the desktop and which costs about a million uncached stores per pass.
+    __atomic_store_n(&render_busy,0,__ATOMIC_RELEASE);
+    return;
   }
   if (take()) {
     render_snapshot=state;

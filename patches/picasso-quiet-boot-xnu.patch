@@ -1,0 +1,39 @@
+diff --git a/osfmk/ipc/ipc_port.c b/osfmk/ipc/ipc_port.c
+--- a/osfmk/ipc/ipc_port.c
++++ b/osfmk/ipc/ipc_port.c
+@@ -1843,7 +1843,16 @@ picasso_sync_ipc_trace(ipc_port_t special_reply_port, ipc_port_t dest_port,
+     unsigned link_state, unsigned msg_sent, unsigned lost_link,
+     unsigned bootstrap_checkin)
+ {
++	static int picasso_probes = -1;
++	if (picasso_probes < 0) {
++		unsigned value = 0;
++		extern int PE_parse_boot_argn(const char *, void *, int);
++		picasso_probes = (PE_parse_boot_argn("picasso-probes", &value, sizeof value) && value != 0);
++	}
++	if (!picasso_probes) {
++		return;
++	}
+ 	task_t client_task = current_task();
+ 	if (client_task == TASK_NULL) {
+ 		return;
+ 	}
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -2726,6 +2726,15 @@ picasso_service_begin(unsigned operation, OSDictionary *dict, const char *detail, unsigned type)
+ picasso_service_begin(unsigned operation, OSDictionary *dict, const char *detail, unsigned type)
+ {
+ 	picasso_service_trace trace = {};
++	static int picasso_probes = -1;
++	if (picasso_probes < 0) {
++		unsigned value = 0;
++		extern int PE_parse_boot_argn(const char *, void *, int);
++		picasso_probes = (PE_parse_boot_argn("picasso-probes", &value, sizeof value) && value != 0);
++	}
++	if (!picasso_probes) {
++		return trace;
++	}
+ 	static const char * const names[] = {
+ 		"backboardd", "SpringBoard", "profiled", "securityd"
+ 	};
