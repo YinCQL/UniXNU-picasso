@@ -131,7 +131,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
     }
     void startVsync() {
-        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        unsigned hz=60;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
         if(!hz || hz>240 || !primary || !bootMapping || vsyncTimer)return;
         IOWorkLoop *loop=getWorkLoop();
         if(!loop)return;
@@ -192,9 +192,9 @@ public:
     bool startDisplay(IOService *provider) {
         if(!IOMobileFramebufferLegacy::start(provider))return false;
         if(primary && bootMapping)announcePoweredByFirmware();
-        unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
+        unsigned enabled=1;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
         if(!enabled)return true;
-        unsigned phase=0;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));
+        unsigned phase=4;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));
         if(enabled!=1 || phase!=4 || !provider || !bootMapping || !primary) {
             native_legacy_pm_observed(1,kIOReturnNotReady,0);IOMobileFramebufferLegacy::stop(provider);return false;
         }
@@ -270,7 +270,7 @@ public:
         kicking=false;
     }
     void kickOnce() {
-        unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
+        unsigned enabled=1;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
         if(!request || !isValidated(request))return;
@@ -354,7 +354,9 @@ public:
         if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
         }
-        const uint32_t barRows=height>sourceHeight?(height-sourceHeight)/2:0;
+        // The phone mode leaves 60 rows below the panel's 2400. Keep all of them at the top: the status bar then
+        // starts 60 px down, clearing the top-right camera, and the UI canvas ends at the physical bottom edge.
+        const uint32_t barRows=height>sourceHeight?(height-sourceHeight>=60?60:height-sourceHeight):0;
         if(!letterbox || !native_legacy_copy_layout(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
             bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
             source->getLength(),sourceStride,width,sourceHeight)) {
@@ -457,7 +459,7 @@ public:
     }
     // Hands the pending head to the unchanged family after the CPU copy.
     bool retireSwap(const OriginalLegacySwapRequest *request,bool force=false) {
-        unsigned retire=0,cpuPresent=0;
+        unsigned retire=0,cpuPresent=1;
         PE_parse_boot_argn("offline-legacy-retire",&retire,sizeof(retire));
         PE_parse_boot_argn("offline-legacy-cpu-present",&cpuPresent,sizeof(cpuPresent));
         if(!(retire==1 || cpuPresent==1 || force))return false;
@@ -511,7 +513,7 @@ public:
         auto bytes=reinterpret_cast<const unsigned char *>(request);
         auto word=[&](unsigned offset){uint32_t value=0;memcpy(&value,bytes+offset,4);return value;};
         OSObject *surface=nullptr;unsigned reason=1;bool accepted=false;
-        unsigned enabled=0;PE_parse_boot_argn("offline-legacy-validate",&enabled,sizeof(enabled));
+        unsigned enabled=1;PE_parse_boot_argn("offline-legacy-validate",&enabled,sizeof(enabled));
         if(enabled==1 && logicalPM && primary && bootMapping && request) {
             reason=2;OSObject *surfaces[4]={};memcpy(surfaces,bytes+2624,sizeof(surfaces));surface=surfaces[0];
             uint32_t width=panelWidth,height=panelHeight;
@@ -588,7 +590,7 @@ public:
         native_legacy_client_observed(status,status==kIOReturnSuccess && client?*client:nullptr);return status;
     }
     bool startHardware() override {
-        unsigned enabled=0;
+        unsigned enabled=1;
         PE_parse_boot_argn("offline-legacy-gop",&enabled,sizeof(enabled));
         if(enabled!=1)return false;
         PE_Video video={};IOService *provider=getProvider();

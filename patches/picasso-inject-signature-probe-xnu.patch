@@ -1,0 +1,28 @@
+--- a/security/mac_vfs.c	2026-11-04 08:47:36
++++ b/security/mac_vfs.c	2026-11-04 08:47:43
+@@ -1350,6 +1350,25 @@
+ 	MAC_CHECK(vnode_check_signature, vp, mac_vnode_label(vp), cpu_type, cs_blob,
+ 	    cs_flags, signer_type, flags, platform, &fatal_failure_desc, &fatal_failure_desc_len);
+ 	VFS_KERNEL_DEBUG_END1(43, vp);
++#if DEVELOPMENT || DEBUG
++	/* Did AMFI accept the inserted SpringBoard library? The open probe shows
++	 * dyld reaching the path; this shows whether validation let it map. */
++	{
++		char picasso_name[32] = "?";
++		proc_name(proc_selfpid(), picasso_name, sizeof picasso_name);
++		if (!strcmp(picasso_name, "SpringBoard") || !strcmp(picasso_name, "PosterBoard")) {
++			char picasso_path[MAXPATHLEN];
++			int picasso_length = MAXPATHLEN;
++			if (vn_getpath(vp, picasso_path, &picasso_length) == 0 &&
++			    strlen(picasso_path) >= 20 &&
++			    !strcmp(picasso_path + strlen(picasso_path) - 20, "/libpicasso-sb.dylib")) {
++				printf("PICASSO_INJECT signature error=%d flags=%x signer=%u platform=%u path=%.160s\n",
++				    error, cs_flags ? *cs_flags : 0u,
++				    signer_type ? *signer_type : 0u, platform, picasso_path);
++			}
++		}
++	}
++#endif
+ 
+ 	if (fatal_failure_desc_len) {
+ 		// A fatal code signature validation failure occured, formulate a crash

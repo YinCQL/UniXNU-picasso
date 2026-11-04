@@ -1,0 +1,64 @@
+--- a/bsd/dev/picasso_usb.c	2026-11-04 09:25:08
++++ b/bsd/dev/picasso_usb.c	2026-11-04 09:25:20
+@@ -2380,7 +2380,50 @@
+ 	*pid = (int)value;
+ 	return true;
+ }
++/* Read-only text screenshot: samples the mapped panel into 48x24 luma digits
++ * and prints the exact BGRX of six columns for the top three rows (the status
++ * bar area). The address and geometry come from the display driver, which maps
++ * the panel for its display-policy check in every image. Nothing is written. */
+ static void
++ud_snapshot(void)
++{
++	extern volatile uint64_t picasso_snapshot_virtual;
++	extern volatile uint32_t picasso_snapshot_width, picasso_snapshot_height, picasso_snapshot_stride;
++	const uint64_t base = picasso_snapshot_virtual;
++	const uint32_t width = picasso_snapshot_width, height = picasso_snapshot_height, stride = picasso_snapshot_stride;
++	printf("PICASSO_SNAPSHOT base=%llx width=%u height=%u stride=%u\n",
++	    (unsigned long long)base, width, height, stride);
++	if (!base || !stride || width < 48 || height < 24) {
++		printf("PICASSO_SNAPSHOT unavailable\n");
++		return;
++	}
++	for (unsigned row = 0; row < 24; ++row) {
++		char text[49];
++		const uint32_t y = (uint32_t)(((uint64_t)height * (2 * row + 1)) / 48);
++		for (unsigned column = 0; column < 48; ++column) {
++			const uint32_t x = (uint32_t)(((uint64_t)width * (2 * column + 1)) / 96);
++			const uint32_t pixel = *(volatile uint32_t *)(uintptr_t)(base + (uint64_t)y * stride + (uint64_t)x * 4u);
++			const unsigned luma = ((((pixel >> 16) & 0xffu) * 30u) + (((pixel >> 8) & 0xffu) * 59u) + ((pixel & 0xffu) * 11u)) / 100u;
++			text[column] = "0123456789abcdef"[luma >> 4];
++		}
++		text[48] = 0;
++		printf("PICASSO_SNAPSHOT_ROW %02u %s\n", row, text);
++	}
++	for (unsigned row = 0; row < 3; ++row) {
++		char hex[6 * 9 + 1];
++		unsigned at = 0;
++		const uint32_t y = (uint32_t)(((uint64_t)height * (2 * row + 1)) / 48);
++		for (unsigned column = 0; column < 6; ++column) {
++			const uint32_t x = (uint32_t)(((uint64_t)width * (2 * column + 1)) / 12);
++			const uint32_t pixel = *(volatile uint32_t *)(uintptr_t)(base + (uint64_t)y * stride + (uint64_t)x * 4u);
++			at += snprintf(hex + at, sizeof(hex) - at, "%08x ", pixel);
++		}
++		if (at) hex[at - 1] = 0;
++		printf("PICASSO_SNAPSHOT_RGB %02u %s\n", row, hex);
++	}
++}
++
++static void
+ ud_process_command(void)
+ {
+ 	int waitPid = 0;
+@@ -2392,7 +2435,9 @@
+ 	ud.commands++;
+ 	printf("PICASSO CDC: command '%s'\n", ud.cmd);
+ 	if (ud_command_is(ud.cmd, "help")) {
+-		printf("PICASSO CDC: commands: help | status | ps | wait <pid|name> | stub-chrono <pid> | stub-lsd <pid> | panic-test | reset-test | start-graphics | register-display | publish-display | publish-display-start | hang-test | reboot-fastboot\n");
++		printf("PICASSO CDC: commands: help | status | ps | snapshot | wait <pid|name> | stub-chrono <pid> | stub-lsd <pid> | panic-test | reset-test | start-graphics | register-display | publish-display | publish-display-start | hang-test | reboot-fastboot\n");
++	} else if (ud_command_is(ud.cmd, "snapshot")) {
++		ud_snapshot();
+ 	} else if (ud_command_is(ud.cmd, "status")) {
+ 		printf("PICASSO CDC: configured=%u host_open=%u live=%u panic=%u "
+ 		    "watchdog=%u armed=%u reset=%u events=%llu tx=%llu "

@@ -1,0 +1,35 @@
+--- a/bsd/vfs/vfs_lookup.c	2026-11-04 08:26:22
++++ b/bsd/vfs/vfs_lookup.c	2026-11-04 08:29:14
+@@ -142,6 +142,24 @@
+ 		    (unsigned long long)thread_tid(vfs_context_thread(ndp->ni_cnd.cn_context)), path);
+ 	}
+ }
++/* Does dyld actually open the injected library, and in which process? AMFI's
++ * accepted signature says nothing about the load; a path copy for OP_OPEN is
++ * the first proof the insertion reached the filesystem. Bounded to 64 lines. */
++static void
++picasso_inject_open_probe(struct nameidata *ndp, proc_t p, const char *path)
++{
++	static unsigned probe_count;
++	if (!p || ndp->ni_op != OP_OPEN) return;
++	const char *base = strrchr(path, '/');
++	base = base ? base + 1 : path;
++	if (strcmp(base, "libpicasso-sb.dylib") && strncmp(base, "picasso-marker-", 15)) return;
++	unsigned ticket = picasso_pid1_trace_ticket(&probe_count, 64);
++	if (!ticket) return;
++	char name[MAXCOMLEN + 1] = "?";
++	proc_name(proc_getpid(p), name, sizeof name);
++	printf("PICASSO_INJECT open=%u pid=%d name=%s path=%.160s\n",
++	    ticket, proc_getpid(p), name, path);
++}
+ #endif
+ 
+ #include <sys/paths.h>
+@@ -340,6 +358,7 @@
+ 	/* Independent path samples correlate with open begin/end by thread. A
+ 	 * copied path is not a successful lookup or a successful open. */
+ 	picasso_pid1_cache_path(ndp, p, cnp->cn_pnbuf);
++	picasso_inject_open_probe(ndp, p, cnp->cn_pnbuf);
+ #endif
+ 	ndp->ni_pathlen = (u_int)bytes_copied;
+ 	bytes_copied = 0;

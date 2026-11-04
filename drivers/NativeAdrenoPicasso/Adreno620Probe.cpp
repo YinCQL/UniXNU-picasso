@@ -620,8 +620,8 @@ extern "C" int native_adreno620_zap_firmware(const uint8_t **mdt,
 
 extern "C" void native_adreno_probe(void)
 {
-    uint32_t stage = 0;
-    if (!PE_parse_boot_argn("sheng-gpu", &stage, sizeof stage) || stage < 1)
+    uint32_t stage = 4;
+    if (PE_parse_boot_argn("sheng-gpu", &stage, sizeof stage) && stage < 1)
         return;
     if (native_adreno_stage_req) return;
     if (stage > 5) stage = 5;

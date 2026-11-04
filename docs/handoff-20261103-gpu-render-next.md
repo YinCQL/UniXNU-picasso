@@ -323,3 +323,469 @@ Known open questions for the boot test:
   `Bridge`) do not exist anywhere in this iPadOS root; those slots cannot be filled by this image.
   The 168 number in the goal counts service bundles in `/Applications`, not home-screen icons; the
   phone default layout has 30 entries (25 obtainable here).
+
+## 2026-11-03 GPU recovery implementation (kernel built, not yet booted)
+
+Commit `afa40a4` implements the restart hook and the reliable hang detector; kernel
+`495f9b28f9dabf04` (saved as `build/kernel-gpu-495f9b28.macho`). The layout images below were
+built before it and keep kernel `aef2bfb67ffb3f46` (`build/kernel-wf167-layout-aef2bfb6.macho`).
+
+- `NativeAdrenoSubmit::hangCheck`: on a device clock only the completed fence counts as progress;
+  a fence that does not move for 1 s declares a hang. The idle case clears the timestamp, so a new
+  job after an idle period gets its full second.
+- `nativeAdrenoHangcheck`: `IOLockTryLock` with a starvation counter, `native_adreno_hangcheck[8]`
+  (polls, fence, hang fence, retries, CP-state hash, trylock misses, same-fence polls, last poll),
+  and a `PICASSO_GPU hangcheck:` line once per stuck second.
+- `native_adreno620_cp_restart` (installed from `publishGpu`): drain/halt SQE, cold GMU restart
+  (`native_adreno620_gmu_restart`, firmware getter added) when GX is off, hw_init/SQE/program,
+  `ring->restart(completed)` at the contract point, CP init, secure-mode packet (non-fatal),
+  scratch-page CACHE_FLUSH_TS probe, then `NativeAdrenoRing::resync` (new) to start client writes at
+  the CP read pointer without wiping the fence page.
+- `recover` replay uses the unframed `submit()` on A6xx (`submitFramed` answers Unsupported there),
+  after the restart set `seqno_=hung`, so `next` still matches each replayed fence.
+- Forced-hang test (CP_PROTECT type-4 write or CP_WAIT_REG_MEM) is not added yet; the natural freeze
+  will exercise the hook first, then `sheng-gpu-hang-test` can make it deterministic.
+
+### Layout image set (all 88 MiB payload, B kernel)
+
+| tag | changes | args |
+|---|---|---|
+| wf167 | identity/mode only, soft addon, grid | 995 |
+| wf168 | wf167 + wallpaper addon `f2c573f7…` | 995 |
+| wf169 | wf167 + `sheng-staged-apps=1`, no grid | 993 |
+| wf170 | wf168 + `sheng-staged-apps=1`, no grid (combined candidate) | 993 |
+
+Boot order: wf167 (geometry/status bar), wf168 (wallpaper), wf169 (apps; first boot copies ~467 MB
+into Data and can take minutes), then wf170 as the combined stable layout image.
+
+## 2026-11-03 upstream ios16 branches: classification and the status-bar path
+
+Fetched `origin/feat/ios16` and `origin/feat/ios16-gpu` (both pinned to the same upstream
+`75fba878…` as this tree). Their userland is iPhone10,3 / 16.7.16 / 20H392 with the 21H461
+kext backend; ours is 21H461 / 17.7.11. The status bar finding is the useful part:
+UIKit's `_UIStatusBarVisualProvider_Pad_ForcedNoCell` (present in our dyld cache) selected by
+`com.apple.UIKit.UIStatusBarVisualProviderClassName` avoids the red `_UIStatusBarVisualProvider_Fallback`.
+
+### Directly adoptable
+- `package/picasso-springboard/picasso-sb-probe.m` (metric hooks for the Pad provider).
+- `scripts/build-picasso-sb-inject.py` (iPhoneOS SDK + ad-hoc signing).
+- The nested `zzzzzz-picasso-springboard-inject` XNU patch (kern_exec env + AMFI call-90 path
+  vars). It applies cleanly to our current patch chain; carried here as
+  `patches/picasso-springboard-inject-xnu.patch` and wired through `unixnu`.
+- `com.apple.UIKit` provider pref and the seed-skip-setup engine (UniXNU
+  `scripts/seed-data-skip-setup.py`, already at the pinned revision).
+- In `feat/ios16-gpu`, nearly every file is byte-identical to HEAD (NativeWlan sources,
+  NativeCpuFreq, ArmSmmu4K, boot-progress, firmware patches, UEFI/DTB). Only the WLAN
+  build/entry wiring and the HID counter atomicity are genuinely new.
+
+### Needs adaptation / conflicts
+- The upstream cmdline carries `picasso_inject_sb=<path>`, `picasso_inject_apps=1`,
+  `amfi_allow_any_signature=1` (108 bytes). Our image is at 995/1000. The carrier here accepts
+  `picasso_inject_sb=1` as a fixed `/private/var/picasso/libpicasso-sb.dylib` default, and the
+  build script trims `-v` and `picasso-aks-state=1` when `SB_INJECT=1`.
+- Do not take the branch GPU/display files: they predate our GMU 500 MHz, CP restart/hangcheck,
+  ring resync and 360x780 letterbox work. `package/PicassoPr13.cpp` duplicates our display symbols.
+- Do not take the branch ArmCpu IPI base (952); our hardware-verified INTIDs are 1008..1015.
+- Upstream has no wallpaper work; its boot-logo constant 29457 does not match our 41011.
+- The branch `picasso_target.py` is 20H392/iPhone X; our seed wrapper hardcodes 21H461 / 17.7.11.
+
+### Current simple fix (no injection needed)
+1. The Data seed transform writes `com.apple.UIKit` (`_UIStatusBarVisualProvider_Pad_ForcedNoCell`,
+   `StatusBarHidesDate=true`) and 21H461 Setup/migration prefs. Verified offline.
+2. `NativeLegacyDisplay.cpp` now places the whole 60-row mode gap at the top (60 top / 0 bottom)
+   instead of 30/30, moving the status bar 60 px down from the physical top to clear the camera.
+3. `SEED_PREFS=1 GRID=0 IPHONE_IDENTITY=1 … build-wf-payload.sh wf171 NG PADDON sheng-display-scale=3`
+   builds the image without `picasso_inject_sb`/`amfi_allow_any_signature`.
+The injection chain remains in the tree as a fallback, dormant unless `SB_INJECT=1`.
+
+### Boots on 2026-11-03
+- wf167 (identity/mode, 30/30 bars, grid): reached the home screen, SpringBoard pid 27 healthy,
+  no NSException/SIGABRT in the CDC log. Status bar is still the red Fallback bar — expected,
+  because only the provider pref removes it and wf167 had no seed transform.
+
+### Data seed identity vs the persistent store (2026-11-03)
+Changing a preference in the Data seed changes its content hash, which is the persistent store's identity
+(`PersistOverlay::checkHeader`): the next boot starts the store over (Dropped pages), discarding the
+LaunchServices database and every runtime Data write. `wf171` (provider pref in the seed) did exactly this
+and then spent >17 minutes rebuilding with all cores pegged at 100% and only one GPU submission; it never
+reached SpringBoard's first frame. Booting the old seed afterwards (`wf173b`) also started over, because
+the store header now belonged to the new seed; that rebuild completed in ~6 minutes and reached the home
+screen (red Fallback bar, as expected without a provider pref; the 60-top/0-bottom letterbox works).
+
+The correction is to leave the seed untouched and write the provider preference from the kernel:
+`patches/picasso-ui-prefs-xnu.patch` writes a 155-byte binary plist to
+`/private/var/mobile/Library/Preferences/com.apple.UIKit.plist` (and `/private/var/preferences/...`) from
+`native_owner_data_prepare`, after the Data mount and before launchd, owner 501:501, mode 0644. It logs
+`PICASSO_UI_PREFS provider=Pad_ForcedNoCell mobile=<err> system=<err>`. `wf176` boots the original seed
+with this kernel (args 973) and reuses the store `wf173b` rebuilt. `wf177` adds `sheng-staged-apps=1`
+(args 993) and the wallpaper addon.
+
+## 2026-11-04 status-bar injection, AMFI trust, and the backboardd SIGBUS
+
+- AMFI rejects the ad-hoc inject dylib even with `amfi_allow_any_signature=1`: `AMFI: '...libpicasso-sb.dylib':
+  unsuitable CT policy 0 for this platform/device, rejecting signature.` The working path is the boot
+  payload's owner trust cache: extend the owner module with the dylib's 20-byte CDHash (same module format
+  as UniXNU `make-owner-trust-bundle.py`) and pass the bundle with `--owner-trust-cache`. `wf179+` boot with
+  `build/owner-trust-sb.bundle`; wf178 (original bundle) never loaded the library.
+- A global `-[UIScreen _isEmbeddedScreen]` YES breaks FBSDisplayMonitor (no main CADisplay). Answer YES only
+  for the status-bar lookup caller: 21H461 UIKitCore calls it from `__UIStatusBarGetVisualProviderClassForScreen`
+  +0x4c and reads the pref at +0x50; return site offset 0x1263b0 from UIKitCore's `__TEXT` base
+  (0x189fe6000), so accept the caller range 0x126360..0x1266c4.
+- The repeated SpringBoard `failed to find the main CADisplay` traps are downstream: **backboardd exits with
+  SIGBUS** (`exit_signal=10 namespace=2 code=a record=not-breakpoint-exit`) about two minutes after UI start
+  whenever the wallpaper overlay mount succeeded (`PICASSO_GPU addon ... wallpaper=5/0`). `wf173b`, whose
+  wallpaper mount failed (`wallpaper=1/2`), has no such exit. runningboardd then kills SpringBoard with
+  "backboardd respawn". The stale `/private/var/ngpu/wallpaper` survives addon rebuilds on the persistent
+  Data store, so removing the addon files alone does not disable the mount.
+- Kernel gate `sheng-ui-extras` (or its own arg per build): bit0 `0x1` = `/Applications` union mount,
+  `0x2` = the two extra 7570 wallpaper variants, `0x4` = the base 7570 Flat overlay. Default 7 when absent.
+  The base mount's source string must stay in `native_gpu_addon_prepare` scope for the other two mounts.
+  News.app is renamed to `News.app.hidden` before the apps mount; it is not the crash trigger, keep for later.
+- The board's only CDC control channel is `bsd/dev/picasso_usb.c` (help/status/ps/.../hang-test/reboot-fastboot).
+  UniXNU's `debug_terminal.py` screen.snapshot/input.touch protocol is not compiled into this kernel, so
+  there is no framebuffer screenshot or per-point touch injection yet; virtual swipes come from
+  `offline-hid-swipe` in `package/HidInputProbe.cpp` (build-wf-payload trims it today).
+- User decision for the night run: skip wallpaper, make status bar + 29 staged apps stable, then GPU
+  stability is the priority.
+
+
+## 2026-11-04 06:40 correction: the SpringBoard trap was a display-policy failure, not backboardd
+
+All four recorded SpringBoard SIGTRAPs un-slide to **0x19f3df2ec**, a fixed `brk #0` inside
+`-[FBSDisplayMonitor _initWithBookendObserver:transformer:]` (FrontBoardServices), reached from
+`+[FBDisplayManager sharedInstance]`'s once block: `[[CADisplay displays] firstObject]` was nil, the
+"failed to find the main CADisplay" branch (0x19f3df29c..0x19f3df2ec) traps. The macOS-side cache
+extraction used for this is `/tmp/dsc-sys` (SystemCryptex `DawnUpdate21H461.J120J121J207J208SystemCryptex`).
+
+`[CADisplay displays]` comes from `query_displays` -> `_CARenderServerGetServerPort(0)` +
+`_CASGetDisplays()`, i.e. the render server's display list. The chain that emptied it since wf178:
+
+1. wf178 dropped the `sheng-display-scale=3` boot argument to make room for the injection pair.
+2. `native_legacy_gop_mapping_observed` compares the boot argument (default 2) with `/chosen`'s
+   `display-scale` (the phone identity writes 3) and returns false on mismatch: `PICASSO_DISPLAY mapped ok=0 ... scale=2`.
+3. `startHardware()` returns that false, so the stock start prints `start_hardware failed`, the
+   IOMobileFramebuffer service never starts, and **no user client is ever opened** (`PICASSO_DISPLAY event=3/4`
+   absent; wf191.log has none).
+4. With no IOMFB display, backboardd's render server has no display; CADisplay is empty; any process that
+   first uses `FBDisplayManager` (SpringBoard ~30-50 s after start) traps. runningboardd gives up after
+   four corpses. The wallpaper/apps/injection flags are unrelated.
+
+Evidence: wf177 (old kernel, `sheng-display-scale=3`, ok=1) has `event=3/4` client opens (backboardd
+matches `IOMobileFramebuffer`, creates `NativeLegacyDisplay`) and no trap in a 5-minute run; wf178..wf191
+(ok=0) have `start_hardware failed`, no clients, and exactly four SpringBoard traps.
+
+**Fix** (`drivers/NativeMobileDisplay/PicassoDisplaySupport.cpp`): when `sheng-display-scale` is absent,
+read the identity's own `/chosen` `display-scale` and use it as the expectation instead of the 2 default,
+so the driver and the layout UIKit reads cannot disagree. No command-line byte is spent.
+
+Test results with kernel sha256 `258a0182fbce7bd1daf34642f745d56bb90f86bd3288ac393d63535095b0c548`:
+
+- `wf193` (inject, apps mount, grid, `sheng-fb-gpu=1`): `mapped ok=1 scale=3`, no trap, SpringBoard stayed
+  alive; backboardd matched IOMobileFramebuffer and opened clients, but **never called a framebuffer method
+  and never kicked a swap** (`PICASSO_FB` 0, `vsync: kick` 0, submit 0) in 5.5 minutes. liveactivitiesd
+  crash-looped.
+- `wf194` (same minus `sheng-fb-gpu`): ran 4+ hours; no trap, no SpringBoard/other service exits, **zero
+  IOMobileFramebuffer clients** — backboardd never performed its window-server IOKit pass (`PICASSO_IOKIT` has
+  only AKS calls). submit stayed 0, screen stayed on the kernel boot-progress page.
+- Old `wf177` baseline still presents frames, so the regression is in the new userland/kernel features, not
+  in the display-policy fix itself. Candidates to isolate: injected dylib into SpringBoard/PosterBoard
+  (`wf196`, no injection), the `/Applications` union mount (`wf195`, `sheng-ui-extras=0`), the kernel-written
+  UIKit prefs. Both isolation images are built (`out/wf195`, `out/wf196`).
+
+**Phone availability**: after the 4-hour `wf194` run, `reboot-fastboot` was sent over the CDC console and the
+phone did reset (`PICASSO CDC: reboot-fastboot requested; ... reset begin mode=0`, IMEM fastboot reason
+0x77665500 read back), but it never enumerated as a fastboot device or a CDC console again (no
+`fastboot devices` entry, no `/dev/cu.usbmodemPICASSO011`, MAC USB tree has only the hub/SSD/Ethernet). It
+took about nine minutes and then re-appeared in fastboot by itself at 06:46 (`fastboot devices` ->
+52cc791d). So the reset did reach the bootloader, but USB enumeration recovered late (the Mac had slept in
+between); do not assume the phone is lost when the console disappears right after `reboot-fastboot` — wait
+and poll. Keep a physical power-button recovery step documented anyway.
+
+### Next actions when the phone is reachable again
+
+1. First boot `out/wf195` (same new kernel, `sheng-ui-extras=0`, injection on, no `sheng-fb-gpu`):
+   if SpringBoard/backboardd reach the display, the `/Applications` union mount is what stalls the UI.
+2. If wf195 stalls, boot `out/wf196` (`TRIM_ARGS=1`, no injection, apps mount on): if that presents, the
+   injected dylib in SpringBoard/PosterBoard is the suspect; then harden it (no `dladdr` per call; resolve
+   the UIKitCore base once) or narrow its target list.
+3. Watch the first three minutes for `PICASSO_DISPLAY event=3/4` (backboardd matched the IOMFB) and
+   `PICASSO_FB`/`vsync: kick` (the render server started the display and swapped).
+4. The face of a successful boot in this port: `PICASSO_DISPLAY mapped ok=1`, `event=3/4` client opens,
+   `PICASSO_FB sel=4/5` from backboardd, `PICASSO_DISPLAY vsync: kick`, `DISPLAY_STATE submit>0`.
+
+The older problem remains after the UI is back: backboardd exits SIGBUS ~10-11 minutes into a working UI
+(wf176/wf177), which is the GPU/compositor stability item the user wants fixed next. That crash has no
+PC in the kernel record; capturing the fault address in the signal/exception path is the first step there.
+
+## 2026-11-04 07:30 the second blocker: `picasso-aks-state` is a boot dependency, not a diagnostic
+
+With the display-policy fix in place, the render server still never presented. Comparing the old working
+baseline (`wf177`) with every new image found the split:
+
+- wf177: `PICASSO_AKS started=1 ephemeral=1 state_only=1`, `PICASSO_AKS ready=1 at display probe`; keybagd,
+  containermanager and securityd AppleKeyStore selectors return 0; SpringBoard walks its service set up to
+  powerd/mediaremoted and the render server calls `PICASSO_FB sel=4/5` and kicks swaps.
+- wf191/wf193/wf194/wf197/wf198: `PICASSO_AKS ready=0 at display probe`, no `started=` line; securityd's
+  AppleKeyStore lookups return `e00002f0` (service not found); SpringBoard's link set grows to
+  callservicesd and then stops, the little CPU sits at 300 MHz/6% busy, and no swap is ever submitted.
+  wf194 showed the same picture for four hours; wf197 for 28 minutes.
+
+`picasso_keystore_probe()` (drivers/AppleKeyStoreState/PicassoKeyStore.cpp) publishes the state-only
+`AppleKeyStore` service **only when `picasso-aks-state=1` is on the command line**. build-wf-payload.sh
+trims that argument in the SB_INJECT/TRIM_ARGS paths as a "state-only diagnostic" — that comment is wrong
+for this port: without the service, keychain/keybag clients fail and SpringBoard's boot crawls through
+timeouts, so the first frame never arrives. wf176/wf177 had the argument, which is why they reached the UI.
+
+Fix under test: put `picasso-aks-state=1` back (as an explicit extra argument, 21 bytes). Images:
+`wf199` = wf198 (no grid, extras=0) + aks-state (single-variable test); `wf200` = wf191-style
+(inject, extras=1, no fb-gpu) + aks-state + grid, dropping `sheng-staged-apps=1` (the Data copy and its
+marker already exist) to stay under 1000 bytes.
+
+**Confirmed on wf199** (07:32 boot, same kernel, no grid, extras=0): `PICASSO_AKS started=1 ephemeral=1`,
+`ready=1`; backboardd opened the display (`event=3/4` x4), called `PICASSO_FB sel=4/5`, armed the vsync
+timer (`kicked=1`), and presented real frames: `PICASSO_DISPLAY frame kind=0 nonblack=203029`,
+`event=6/7/8/9/10/11` all present, 12 FB calls / 8 kicks, zero service exits or crashes in the capture.
+So the two regressions since wf178 were (1) the missing `sheng-display-scale` (no main CADisplay) and
+(2) the trimmed `picasso-aks-state=1` (no AppleKeyStore service -> keychain clients time out -> SpringBoard's
+boot crawls and no swap is ever submitted). Neither is related to the wallpaper, the inject dylib or the
+apps union mount.
+
+`wf200` = inject + apps mount (`sheng-ui-extras=1`) + grid + aks, no fb-gpu, with `sheng-staged-apps=1`
+dropped (the Data copy already exists) to fit the command line; it is the candidate for the morning
+status-bar (real bar instead of red) and 29-app check.
+
+### Diagnostic kernel for the compositor bus error (`patches/picasso-fault-dump-xnu.patch`)
+
+The historical backboardd SIGBUS (`exit_signal=10`, `namespace=2`, `code=a`) had no PC because the kernel only
+snapshots user state for BRK. The new patch captures the same bounded snapshot for unhandled user data aborts
+(`handle_user_abort` carries the fault address), extends the exit matcher to SIGBUS/SIGSEGV, and prints
+`FAR=` (the fault address) with `record=data-abort-snapshot`. It is wired into the patch chain by `unixnu`
+(last, z-count 31) and builds as kernel sha256 `b19623e7ed45d97...` (log `out/build-kernel-wf201.log`).
+`out/wf201` carries that kernel with the same command line as wf200; run it when the SIGBUS reproduces and
+symbolize the reported PC/ESR/FAR.
+
+## 2026-11-04 08:00 the red bar: PAC-signed return address in the arm64 inject library
+
+`picasso-sb-probe.m` is built arm64 (`scripts/build-picasso-sb-inject.py`) and inserted into arm64e
+SpringBoard/UIKitCore. UIKit calls `-[UIScreen _isEmbeddedScreen]` through `objc_msgSend` with `bl`, so the
+LR our hook reads from `__builtin_return_address(0)` carries a pointer-authentication signature in the high
+bits. An arm64 build copies x30 as a plain integer, so `dladdr(caller)` and the `0x126360..0x1266c4` offset
+comparison both saw a garbage address: wf181–wf184 loaded the library and still got the red Fallback bar.
+wf179's global YES only "worked" because it never examined the caller (the FBS trap in that run is explained
+by the concurrently broken display policy, not by the hook).
+
+Fix: mask to the 47-bit user VA (`& 0x00007fffffffffff`), then resolve UIKitCore with
+`class_getImageName(objcGetClass("UIScreen"))` + `_dyld_get_image_header` instead of trusting `dladdr`'s
+shared-cache view; keep dladdr as a fallback. Rebuilt dylib: 69,056 bytes, CDHash
+`65f10a18c007b2f65a92d34d3ebd23dc8a7fe5a5`, embedded into `build/ngpu-addon-sb-wf203.bin` (mode 0755).
+
+A rebuilt dylib changes the CDHash, so the pre-boot trust bundle must be regenerated; the old
+`build/owner-trust-sb.bundle` still listed the previous hash `f8908bd5…`. New reproducible tool:
+`scripts/build-sb-trust-bundle.py OWNER.bundle LIB.dylib OUTPUT.bundle` (verified byte-identical to the
+earlier hand-built bundle for the same input). wf203 = wf200's command line + `amfi_allow_any_signature=1`
+(`SB_INJECT=1` default), `OWNER_TRUST=build/owner-trust-sb.bundle`, kernel `d8218d65…` (the RGB grid-probe
+kernel, which also carries the fault-dump patch), args 998/1000.
+
+Grid evidence from wf200 before the switch: row 00 all-zero, row 01 a uniform `555555555555` band (a solid
+colour, not glyphs on black) — consistent with the red Fallback bar; `PICASSO_GRID_RGB` (wf202+ kernel)
+prints the exact BGRX for rows 0–6 to settle it.
+
+wf200 stability: UI up at ~07:33, 15 frames, SpringBoard (pid 26) alive at 07:52, **no backboardd SIGBUS
+in 19 minutes** with the wallpaper overlay absent — supports the wallpaper-mount → SIGBUS correlation in
+the 2026-11-04 section above.
+
+### wf203 / wf204: the red bar survives the PAC fix and even an unconditional YES
+
+- wf203 (PAC-masked caller check, `amfi_allow_any_signature=1`, new trust bundle, args 977): UI up 80 s
+  after boot, `mapped ok=1 scale=3`, submit frames, no trap — but row 01 reads `PICASSO_GRID_RGB 01
+  ffbf342b` in all 12 columns, the same solid red Fallback band, and `PICASSO_SBINJECT library ran` still
+  never appears. `PICASSO_INJECT dyld policy pid=27 old=69 new=6b result=0` confirms the env/MAC path runs.
+- wf204 = wf203 with `picasso_is_embedded` returning YES unconditionally (no caller inspection at all):
+  **identical red band**, no trap, no AMFI rejection. So either the library is not actually loaded in the
+  process drawing the lock-screen bar, or that bar is not selected by this UIKit function at all.
+- New fact: every probe so far sampled the **lock screen** (rows 03–06 = the big clock). We had never
+  unlocked the phone. wf205 therefore re-enables the kernel's own virtual touch (`offline-hid-swipe=16`,
+  stripped by build-wf-payload.sh in every other image; `package/HidInputProbe.cpp:204` sends a bottom-edge
+  swipe), keeps `sheng-fb-gpu=1` (GPU work) and the grid, and drops `amfi_allow_any_signature` to fit
+  1000 bytes (986). If the home-screen bar is black the red we have been chasing is lock-screen-only.
+
+### wf205: GPU scan-out present, virtual touch delivers, bar still red
+
+- wf205 = wf204 arguments + `sheng-fb-gpu=1` restored + `offline-hid-swipe=16`, minus
+  `amfi_allow_any_signature` (986/1000 bytes).
+- Unlike wf193, the GPU hand-off does not stall: `PICASSO_DISPLAY frame kind=0 nonblack=209515` at t+164 s,
+  **193 presents in 11 minutes**, `transfer_fail=1/194`, no service exit, no SIGBUS, no SpringBoard trap.
+  The wallpaper overlay was mounted on this boot (`PICASSO_GPU addon ... wallpaper=5/0`, stale Data files),
+  so the historical wallpaper→backboardd-SIGBUS combination did **not** reproduce with this kernel/addon.
+- Virtual touch works: `PICASSO_HID swipe 2 moved=1 reports=26 edge=1/1`, 16/16 swipes sent from t≈68 s
+  every 20 s. The screen nevertheless stays on the lock screen (white wallpaper, black clock, red bar
+  sampled again at 12 columns `ffbf342b`); no keypad ever draws, so either the swipe does not reach the
+  lock-screen recognizer or no passcode-protected unlock happens without a passcode.
+- GPU: `PICASSO_GPU cp: metal published`, but `metal diag opens=0 foreign=0` and `client: calls=0` in the
+  early samples — backboardd never opens the accelerator user client, so the Metal plugin is not driving
+  anything. `NativeAdreno: refusing to publish without a started CP` also appears before publication.
+- Lock screen aside, every process that could draw the bar has been probed: scoped hook (wf203, wf205) and
+  unconditional YES (wf204) both leave it red. That points at the library not being mapped at all rather
+  than at the caller test, so the next kernel logs the actual `open(2)` of the injected path:
+  `patches/picasso-inject-open-probe-xnu.patch` (wired into `unixnu`, z-count 33, applies last) prints
+  `PICASSO_INJECT open=<n> pid=<pid> name=<proc> path=...` for any process. Kernel sha256
+  `bf9b113830caf99f78438010f09599b025a46ba73d6a54c24a0e54ec8f013a18`, image `out/wf206` (same command
+  line as wf205).
+- Note: a stale `out/picasso/tree/build` made `unixnu build kernel prelink` fail at the object scan
+  (`genassym.o ... not recognized as a valid object file`); `rm -rf out/picasso/tree/build/xnu` fixed it.
+
+### What UIKit's "embedded" actually means (21H461, disassembled)
+
+`-[UIScreen _isEmbeddedScreen]` (0x18a00b1a8) evaluates, when the internal override preference is
+default, `byte(self+0xcd) && !-[UIScreen _isExternal]`:
+- `byte(self+0xcd)` is written in `-[UIScreen initWithDisplayConfiguration:forceMainScreen:]`
+  (0x18a2bcbe4) as `forceMainScreen || [displayConfiguration isMainDisplay]`.
+- `-[UIScreen _isExternal]` (0x18a00b21c) reads the FBSDisplay at `self+0xa0` and returns
+  `[display isExternal]`, or YES when that object is nil.
+So the red Fallback bar means the generated display is either not main or reported external by
+FrontBoard. The internal preference path (0x1f48cd270) can only force NO, never YES.
+`+[UIScreen _embeddedScreen]` (0x18aa7a5a4) returns the first screen that answers YES, confirming that
+no screen in this system is embedded. The durable fix is therefore either (a) make the injected
+`_isEmbeddedScreen` hook work in the drawing process, or (b) make FrontBoard's FBSDisplay report
+main/built-in so UIKit answers YES by itself.
+
+### wf206/wf208: the injected library IS mapped and AMFI accepts it
+
+- `patches/picasso-inject-open-probe-xnu.patch` (kernel `bf9b1138…`, image wf206) prints the namei path
+  copy for any `OP_OPEN` of `libpicasso-sb.dylib`. Result:
+  `PICASSO_INJECT open=6 pid=27 name=SpringBoard path=/private/var/mobile/Library/picasso/libpicasso-sb.dylib`
+  (three times), then `open=9 pid=175 name=PosterBoard ...`. dyld honours the insert in both UI processes.
+- `patches/picasso-inject-signature-probe-xnu.patch` (kernel `a688888c…`, image wf208) reports AMFI's
+  verdict from `mac_vnode_check_signature`: `PICASSO_INJECT signature error=0 flags=24000003 signer=0
+  platform=2 path=...libpicasso-sb.dylib`. The ad-hoc library is therefore accepted, mapped, and its
+  constructor runs — the trust bundle works without `amfi_allow_any_signature`.
+- Yet the bar is still `ffbf342b` in wf206 and wf208, and it was unchanged with the unconditional-YES
+  probe (wf204). That leaves the constructor's own installation as the suspect: either `objc_getClass`/
+  `class_getInstanceMethod` fails at constructor time in these processes, or `method_setImplementation`
+  does not affect the shared-cache dispatch.
+- wf209 (kernel `cf351409…`, image `out/wf209`, addon `build/ngpu-addon-sb-wf209.bin`, dylib CDHash
+  `714fac9d…`) answers exactly that: the constructor opens `/private/var/ngpu/picasso-marker-constructor`,
+  then `-uikit-ok|uikit-missing`, `-swizzle-ok|swizzle-fail`, `-object-ok|object-fail`; the widened open
+  probe logs the path copy even when the sandbox denies the open. Not booted: the phone's battery died
+  at ~09:07, right after wf208.
+
+### wf210/wf211: self-healing install and an apps-visibility probe
+
+- Because the library is mapped but the bar never changes, the dylib now retries every install from the
+  constructor and again at +1 s/+5 s/+15 s on the main queue (each step idempotent and re-scanning the
+  method table), so an initializer that runs before UIKit realises its classes cannot lose. Every attempt
+  opens `/private/var/ngpu/picasso-marker-<tag>{uikit-,swizzle-,object-,metrics-,wallpaper-}<ok|fail|missing>`
+  plus `picasso-marker-constructor`; the kernel path-copy probe prints them (sandbox-independent).
+  Dylib CDHash `ddf99ef1…`, bundle `build/owner-trust-sb-late.bundle`, addon `build/ngpu-addon-sb-wf210.bin`.
+- New kernel patch `patches/picasso-apps-view-probe-xnu.patch` (z-count 35) looks up twelve bundles through
+  the mounted /Applications (Camera, Mail, Safari, Weather, Notes, Calendar, Reminders, Maps, Photos,
+  Contacts, Timer, Videos) and prints `PICASSO_APPS_VIEW found=<bits>`, separating a mount problem from a
+  LaunchServices/SpringBoard one. Kernel `8121bde24d68134d…`, image `out/wf211` (same command line).
+- The status bar still shows `ffbf342b` through wf208; the phone's battery died at ~09:07 and it has not
+  enumerated over USB since, so wf210/wf211 have not been booted.
+
+### The red strip is exactly the Fallback provider's own background
+
+`-[_UIStatusBarVisualProvider_Fallback setupInContainerView:]` (UIKitCore 0x18ae97100) calls
+`+[UIColor systemRedColor]`, then `colorWithAlphaComponent:0.75`, then `setBackgroundColor:` on the status
+bar's content view. systemRedColor is (255, 59, 48); at 75% over black that is (191, 44, 36) — the sampled
+band is `ffbf342b`, i.e. (191, 52, 43) with the compositor's rounding. So the whole red-bar symptom is the
+provider selection, not a theme, a wallpaper or a kernel bar.
+
+### wf213: one boot that answers every open question
+
+`out/wf213` (kernel `8121bde24d68134d…`, published GPU addon `--publish --clients '*'`, dylib CDHash
+`3a34d376…`, trust `build/owner-trust-sb-diag.bundle`) carries:
+- the retrying, idempotent install (`constructor`, then `late1-/late2-/late3-` at +1/+5/+15 s) with
+  `picasso-marker-<tag>{uikit,swizzle,object,metrics,wallpaper}-<ok|fail|missing>` opened for each attempt;
+- a one-shot diagnostic inside the `_isEmbeddedScreen` hook that opens
+  `picasso-marker-embedded-orig<0|1>-main<0|1>` — the unmodified method's answer and UIKit's own
+  main-display byte at UIScreen+0xcd — before returning the scoped YES;
+- `PICASSO_APPS_VIEW found=<bits>` for twelve bundles through the mounted /Applications;
+- the documented-working GPU configuration (published addon, clients `*`, plugin CDHash `5184dad4…`).
+If the marker shows `main0`, the screen is not main; if `main1` and the bar is still red, UIKit's
+`_isExternal` is true and FrontBoard's display identity must be fixed instead.
+
+### wf214: text-mode screen capture over the existing CDC console
+
+The giulia GSC1 screenshot protocol is not compiled into this kernel, and adding a second binary stream to
+the only control channel was judged too risky for tonight. Instead the console gains a read-only command:
+
+- `PicassoDisplaySupport.cpp` exports `picasso_snapshot_virtual/{width,height,stride}` from the mapping its
+  display-policy check already creates (so it exists in every image, with or without the grid argument).
+- `patches/picasso-cdc-snapshot-xnu.patch` adds `ud_snapshot()`: 24 rows x 48 luma digits (`PICASSO_SNAPSHOT_ROW`)
+  plus the exact BGRX of six columns for the top three rows (`PICASSO_SNAPSHOT_RGB`), through the existing
+  printf/CDC path. It writes nothing and touches no endpoint.
+- Send it with `python3 scripts/picasso-cdc-command.py --command snapshot --output out/sb-runs/snap.log`.
+  `help` lists it between `ps` and `wait`.
+Kernel `316bdac38efeebc2…`, image `out/wf214` (diag dylib `3a34d376…`, published GPU addon). This is the
+screen check to use on the next boot: the status bar row shows either the red Fallback background or black
+with white glyphs, and the icon grid shows the app count.
+
+### Resume procedure after the battery is charged (exact steps)
+
+1. `fastboot boot out/wf214/picasso/boot/wf214.img`
+2. capture: `until [ -e /dev/cu.usbmodemPICASSO011 ]; do sleep 1; done; cat /dev/cu.usbmodemPICASSO011 > out/sb-runs/wf214.log`
+3. once SpringBoard is up, in a second shell:
+   `python3 scripts/picasso-cdc-command.py --command snapshot --output out/sb-runs/wf214-snapshot.log`
+4. read, in this order:
+   - `PICASSO_SNAPSHOT_RGB 01 …`: `ffbf342b` = still Fallback; black + white glyphs = fixed.
+   - `PICASSO_SNAPSHOT_ROW`: 48x24 luma, icon grid and page content.
+   - `picasso-marker-*` lines from the dylib: `constructor`, `late1-`, `swizzle-ok|fail`, `uikit-ok|missing`,
+     `embedded-orig?-main?`.
+   - `PICASSO_APPS_VIEW found=<bits>` (12 bundles; bit order: Camera, Mail, Safari, Weather, Notes, Calendar,
+     Reminders, Maps, Photos, Contacts, Timer, Videos).
+   - `PICASSO_GPU metal diag / submits live / client:` and any `EL0`/`data-abort` lines.
+5. If `swizzle-ok` appears and the bar is still red, the next change is `_isEmbeddedScreen` returning YES for
+   every caller in the UI processes (the wf204 probe) now that the late install is in place, then check for the
+   `main0` case from the marker.
+
+### wf214 (published addon): the GPU works, but the render server's surface format is rejected
+
+Boot at 10:31:52 with the documented published addon (`--publish --clients '*'`, plugin CDHash `5184dad4…`),
+`PICASSO_APPS_VIEW found=6ef` (nine of twelve probe names; the misses are name guesses, so the union mount
+is fine) and `PICASSO_INJECT signature error=0` again.
+
+New, first-of-its-kind GPU evidence:
+- `PICASSO_GPU submits live 9: submissions=304 ibs=2790 max=50 many=57 opens=95` — backboardd *does* load
+  the Metal plugin and submit through it under the published addon. The 304-instance / 95-open numbers are
+  two orders of magnitude above every earlier run (wf205: `opens=0`, `submissions=1`).
+- `PICASSO_GPU hangcheck: fence=305 hang_fence=305` — every fence is a hang fence; the GPU never retires.
+- The display rejects **every** swap: `submit=3013 accept=0 reject=3013 reasons=0/0/0/0/3013/0/0/0`
+  (reason 4), with
+  `PICASSO_DISPLAY surface rejected width=1080 height=2340 format=26424741 planes=1 stride=1088
+  allocation=10371072 length=10371072`.
+  `0x26424741` is `'&BGA'`, the compressed storage format the CPU path deliberately refuses
+  (`PicassoGop.h`: "CPU presentation supports linear BGRA only"). With the Metal plugin active the render
+  server allocates GPU-preferred compressed scanout surfaces, so the CPU validation path can never accept
+  them, the swaps never complete, backboardd respawns and runningboardd then kills SpringBoard — no desktop.
+- Next GPU change: in GPU mode (`sheng-fb-gpu=1` with a published plugin) accept `'&BGA'` (and the other
+  GPU-samplable formats) in the swap validation and let `native_legacy_gpu_offer` hand it to the plugin,
+  instead of rejecting it on the CPU format check; the reject must at least not happen before the offer.
+- Immediate recovery image for UI work: wf215 = kernel `316bdac3…` + the unpublished addon + the
+  marker/diagnostic dylib, so the desktop and the status-bar markers are available again.
+
+### Retracted hypothesis: injected library and __init_offsets
+
+Correction on 2026-11-04: the actual dyld-1165.3 source handles `S_INIT_FUNC_OFFSETS` in
+`MachOAnalyzer::forEachInitializer`, and `Loader::findAndRunAllInitializers` invokes them.
+The former claim that iOS 17 skips that section in ordinary dylibs is false.
+wf216 produced no trap; later `+load` and marker probes also produced no execution evidence.
+Open + AMFI signature success still does not prove a completed mapping. Policy `0x6b` allows failed
+library insertion, so obtain the loader error before changing initializer formats or blaming PAC.
+The `+load` experiment remains in the source, with no successful execution observed.
+
+### Stale publish marker in Data kept the GPU in production mode
+
+wf214 installed a published addon; its `addons/NativeAdrenoMetal.publish` and `.clients` files persist in
+Data. wf215/wf216 used unpublished addons but the plugin still ran the production path
+(`submissions=774`, `hang_fence=775`), backboardd died and runningboardd killed SpringBoard.
+`patches/picasso-addon-marker-sync-xnu.patch` (z-count 37) makes the addon the authority: when the current
+addon does not carry either marker, the installer unlinks the stale Data file. Kernel `5f5a51bd9e6262ef…`,
+image `out/wf217` (+load dylib CDHash `19192009…`).
+
+### 2026-11-04 session summary
+
+The corrected current state, the red-bar analysis, the unresolved injection failure, the GPU
+`'&BGA'` surface rejection, the image evidence and the next-agent prompt are in
+`docs/handoff-20261104-statusbar-gpu.md`. Read that first.

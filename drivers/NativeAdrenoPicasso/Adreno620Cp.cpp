@@ -2315,9 +2315,10 @@ extern "C" int native_adreno620_cp_start(void)
     /* Register the accelerator for Metal (sheng-gpu-metal=1). The plugin's
      * user client opens the service published just above, so publishing is
      * implied when it was not requested separately. */
-    uint32_t metalValue = 0;
-    if (PE_parse_boot_argn("sheng-gpu-metal", &metalValue,
-        static_cast<int>(sizeof metalValue)) && metalValue) {
+    uint32_t metalValue = 1;
+    PE_parse_boot_argn("sheng-gpu-metal", &metalValue,
+        static_cast<int>(sizeof metalValue));
+    if (metalValue) {
         if (!service && !publishGpu()) {
             printf("PICASSO_GPU cp: metal publish failed\n");
             return -1;

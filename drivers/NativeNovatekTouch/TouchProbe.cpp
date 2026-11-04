@@ -715,8 +715,8 @@ void touchThread(void *, wait_result_t) {
 
 // Callable from the boot monitor. `sheng-touch=<n>` selects the last stage to run; without it the probe does nothing.
 extern "C" void native_novatek_touch_probe(void) {
-    unsigned stage = 0;
-    if (!PE_parse_boot_argn("sheng-touch", &stage, sizeof stage) || stage < 1) return;
+    unsigned stage = 4;
+    if (PE_parse_boot_argn("sheng-touch", &stage, sizeof stage) && stage < 1) return;
     if (native_novatek_touch_stage_req) return;
     if (stage > 4) stage = 4;
     marker(0x01);

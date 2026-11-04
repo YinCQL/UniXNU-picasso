@@ -22,11 +22,33 @@ def prepare(device=DEVICE, source=None):
     topology_patch = device / 'patches/picasso-cpu-topology-xnu.patch'
     swap_patch = device / 'patches/picasso-swap-retry-xnu.patch'
     gestalt_patch = device / 'patches/picasso-clear-gestalt-xnu.patch'
+    sb_patch = device / 'patches/picasso-springboard-inject-xnu.patch'
+    prefs_patch = device / 'patches/picasso-ui-prefs-xnu.patch'
+    fault_patch = device / 'patches/picasso-fault-dump-xnu.patch'
+    open_probe_patch = device / 'patches/picasso-inject-open-probe-xnu.patch'
+    signature_probe_patch = device / 'patches/picasso-inject-signature-probe-xnu.patch'
+    apps_view_patch = device / 'patches/picasso-apps-view-probe-xnu.patch'
+    snapshot_patch = device / 'patches/picasso-cdc-snapshot-xnu.patch'
+    addon_sync_patch = device / 'patches/picasso-addon-marker-sync-xnu.patch'
+    bindfs_fileid_patch = device / 'patches/picasso-bindfs-fileid-xnu.patch'
+    ls_rebuild_patch = device / 'patches/picasso-ls-rebuild-xnu.patch'
+    ca_prefs_patch = device / 'patches/picasso-ca-prefs-xnu.patch'
     fingerprint = hashlib.sha256(patch.read_bytes() + b'\0' + usb_patch.read_bytes() +
                                  b'\0' + cpu_idle_patch.read_bytes() +
                                  b'\0' + topology_patch.read_bytes() +
                                  b'\0' + swap_patch.read_bytes() +
-                                 b'\0' + gestalt_patch.read_bytes()).hexdigest()
+                                 b'\0' + gestalt_patch.read_bytes() +
+                                 b'\0' + sb_patch.read_bytes() +
+                                 b'\0' + prefs_patch.read_bytes() +
+                                 b'\0' + fault_patch.read_bytes() +
+                                 b'\0' + open_probe_patch.read_bytes() +
+                                 b'\0' + signature_probe_patch.read_bytes() +
+                                 b'\0' + apps_view_patch.read_bytes() +
+                                 b'\0' + snapshot_patch.read_bytes() +
+                                 b'\0' + addon_sync_patch.read_bytes() +
+                                 b'\0' + bindfs_fileid_patch.read_bytes() +
+                                 b'\0' + ls_rebuild_patch.read_bytes() +
+                                 b'\0' + ca_prefs_patch.read_bytes()).hexdigest()
     cache = device / '.cache'
     target = cache / f'upstream-{revision[:12]}-{fingerprint[:12]}'
     if target.is_dir():
@@ -77,6 +99,51 @@ def prepare(device=DEVICE, source=None):
         # the first userland process: the phone identity must not be undone by the answers cached under the old one.
         (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-clear-gestalt.patch').write_bytes(
             gestalt_patch.read_bytes())
+        # Adds DYLD_INSERT_LIBRARIES to SpringBoard's exec and grants that process AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS.
+        # Boot arg picasso_inject_sb=1 selects the fixed /private/var/picasso/libpicasso-sb.dylib path (the 1000-byte
+        # command line cannot carry the full path); a literal /path value keeps the upstream form. Applies last.
+        (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-springboard-inject.patch').write_bytes(
+            sb_patch.read_bytes())
+        # Writes the UIKit Pad_ForcedNoCell provider preference into Data from the kernel, so the Data seed's
+        # identity (and its persistent-store LaunchServices database) survives a status-bar change.
+        (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-ui-prefs.patch').write_bytes(
+            prefs_patch.read_bytes())
+        # Records unhandled user data aborts (SIGBUS/SIGSEGV) in the same bounded register snapshot as user
+        # breakpoints and reports PC/ESR/FAR at exit, so the compositor's bus error can be symbolized.
+        (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-fault-dump.patch').write_bytes(
+            fault_patch.read_bytes())
+        # Logs every OP_OPEN path copy for libpicasso-sb.dylib (any pid), proving whether dyld actually
+        # opened the inserted library in SpringBoard/PosterBoard. Applies last.
+        (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-inject-open-probe.patch').write_bytes(
+            open_probe_patch.read_bytes())
+        # Reports the AMFI signature verdict for the injected library in SpringBoard/PosterBoard, separating
+        # "dyld opened it" from "validation let it map". Applies last.
+        (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-inject-signature-probe.patch').write_bytes(
+            signature_probe_patch.read_bytes())
+        # Reports which of a dozen bundles the /Applications union mount really exposes, separating a mount
+        # problem from a LaunchServices/SpringBoard one. Applies last.
+        (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-apps-view-probe.patch').write_bytes(
+            apps_view_patch.read_bytes())
+        # Adds the read-only "snapshot" command to the CDC console: 48x24 luma digits plus the status bar's
+        # exact BGRX, so the screen can be checked without the GSC1 binary protocol. Applies last.
+        (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-cdc-snapshot.patch').write_bytes(
+            snapshot_patch.read_bytes())
+        # Deletes a stale NativeAdrenoMetal.publish/.clients marker when the current addon does not carry
+        # it, so an unpublished addon really runs the CPU/software path. Applies last.
+        (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-addon-marker-sync.patch').write_bytes(
+            addon_sync_patch.read_bytes())
+        # Reuses Sheng's bindfs file-ID lookup for LaunchServices and fsgetpath.
+        (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-bindfs-fileid.patch').write_bytes(
+            bindfs_fileid_patch.read_bytes())
+        # Reuses Sheng's dynamic LaunchServices cache search, opt-in and only
+        # after the /Applications file-ID round trips succeed.
+        (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-ls-rebuild.patch').write_bytes(
+            ls_rebuild_patch.read_bytes())
+        # Writes CAEnableDeepFramebuffer/CAEnableFramebufferCompression/CAEnableIOSurfaceCompression=false into the
+        # Data preferences before launchd, so CoreAnimation allocates linear BGRA drawables instead of compressed
+        # '&BGA' surfaces after the published Metal addon starts. Applies last.
+        (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-ca-prefs.patch').write_bytes(
+            ca_prefs_patch.read_bytes())
         tree.rename(target)
     return target
 

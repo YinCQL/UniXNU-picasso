@@ -1268,7 +1268,7 @@ static void monitor(void *arg, wait_result_t result) {
         // Default 0 runs it at the first pass, which is also the earliest boot state.
         static unsigned touch_start_at,touch_start_set;
         if(!touch_start_set) {
-          touch_start_set=1;touch_start_at=0;
+          touch_start_set=1;touch_start_at=60;
           PE_parse_boot_argn("sheng-touch-start",&touch_start_at,sizeof(touch_start_at));
         }
         if(native_novatek_touch_probe && now>=touch_start_at)native_novatek_touch_probe();

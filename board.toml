@@ -177,6 +177,11 @@ volume = "PICASSOESP"
 # Room for the kernel, original trust caches and packed APFS Data seed.
 # The payload builder retains its 95% content limit; CI checks the actual seed.
 size_mib = 60
+# The Data seed transform (unixnu build payload --skip-setup) marks Setup done for the 21H461 userland
+# and, when this image asks for it, selects the rectangular Pad status bar provider and places the
+# ad-hoc SpringBoard inject library the kernel loads (fixed runtime path /private/var/picasso/libpicasso-sb.dylib).
+skip_setup_tool = "scripts/picasso-seed-skip-setup.py"
+skip_setup_args = ["--no-auto-dim", "--inject-lib", "build/libpicasso-sb.dylib", "--statusbar-provider", "_UIStatusBarVisualProvider_Pad_ForcedNoCell"]
 loader = "firmware"
 title = "Boot"
 dram_size = "0x180000000"
@@ -278,13 +283,6 @@ kernel_args = [
   # window; registration/publication remain explicit CDC commands.
   "offline-mobile-graphics-load=1",
   "offline-legacy-register=1",
-  "offline-legacy-gop=1",
-  "offline-legacy-pm=1",
-  "offline-legacy-phase=4",
-  "offline-legacy-validate=1",
-  "offline-legacy-transfer=1",
-  "offline-legacy-cpu-present=1",
-  "sheng-vsync=60",
   # GPU scanout hand-off: the display driver offers each finished frame to the
   # Adreno plugin, which blits it into the GOP mapping instead of the CPU
   # copying the whole frame. Without this argument the plugin answers
@@ -319,7 +317,6 @@ kernel_args = [
   # The synthetic bottom-edge swipe that unlocks this iPad identity; auto-home did
   # not leave the lock screen. One gesture every 20 s from t=540 s covers the window
   # in which SpringBoard takes the panel.
-  "offline-hid-start=540",
   "offline-hid-swipe=16",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
