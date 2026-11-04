@@ -343,3 +343,11 @@ Do not carry its "App normal" conclusion forward.
   mount), `offline-legacy-register=1` (offline-component-load-probes patch), plus the injection,
   LS-rebuild, staged-apps, swipe and identity/experiment arguments. board.toml lost the duplicated
   `offline-hid-start=540` and the baked display/vsync rows. Command line: 990 -> 645 bytes.
+- **Merged tree (wf229)**: after merging `fork/stage12/picasso-cpufreq-big` (the other session's
+  touch/Data work), the same kernel + addon boots to the desktop with the fixes intact:
+  identity iPhone13,1, CA prefs, GPU metal published, HID probe at 60 s, NVT stage 4 touch reports,
+  `submit=46 accept=46 reject=0` growing, fence advancing, no panic/service exit. First compositor
+  swap arrives about 6.5 minutes after boot in both wf228 and wf229, so do not treat an early empty
+  display counter as a regression. The merged HID stack reports
+  `swipe unavailable started=1 digitizer=0 sink=1`, so the offline auto-swipe no longer unlocks;
+  real touch still works. Branch pushed as 41202dd; PR #13 has the evidence comment.
