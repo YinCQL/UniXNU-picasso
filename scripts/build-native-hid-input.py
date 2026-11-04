@@ -2,6 +2,7 @@
 """Qualify an owned offline HID source against the unchanged target IOHIDDevice."""
 import hashlib,json,struct,subprocess,sys
 from pathlib import Path
+from picasso_llvm import tool as llvm_tool
 ROOT=Path(__file__).resolve().parents[1];OUT=ROOT/'build/native-hid-input';OUT.mkdir(exist_ok=True)
 sys.path.insert(0,str(ROOT/'kits/NativePrelink'))
 from native_prelink import macho,backed_offset,exports
@@ -84,8 +85,8 @@ require(undefined==set(bindings),'All and only actual original HID imports bound
 asm=OUT/'original-bindings.S';asm.write_text(''.join(f'.globl {n}\n.set {n}, {a:#x}\n' for n,a in sorted(bindings.items())))
 sdk=run(['xcrun','--sdk','iphoneos','--show-sdk-path'],text=True).strip()
 run(['xcrun','clang','-target','arm64-apple-ios17.0','-isysroot',sdk,'-c',asm,'-o',OUT/'hid-original-bindings.o'])
-llvm=Path(run(['brew','--prefix','llvm'],text=True).strip())/'bin';late=OUT/'NativeHidInput.late.o'
-run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeHidInput.cpp',obj,late])
+late=OUT/'NativeHidInput.late.o'
+run([llvm_tool('llvm-objcopy'),'--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeHidInput.cpp',obj,late])
 def code(data,image):
     s=next(s for g in image['segments'] for s in g['sections'] if s['name']=='__text');return data[s['fileoff']:s['fileoff']+s['size']]
 require(code(raw,om)==code(late.read_bytes(),macho(late.read_bytes())),'Owned code unchanged by deferred metaclass registration')

@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7399,6 +7399,10 @@
+@@ -7408,6 +7408,10 @@
  volatile int native_gpu_addon2_status = -1;
  volatile int native_gpu_addon3_stage = 0;
  volatile int native_gpu_addon3_status = -1;
@@ -11,7 +11,7 @@
  static void
  native_gpu_addon_mount(proc_t p, user_addr_t scratch, user_addr_t offset, const char *source, size_t source_size,
      const char *point, size_t point_size, const char *visible, const char *own, volatile int *stage, volatile int *status)
-@@ -7691,14 +7695,37 @@
+@@ -7855,14 +7859,37 @@
  	    "/System/Library/LaunchDaemons/org.blu-sharky.adrenoprobed.plist", &native_gpu_addon2_stage, &native_gpu_addon2_status);
  	/* The default iPadOS 17 wallpaper's layered animation with PNG images in place of its HEIC ones (no hardware HEVC decoder here).
  	 * The overlay carries the animation's documents and the PNG images; the sealed assets directory stays visible below it. */
@@ -48,10 +48,10 @@
 +	    "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/7570.iPadOS_17-834w-1112h@2x~ipad.wallpaper/"
 +	    "7570.iPadOS_17_Background-834w-1112h@2x~ipad.ca/J120.png", &native_gpu_addon5_stage, &native_gpu_addon5_status);
 +	}
- }
- 
- /* The deletable system apps (Weather, Notes, Calendar, ...) ship in the OS volume's /private/var/staged_system_apps. A restore copies
-@@ -8008,7 +8035,201 @@
+ 	native_cryptex_os_view(p, scratch);
+ 	native_gestalt_cache_drop(p, scratch);
+ 	native_ls_store_drop(p, scratch);
+@@ -8175,6 +8202,200 @@
  	vnode_put(vp);
  }
  
@@ -76,7 +76,7 @@
 +	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
 +	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x76,
 +};
- static int
++static int
 +native_picasso_ui_pref_write(const char *path)
 +{
 +	vfs_context_t ctx = vfs_context_current();
@@ -249,11 +249,10 @@
 +	    &native_picasso_apps_stage, &native_picasso_apps_status);
 +	printf("PICASSO_APPS_MOUNT stage=%d status=%d\n", native_picasso_apps_stage, native_picasso_apps_status);
 +}
-+static int
+ static int
  native_owner_data_prepare(proc_t p, user_addr_t scratch)
  {
- 	uint64_t base = 0, size = 0;
-@@ -8076,7 +8297,13 @@
+@@ -8243,7 +8464,13 @@
  	    strcmp(vfs_statfs(data_mount)->f_fstypename, "apfs")) error = EINVAL;
  	if (!error) native_owner_data_stage = 4;
  	if (!error) native_gpu_addon_prepare(p, scratch);

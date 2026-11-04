@@ -14,6 +14,7 @@ import shutil
 import struct
 import subprocess
 import sys
+from picasso_llvm import tool as llvm_tool
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -412,11 +413,10 @@ def main():
         check=True,
     )
 
-    llvm = Path(run(["brew", "--prefix", "llvm"], text=True).strip()) / "bin"
     late = OUT / "NativeLegacyDisplay.late.o"
     subprocess.run(
         [
-            str(llvm / "llvm-objcopy"),
+            str(llvm_tool("llvm-objcopy")),
             "--remove-section=__DATA,__mod_init_func",
             "--globalize-symbol=__GLOBAL__sub_I_NativeLegacyDisplay.cpp",
             str(obj),
@@ -448,7 +448,7 @@ def main():
     presenter_late = OUT / "NativeGOPPresenter.late.o"
     subprocess.run(
         [
-            str(llvm / "llvm-objcopy"),
+            str(llvm_tool("llvm-objcopy")),
             "--remove-section=__DATA,__mod_init_func",
             "--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp",
             str(presenter_obj),
@@ -478,7 +478,7 @@ def main():
     keyevents_late = OUT / "NativeKeyStoreEvents.late.o"
     subprocess.run(
         [
-            str(llvm / "llvm-objcopy"),
+            str(llvm_tool("llvm-objcopy")),
             "--remove-section=__DATA,__mod_init_func",
             "--globalize-symbol=__GLOBAL__sub_I_NativeKeyStoreEvents.cpp",
             str(keyevents_object),

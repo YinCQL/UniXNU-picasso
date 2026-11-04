@@ -12,6 +12,9 @@ XNU_VERSION=${UNIXNU_XNU_VERSION:-10063.141.1}
 LIBPLATFORM_TAG=${UNIXNU_LIBPLATFORM_TAG:-libplatform-316.100.10}
 LIBDISPATCH_TAG=${UNIXNU_LIBDISPATCH_TAG:-libdispatch-1477.100.9}
 AVAILABILITY_TAG=${UNIXNU_AVAILABILITYVERSIONS_TAG:-AvailabilityVersions-141.1}
+# The architecture and OS profiles select the kernel slice and the deployment target.
+XNU_ARCH_STRING=${UNIXNU_XNU_ARCH:-arm64}
+IOS_VERSION=${UNIXNU_IOS_VERSION:-17.0}
 if [ ! -d refer/xnu/.git ]; then
   git clone --depth 1 --branch "$XNU_TAG" https://github.com/apple-oss-distributions/xnu.git refer/xnu
 fi
@@ -31,6 +34,8 @@ if [ ! -x .cache/fakeroot/usr/local/libexec/availability.pl ]; then
     OBJROOT="$ROOT/build/availability" SYMROOT="$ROOT/build/availability" \
     DSTROOT="$ROOT/.cache/fakeroot" CMAKE="$(command -v cmake)" NINJA="$(command -v ninja)"
 fi
+# Format 2 prepares its ordered patch series through the shared resolver.
+if [ -z "${UNIXNU_PATCH_LIST:-}" ]; then
 # Patch order matters, and later patches overlap earlier contexts. A reverse
 # check cannot tell "already applied" from "applied and then extended", so
 # persist the exact patch-chain identity and replay only onto a clean cache.
@@ -64,6 +69,18 @@ if [ ! -f "$PATCH_STAMP" ] || [ "$(cat "$PATCH_STAMP")" != "$PATCH_FINGERPRINT" 
 fi
 export XNU_AVAILABILITY_PL=$ROOT/.cache/fakeroot/usr/local/libexec/availability.pl
 python3 scripts/prepare-xnu-source.py
+fi
+# A Linux host builds with upstream clang and GNU tools (scripts/linux): rewrite the few sources that assume
+# Apple's, and pass xnu's make what a Mac provides itself (host compiler, mig, memory and CPU counts).
+XNU_HOST_MAKE_ARGS=()
+if [ "$(uname -s)" = Linux ]; then
+  python3 scripts/linux/prepare-xnu.py source
+  export PLATFORM=iPhoneOS HOST_CC="$CLT_PREFIX/bin/xnu-host-cc" MIGCOM="$CLT_PREFIX/libexec/migcom"
+  XNU_HOST_MAKE_ARGS=(TIGHTBEAMC=tightbeamc-not-supported BUILD_DSYM=0
+    MEMORY_SIZE="$(( $(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE) ))"
+    SYSCTL_HW_PHYSICALCPU="$(nproc)" SYSCTL_HW_LOGICALCPU="$(nproc)"
+    LD_KERNEL_LIBS="$ROOT/.cache/fakeroot/usr/local/lib/kernel/libcc_kext.a")
+fi
 # The first pass of a new tree (XNU_BOOTSTRAP=1, set by the unixnu driver) only has to leave the compile records and
 # link.filelist for the archive builders that run after it, so it links without their archives.
 BOOTSTRAP=${XNU_BOOTSTRAP:-0}
@@ -77,6 +94,7 @@ if [ "$BOOT_PROGRESS" != 0 ] && [ "$BOOT_PROGRESS" != 1 ]; then
   exit 1
 fi
 if [ "$BOOT_PROGRESS" = 1 ]; then
+  # The board diagnostics use the UFS/owner-root paths; they do not touch the Virtio block driver.
   if [ "${XNU_NATIVE_UFS:-0}" != 1 ] || [ "${XNU_OWNER_ROOT_AUDIT:-0}" != 1 ] || \
      [ "${XNU_SOURCE_CORECRYPTO14:-0}" != 1 ]; then
     echo 'Boot progress requires the audited UFS/owner-root and source-corecrypto build' >&2
@@ -157,9 +175,13 @@ if [ ! -d refer/libplatform/.git ]; then
 fi
 export KERNEL_SDKROOT=$ROOT/.cache/fakeroot
 mkdir -p "$KERNEL_SDKROOT/usr/local/include/kernel" "$ROOT/build/xnu/obj/EXPORT_HDRS/libsa"
-ditto refer/libplatform/include "$KERNEL_SDKROOT/usr/local/include"
-ditto refer/libplatform/private "$KERNEL_SDKROOT/usr/local/include"
-ditto refer/libplatform/private/platform "$KERNEL_SDKROOT/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform"
+copy_tree() {
+  mkdir -p "$2"
+  cp -R "$1/." "$2/"
+}
+copy_tree refer/libplatform/include "$KERNEL_SDKROOT/usr/local/include"
+copy_tree refer/libplatform/private "$KERNEL_SDKROOT/usr/local/include"
+copy_tree refer/libplatform/private/platform "$KERNEL_SDKROOT/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform"
 if [ ! -d refer/libdispatch/.git ]; then
   git clone --depth 1 --branch "$LIBDISPATCH_TAG" https://github.com/apple-oss-distributions/libdispatch.git refer/libdispatch
 fi
@@ -183,14 +205,21 @@ if [ ! -f "$KERNEL_SDKROOT/.xnu-$XNU_VERSION-headers" ]; then
     MACHINE_CONFIGS=BCM2837 KERNEL_CONFIGS=DEVELOPMENT \
     RC_DARWIN_KERNEL_VERSION="$XNU_DARWIN" RC_ProjectSourceVersion="$XNU_VERSION" \
     MAKEJOBS=-j"${JOBS:-4}" OBJROOT="$ROOT/build/xnu/obj" \
-    SYMROOT="$ROOT/build/xnu/sym" DSTROOT="$KERNEL_SDKROOT"
+    SYMROOT="$ROOT/build/xnu/sym" DSTROOT="$KERNEL_SDKROOT" \
+    ${XNU_HOST_MAKE_ARGS[@]+"${XNU_HOST_MAKE_ARGS[@]}"}
   touch "$KERNEL_SDKROOT/.xnu-$XNU_VERSION-headers"
 fi
 if [ ! -f "$KERNEL_SDKROOT/usr/local/lib/kernel/libfirehose_kernel.a" ]; then
   bash scripts/build-firehose.sh
 fi
+if [ "$(uname -s)" = Linux ]; then
+  python3 scripts/linux/prepare-xnu.py libs
+fi
 # The baseline builds the kernel; `all` also checks the Apple kext export ABI.
 EXTRA_MAKE_ARGS=()
+# A fileset boot replaces com.apple.kernel inside a kernel collection: the
+# native executable must carry chained fixups and split-segment records.
+EXTRA_MAKE_ARGS+=("XNU_KERNEL_CHAINED_FIXUPS=${XNU_KERNEL_CHAINED_FIXUPS:-0}")
 ARM_DT_PLATFORM=${XNU_ARM_DT_PLATFORM:-0}
 if [ "$ARM_DT_PLATFORM" != 0 ] && [ "$ARM_DT_PLATFORM" != 1 ]; then
   echo 'XNU_ARM_DT_PLATFORM must be 0 or 1' >&2
@@ -246,10 +275,8 @@ if [ "$NATIVE_RAM_BLOCK" != 0 ] && [ "$NATIVE_RAM_BLOCK" != 1 ]; then
   echo 'XNU_NATIVE_RAM_BLOCK must be 0 or 1' >&2
   exit 1
 fi
-if [ "$NATIVE_RAM_BLOCK" = 1 ]; then
-  # RAM storage imports IOBlockStorageDevice and SHA-256, not IOAESAccelerator.
-  # Picasso's NativeUfs archive already binds the same original storage class;
-  # its RAM archive builder checks those imports against the actual UFS bindings.
+# Source storage starts its RAM disk; the prelinked path uses the qualified original bindings.
+if [ "$NATIVE_RAM_BLOCK" = 1 ] && [ "${XNU_SOURCE_STORAGE:-0}" != 1 ]; then
   if [ "${XNU_NATIVE_AES:-0}" != 1 ] && { [ "${XNU_NATIVE_UFS:-0}" != 1 ] ||
       [ "$CRYPTO_BOOTSTRAP_MODE" != prelinked ] || [ "${XNU_SOURCE_CORECRYPTO14:-0}" != 1 ]; }; then
     echo 'NativeRamBlock requires original storage/SHA-256 via NativeAES or NativeUfs with prelinked corecrypto' >&2
@@ -326,8 +353,8 @@ if [ "$OWNER_ROOT_AUDIT" != 0 ] && [ "$OWNER_ROOT_AUDIT" != 1 ]; then
   exit 1
 fi
 if [ "$OWNER_ROOT_AUDIT" = 1 ] && [ "$OWNER_ROOT_PROBE" != 1 ] && \
-   [ "${XNU_NATIVE_UFS:-0}" != 1 ]; then
-  echo 'The root-binding audit requires real owner-verified block crypto (NativeUfs or VerifiedRoot)' >&2
+   [ "${XNU_SOURCE_STORAGE:-0}" != 1 ] && [ "${XNU_NATIVE_UFS:-0}" != 1 ]; then
+  echo 'The root-binding audit requires real owner-verified block crypto' >&2
   exit 1
 fi
 OWNER_ROOT_TRUST=${XNU_OWNER_ROOT_TRUST:-0}
@@ -336,8 +363,9 @@ if [ "$OWNER_ROOT_TRUST" != 0 ] && [ "$OWNER_ROOT_TRUST" != 1 ]; then
   exit 1
 fi
 if [ "$OWNER_ROOT_TRUST" = 1 ] && { [ "$OWNER_ROOT_AUDIT" != 1 ] || \
-    { [ "${XNU_NATIVE_VIRTIO_BLOCK:-0}" != 1 ] && [ "${XNU_NATIVE_UFS:-0}" != 1 ]; }; }; then
-  echo 'Owner root acceptance requires actual mounted-media binding and verified block storage (NativeUfs or VirtIO)' >&2
+   { [ "${XNU_NATIVE_VIRTIO_BLOCK:-0}" != 1 ] && [ "${XNU_SOURCE_STORAGE:-0}" != 1 ] &&
+     [ "${XNU_NATIVE_UFS:-0}" != 1 ]; }; }; then
+  echo 'Owner root acceptance requires actual mounted-media binding and verified block storage' >&2
   exit 1
 fi
 ADRENO_FIRMWARE_PROBE=${XNU_ADRENO_FIRMWARE_PROBE:-0}
@@ -465,7 +493,7 @@ if [ "$OWNER_DATA_MOUNT" = 1 ] && [ "$OWNER_BOOT_MANIFEST" != 1 ]; then
   exit 1
 fi
 OWNER_DATA_HEADER=$ROOT/build/xnu/owner-data-volume.h
-python3 - "$OWNER_DATA_HEADER" "$OWNER_DATA_MOUNT" "$NATIVE_RAM_BLOCK" "${XNU_OWNER_DATA_VOLUME_UUID:-}" "${XNU_OWNER_CACHE_VOLUME_UUID:-}" <<'PY_DATA_UUID'
+python3 - "$OWNER_DATA_HEADER" "$OWNER_DATA_MOUNT" "$NATIVE_RAM_BLOCK" "${XNU_OWNER_DATA_VOLUME_UUID:-}" "${XNU_OWNER_CACHE_VOLUME_UUID:-}" "${XNU_OWNER_ROOT_VOLUME_UUID:-}" "$OWNER_BOOT_MANIFEST" <<'PY_DATA_UUID'
 from pathlib import Path
 import sys
 import uuid
@@ -488,12 +516,20 @@ if len(sys.argv) > 5 and sys.argv[5]:
     except ValueError:
         raise SystemExit('Set XNU_OWNER_CACHE_VOLUME_UUID to the SystemOS volume UUID of the signed policy')
 text += '#define XNU_OWNER_CACHE_VOLUME_UUID "' + cache + '"\n'
+# The OS root volume of the boot manifest comes from the OS profile ([root] os_volume_uuid).
+if len(sys.argv) > 6 and sys.argv[6]:
+    try:
+        text += '#define XNU_OWNER_ROOT_VOLUME_UUID "' + str(uuid.UUID(sys.argv[6])).upper() + '"\n'
+    except ValueError:
+        raise SystemExit('Set XNU_OWNER_ROOT_VOLUME_UUID to the OS volume UUID of the signed policy')
+elif len(sys.argv) > 7 and sys.argv[7] == '1':
+    raise SystemExit('The owner boot manifest needs XNU_OWNER_ROOT_VOLUME_UUID (OS profile [root] os_volume_uuid)')
 path.parent.mkdir(parents=True, exist_ok=True)
 if not path.exists() or path.read_text() != text:
     path.write_text(text)
 PY_DATA_UUID
 OWNER_DATA_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-data-mount-mode
-OWNER_DATA_MODE="$OWNER_DATA_MOUNT:$NATIVE_RAM_BLOCK:${XNU_OWNER_DATA_VOLUME_UUID:-}:${XNU_OWNER_CACHE_VOLUME_UUID:-}"
+OWNER_DATA_MODE="$OWNER_DATA_MOUNT:$NATIVE_RAM_BLOCK:${XNU_OWNER_DATA_VOLUME_UUID:-}:${XNU_OWNER_CACHE_VOLUME_UUID:-}:${XNU_OWNER_ROOT_VOLUME_UUID:-}"
 if [ "$(cat "$OWNER_DATA_STAMP" 2>/dev/null || echo 0)" != "$OWNER_DATA_MODE" ]; then
   python3 - "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o" "$ROOT/build/xnu/stale-owner-data" <<'PY_DATA_STALE'
 from pathlib import Path
@@ -567,7 +603,12 @@ if { [ "$OWNER_CACHE_CARRIER" = 1 ] && [ "$OWNER_CACHE_STARTUP" != 1 ]; } ||
   echo 'Owner carrier policy requires authenticated owner startup; wrong UUID is an isolated negative control' >&2
   exit 1
 fi
-EXTRA_MAKE_ARGS+=("vm_unix.o_CFLAGS_ADD=-DXNU_OWNER_CACHE_CARRIER=$OWNER_CACHE_CARRIER -DXNU_OWNER_CACHE_CARRIER_WRONG_UUID=$OWNER_CACHE_CARRIER_WRONG_UUID")
+# A command-line per-file flag replaces the source's own; keep its semantic types.
+VM_UNIX_TYPES=
+if grep -q FORCE_UNSAFE_TYPES .cache/xnu-work/bsd/conf/Makefile.template; then
+  VM_UNIX_TYPES=-DVM_UNSAFE_TYPES
+fi
+EXTRA_MAKE_ARGS+=("vm_unix.o_CFLAGS_ADD=$VM_UNIX_TYPES -DXNU_OWNER_CACHE_CARRIER=$OWNER_CACHE_CARRIER -DXNU_OWNER_CACHE_CARRIER_WRONG_UUID=$OWNER_CACHE_CARRIER_WRONG_UUID")
 OWNER_CARRIER_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-cache-carrier-mode
 if [ "$(cat "$OWNER_CARRIER_STAMP" 2>/dev/null || echo 0:0)" != "$OWNER_CACHE_CARRIER:$OWNER_CACHE_CARRIER_WRONG_UUID" ]; then
   rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/vm_unix.o"
@@ -755,7 +796,7 @@ PY_GPU_BROKER
     KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$CONSOLE_ARCHIVE"
     KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $CONSOLE_ARCHIVE"
   fi
-  if [ "$NATIVE_RAM_BLOCK" = 1 ]; then
+  if [ "$NATIVE_RAM_BLOCK" = 1 ] && [ "${XNU_SOURCE_STORAGE:-0}" != 1 ]; then
     RAM_BLOCK_ARCHIVE=$ROOT/build/native-ram-block/libNativeRamBlock.a
     test -f "$RAM_BLOCK_ARCHIVE"
     if [ "${XNU_NATIVE_VIRTIO_BLOCK:-0}" = 1 ]; then
@@ -877,13 +918,13 @@ PY
 EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_BOOT_PROGRESS=$BOOT_PROGRESS"
 make -C .cache/xnu-work "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iphoneos}" ARCH_CONFIGS=ARM64 \
   MACHINE_CONFIGS=BCM2837 KERNEL_CONFIGS=DEVELOPMENT \
-  ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY \
+  ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG="$XNU_ARCH_STRING" LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY \
   ARM64_LINK_ADDR=0xfffffff007004000 ARM64_PLKSEG_ADDR=0xfffffff004004000 \
-  DEPLOYMENT_TARGET_FLAGS="-miphoneos-version-min=17.0 -DXNU_TARGET_OS_IOS" \
-  DEPLOYMENT_LINKER_FLAGS="-Wl,-ios_version_min,17.0" \
+  DEPLOYMENT_TARGET_FLAGS="-miphoneos-version-min=$IOS_VERSION -DXNU_TARGET_OS_IOS" \
+  DEPLOYMENT_LINKER_FLAGS="-Wl,-ios_version_min,$IOS_VERSION" \
   RC_DARWIN_KERNEL_VERSION="$XNU_DARWIN" RC_ProjectSourceVersion="$XNU_VERSION" \
   BUILD_LTO=0 BOUND_CHECKS=0 BUILD_WERROR="${XNU_BUILD_WERROR:-0}" MAKEJOBS=-j"${JOBS:-4}" \
-  CFLAGS_EXTRA="$EXTRA_CFLAGS" "${EXTRA_MAKE_ARGS[@]}" \
+  CFLAGS_EXTRA="$EXTRA_CFLAGS" "${EXTRA_MAKE_ARGS[@]}" ${XNU_HOST_MAKE_ARGS[@]+"${XNU_HOST_MAKE_ARGS[@]}"} \
   OBJROOT="$ROOT/build/xnu/ios-obj" SYMROOT="$ROOT/build/xnu/ios-sym" DSTROOT="$ROOT/build/xnu/ios-dst"
 if [ "${XNU_SOURCE_CORECRYPTO14:-0}" = 1 ] && [ "$CRYPTO_BOOTSTRAP_MODE" = source ]; then
   python3 scripts/seal-source-crypto-kernel.py \

@@ -1,0 +1,85 @@
+name: Build Picasso Kernel (Linux)
+
+# Builds and prelinks kernel.macho from the pinned upstream and device sources.
+# APFS Data preparation, UIKit libraries and boot.img composition are separate steps.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: picasso-linux-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  kernel_linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      UNIXNU_TOOLCHAIN: /opt/unixnu-linux
+      UNIXNU_LLVM_BIN: /opt/unixnu-linux/llvm/bin
+    defaults:
+      run:
+        shell: bash
+        working-directory: device
+    steps:
+      - name: Check out the picasso device repo
+        uses: actions/checkout@v4
+        with:
+          path: device
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare the pinned upstream source
+        run: |
+          mkdir -p out/picasso/logs
+          TREE=$(python3 ./unixnu --prepare)
+          echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
+
+      - name: Install the Linux Mach-O kernel toolchain
+        run: |
+          sudo python3 "$UNIXNU_TREE/scripts/linux/setup-toolchain.py" "$UNIXNU_TOOLCHAIN" \
+            2>&1 | tee out/picasso/logs/linux-toolchain.log
+          echo "$UNIXNU_LLVM_BIN" >> "$GITHUB_PATH"
+          test -x "$UNIXNU_LLVM_BIN/llvm-objcopy"
+
+      - name: Prepare authenticated stock touch firmware
+        run: |
+          python3 scripts/fetch-picasso-touch-firmware.py --output out/picasso/novatek/firmware.bin
+          echo "NOVATEK_TOUCH_FW=$PWD/out/picasso/novatek/firmware.bin" >> "$GITHUB_ENV"
+
+      - name: Fetch the pinned kernelcache and check the original class ABI
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 ./unixnu defconfig picasso_defconfig
+          python3 ./unixnu ipsw fetch KernelCache 2>&1 | tee out/picasso/logs/linux-ipsw.log
+          echo "UNIXNU_KERNELCACHE=$PWD/out/ipsw/21H461/kernelcache.decompressed" >> "$GITHUB_ENV"
+          python3 scripts/check-picasso-original-abi.py \
+            --kernelcache out/ipsw/21H461/kernelcache.decompressed \
+            --native-prelink-dir "$UNIXNU_TREE/kits/XnuPrelink" \
+            --output out/picasso/logs/original-abi.json
+
+      - name: Build and prelink the Picasso kernel
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
+          python3 ./unixnu build kernel -j 2 2>&1 | tee out/picasso/logs/linux-build.log
+          test -s out/picasso/kernel/kernel.macho
+          sha256sum out/picasso/kernel/kernel.macho > out/picasso/kernel/SHA256SUMS
+
+      - name: Upload the prelinked kernel and build reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: picasso-linux-kernel-${{ github.run_number }}
+          path: |
+            device/out/picasso/kernel/
+            device/out/picasso/logs/
+          if-no-files-found: warn

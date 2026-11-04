@@ -1,6 +1,6 @@
---- a/bsd/kern/kern_exec.c	2026-11-04 10:58:06
-+++ b/bsd/kern/kern_exec.c	2026-11-04 10:58:06
-@@ -7651,6 +7651,7 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7652,6 +7652,7 @@
  	native_gpu_addon_files = (int)count;
  	vfs_context_t ctx = vfs_context_current();
  	char path[192];
@@ -8,7 +8,7 @@
  	at = 24;
  	for (uint32_t i = 0; i < count; ++i) {
  		uint32_t name_bytes = 0, mode = 0;
-@@ -7662,6 +7663,8 @@
+@@ -7663,6 +7664,8 @@
  		at += 24;
  		const char *name = (const char *)(addon + at);
  		at += (name_bytes + 7) & ~7ULL;
@@ -18,9 +18,10 @@
  		uint8_t *data = kalloc_data(size ? size : 1, Z_WAITOK);
  		int error = data ? native_gpu_addon_inflate(addon + at, packed, data, size) : ENOMEM;
 @@ -7684,6 +7687,26 @@
+ 			native_gpu_addon_written++;
  		}
  		at += (packed + 7) & ~7ULL;
- 	}
++	}
 +	/* The addon is the authority for its own directory. A publish/clients marker
 +	 * left behind by an earlier published addon survives the Data volume and
 +	 * kept the Metal plugin in its production path after the unpublished addon
@@ -40,7 +41,6 @@
 +		if (!copyout(stale, request.path, strlen(stale) + 1)) {
 +			(void)unlink(p, &request, &result);
 +		}
-+	}
+ 	}
  }
- static void
- native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ /* The OS cryptex where iPadOS looks for it. The root volume's entries for cryptex content are links into /System/Cryptexes/OS, which

@@ -49,6 +49,7 @@ CONFIG_XNU_OWNER_CACHE_STARTUP=y
 # Publish the authenticated boot manifest for the mounted pair; requires the
 # startup selection. Data is a separate volatile APFS volume prepared in CI.
 CONFIG_XNU_OWNER_BOOT_MANIFEST=y
+CONFIG_XNU_OWNER_ROOT_VOLUME_UUID="04769D26-2CA0-4825-B443-E2E5F88300F2"
 CONFIG_XNU_OWNER_CACHE_VOLUME_UUID="8846FE78-2910-4297-AF97-D59BB6F8FC16"
 # The shared cache is now on the process root mount, so the additional
 # non-union carrier allowance is unnecessary. Original signature and owner
