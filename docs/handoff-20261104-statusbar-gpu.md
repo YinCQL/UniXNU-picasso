@@ -351,3 +351,16 @@ Do not carry its "App normal" conclusion forward.
   display counter as a regression. The merged HID stack reports
   `swipe unavailable started=1 digitizer=0 sink=1`, so the offline auto-swipe no longer unlocks;
   real touch still works. Branch pushed as 41202dd; PR #13 has the evidence comment.
+- **Apps and the vnode table (wf230..wf234)**: the staged bundles and the copy marker persist across boots
+  (probe `PICASSO_PERSIST marker size=0`, `staged size=4598`), but
+  `/private/var/mobile/Library/MobileInstallation/MobileInstallation.plist` never exists (`err=2`), so lsd
+  needs the `picasso-ls-rebuild=1` csstore drop (`removed=1`) to rescan /Applications on every boot.
+  That rescan used to hit a **1024-entry vnode table**: XNU sizes it as `sane_size/64k + 1024`, and
+  `sane_size` is still 0 when `unix_startup` runs on this port. The resulting vnode jetsam killed
+  backboardd/SpringBoard (`Initiating vnode jetsam : 1024 desired`), and `-no_vnode_jetsam` turned that
+  into a panic (`vnode table is full @vfs_subr.c:5937`). Fix: the ADT `/defaults` node now carries
+  `kern.maxvnodes = 32768`, which `PE_get_default` reads before the memory-based fallback. wf234
+  (ls-rebuild + staged-apps, no jetsam override): submit=384 accept=384 reject=0, copies=383,
+  GPU submissions=385, **vnode jetsam=0, service exits=0, no panic**; the desktop and apps are back.
+  The proper long-term fix is still to have installd maintain MobileInstallation.plist (or to keep the
+  bindfs volume/file IDs stable) so the per-boot LaunchServices rescan can be dropped.

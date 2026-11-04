@@ -257,7 +257,12 @@ def main():
                       ('#size-cells', struct.pack('<I', 0))], children=cpus),
         *([node('psci', [('compatible', b'arm,psci-1.0\0'), ('method', args.psci_method.encode() + b'\0')])] if len(cpus) > 1 else []),
         # Suspend/resume is not implemented for this board. Block CPU parking.
-        node('defaults', [('sleep-disabled', struct.pack('<I', 1))]),
+        # XNU sizes the vnode table from sane_size at startup, which is still zero on this port, so
+        # desiredvnodes collapses to 1024; a LaunchServices rescan then fills it and vnode jetsam kills
+        # backboardd/SpringBoard (or the kernel panics with the jetsam off). PE_get_default reads this
+        # property before the memory-based fallback, so the table gets a real size here.
+        node('defaults', [('sleep-disabled', struct.pack('<I', 1)),
+                          ('kern.maxvnodes', struct.pack('<I', 32768))]),
         node('options', []),
         # J120 has no Home button; MobileGestalt reads that from here. Without the
         # node an iPad identity still advertises a Home button and the userspace

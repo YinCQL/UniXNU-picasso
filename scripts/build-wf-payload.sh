@@ -112,7 +112,7 @@ if [ "${SB_INJECT:-0}" = "1" ]; then
     ARGS+=(--kernel-arg amfi_allow_any_signature=1)
   fi
 fi
-for extra in "$@"; do ARGS+=(--kernel-arg "$extra"); done
+for extra in "$@"; do ARGS+=(--kernel-arg="$extra"); done
 python3 unixnu build payload --out "out/${TAG}" --kernel out/picasso/kernel/kernel.macho \
   --data-ramdisk "$DATA_RAMDISK" "${SKIP_SETUP[@]}" \
   --owner-trust-cache "$OWNER_TRUST" --gpu-addon "$ADDON" \
