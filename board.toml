@@ -232,6 +232,12 @@ kernel_args = [
   # Request the optional NativeUfs store window for changed Data pages.
   # The generated APFS seed has 1024 MiB sparse logical capacity.
   "sheng-data-persist=2",
+  # Permanent build defaults for the userland: the device identity and the app registration are
+  # not per-experiment options. wf243 was built without the phone identity and came up in the iPad
+  # layout with no App icons; the LaunchServices cache then had to be rebuilt on the next boot.
+  # These two args make every payload rescan /Applications and stage the app bundles.
+  "picasso-ls-rebuild=1",
+  "sheng-staged-apps=1",
   # Diagnostic bring-up isolation: the original watchdogd's service checks do
   # not complete on this kernel yet. Disable only its launch job for this boot.
   "sheng-disable-watchdogd=1",

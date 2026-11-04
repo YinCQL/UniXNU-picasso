@@ -89,7 +89,10 @@ if os.environ.get('NO_FBGPU') == '1':
 
 open(p,'w').write(s)
 EOF
-if [ "${IPHONE_IDENTITY:-0}" = "1" ]; then export PICASSO_PHONE_IDENTITY=1; fi
+# The phone identity is the build default. It used to be opt-in, and one run that forgot it built the
+# iPad layout with no App icons (wf243); the identity changes the geometry, the CA surface choice and the
+# App registration, so it must not depend on the caller remembering. IPHONE_IDENTITY=0 opts out explicitly.
+if [ "${IPHONE_IDENTITY:-1}" = "1" ]; then export PICASSO_PHONE_IDENTITY=1; else unset PICASSO_PHONE_IDENTITY; fi
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 export UNIXNU_KERNELCACHE=/Users/silenzio/Desktop/development/ios/UniXNU/out/ipsw/21H461/kernelcache.decompressed
 # Permanent board defaults (cpufreq, GPU probe/metal, HID start, touch stages, vsync, the
