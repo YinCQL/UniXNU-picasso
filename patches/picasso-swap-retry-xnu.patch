@@ -1,0 +1,46 @@
+--- a/osfmk/vm/vm_compressor_backing_store.c
++++ b/osfmk/vm/vm_compressor_backing_store.c
+@@ -520,6 +520,21 @@
+ 	printf("VM Swap Subsystem is ON\n");
+ }
+ 
++/*
++ * sheng: the first swapfile create attempt runs while / is still the read-only system
++ * volume, so it fails with EROFS (/private/var is not yet the writable RAM Data volume).
++ * The boot path calls this right after mounting that volume: clear the failure time so
++ * VM_SWAP_SHOULD_CREATE() is true again and wake the creator to retry on the writable path.
++ */
++void
++vm_swap_retry_create(void)
++{
++	lck_mtx_lock(&vm_swap_data_lock);
++	vm_swapfile_last_failed_to_create_ts = 0;
++	thread_wakeup((event_t)&vm_swapfile_create_needed);
++	lck_mtx_unlock(&vm_swap_data_lock);
++}
++
+ 
+ #if RECORD_THE_COMPRESSED_DATA
+ 
+@@ -812,6 +827,7 @@
+ 			HIBLOG("vm_swap_create_file failed @ %lu secs\n", (unsigned long)sec);
+ 		} else {
+ 			vm_swapfile_last_successful_create_ts = sec;
++			HIBLOG("vm_swap_create_file created @ %lu secs on %s0\n", (unsigned long)sec, swapfilename);
+ 		}
+ 	}
+ 	vm_swapfile_create_thread_running = 0;
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8216,6 +8216,11 @@
+ 	int data_error = native_owner_data_prepare(p, (user_addr_t)scratch_addr);
+ 	boot_progress_stage("Data mount returned");
+ 	if (data_error) panic("offline scratch Data mount failed: %d", data_error);
++	{
++		/* Retry swap creation now that /private/var is writable. */
++		extern void vm_swap_retry_create(void);
++		vm_swap_retry_create();
++	}
+ #if defined(XNU_BOOT_PROGRESS) && XNU_BOOT_PROGRESS
+ 	extern int sheng_boot_watchdog_policy(void *, uint64_t);
+ 	boot_progress_stage("temporary watchdog launch policy enter");

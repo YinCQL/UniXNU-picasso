@@ -12,6 +12,16 @@ import tempfile
 DEVICE = Path(__file__).resolve().parent
 UPSTREAM = 'https://github.com/UniXNU/UniXNU.git'
 
+# Ordered after the iOS16 ABI/diagnostic overlays embedded in the source patch.
+# Identity, UIKit seed preferences and scoped library trust remain iOS16-specific.
+LATE_OVERLAYS = [
+    'cpu-idle', 'cpu-topology', 'swap-retry', 'clear-gestalt', 'apps-mount',
+    'inject-open-probe', 'inject-signature-probe', 'apps-view-probe',
+    'cdc-snapshot', 'addon-marker-sync', 'bindfs-fileid', 'ls-rebuild',
+    'ca-prefs', 'persist-probe', 'cdc-poller-sleep', 'cdc-cpu-usage',
+    'quiet-boot', 'quiet-boot2', 'defer-ps', 'ls-persist',
+]
+
 
 def prepare(device=DEVICE, source=None):
     revision = (device / 'upstream.rev').read_text().strip()
@@ -19,10 +29,11 @@ def prepare(device=DEVICE, source=None):
         raise ValueError('upstream.rev must contain a full Git commit ID')
     patch = device / 'patches/unixnu-source-kernel.patch'
     usb_patch = device / 'patches/picasso-usb-console-xnu.patch'
-    overlays = [device / 'patches/picasso-cpu-idle-xnu.patch',
-                device / 'patches/picasso-cpu-topology-xnu.patch']
+    overlays = [device / ('patches/picasso-' + name + '-xnu.patch')
+                for name in LATE_OVERLAYS]
+    ram_block_patch = device / 'patches/picasso-native-ram-block-mode1-guard.patch'
     fingerprint = hashlib.sha256(b'\0'.join(
-        p.read_bytes() for p in [patch, usb_patch, *overlays])).hexdigest()
+        p.read_bytes() for p in [patch, usb_patch, ram_block_patch, *overlays])).hexdigest()
     cache = device / '.cache'
     target = cache / f'upstream-{revision[:12]}-{fingerprint[:12]}'
     if target.is_dir():
@@ -53,13 +64,15 @@ def prepare(device=DEVICE, source=None):
             git('-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', '--recursive', cwd=tree)
         git('apply', '--check', patch, cwd=tree)
         git('apply', patch, cwd=tree)
+        git('apply', '--check', ram_block_patch, cwd=tree / 'drivers/NativeRamBlock')
+        git('apply', ram_block_patch, cwd=tree / 'drivers/NativeRamBlock')
         embedded_usb_patch = tree / 'patches/xnu/zzz-picasso-usb-console.patch'
         if not embedded_usb_patch.is_file():
             raise FileNotFoundError(f'{embedded_usb_patch} missing from source patch')
         embedded_usb_patch.write_bytes(usb_patch.read_bytes())
-        for name, overlay in zip(('zzzzzzzzzzzzzzzzzzzzzzzz-picasso-cpu-idle.patch',
-                                  'zzzzzzzzzzzzzzzzzzzzzzzzz-picasso-cpu-topology.patch'), overlays):
-            (tree / 'patches/xnu' / name).write_bytes(overlay.read_bytes())
+        for index, (name, overlay) in enumerate(zip(LATE_OVERLAYS, overlays)):
+            installed = 'z' * (24 + index) + '-picasso-' + name + '.patch'
+            (tree / 'patches/xnu' / installed).write_bytes(overlay.read_bytes())
         tree.rename(target)
     return target
 

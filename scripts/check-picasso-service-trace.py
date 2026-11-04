@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 
 ROOT = Path(__file__).resolve().parents[1]
-CASE_COUNT = 9
+CASE_COUNT = 11
 
 
 def main():

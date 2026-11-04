@@ -1,0 +1,130 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -96,6 +96,7 @@
+ #include <sys/mount_internal.h>
+ #include <sys/vnode_internal.h>
+ #include <sys/fsgetpath.h>
++#include <sys/dirent.h>
+ #include <sys/file_internal.h>
+ #include <sys/stat.h>
+ #include <sys/uio_internal.h>
+@@ -8048,6 +8049,102 @@
+ 
+ #if DEVELOPMENT || DEBUG
+ static volatile int native_picasso_apps_stage = 0, native_picasso_apps_status = -1;
++static int
++native_picasso_ls_names(const char *path, const char *prefix, char (*names)[64], unsigned max, unsigned *found)
++{
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	*found = 0;
++	int error = vnode_lookup(path, 0, &vp, ctx);
++	if (error) return error;
++	char *buffer = kalloc_data(4096, Z_WAITOK);
++	uio_t uio = buffer ? uio_create(1, 0, UIO_SYSSPACE, UIO_READ) : NULL;
++	if (!uio) error = ENOMEM;
++	int eof = 0;
++	const size_t prefix_length = strlen(prefix);
++	while (uio && !eof && *found < max) {
++		uio_reset(uio, uio_offset(uio), UIO_SYSSPACE, UIO_READ);
++		uio_addiov(uio, CAST_USER_ADDR_T(buffer), 4096);
++		int entries = 0;
++		error = VNOP_READDIR(vp, uio, 0, &eof, &entries, ctx);
++		if (error) break;
++		size_t used = 4096 - uio_resid(uio);
++		if (!used) break;
++		const size_t header = offsetof(struct dirent, d_name);
++		for (size_t at = 0; at + header < used && *found < max;) {
++			const struct dirent *entry = (const struct dirent *)(buffer + at);
++			if (entry->d_reclen <= header || entry->d_reclen > used - at ||
++			    entry->d_namlen >= entry->d_reclen - header) {
++				error = EIO;
++				break;
++			}
++			const int dot = entry->d_name[0] == '.' &&
++			    (entry->d_namlen == 1 || (entry->d_namlen == 2 && entry->d_name[1] == '.'));
++			if (!dot && entry->d_namlen < 64 && entry->d_namlen >= prefix_length &&
++			    !strncmp(entry->d_name, prefix, prefix_length)) {
++				memcpy(names[*found], entry->d_name, entry->d_namlen);
++				names[(*found)++][entry->d_namlen] = 0;
++			}
++			at += entry->d_reclen;
++		}
++		if (error) break;
++	}
++	if (uio) uio_free(uio);
++	if (buffer) kfree_data(buffer, 4096);
++	vnode_put(vp);
++	return error;
++}
++
++static void
++native_picasso_ls_store_drop(proc_t p, user_addr_t scratch)
++{
++	/* Reuse Sheng's container search; a UUID belongs to a Data store, not to
++	 * a device or OS image. Remove only regenerable LaunchServices caches. */
++	static const char *const parents[] = {
++		"/private/var/mobile/Containers/Data/InternalDaemon",
++		"/private/var/containers/Data/InternalDaemon",
++		"/private/var/containers/Data/System"
++	};
++	static const char prefix[] = "com.apple.LaunchServices-";
++	char (*containers)[64] = kalloc_data(128 * 64, Z_WAITOK);
++	char (*files)[64] = kalloc_data(8 * 64, Z_WAITOK);
++	char *path = kalloc_data(256, Z_WAITOK);
++	int removed = 0, looked = 0, failed = 0;
++	if (!containers || !files || !path) {
++		printf("PICASSO_LS_REBUILD error=%d\n", ENOMEM);
++		goto done;
++	}
++	for (size_t k = 0; k < sizeof(parents) / sizeof(parents[0]); ++k) {
++		unsigned count = 0;
++		int error = native_picasso_ls_names(parents[k], "", containers, 128, &count);
++		if (error) {
++			if (error != ENOENT) failed++;
++			continue;
++		}
++		for (unsigned i = 0; i < count; ++i) {
++			snprintf(path, 256, "%s/%s/Library/Caches", parents[k], containers[i]);
++			unsigned n = 0;
++			if (native_picasso_ls_names(path, prefix, files, 8, &n)) continue;
++			looked++;
++			for (unsigned j = 0; j < n; ++j) {
++				snprintf(path, 256, "%s/%s/Library/Caches/%s", parents[k], containers[i], files[j]);
++				struct unlink_args request = {.path = scratch + 0xc00};
++				int32_t result = 0;
++				error = copyout(path, request.path, strlen(path) + 1);
++				if (!error) error = unlink(p, &request, &result);
++				if (!error) removed++;
++				else failed++;
++				printf("PICASSO_LS_REBUILD file=%s error=%d\n", path, error);
++			}
++		}
++	}
++	printf("PICASSO_LS_REBUILD removed=%d looked=%d failed=%d\n", removed, looked, failed);
++done:
++	if (containers) kfree_data(containers, 128 * 64);
++	if (files) kfree_data(files, 8 * 64);
++	if (path) kfree_data(path, 256);
++}
++
+ static void
+ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+ {
+@@ -8118,6 +8215,16 @@
+ 		}
+ 		if (path) kfree_data(path, MAXPATHLEN);
+ 		printf("PICASSO_APPS_VIEW found=%03x fileid=%03x\n", found, resolved);
++		uint32_t rebuild = 0;
++		if (PE_parse_boot_argn("picasso-ls-rebuild", &rebuild, sizeof(rebuild)) && rebuild == 1) {
++			if (native_picasso_apps_stage == 5 && !native_picasso_apps_status &&
++			    found == 0xfff && resolved == 0xfff) {
++				native_picasso_ls_store_drop(p, scratch);
++			} else {
++				printf("PICASSO_LS_REBUILD skipped stage=%d status=%d found=%03x fileid=%03x\n",
++				    native_picasso_apps_stage, native_picasso_apps_status, found, resolved);
++			}
++		}
+ 	}
+ 	printf("PICASSO_APPS_MOUNT stage=%d status=%d\n", native_picasso_apps_stage, native_picasso_apps_status);
+ }

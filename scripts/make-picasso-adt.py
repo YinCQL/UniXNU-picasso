@@ -235,7 +235,8 @@ def main():
                       ('#size-cells', struct.pack('<I', 0))], children=cpus),
         *([node('psci', [('compatible', b'arm,psci-1.0\0'), ('method', args.psci_method.encode() + b'\0')])] if len(cpus) > 1 else []),
         # Suspend/resume is not implemented for this board. Block CPU parking.
-        node('defaults', [('sleep-disabled', struct.pack('<I', 1))]),
+        node('defaults', [('sleep-disabled', struct.pack('<I', 1)),
+                          ('kern.maxvnodes', struct.pack('<I', 32768))]),
         node('options', []),
         # The selected port gesture model has no Home button. Publish only
         # Picasso's three buttons; do not invent the iPhone's ringer switch.

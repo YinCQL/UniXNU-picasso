@@ -1,0 +1,49 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -107,6 +107,38 @@
+ #include <sys/sysctl.h>
+ #include <sys/persona.h>
+ #include <sys/reason.h>
++static void
++picasso_clear_mobilegestalt_cache(void)
++{
++	static const char * const paths[] = {
++		"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
++		"/private/var/mobile/Library/Preferences/com.apple.MobileGestalt.plist",
++		"/private/var/mobile/Library/Preferences/com.apple.mobilegestalt.plist",
++	};
++	vfs_context_t ctx = vfs_context_create(NULL);
++	for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
++		struct nameidata nd;
++		NDINIT(&nd, DELETE, OP_UNLINK, LOCKPARENT, UIO_SYSSPACE, CAST_USER_ADDR_T(paths[i]), ctx);
++		int error = namei(&nd);
++		if (error) {
++			continue;
++		}
++		vnode_t dvp = nd.ni_dvp;
++		vnode_t vp = nd.ni_vp;
++		if (vp && vp->v_type != VDIR) {
++			error = VNOP_REMOVE(dvp, vp, &nd.ni_cnd, 0, ctx);
++			if (error == 0) {
++				printf("PICASSO_GESTALT removed %s\n", paths[i]);
++			}
++		}
++		nameidone(&nd);
++		vnode_put(dvp);
++		if (vp) {
++			vnode_put(vp);
++		}
++	}
++	vfs_context_rele(ctx);
++}
+ #if SYSV_SHM
+ #include <sys/shm_internal.h>           /* shmexec() */
+ #endif
+@@ -8220,6 +8252,7 @@
+ 		/* Retry swap creation now that /private/var is writable. */
+ 		extern void vm_swap_retry_create(void);
+ 		vm_swap_retry_create();
++		picasso_clear_mobilegestalt_cache();
+ 	}
+ #if defined(XNU_BOOT_PROGRESS) && XNU_BOOT_PROGRESS
+ 	extern int sheng_boot_watchdog_policy(void *, uint64_t);

@@ -54,6 +54,13 @@ static uint64_t thread_tid(void *t) { return *static_cast<uint64_t *>(t); }
 static std::mutex output_lock;
 static std::string output;
 static unsigned lines;
+static int probesMode = -1;
+static bool PE_parse_boot_argn(const char *name, void *value, int size) {
+    assert(!strcmp(name, "picasso-probes") && size == sizeof(unsigned));
+    if (probesMode < 0) return false;
+    *static_cast<unsigned *>(value) = static_cast<unsigned>(probesMode);
+    return true;
+}
 static int host_log(const char *format, ...) {
     char text[1024]; va_list args; va_start(args, format);
     int count = vsnprintf(text, sizeof(text), format, args); va_end(args);
@@ -180,6 +187,16 @@ int main(int argc, char **argv) {
         for (auto &t : workers) t.join();
         assert(lines == 1920); contains("sample=24");
         assert(output.find("sample=25") == std::string::npos);
+    } else if (scenario == 9) {
+        probesMode = 0;
+        auto trace = picasso_service_begin(0, &dict, nullptr, 0);
+        picasso_service_end(trace, 0, 0, true);
+        assert(!trace.ticket && !lines && !dict.reads);
+    } else if (scenario == 10) {
+        probesMode = 1;
+        auto trace = picasso_service_begin(0, &dict, nullptr, 0);
+        picasso_service_end(trace, 0, 0, true);
+        assert(trace.ticket && lines == 4 && dict.reads == 3);
     } else assert(false);
     unsigned newlines = 0; for (char c : output) if (c == '\n') ++newlines;
     assert(newlines == lines);

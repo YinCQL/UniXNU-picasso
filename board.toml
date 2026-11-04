@@ -274,6 +274,11 @@ kernel_args = [
   "offline-legacy-cpu-present=1",
   # Offer frames to the GPU client; keep the CPU path when no client accepts.
   "sheng-fb-gpu=1",
+  # Rebuild application registration after the staged Applications view mounts.
+  "picasso-ls-rebuild=1",
+  "sheng-staged-apps=1",
+  # Keep boot diagnostic painters from covering the system UI.
+  "sheng-banner=0",
   # State queries only for unprotected RAM Data; no keybag/key operations.
   "picasso-aks-state=1",
   # Software refresh notifications only; panel timing remains firmware-owned.

@@ -1,0 +1,38 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8022,6 +8022,25 @@
+ 	vnode_put(vp);
+ }
+ 
++#if DEVELOPMENT || DEBUG
++static volatile int native_picasso_apps_stage = 0, native_picasso_apps_status = -1;
++static void
++native_picasso_apps_mount(proc_t p, user_addr_t scratch)
++{
++	static const char source[] = "/private/var/staged_system_apps";
++	static const char point[] = "/Applications";
++	uint32_t picassoExtras = 7;
++	PE_parse_boot_argn("sheng-ui-extras", &picassoExtras, sizeof(picassoExtras));
++	if (!(picassoExtras & 1)) {
++		printf("PICASSO_APPS_MOUNT skipped extras=%u\n", picassoExtras);
++		return;
++	}
++	native_gpu_addon_mount(p, scratch, 0xc00, source, sizeof(source), point, sizeof(point),
++	    "/Applications/Camera.app/Info.plist", "/Applications/MobileMail.app/Info.plist",
++	    &native_picasso_apps_stage, &native_picasso_apps_status);
++	printf("PICASSO_APPS_MOUNT stage=%d status=%d\n", native_picasso_apps_stage, native_picasso_apps_status);
++}
++#endif
+ static int
+ native_owner_data_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -8091,6 +8110,9 @@
+ 	if (!error) native_owner_data_stage = 4;
+ 	if (!error) native_gpu_addon_prepare(p, scratch);
+ 	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
++#if DEVELOPMENT || DEBUG
++	if (!error) native_picasso_apps_mount(p, scratch);
++#endif
+ done:
+ 	if (data_root) vnode_put(data_root);
+ 	native_owner_data_status = error;

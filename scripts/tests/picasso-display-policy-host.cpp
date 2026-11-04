@@ -7,6 +7,11 @@
 #include <map>
 #include <string>
 #include <vector>
+#ifdef _MSC_VER
+#include <intrin.h>
+#define __ATOMIC_RELEASE 3
+#define __atomic_store_n(p,v,o) ((void)_InterlockedExchange64((volatile long long *)(p),(long long)(v)))
+#endif
 
 struct OSObject {
     unsigned refs = 1;
@@ -49,7 +54,10 @@ IORegistryEntry *IORegistryEntry::fromPath(const char *, void *) {
 }
 struct IOService {};
 struct IOMemoryMap {
+    unsigned refs = 1;
     uint64_t address = 0xa0000000, length = 4320 * 2400;
+    void retain() { ++refs; }
+    uint64_t getVirtualAddress() const { return address + 0x100000000; }
     uint64_t getPhysicalAddress() const { return address; }
     uint64_t getLength() const { return length; }
 };
@@ -64,6 +72,9 @@ static void IOLog(const char *, ...) {}
 static void *gIODTPlane = nullptr;
 static IORegistryEntry *displayChosen = nullptr;
 static bool scaleAdded = false, rotationAdded = false;
+static IOMemoryMap *snapshotMapping = nullptr;
+static uint64_t picasso_snapshot_virtual;
+static uint32_t picasso_snapshot_width, picasso_snapshot_height, picasso_snapshot_stride;
 #define OSDynamicCast(type, value) dynamic_cast<type *>(value)
 #define OSSafeReleaseNULL(value) do { if (value) { (value)->release(); (value) = nullptr; } } while (0)
 
@@ -121,5 +132,8 @@ int main(int argc, char **argv) {
     root = new IORegistryEntry; consoleError = 1;
     assert(!start(map)); assert(root->props.empty()); consoleError = 0; closeRoot();
     assert(!start(map));
+    assert(snapshotMapping == &map && map.refs == 2);
+    assert(picasso_snapshot_virtual == map.getVirtualAddress());
+    assert(picasso_snapshot_width == 1080 && picasso_snapshot_height == 2400 && picasso_snapshot_stride == 4320);
     std::puts("PASS display policy: scale and rollback scenarios");
 }

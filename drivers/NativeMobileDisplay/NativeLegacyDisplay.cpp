@@ -6,6 +6,7 @@
 #include "NativeLegacyBootLogo.h"
 #include "PicassoGop.h"
 #include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
@@ -38,7 +39,7 @@ extern "C" void native_legacy_retirement_observed(IOService *);
 // to the privileged GPU client instead of being copied. The presenter's offer
 // either takes the frame or refuses it, in which case this file keeps the CPU
 // path unchanged. A failed GPU copy falls back for the rest of the kick.
-extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height,uint32_t destY);
 extern "C" void native_legacy_swap_stage(unsigned stage);
 extern "C" void native_legacy_gpu_fallback_observed(int status);
 extern "C" void native_legacy_retirement_failed(IOService *);
@@ -61,6 +62,9 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool primary=false;
     bool logicalPM=false;
     bool transferred=false;
+    // Submission, completion and refresh can kick concurrently. Preserve nested
+    // retirement callbacks while serializing queue pumps from other threads.
+    IORecursiveLock *kickLock=nullptr;
     bool benchmarked=false;
     // One bounded cached copy of visible pixels, independent of IOSurface lifetime.
     void *copyShadow=nullptr;
@@ -124,7 +128,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // client queue at +5592 never changes while the sender walks it.
     IOTimerEventSource *vsyncTimer=nullptr;
     uint64_t vsyncInterval=0,vsyncNext=0;
-    unsigned vsyncHz=0;
+    unsigned vsyncHz=0,pumpTicks=0;
     bool vsyncArmed=false;
     /* wf131 measured the compositor kicking the swap queue three times with the client queue
      * at +5592 still empty every time, so the tick that stands in for the absent panel
@@ -155,6 +159,9 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         const uint64_t now=mach_absolute_time();
         native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);
         native_legacy_vsync_observed(1,vsyncHz);
+        // A lost submission kick must not require another user frame to recover.
+        // Pump once a second; the presenter owns timeout and completion identity.
+        if(vsyncHz && (++pumpTicks%vsyncHz)==0)kickSwapQueue();
         vsyncNext+=vsyncInterval;
         if(vsyncNext<=now){vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}
         vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
@@ -188,7 +195,12 @@ public:
         Args args={this,status};
         IOWorkLoop *loop=getWorkLoop();
         auto action=[](OSObject *,void *a0,void *,void *,void *)->IOReturn {
-            Args *a=(Args *)a0;a->display->finishGpuSwap(a->status);return kIOReturnSuccess;
+            Args *a=(Args *)a0;
+            if(!a->display->kickLock)return kIOReturnNotReady;
+            IORecursiveLockLock(a->display->kickLock);
+            a->display->finishGpuSwap(a->status);
+            IORecursiveLockUnlock(a->display->kickLock);
+            return kIOReturnSuccess;
         };
         // runAction is synchronous: the stack arguments stay live until the
         // framebuffer gate is acquired. Never mutate the swap queue ungated
@@ -196,7 +208,7 @@ public:
         if(loop && loop->runAction(action,this,&args)==kIOReturnSuccess)return;
         native_legacy_retirement_failed(this);
     }
-    void free() override {stopVsync();resetCopyShadow();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+    void free() override {stopVsync();resetCopyShadow();if(kickLock){IORecursiveLockFree(kickLock);kickLock=nullptr;}if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
         stopVsync();
         resetCopyShadow();
@@ -220,6 +232,8 @@ public:
     }
     bool startDisplay(IOService *provider) {
         if(!IOMobileFramebufferLegacy::start(provider))return false;
+        if(!kickLock)kickLock=IORecursiveLockAlloc();
+        if(!kickLock){IOMobileFramebufferLegacy::stop(provider);return false;}
         if(primary && bootMapping)announcePoweredByFirmware();
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
         if(!enabled)return true;
@@ -282,6 +296,12 @@ public:
     // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
     bool kicking=false,rekick=false;
     void kickSwapQueue() override {
+        if(!kickLock)return;
+        IORecursiveLockLock(kickLock);
+        kickSwapLocked();
+        IORecursiveLockUnlock(kickLock);
+    }
+    void kickSwapLocked() {
         /* wf131: whether the compositor's queued swap ever reaches the kick, and whether a
          * vsync client is registered at that moment. wf132: the kick also establishes that a
          * display client exists, which is what the tick needs to run. */
@@ -371,7 +391,7 @@ public:
         if(!gpuBypass) {
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
         }
-        if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
+        if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height,0)) {
             // The GPU writes the scanout memory behind the CPU's back: the
             // differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
@@ -480,7 +500,7 @@ public:
     void finishTransfer(const OriginalLegacySwapRequest *request,bool force=false) {
         // Only after the real copy and store barrier: select the actual pending head and let the unchanged family release it and wake
         // waiters. This reports memory scanout completion, not a panel vblank or hardware fence.
-        if(!retireSwap(request,force)){native_legacy_retirement_failed(this);return;}
+        if(!retireSwap(request,force)){native_legacy_retirement_failed(this);transferred=false;return;}
         // The unchanged family has retired this generation and released its current reference. Permit the next independently validated
         // single pending frame. Keep the latch set while completion can reenter this method, and whenever retirement remains disabled.
         transferred=false;

@@ -406,7 +406,7 @@ extern "C" void sheng_cpufreq_poll(void) {
 }
 
 extern "C" void sheng_cpufreq_probe(void) {
-    unsigned mode = 0, capMHz = 0, minMHz = 0, boostMs = 1000, frameMs = 300, framePct = 60;
+    unsigned mode = 4, capMHz = 0, minMHz = 0, boostMs = 1000, frameMs = 300, framePct = 60;
     PE_parse_boot_argn("sheng-cpufreq", &mode, sizeof(mode));
     PE_parse_boot_argn("sheng-cpufreq-cap", &capMHz, sizeof(capMHz));
     PE_parse_boot_argn("sheng-cpufreq-min", &minMHz, sizeof(minMHz));

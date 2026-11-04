@@ -1,0 +1,134 @@
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -4058,3 +4058,103 @@
+ 	return exit_with_reason(p, W_EXITCODE(0, SIGKILL), (int *)NULL, FALSE, FALSE,
+ 	           0, reason);
+ }
++
++#if DEVELOPMENT || DEBUG
++#include <kern/clock.h>
++#include <kern/task_ref.h>
++struct picasso_process_row {
++	int pid;
++	int stat;
++	task_t task;
++	uint64_t user_ms, system_ms, resident;
++	char name[33];
++};
++extern void picasso_task_usage(task_t, uint64_t *, uint64_t *, uint64_t *);
++void picasso_live_process_list(unsigned);
++void
++picasso_live_process_list(unsigned sample)
++{
++	/* The CDC poller thread runs on a 16 KiB kernel stack; 256 rows of this size would
++	 * overflow it (wf255: __chkstk probe faulted on the first ps command). */
++	struct picasso_process_row *rows =
++	    kalloc_data(256 * sizeof *rows, Z_WAITOK | Z_ZERO);
++	if (rows == NULL) {
++		printf("PICASSO_PS begin sample=%u error=ENOMEM\n", sample);
++		return;
++	}
++	unsigned count = 0, total = 0;
++	proc_t p;
++
++	proc_list_lock();
++	ALLPROC_FOREACH(p) {
++		++total;
++		if (count == 256) {
++			continue;
++		}
++		rows[count].pid = proc_getpid(p);
++		rows[count].stat = p->p_stat;
++		/* Reference the task under the proc list lock (proc_task is cleared on exec/exit) and read
++		 * its counters after the lock is dropped. proc_find() must not be used here: this runs in
++		 * the CDC command handler, which holds the console lock, and proc_find takes the proc list
++		 * lock; a thread holding the proc list lock while printing to the console deadlocks it. */
++		rows[count].task = proc_task(p);
++		if (rows[count].task) task_reference(rows[count].task);
++		strlcpy(rows[count].name, p->p_name, sizeof(rows[count].name));
++		++count;
++	}
++	proc_list_unlock();
++
++	/* Cumulative CPU time and resident memory, so two ps samples give per-process usage. The
++	 * readings are the lock-free ones TASK_ABSOLUTETIME_INFO and TASK_BASIC_INFO use. */
++	for (unsigned i = 0; i < count; ++i) {
++		if (rows[i].task) {
++			if (rows[i].pid > 0) {
++				uint64_t u = 0, sy = 0, r = 0, ns = 0;
++				picasso_task_usage(rows[i].task, &u, &sy, &r);
++				absolutetime_to_nanoseconds(u, &ns); rows[i].user_ms = ns / 1000000;
++				ns = 0; absolutetime_to_nanoseconds(sy, &ns); rows[i].system_ms = ns / 1000000;
++				rows[i].resident = r;
++			}
++			task_deallocate(rows[i].task);
++			rows[i].task = TASK_NULL;
++		}
++	}
++
++	printf("PICASSO_PS begin sample=%u total=%u listed=%u\n",
++	    sample, total, count);
++	/* The console handler runs this while it holds the poll lock: one line per process
++	 * stalls the USB drain and the armed console watchdog resets the device (wf251).
++	 * Report the busiest twelve and the processes the UI work centers on. */
++	{
++		unsigned char shown[256] = {};
++		static const char * const named[] = {"SpringBoard", "backboardd", "Preferences", "launchd"};
++		for (unsigned rank = 0; rank < 12; ++rank) {
++			unsigned best = count;
++			uint64_t best_ms = 0;
++			for (unsigned i = 0; i < count && i < 256; ++i) {
++				if (shown[i] || rows[i].pid <= 0) continue;
++				const uint64_t total_ms = rows[i].user_ms + rows[i].system_ms;
++				if (best == count || total_ms > best_ms) {best = i; best_ms = total_ms;}
++			}
++			if (best == count || !best_ms) break;
++			shown[best] = 1;
++			printf("PICASSO_PS top rank=%u pid=%d stat=%d u=%llu s=%llu r=%llu name=%s\n",
++			    rank + 1, rows[best].pid, rows[best].stat,
++			    (unsigned long long)rows[best].user_ms, (unsigned long long)rows[best].system_ms,
++			    (unsigned long long)rows[best].resident, rows[best].name);
++		}
++		for (unsigned n = 0; n < sizeof(named) / sizeof(named[0]); ++n) {
++			for (unsigned i = 0; i < count && i < 256; ++i) {
++				if (shown[i] || rows[i].pid <= 0 || strcmp(rows[i].name, named[n])) continue;
++				shown[i] = 1;
++				printf("PICASSO_PS named name=%s pid=%d u=%llu s=%llu r=%llu\n",
++				    rows[i].name, rows[i].pid,
++				    (unsigned long long)rows[i].user_ms, (unsigned long long)rows[i].system_ms,
++				    (unsigned long long)rows[i].resident);
++			}
++		}
++	}
++	printf("PICASSO_PS end sample=%u\n", sample);
++	kfree_data(rows, 256 * sizeof *rows);
++}
++#endif
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10382,3 +10382,25 @@
+ }
+ #endif
+ /* PICASSO_SERVICE_WAIT_TASK_END */
++
++#if DEVELOPMENT || DEBUG
++void picasso_task_usage(task_t task, uint64_t *user, uint64_t *system, uint64_t *resident);
++void
++picasso_task_usage(task_t task, uint64_t *user, uint64_t *system, uint64_t *resident)
++{
++	if (!task) {
++		*user = *system = *resident = 0;
++		return;
++	}
++	struct recount_times_mach times = recount_task_times(task);
++	*user = times.rtm_user;
++	*system = times.rtm_system;
++	*resident = 0;
++	if (task->ledger) {
++		ledger_amount_t bytes = 0;
++		if (ledger_get_balance(task->ledger, task_ledgers.phys_mem, &bytes) == KERN_SUCCESS && bytes > 0) {
++			*resident = (uint64_t)bytes;
++		}
++	}
++}
++#endif

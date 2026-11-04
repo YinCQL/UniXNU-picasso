@@ -295,6 +295,31 @@ int main()
         CHECK(p.submit.recover([](void *,NativeAdrenoRing *,uint32_t)->IOReturn {return kIOReturnIOError;},nullptr,&ringclock,&result)==kIOReturnIOError);
         CHECK(p.submit.poisoned());
     }
+    // Device-clock hang detection must ignore CP prefetch movement and reset on a real fence.
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096}; uint32_t fence=0;
+        clock_us=100;
+        CHECK(p.submit.submit(&p.vm,&buffer,1,0,&fence,&ringclock)==kIOReturnSuccess);
+        bool hung=true;CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);
+        for(unsigned i=1;i<=10;++i) {
+            cp.regs[0x0928]=i*0x1000;clock_us=100+i*99999;
+            CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);
+        }
+        clock_us=100+1000000ULL;
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);
+        fencemem[1]=fence;
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);
+        CHECK(p.submit.wait(fence,&ringclock,1000)==kIOReturnSuccess);
+        CHECK(p.submit.submit(&p.vm,&buffer,1,0,&fence,&ringclock)==kIOReturnSuccess);
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);
+        clock_us+=1000000ULL-1;
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);
+        ++clock_us;CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);
+        fencemem[1]=fence;CHECK(p.submit.wait(fence,&ringclock,1000)==kIOReturnSuccess);
+        CHECK(p.submit.detach()==kIOReturnSuccess);
+    }
     std::printf("PASS: 1 execbuf submission with exact IB packet and fence, 8 pre-reference refusals, 1 duplicate-buffer reference case and 1 poisoned-commit retention case over software SMMU/CP peers; 2 write-combine audit cases (trusted, dirty and failed); 1 hangcheck and 1 recovery with replay, VM continuation after the lost job and 1 failed restart\n");
 }
 /* Physical-page maintenance (imported BOs): record it; no host page is touched. */

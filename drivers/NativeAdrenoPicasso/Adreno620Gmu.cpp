@@ -25,6 +25,10 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <string.h>
 
+/* Both validated firmware images, for the cold restart (Adreno620Probe.cpp). */
+extern "C" int native_adreno620_gmu_firmware(const uint8_t **gmu, size_t *gmu_bytes,
+    const uint8_t **sqe, size_t *sqe_bytes);
+
 namespace {
 
 /* GMU CSR dword offsets (adreno_a6xx_gmu.c / a6xx_reg.h) are GPU-window register indices: a GMU CSR at
@@ -795,6 +799,9 @@ void printSmmuFault()
 
 bool mapPayloads()
 {
+    /* The cold GMU restart re-runs gmu_boot over the same buffers; mapping them twice would leak every
+     * intermediate mapping, and the payload contents are unchanged. */
+    if (gState->buffersMapped) return true;
     NativeAdrenoGmuPayload payload[5] = {};
     const IOReturn status = NativeAdrenoGmuContextPayloads(payload);
     if (status) {
@@ -1629,10 +1636,19 @@ extern "C" int native_adreno620_hfi_handshake(void)
 
     /* Stages through CORE_FW_START, the first GX vote, the GPU_SET OOB and START, in one uninterrupted sequence
      * (a6xx_gmu_resume's order); no console output between CORE_FW_START and the vote. */
-    const unsigned perfIndex = bin->initial_level < bin->count ?
-        unsigned(bin->count - 1 - bin->initial_level) : unsigned(bin->count - 1);
-    printf("PICASSO_GPU hfi: initial perf index=%u (dt level=%u of %lu)\n",
-        perfIndex, bin->initial_level, static_cast<unsigned long>(bin->count));
+    /* The HFI perf table is ascending by frequency while qcom,gpu-pwrlevels lists levels descending, so
+     * the port's old `count - 1 - initial_pwrlevel` picked index 1 (275 MHz) for this speed bin. The DT's
+     * top-level qcom,initial-pwrlevel = 3 names the nominal level, and index 3 is 500 MHz in both the 5-
+     * and 7-level bins; start there. sheng-gpu-perf-index overrides it for before/after measurements. */
+    unsigned perfIndex = bin->count > 3 ? 3u : unsigned(bin->count - 1);
+    unsigned requestedIndex = 0;
+    if (PE_parse_boot_argn("sheng-gpu-perf-index", &requestedIndex, sizeof requestedIndex) &&
+        requestedIndex < bin->count) {
+        perfIndex = requestedIndex;
+    }
+    printf("PICASSO_GPU hfi: initial perf index=%u (dt level=%u of %lu, boot index=%u %s)\n",
+        perfIndex, bin->initial_level, static_cast<unsigned long>(bin->count), requestedIndex,
+        perfIndex == requestedIndex ? "from boot arg" : "nominal");
     unsigned lastStage = 0;
     const AdrenoHfiStatus status = hfiStartupBeforeStart(config, perfIndex, &lastStage);
     printf("PICASSO_GPU hfi: run status=%d last-stage=%u skipped=%u\n",
@@ -1644,5 +1660,31 @@ extern "C" int native_adreno620_hfi_handshake(void)
     }
     s.hfiStarted = true;
     printf("PICASSO_GPU hfi: core firmware started\n");
+    return 0;
+}
+
+/* Cold GMU restart after a GPU hang with GX off (a6xx_gmu_restart's reset+fw_start path): the one-shot
+ * boot gates are cleared, the already-mapped payloads are reused (mapPayloads is idempotent) and the
+ * firmware is downloaded again; the HFI handshake re-votes GX and takes the GPU_SET OOB. The TZ/PAS
+ * state is not re-created (the zap image is retained by loadZap), so a GPU that comes back secure-only
+ * will fail the CP restart's leaveSecureMode probe instead of silently running protected-only. */
+extern "C" int native_adreno620_gmu_restart(void)
+{
+    if (!gState) return -1;
+    GmuState &s = *gState;
+    const uint8_t *gmu = nullptr;
+    const uint8_t *sqe = nullptr;
+    size_t gmuBytes = 0, sqeBytes = 0;
+    if (native_adreno620_gmu_firmware(&gmu, &gmuBytes, &sqe, &sqeBytes)) {
+        printf("PICASSO_GPU gmu: restart without staged firmware\n");
+        return -1;
+    }
+    printf("PICASSO_GPU gmu: restart begin\n");
+    s.booted = false;
+    s.hfiStarted = false;
+    s.hfiInitialized = false;
+    if (native_adreno620_gmu_boot(gmu, gmuBytes, sqe, sqeBytes)) return -1;
+    if (native_adreno620_hfi_handshake()) return -1;
+    printf("PICASSO_GPU gmu: restart complete\n");
     return 0;
 }

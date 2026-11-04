@@ -1,0 +1,840 @@
+--- a/bsd/dev/picasso_usb.c
++++ b/bsd/dev/picasso_usb.c
+@@ -383,6 +383,7 @@
+ 	bool        reboot_pending;
+ 	uint64_t    session_deadline;
+ 	unsigned    ps_pending;
++	unsigned    save_ls_pending;
+ 	bool        reset_pending;
+ 	bool        hang_pending;
+ 	bool        watchdog;
+@@ -2307,7 +2308,7 @@
+ 	ud.commands++;
+ 	printf("PICASSO CDC: command '%s'\n", ud.cmd);
+ 	if (ud_command_is(ud.cmd, "help")) {
+-		printf("PICASSO CDC: commands: help | status | ps | snapshot | panic-test | reset-test | hang-test | reboot-fastboot\n");
++		printf("PICASSO CDC: commands: help | status | ps | snapshot | save-ls | panic-test | reset-test | hang-test | reboot-fastboot\n");
+ 	} else if (ud_command_is(ud.cmd, "snapshot")) {
+ 		ud_snapshot();
+ 	} else if (ud_command_is(ud.cmd, "status")) {
+@@ -2321,6 +2322,8 @@
+ 		    os_atomic_load(&pur_dropped, relaxed));
+ 	} else if (ud_command_is(ud.cmd, "ps")) {
+ 		ud.ps_pending = ++processSamples;
++	} else if (ud_command_is(ud.cmd, "save-ls")) {
++		ud.save_ls_pending = 1;
+ 	} else if (ud_command_is(ud.cmd, "panic-test")) {
+ 		printf("PICASSO CDC: panic-test requested; emitting marker now\n");
+ 		/*
+@@ -2598,6 +2601,10 @@
+ 	if (sample && !ud.panic_mode) {
+ 		extern void picasso_live_process_list(unsigned);
+ 		picasso_live_process_list(sample);
++	}
++	if (os_atomic_xchg(&ud.save_ls_pending, 0, relaxed) && !ud.panic_mode) {
++		extern int picasso_ls_export(void);
++		printf("PICASSO_LSP export files=%d\n", picasso_ls_export());
+ 	}
+ 	if (ud.reboot_pending && !ud.panic_mode) {
+ 		ud.reboot_pending = false;
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 5272b82..8a3f9cc 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8345,6 +8345,747 @@ done:
+ 	if (path) kfree_data(path, 256);
+ }
+ 
++/* Persistent LaunchServices cache (PCLSD001 blob in the board aux window).
++ * The lsd rebuild does not survive a reboot by itself: the Data volume starts from the seed
++ * every boot. The export command (CDC "save-ls") copies the rebuilt com.apple.LaunchServices-*
++ * files into the board aux window (raw 4096-byte blocks with FUA, directly below the Data
++ * store), and the next boot restores them before the drop would run, so lsd does not rescan
++ * every application.
++ *
++ * Neither a Data file nor the raw store window is used. A Data file follows the file system's
++ * checkpoint: an unclean reboot can replay an older state with partly overwritten blocks (wf263:
++ * old size, wrong hash). The store window belongs to the Data overlay, which opens it before this
++ * code runs and keeps its own page layout there (wf258: writing at relative block 0 stepped on it).
++ * The aux window is its own region, validated by the same geometry checks, and a torn write only
++ * fails the blob's CRC, which makes the next boot drop and rebuild as if no blob existed. */
++#define PICASSO_LSP_MAGIC "PCLSD001"
++#define PICASSO_LSP_MAX   (16U << 20)
++#define PICASSO_LSP_BLOCKS (PICASSO_LSP_MAX / 4096)   /* the board aux window: 16 MiB */
++
++extern int native_ufs_aux_open(uint64_t, uint64_t *, const char **) __attribute__((weak_import));
++extern int native_ufs_aux_read(uint64_t, uint32_t, void *) __attribute__((weak_import));
++extern int native_ufs_aux_write(uint64_t, uint32_t, const void *) __attribute__((weak_import));
++
++static uint32_t
++picasso_lsp_hash(const uint8_t *data, size_t length)
++{
++	uint32_t hash = 2166136261u;
++	for (size_t i = 0; i < length; ++i) {
++		hash ^= data[i];
++		hash *= 16777619u;
++	}
++	return hash;
++}
++
++/* Reads a whole file. A NULL buffer only reports the size (capacity is still checked),
++ * so the restore path can size its allocation from the blob instead of always taking
++ * the 16 MiB maximum. */
++static int
++picasso_lsp_read_file(const char *path, uint8_t *buffer, uint64_t capacity, uint64_t *size, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	int error = vnode_open(path, FREAD | O_NOFOLLOW, 0, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_data_size, 0);
++	error = vnode_getattr(vp, &va, ctx);
++	if (!error) {
++		*size = (uint64_t)va.va_data_size;
++		if (*size > capacity) {
++			error = EFBIG;
++		}
++	}
++	int resid = 0;
++	if (!error && buffer && *size) {
++		error = vn_rdwr(UIO_READ, vp, (caddr_t)buffer, (int)*size, 0, UIO_SYSSPACE,
++		    IO_NOAUTH, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (!error && resid) {
++			error = EIO;
++		}
++	}
++	vnode_close(vp, FREAD, ctx);
++	return error;
++}
++
++static int
++picasso_lsp_restore(proc_t p, user_addr_t scratch)
++{
++	uint8_t *header = NULL, *blob = NULL;
++	uint64_t total = 0, first = 0;
++	int restored = 0;
++	vfs_context_t ctx = vfs_context_current();
++	const char *why = "";
++	(void)p;
++	(void)scratch;
++	/* The blob lives in the board aux window (raw blocks with FUA, below the Data store), not in a
++	 * Data file: a file write follows the file system's checkpoint, and an unclean reboot can replay
++	 * an older state with partly overwritten blocks (wf263: old size, wrong hash). */
++	if (native_ufs_aux_open == NULL || native_ufs_aux_read == NULL ||
++	    !native_ufs_aux_open(PICASSO_LSP_BLOCKS, &first, &why)) {
++		return 0;
++	}
++	header = kalloc_data(4096, Z_WAITOK | Z_ZERO);
++	if (!header) {
++		return 0;
++	}
++	if (!native_ufs_aux_read(0, 1, header) || memcmp(header, PICASSO_LSP_MAGIC, 8)) {
++		goto done;   /* never exported: nothing to restore */
++	}
++	uint32_t version = 0, count = 0, crc = 0;
++	memcpy(&version, header + 8, 4);
++	memcpy(&count, header + 12, 4);
++	memcpy(&total, header + 16, 8);
++	memcpy(&crc, header + 24, 4);
++	if (version != 1 || !count || count > 64 || total < 32 || total > PICASSO_LSP_MAX) {
++		goto done;
++	}
++	blob = kalloc_data((size_t)total, Z_WAITOK | Z_ZERO);
++	if (!blob) {
++		goto done;
++	}
++	if (!native_ufs_aux_read(0, (uint32_t)((total + 4095) / 4096), blob)) {
++		goto done;
++	}
++	const uint32_t actual = picasso_lsp_hash(blob + 32, (size_t)(total - 32));
++	if (actual != crc) {
++		printf("PICASSO_LSP restore=bad-blob total=%llu count=%u stored=%08x actual=%08x\n",
++		    (unsigned long long)total, count, crc, actual);
++		goto done;
++	}
++	uint64_t at = 32;
++	for (uint32_t i = 0; i < count; ++i) {
++		uint32_t path_bytes = 0, mode = 0, data_bytes = 0;
++		if (total - at < 12) {
++			break;
++		}
++		memcpy(&path_bytes, blob + at, 4);
++		memcpy(&mode, blob + at + 4, 4);
++		memcpy(&data_bytes, blob + at + 8, 4);
++		at += 12;
++		if (path_bytes < 2 || path_bytes > 255 || total - at < path_bytes ||
++		    total - at - path_bytes < data_bytes) {
++			break;
++		}
++		const char *path = (const char *)(blob + at);
++		if (path[0] != '/' || path[path_bytes - 1]) {
++			break;
++		}
++		at += path_bytes;
++		/* native_gpu_addon_write returns 0 on a write, -1 when the file already
++		 * matched; both mean the cache is in place. */
++		const int werr = native_gpu_addon_write(path, blob + at, data_bytes, mode & 0777, ctx);
++		if (werr == 0 || werr == -1) {
++			++restored;
++		} else {
++			printf("PICASSO_LSP restore=write-failed err=%d path=%s\n", werr, path);
++		}
++		at += data_bytes;
++	}
++done:
++	if (blob) {
++		kfree_data(blob, (size_t)total);
++	}
++	if (header) {
++		kfree_data(header, 4096);
++	}
++	return restored;
++}
++
++/* The metal2vulkan runtime's cache directory (NativeAdrenoMetalPlugin: candidate 4, the process's
++ * Library/Caches/com.apple.backboardd/m2v). Its size at boot tells whether the pipeline cache really
++ * survives on Data or is rebuilt every boot: the runtime compiles the whole UI when it is empty. */
++static void
++picasso_m2v_scan(const char *path, unsigned depth, unsigned *files, uint64_t *bytes, vfs_context_t ctx)
++{
++	if (depth > 4) {
++		return;
++	}
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, 0, &vp, ctx)) {
++		return;
++	}
++	char *buffer = kalloc_data(4096, Z_WAITOK);
++	uio_t uio = buffer ? uio_create(1, 0, UIO_SYSSPACE, UIO_READ) : NULL;
++	int eof = 0;
++	while (uio && !eof) {
++		uio_reset(uio, uio_offset(uio), UIO_SYSSPACE, UIO_READ);
++		uio_addiov(uio, CAST_USER_ADDR_T(buffer), 4096);
++		int entries = 0;
++		if (VNOP_READDIR(vp, uio, 0, &eof, &entries, ctx)) {
++			break;
++		}
++		size_t used = 4096 - uio_resid(uio);
++		if (!used) {
++			break;
++		}
++		const size_t header = offsetof(struct dirent, d_name);
++		for (size_t at = 0; at + header < used;) {
++			const struct dirent *entry = (const struct dirent *)(buffer + at);
++			if (entry->d_reclen <= header || entry->d_reclen > used - at ||
++			    entry->d_namlen >= entry->d_reclen - header) {
++				break;
++			}
++			const int dot = entry->d_name[0] == '.' &&
++			    (entry->d_namlen == 1 || (entry->d_namlen == 2 && entry->d_name[1] == '.'));
++			if (!dot) {
++				char child[256];
++				snprintf(child, sizeof child, "%s/%s", path, entry->d_name);
++				vnode_t cvp = NULLVP;
++				if (!vnode_lookup(child, 0, &cvp, ctx)) {
++					struct vnode_attr va;
++					VATTR_INIT(&va);
++					VATTR_WANTED(&va, va_mode);
++					VATTR_WANTED(&va, va_data_size);
++					if (!vnode_getattr(cvp, &va, ctx)) {
++						if (VATTR_IS_SUPPORTED(&va, va_mode) && (va.va_mode & S_IFMT) == S_IFDIR) {
++							picasso_m2v_scan(child, depth + 1, files, bytes, ctx);
++						} else if (VATTR_IS_SUPPORTED(&va, va_data_size)) {
++							++*files;
++							*bytes += (uint64_t)va.va_data_size;
++						}
++					}
++					vnode_put(cvp);
++				}
++			}
++			at += entry->d_reclen;
++		}
++	}
++	if (uio) {
++		uio_free(uio);
++	}
++	if (buffer) {
++		kfree_data(buffer, 4096);
++	}
++	vnode_put(vp);
++}
++
++static void
++picasso_m2v_probe(void)
++{
++	unsigned files = 0;
++	uint64_t bytes = 0;
++	picasso_m2v_scan("/private/var/mobile/Library/Caches/com.apple.backboardd/m2v", 0, &files, &bytes,
++	    vfs_context_current());
++	printf("PICASSO_M2V dir files=%u bytes=%llu\n", files, (unsigned long long)bytes);
++}
++
++/* ---- Pipeline cache: the runtime's cache directory, exported raw and replayed at boot ----------------
++ * NativeAdrenoMetalPlugin's exporter sends its cache directory as SHEXR001 over method 0x7100 whenever it
++ * changed and stayed stable for one period. The Data file system cannot be trusted to keep the late writes
++ * across an unclean reboot (the APFS checkpoint replays an older state), so the stream goes to the aux
++ * window instead: raw blocks with FUA. The next boot replays it into the runtime's cache directory before
++ * backboardd opens the device, so the UI starts as cache hits.
++ * Layout: aux block 4096 is the header, blocks 4097.. the stream (SHEXR001: 16-byte header, then the
++ * M2VCACH1 directory stream). The header is written last with valid=1 and the stream's FNV-1a. */
++#define PICASSO_PIPE_BLOCK 4096u
++#define PICASSO_PIPE_MAX   (192u << 20)
++#define PICASSO_PIPE_MAGIC "M2VEXPRT"
++#define PICASSO_M2V_DIR    "/private/var/mobile/Library/Caches/com.apple.backboardd/m2v"
++#define PICASSO_M2V_UID    501u
++#define PICASSO_M2V_GID    501u
++#define PICASSO_PIPE_WINDOW (32u * 4096u)
++
++static uint8_t picasso_pipe_tail[4096];
++static uint32_t picasso_pipe_tail_bytes, picasso_pipe_total, picasso_pipe_hash;
++static uint64_t picasso_pipe_next;
++static int picasso_pipe_active;
++static int picasso_pipe_opened;
++
++static uint32_t
++picasso_lsp_hash_step(uint32_t hash, const uint8_t *data, size_t length)
++{
++	for (size_t i = 0; i < length; ++i) {
++		hash ^= data[i];
++		hash *= 16777619u;
++	}
++	return hash;
++}
++
++static int
++picasso_pipe_header_write(uint32_t total, uint32_t hash, uint32_t generation, uint32_t valid)
++{
++	uint8_t *block = kalloc_data(4096, Z_WAITOK | Z_ZERO);
++	if (!block) {
++		return 0;
++	}
++	uint32_t version = 1;
++	memcpy(block, PICASSO_PIPE_MAGIC, 8);
++	memcpy(block + 8, &version, 4);
++	memcpy(block + 12, &total, 4);
++	memcpy(block + 16, &hash, 4);
++	memcpy(block + 20, &generation, 4);
++	memcpy(block + 24, &valid, 4);
++	const int ok = native_ufs_aux_write(PICASSO_PIPE_BLOCK, 1, block);
++	kfree_data(block, 4096);
++	return ok;
++}
++
++/* Method 0x7100 sink: the strong definition overrides NativeAdrenoStubs.c's weak no-op. Pieces arrive in
++ * order; the tail of a block is kept until the next piece completes it, and the header becomes valid only
++ * when the announced total has arrived. A torn export therefore reads as absent, never as a short stream. */
++int
++boot_log_export_put(uint32_t generation, uint32_t total, uint32_t offset, const void *data, uint32_t size)
++{
++	if (native_ufs_aux_open == NULL || native_ufs_aux_write == NULL || !generation || !data || !size) {
++		return -1;
++	}
++	uint64_t first = 0;
++	const char *why = "";
++	if (!picasso_pipe_opened && !native_ufs_aux_open(65536, &first, &why)) {
++		return -4;
++	}
++	picasso_pipe_opened = 1;
++	uint8_t *bytes = (uint8_t *)(uintptr_t)data;
++	if (offset == 0) {
++		if (total < 16 || total > PICASSO_PIPE_MAX) {
++			return -5;
++		}
++		picasso_pipe_total = total;
++		picasso_pipe_hash = 2166136261u;
++		picasso_pipe_tail_bytes = 0;
++		picasso_pipe_next = PICASSO_PIPE_BLOCK + 1;
++		if (!picasso_pipe_header_write(total, 0, generation, 0)) {
++			return -6;
++		}
++		picasso_pipe_active = 1;
++	}
++	if (!picasso_pipe_active || total != picasso_pipe_total || offset > total || size > total - offset) {
++		return -3;
++	}
++	while (size) {
++		uint32_t n = 4096 - picasso_pipe_tail_bytes;
++		if (n > size) {
++			n = size;
++		}
++		memcpy(picasso_pipe_tail + picasso_pipe_tail_bytes, bytes, n);
++		picasso_pipe_hash = picasso_lsp_hash_step(picasso_pipe_hash, bytes, n);
++		picasso_pipe_tail_bytes += n;
++		bytes += n;
++		size -= n;
++		offset += n;
++		if (picasso_pipe_tail_bytes == 4096) {
++			if (!native_ufs_aux_write(picasso_pipe_next++, 1, picasso_pipe_tail)) {
++				picasso_pipe_active = 0;
++				return -6;
++			}
++			picasso_pipe_tail_bytes = 0;
++		}
++	}
++	if (offset == total) {
++		if (picasso_pipe_tail_bytes) {
++			memset(picasso_pipe_tail + picasso_pipe_tail_bytes, 0, 4096 - picasso_pipe_tail_bytes);
++			if (!native_ufs_aux_write(picasso_pipe_next++, 1, picasso_pipe_tail)) {
++				picasso_pipe_active = 0;
++				return -6;
++			}
++		}
++		if (!picasso_pipe_header_write(total, picasso_pipe_hash, generation, 1)) {
++			picasso_pipe_active = 0;
++			return 0;
++		}
++		picasso_pipe_active = 0;
++		printf("PICASSO_M2V export total=%u blocks=%llu\n", total,
++		    (unsigned long long)(picasso_pipe_next - PICASSO_PIPE_BLOCK));
++	}
++	return 0;
++}
++
++/* Sequential reader over the stream in the aux window. */
++static uint64_t picasso_pipe_cursor;
++static uint8_t *picasso_pipe_window;
++static uint32_t picasso_pipe_window_used, picasso_pipe_window_bytes;
++static uint64_t picasso_pipe_remaining;
++
++static int
++picasso_pipe_read(void *dst, uint32_t n)
++{
++	uint8_t *out = dst;
++	if (n > picasso_pipe_remaining) {
++		return 0;
++	}
++	while (n) {
++		if (picasso_pipe_window_used == picasso_pipe_window_bytes) {
++			if (!native_ufs_aux_read(picasso_pipe_cursor, 32, picasso_pipe_window)) {
++				return 0;
++			}
++			picasso_pipe_cursor += 32;
++			picasso_pipe_window_used = 0;
++			picasso_pipe_window_bytes = PICASSO_PIPE_WINDOW;
++		}
++		uint32_t k = picasso_pipe_window_bytes - picasso_pipe_window_used;
++		if (k > n) {
++			k = n;
++		}
++		memcpy(out, picasso_pipe_window + picasso_pipe_window_used, k);
++		picasso_pipe_window_used += k;
++		out += k;
++		n -= k;
++		picasso_pipe_remaining -= k;
++	}
++	return 1;
++}
++
++static uint8_t picasso_pipe_scratch[4096];
++
++static int
++picasso_pipe_skip(uint64_t n)
++{
++	while (n) {
++		uint32_t k = n < sizeof picasso_pipe_scratch ? (uint32_t)n : sizeof picasso_pipe_scratch;
++		if (!picasso_pipe_read(picasso_pipe_scratch, k)) {
++			return 0;
++		}
++		n -= k;
++	}
++	return 1;
++}
++
++static void
++picasso_pipe_reset(void)
++{
++	picasso_pipe_cursor = PICASSO_PIPE_BLOCK + 1;
++	picasso_pipe_window_used = picasso_pipe_window_bytes = 0;
++}
++
++static int
++picasso_m2v_mkdirs(proc_t p, user_addr_t scratch, const char *full, vfs_context_t ctx)
++{
++	char path[320];
++	strlcpy(path, full, sizeof path);
++	for (char *s = path + 1; *s; ++s) {
++		if (*s != '/') {
++			continue;
++		}
++		*s = 0;
++		struct mkdir_args request = {.path = scratch + 0xc00, .mode = 0700};
++		int32_t result = 0;
++		int error = copyout(path, request.path, strlen(path) + 1);
++		const int made = !error && mkdir(p, &request, &result) == 0;
++		*s = '/';
++		if (!made) {
++			continue;   /* an existing directory keeps its owner (never chown /private and friends) */
++		}
++		vnode_t dvp = NULLVP;
++		if (!vnode_lookup(path, 0, &dvp, ctx)) {
++			struct vnode_attr va;
++			VATTR_INIT(&va);
++			VATTR_SET(&va, va_mode, 0700);
++			VATTR_SET(&va, va_uid, PICASSO_M2V_UID);
++			VATTR_SET(&va, va_gid, PICASSO_M2V_GID);
++			(void)vnode_setattr(dvp, &va, ctx);
++			vnode_put(dvp);
++		}
++	}
++	return 0;
++}
++
++static int
++picasso_m2v_write(const char *path, uint32_t mode, uint32_t uid, uint32_t gid, uint64_t size,
++    proc_t p, user_addr_t scratch, vfs_context_t ctx)
++{
++	(void)p;
++	(void)scratch;
++	vnode_t vp = NULLVP;
++	const uint32_t file_mode = (mode & 0777) ? (mode & 0777) : 0600;
++	int error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, file_mode, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	uint8_t *buffer = kalloc_data(65536, Z_WAITOK);
++	if (!buffer) {
++		vnode_close(vp, FWRITE, ctx);
++		return ENOMEM;
++	}
++	uint64_t at = 0;
++	while (!error && at < size) {
++		uint32_t k = size - at < 65536 ? (uint32_t)(size - at) : 65536;
++		if (!picasso_pipe_read(buffer, k)) {
++			error = EIO;
++			break;
++		}
++		int resid = 0;
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)buffer, (int)k, (off_t)at, UIO_SYSSPACE,
++		    IO_NOAUTH | IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (!error && resid) {
++			error = EIO;
++		}
++		at += k;
++	}
++	kfree_data(buffer, 65536);
++	if (!error) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_mode, file_mode);
++		VATTR_SET(&va, va_uid, uid);
++		VATTR_SET(&va, va_gid, gid);
++		error = vnode_setattr(vp, &va, ctx);
++	}
++	if (!error) {
++		error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++	}
++	vnode_close(vp, FWRITE, ctx);
++	return error;
++}
++
++static void
++picasso_m2v_import(proc_t p, user_addr_t scratch)
++{
++	if (native_ufs_aux_open == NULL || native_ufs_aux_read == NULL) {
++		return;
++	}
++	uint64_t first = 0;
++	const char *why = "";
++	if (!native_ufs_aux_open(65536, &first, &why)) {
++		return;
++	}
++	uint8_t *header = kalloc_data(4096, Z_WAITOK | Z_ZERO);
++	picasso_pipe_window = kalloc_data(PICASSO_PIPE_WINDOW, Z_WAITOK | Z_ZERO);
++	if (!header || !picasso_pipe_window) {
++		goto done;
++	}
++	if (!native_ufs_aux_read(PICASSO_PIPE_BLOCK, 1, header) || memcmp(header, PICASSO_PIPE_MAGIC, 8)) {
++		goto done;
++	}
++	uint32_t version = 0, total = 0, stored = 0, generation = 0, valid = 0;
++	memcpy(&version, header + 8, 4);
++	memcpy(&total, header + 12, 4);
++	memcpy(&stored, header + 16, 4);
++	memcpy(&generation, header + 20, 4);
++	memcpy(&valid, header + 24, 4);
++	if (version != 1 || !valid || total < 16 || total > PICASSO_PIPE_MAX) {
++		goto done;
++	}
++	/* First pass: the stream's hash. Nothing is written for a stream that is not exactly the one the
++	 * exporter completed (a torn write just means "no cache this boot"). */
++	picasso_pipe_reset();
++	picasso_pipe_remaining = total;
++	uint32_t running = 2166136261u;
++	while (picasso_pipe_remaining) {
++		uint32_t k = picasso_pipe_remaining < sizeof picasso_pipe_scratch ? (uint32_t)picasso_pipe_remaining
++		    : sizeof picasso_pipe_scratch;
++		if (!picasso_pipe_read(picasso_pipe_scratch, k)) {
++			goto done;
++		}
++		running = picasso_lsp_hash_step(running, picasso_pipe_scratch, k);
++	}
++	if (running != stored) {
++		printf("PICASSO_M2V import=bad-stream total=%u stored=%08x actual=%08x\n", total, stored, running);
++		goto done;
++	}
++	/* Second pass: parse and write. */
++	picasso_pipe_reset();
++	picasso_pipe_remaining = total;
++	vfs_context_t ctx = vfs_context_current();
++	uint8_t head[16];
++	uint32_t stream_bytes = 0, zero = 0;
++	if (!picasso_pipe_read(head, 16) || memcmp(head, "SHEXR001", 8)) {
++		goto done;
++	}
++	memcpy(&stream_bytes, head + 8, 4);
++	memcpy(&zero, head + 12, 4);
++	if (stream_bytes != total - 16) {
++		goto done;
++	}
++	uint8_t magic[8];
++	if (!picasso_pipe_read(magic, 8) || memcmp(magic, "M2VCACH1", 8)) {
++		goto done;
++	}
++	uint32_t root_length = 0, count = 0;
++	if (!picasso_pipe_read(&root_length, 4) || root_length > 4096 || !picasso_pipe_skip(root_length) ||
++	    !picasso_pipe_read(&count, 4) || count > (1u << 20)) {
++		goto done;
++	}
++	unsigned files = 0, skipped = 0;
++	uint64_t bytes = 0;
++	(void)picasso_m2v_mkdirs(p, scratch, PICASSO_M2V_DIR "/x", ctx);
++	for (uint32_t i = 0; i < count; ++i) {
++		uint32_t path_length = 0, mode = 0, uid = 0, gid = 0;
++		uint64_t size = 0;
++		if (!picasso_pipe_read(&path_length, 4) || !picasso_pipe_read(&mode, 4) ||
++		    !picasso_pipe_read(&uid, 4) || !picasso_pipe_read(&gid, 4) ||
++		    !picasso_pipe_read(&size, 8)) {
++			break;
++		}
++		if (path_length == 0 || path_length > 255 || size > total) {
++			break;
++		}
++		char relative[256];
++		if (!picasso_pipe_read(relative, path_length)) {
++			break;
++		}
++		relative[path_length] = 0;
++		int dots = 0;
++		for (uint32_t k = 0; k + 1 < path_length; ++k) {
++			if (relative[k] == '.' && relative[k + 1] == '.') {
++				dots = 1;
++			}
++		}
++		if (relative[0] == '/' || dots || memchr(relative, 0, path_length)) {
++			break;
++		}
++		if (sizeof(PICASSO_M2V_DIR) + path_length + 1 > 300) {
++			break;
++		}
++		char full[320];
++		snprintf(full, sizeof full, PICASSO_M2V_DIR "/%s", relative);
++		vnode_t vp = NULLVP;
++		int error = vnode_lookup(full, 0, &vp, ctx);
++		int same = 0;
++		if (!error) {
++			struct vnode_attr va;
++			VATTR_INIT(&va);
++			VATTR_WANTED(&va, va_data_size);
++			if (!vnode_getattr(vp, &va, ctx) && VATTR_IS_SUPPORTED(&va, va_data_size)) {
++				same = (uint64_t)va.va_data_size == size;
++			}
++			vnode_put(vp);
++		}
++		if (same) {
++			++skipped;
++			if (!picasso_pipe_skip(size)) {
++				break;
++			}
++			continue;
++		}
++		picasso_m2v_mkdirs(p, scratch, full, ctx);
++		error = picasso_m2v_write(full, mode, uid ? uid : PICASSO_M2V_UID, gid ? gid : PICASSO_M2V_GID,
++		    size, p, scratch, ctx);
++		if (error) {
++			/* The write consumed part of the stream: stop instead of skipping a full record and
++			 * desynchronising the rest. A partly written cache file is left behind and the runtime
++			 * recompiles that entry; the next export replaces it. */
++			printf("PICASSO_M2V import=write-failed err=%d path=%s\n", error, full);
++			break;
++		}
++		++files;
++		bytes += size;
++	}
++	printf("PICASSO_M2V import files=%u skipped=%u bytes=%llu\n", files, skipped,
++	    (unsigned long long)bytes);
++done:
++	if (picasso_pipe_window) {
++		kfree_data(picasso_pipe_window, PICASSO_PIPE_WINDOW);
++		picasso_pipe_window = NULL;
++	}
++	if (header) {
++		kfree_data(header, 4096);
++	}
++}
++
++int
++picasso_ls_export(void)
++{
++	static const char *const parents[] = {
++		"/private/var/mobile/Containers/Data/InternalDaemon",
++		"/private/var/containers/Data/InternalDaemon",
++		"/private/var/containers/Data/System"
++	};
++	static const char prefix[] = "com.apple.LaunchServices-";
++	char (*containers)[64] = kalloc_data(128 * 64, Z_WAITOK);
++	char (*files)[8][64] = kalloc_data(8 * 64, Z_WAITOK);
++	char *path = kalloc_data(256, Z_WAITOK);
++	uint8_t *blob = NULL;
++	uint32_t count = 0;
++	uint64_t at = 32;
++	vfs_context_t ctx = vfs_context_current();
++	if (!containers || !files || !path) {
++		goto done;
++	}
++	blob = kalloc_data(PICASSO_LSP_MAX, Z_WAITOK | Z_ZERO);
++	if (!blob) {
++		goto done;
++	}
++	for (size_t k = 0; k < sizeof(parents) / sizeof(parents[0]); ++k) {
++		unsigned container_count = 0;
++		if (native_picasso_ls_names(parents[k], "", containers, 128, &container_count)) {
++			continue;
++		}
++		for (unsigned i = 0; i < container_count; ++i) {
++			snprintf(path, 256, "%s/%s/Library/Caches", parents[k], containers[i]);
++			unsigned file_count = 0;
++			if (native_picasso_ls_names(path, prefix, *files, 8, &file_count)) {
++				continue;
++			}
++			for (unsigned j = 0; j < file_count; ++j) {
++				uint64_t file_bytes = 0;
++				char full[320];
++				snprintf(full, sizeof full, "%s/%s", path, (*files)[j]);
++				const size_t path_bytes = strlen(full) + 1;
++				if (at + 12 + path_bytes > PICASSO_LSP_MAX) {
++					goto finish;
++				}
++				memcpy(blob + at + 12, full, path_bytes);
++				if (picasso_lsp_read_file(full, blob + at + 12 + path_bytes,
++				    PICASSO_LSP_MAX - (at + 12 + path_bytes), &file_bytes, ctx)) {
++					continue;
++				}
++				/* The csstore is a keyed archive; a byte scan for the bundle names tells whether the
++				 * application registrations are in this store at all. */
++				static const char *const lsIds[] = {
++					"com.apple.camera", "com.apple.mobilesafari", "com.apple.mobilemail",
++					"Camera.app", "MobileSafari.app", "MobileMail.app"
++				};
++				const uint8_t *const file_data = blob + at + 12 + path_bytes;
++				for (unsigned id = 0; id < sizeof(lsIds) / sizeof(lsIds[0]); ++id) {
++					const size_t n = strlen(lsIds[id]);
++					uint32_t hits = 0;
++					for (uint64_t pos = 0; pos + n <= file_bytes; ++pos) {
++						if (!memcmp(file_data + pos, lsIds[id], n)) {
++							++hits;
++						}
++					}
++					printf("PICASSO_LSP id=%s count=%u\n", lsIds[id], hits);
++				}
++				memcpy(blob + at, &(uint32_t){ (uint32_t)path_bytes }, 4);
++				memcpy(blob + at + 4, &(uint32_t){ 0644 }, 4);
++				memcpy(blob + at + 8, &(uint32_t){ (uint32_t)file_bytes }, 4);
++				at += 12 + path_bytes + file_bytes;
++				++count;
++			}
++		}
++	}
++finish:
++	if (!count) {
++		goto done;
++	}
++	uint32_t version = 1, header_count = count, crc = picasso_lsp_hash(blob + 32, (size_t)(at - 32));
++	memcpy(blob, PICASSO_LSP_MAGIC, 8);
++	memcpy(blob + 8, &version, 4);
++	memcpy(blob + 12, &header_count, 4);
++	memcpy(blob + 16, &at, 8);
++	memcpy(blob + 24, &crc, 4);
++	const uint64_t blocks = (at + 4095) / 4096;
++	uint64_t first = 0;
++	const char *why = "";
++	if (blocks > PICASSO_LSP_BLOCKS || native_ufs_aux_write == NULL ||
++	    !native_ufs_aux_open(PICASSO_LSP_BLOCKS, &first, &why) ||
++	    !native_ufs_aux_write(0, (uint32_t)blocks, blob)) {
++		printf("PICASSO_LSP export=write-failed bytes=%llu blocks=%llu why=%s\n",
++		    (unsigned long long)at, (unsigned long long)blocks, why);
++		count = 0;
++		goto done;
++	}
++	printf("PICASSO_LSP export files=%u bytes=%llu blocks=%llu first=%llu\n",
++	    count, (unsigned long long)at, (unsigned long long)blocks, (unsigned long long)first);
++done:
++	if (blob) {
++		kfree_data(blob, PICASSO_LSP_MAX);
++	}
++	if (containers) {
++		kfree_data(containers, 128 * 64);
++	}
++	if (files) {
++		kfree_data(files, 8 * 64);
++	}
++	if (path) {
++		kfree_data(path, 256);
++	}
++	return (int)count;
++}
++
+ static void
+ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+ {
+@@ -8375,6 +9116,11 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+ 		char view[96];
+ 		vnode_t root = NULLVP;
+ 		if (!vnode_lookup("/Applications", 0, &root, ctx)) {
++			struct vfsstatfs *appfs = vfs_statfs(vnode_mount(root));
++			/* Bundle identity LaunchServices records is (volume fsid, file id): print it so two
++			 * boots can be compared directly. */
++			printf("PICASSO_APPS_IDCAP mount_fsid=%08x/%08x\n",
++			    (unsigned)appfs->f_fsid.val[0], (unsigned)appfs->f_fsid.val[1]);
+ 			struct vfs_attr vfa;
+ 			VFSATTR_INIT(&vfa);
+ 			VFSATTR_WANTED(&vfa, f_capabilities);
+@@ -8409,8 +9155,11 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+ 					else error = ENAMETOOLONG;
+ 				}
+ 				if (!error && !strcmp(path, view)) resolved |= 1u << i;
+-				printf("PICASSO_APPS_FILEID bundle=%s error=%d path=%s\n",
+-				    picassoApps[i], error, !error ? path : "<unresolved>");
++				struct vfsstatfs *vfs = vnode_mount(vp) ? vfs_statfs(vnode_mount(vp)) : NULL;
++				printf("PICASSO_APPS_FILEID bundle=%s error=%d fileid=%llu fsid=%08x/%08x path=%s\n",
++				    picassoApps[i], error, error ? 0ULL : (unsigned long long)va.va_fileid,
++				    vfs ? (unsigned)vfs->f_fsid.val[0] : 0, vfs ? (unsigned)vfs->f_fsid.val[1] : 0,
++				    !error ? path : "<unresolved>");
+ 				vnode_put(vp);
+ 			}
+ 		}
+@@ -8420,7 +9169,21 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+ 		if (PE_parse_boot_argn("picasso-ls-rebuild", &rebuild, sizeof(rebuild)) && rebuild == 1) {
+ 			if (native_picasso_apps_stage == 5 && !native_picasso_apps_status &&
+ 			    found == 0xfff && resolved == 0xfff) {
+-				native_picasso_ls_store_drop(p, scratch);
++				picasso_m2v_probe();
++				picasso_m2v_import(p, scratch);
++				/* Off by default: lsd treats a store restored from an earlier boot as stale and
++				 * prunes the application records (the home screen loses its icons), so the drop and
++				 * rescan stay the shipped path until that validation is understood. The aux window,
++				 * the export command and the restore code remain for A/B experiments
++				 * (picasso-ls-restore=1). */
++				uint32_t restore = 0;
++				PE_parse_boot_argn("picasso-ls-restore", &restore, sizeof(restore));
++				const int restored = restore ? picasso_lsp_restore(p, scratch) : 0;
++				if (restored > 0) {
++					printf("PICASSO_LS_REBUILD restored=%d\n", restored);
++				} else {
++					native_picasso_ls_store_drop(p, scratch);
++				}
+ 			} else {
+ 				printf("PICASSO_LS_REBUILD skipped stage=%d status=%d found=%03x fileid=%03x\n",
+ 				    native_picasso_apps_stage, native_picasso_apps_status, found, resolved);

@@ -1,0 +1,45 @@
+--- a/bsd/dev/picasso_usb.c
++++ b/bsd/dev/picasso_usb.c
+@@ -382,6 +382,7 @@
+ 	bool        cmd_pending;
+ 	bool        reboot_pending;
+ 	uint64_t    session_deadline;
++	unsigned    ps_pending;
+ 	bool        reset_pending;
+ 	bool        hang_pending;
+ 	bool        watchdog;
+@@ -2301,11 +2302,12 @@
+ static void
+ ud_process_command(void)
+ {
++	static unsigned processSamples;
+ 	ud.cmd_pending = false;
+ 	ud.commands++;
+ 	printf("PICASSO CDC: command '%s'\n", ud.cmd);
+ 	if (ud_command_is(ud.cmd, "help")) {
+-		printf("PICASSO CDC: commands: help | status | snapshot | panic-test | reset-test | hang-test | reboot-fastboot\n");
++		printf("PICASSO CDC: commands: help | status | ps | snapshot | panic-test | reset-test | hang-test | reboot-fastboot\n");
+ 	} else if (ud_command_is(ud.cmd, "snapshot")) {
+ 		ud_snapshot();
+ 	} else if (ud_command_is(ud.cmd, "status")) {
+@@ -2317,6 +2319,8 @@
+ 		    ud.watchdog ? 1u : 0u, ud.watchdog_armed ? 1u : 0u,
+ 		    ud.reset_mode, ud.events, ud.chars, ud.rx_bytes,
+ 		    os_atomic_load(&pur_dropped, relaxed));
++	} else if (ud_command_is(ud.cmd, "ps")) {
++		ud.ps_pending = ++processSamples;
+ 	} else if (ud_command_is(ud.cmd, "panic-test")) {
+ 		printf("PICASSO CDC: panic-test requested; emitting marker now\n");
+ 		/*
+@@ -2590,6 +2594,11 @@
+ 	bool normal = !ud.panic_mode && !ud.reboot_pending && !ud.hang_pending &&
+ 	    !ud.panic_pending && !ud.reset_pending;
+ 	os_atomic_store(&ud.poll_lock, 0, release);
++	unsigned sample = os_atomic_xchg(&ud.ps_pending, 0, relaxed);
++	if (sample && !ud.panic_mode) {
++		extern void picasso_live_process_list(unsigned);
++		picasso_live_process_list(sample);
++	}
+ 	if (ud.reboot_pending && !ud.panic_mode) {
+ 		ud.reboot_pending = false;
+ 		ud_finish_reboot();

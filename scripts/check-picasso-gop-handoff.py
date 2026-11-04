@@ -32,7 +32,10 @@ def main():
     presenter, display = [p.read_text() for p in paths]
     methods = '\n'.join(extract(presenter, m).replace('NativeGOPPresenter::', '') for m in
                         ('bool NativeGOPPresenter::offer(', 'IOReturn NativeGOPPresenter::waitSwap(',
-                         'IOReturn NativeGOPPresenter::completeSwap(', 'void NativeGOPPresenter::abandonSwap('))
+                         'IOReturn NativeGOPPresenter::completeSwap(', 'void NativeGOPPresenter::abandonSwap(',
+                         'void NativeGOPPresenter::abandonDisplay('))
+    watchdog = extract(presenter, 'void NativeGOPPresenter::watchdogFired(')
+    methods += '\n' + watchdog.replace('void NativeGOPPresenter::watchdogFired(', 'static void watchdogFired(').replace('NativeGOPPresenter', 'Presenter')
     offer = extract(display, 'if(!gpuBypass && native_legacy_gpu_offer(')
     completion = extract(display, 'void finishGpuSwap(')
     fixture = root / 'scripts/tests/picasso-gop-handoff-host.cpp'

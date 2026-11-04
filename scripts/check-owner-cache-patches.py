@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay the device's pinned patch chain twice in an isolated directory.
+"""Check cold application, cache reuse and invalidation of the pinned patch chain.
 
 No SDK, device writes, network fetches or builds. --upstream and --xnu are Git
 checkouts with the pinned commits available. --prelink-patches is the patches/
@@ -9,8 +9,11 @@ not exist; all generated files are kept there for inspection.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import runpy
+import shutil
 import subprocess
 import zipfile
 
@@ -59,49 +62,78 @@ def main():
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     revision = (DEVICE / 'upstream.rev').read_text().strip()
-    tree, xnu = out / 'tree', out / 'xnu'
+    tree = out / 'tree'
+    xnu = tree / '.cache/xnu-work'
     export(a.upstream, revision, tree)
     # Normalize the Windows checkout just as the committed Linux/macOS blob.
     outer = out / 'device.patch'
     outer.write_text((DEVICE / 'patches/unixnu-source-kernel.patch').read_text(encoding='utf-8'),
                      encoding='utf-8', newline='\n')
     apply(tree, outer)
+    wrapper = runpy.run_path(str(DEVICE / 'unixnu'))
+    for index, name in enumerate(wrapper['LATE_OVERLAYS']):
+        target = tree / 'patches/xnu' / ('z' * (24 + index) + '-picasso-' + name + '.patch')
+        target.write_bytes((DEVICE / ('patches/picasso-' + name + '-xnu.patch')).read_bytes().replace(b'\r\n', b'\n'))
     usb = (DEVICE / 'patches/picasso-usb-console-xnu.patch').read_text(encoding='utf-8')
     (tree / 'patches/xnu/zzz-picasso-usb-console.patch').write_text(usb, encoding='utf-8', newline='\n')
-    baseline = (tree / 'scripts/build-xnu-4k-baseline.sh').read_text()
+    # Format1 copies device scripts after upstream scripts. Exercise that actual
+    # fingerprint stage, including a cache hit and invalidation, without an SDK.
+    baseline = (DEVICE / 'scripts/build-xnu-4k-baseline.sh').read_text()
     xnu_rev = re.search(r'XNU_COMMIT=\$\{UNIXNU_XNU_COMMIT:-([0-9a-f]{40})\}', baseline)[1]
-    export(a.xnu, xnu_rev, xnu)
-    late_block = baseline.split('for LATE_PATCH in ', 1)[1].split('; do', 1)[0]
-    late = [tree / path for path in re.findall(r'"\$ROOT/([^"\n]+)"', late_block)]
-    # User-abort hooks modify launchd diagnostic context, which in turn modifies
-    # owner, signature-cache and boot-progress patches. Undo consumers first.
-    user_abort = tree / 'patches/xnu/zzzzzz-picasso-user-abort.patch'
-    framebuffer = tree / 'patches/xnu/zzzzzz-picasso-ios16-framebuffer-swap.patch'
-    diagnostics = tree / 'patches/xnu/zzzzz-picasso-launchd-diagnostics.patch'
-    assert diagnostics.is_file(), 'Missing launchd diagnostics patch'
-    assert late[:3] == [user_abort, framebuffer, diagnostics], 'Undo dependent diagnostics first'
-    assert late[3] == tree / 'patches/xnu/zzzz-picasso-systemos-union.patch'
+    reference = tree / 'refer/xnu'
+    reference.parent.mkdir(parents=True, exist_ok=True)
+    export(a.xnu, xnu_rev, reference)
+    git(reference, 'add', '-A')
+    git(reference, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+        'commit', '-qm', 'Pinned XNU source fixture')
+    xnu.parent.mkdir(parents=True, exist_ok=True)
+    git(tree, '-c', 'core.autocrlf=false', 'clone', '--shared', reference, xnu)
     prelink = sorted(a.prelink_patches.resolve().glob('*.patch'))
     if not prelink:
         raise RuntimeError('No prelink patches; refusing an incomplete replay')
-    patches = sorted((tree / 'patches/xnu').glob('*.patch')) + prelink
+    installed = tree / 'kits/NativePrelink/patches'
+    installed.mkdir(parents=True, exist_ok=True)
+    for patch in prelink:
+        (installed / patch.name).write_bytes(patch.read_bytes().replace(b'\r\n', b'\n'))
+    patches = sorted((tree / 'patches/xnu').glob('*.patch')) + sorted(installed.glob('*.patch'))
+    stage = tree / 'patch-stage.sh'
+    stage.write_text('set -euo pipefail\nROOT=$(pwd)\n'
+                     '# Git Bash provides sha256sum rather than the macOS shasum utility.\n'
+                     'if ! command -v shasum >/dev/null; then\n'
+                     '  shasum() { test "$1" = -a && test "$2" = 256; shift 2; sha256sum "$@"; }\n'
+                     'fi\n' +
+                     baseline[baseline.index('# Patch order matters,'):baseline.index('export XNU_AVAILABILITY_PL=')],
+                     encoding='utf-8', newline='\n')
+    bash = shutil.which('bash')
+    if os.name == 'nt':
+        candidate = Path(os.environ.get('ProgramFiles', 'C:/Program Files')) / 'Git/bin/bash.exe'
+        if candidate.is_file():
+            bash = str(candidate)
+    if not bash:
+        raise RuntimeError('Bash is required to execute the production patch stage')
+    env = dict(os.environ, GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='core.autocrlf', GIT_CONFIG_VALUE_0='false')
     passes = []
     previous_sources = None
-    for pass_number in (1, 2):
-        for patch in late:
-            if git(xnu, 'apply', '--reverse', '--check', patch, check=False).returncode == 0:
-                git(xnu, 'apply', '--reverse', '--whitespace=nowarn', patch)
-        applied = 0
-        for patch in patches:
-            if git(xnu, 'apply', '--reverse', '--check', patch, check=False).returncode:
-                apply(xnu, patch)
-                applied += 1
-        sources = tuple((xnu / p).read_bytes() for p in REPLAY_SOURCES)
+    for pass_number in (1, 2, 3):
+        if pass_number == 3:
+            preparation = tree / 'scripts/prepare-xnu-source.py'
+            preparation.write_bytes(preparation.read_bytes() + b'\n# Host fixture: invalidate the preparation fingerprint.\n')
+        result = subprocess.run([bash, '--noprofile', '--norc', stage.name], cwd=tree, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        (out / f'patch-stage-{pass_number}.log').write_bytes(result.stdout + result.stderr)
+        if result.returncode:
+            raise RuntimeError(f'Production patch stage {pass_number} failed: {result.stderr.decode("utf-8", "replace")}')
+        sources = {str(p.relative_to(xnu)): hashlib.sha256(p.read_bytes()).hexdigest()
+                   for p in xnu.rglob('*') if p.is_file() and '.git' not in p.parts
+                   and p.name != '.picasso-patch-fingerprint'}
         if previous_sources is not None:
             assert sources == previous_sources, 'Second pass changed generated source bytes'
         previous_sources = sources
-        passes.append({'pass': pass_number, 'patches': len(patches), 'applied': applied})
-        print(f'PASS {pass_number}: {len(patches)} patches checked, {applied} applied')
+        archives = list(xnu.parent.glob('xnu-work-before-*'))
+        assert len(archives) == (1 if pass_number == 3 else 0)
+        passes.append({'pass': pass_number, 'patches': len(patches), 'archives': len(archives),
+                       'fingerprint': (xnu / '.picasso-patch-fingerprint').read_text().strip()})
+        print(f'PASS {pass_number}: {len(patches)} patches, production fingerprint stage, {len(archives)} archived caches')
     kern = (xnu / 'bsd/kern/kern_exec.c').read_text()
     vm = (xnu / 'bsd/vm/vm_unix.c').read_text()
     assert kern.count('native_owner_cache_prepare(proc_t p,') == 1

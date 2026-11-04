@@ -46,6 +46,14 @@ static unsigned reportCounts[12][2];
 static IORegistryEntry *displayChosen;
 static bool scaleAdded, rotationAdded;
 
+extern "C" {
+volatile uint64_t picasso_snapshot_virtual;
+volatile uint32_t picasso_snapshot_width, picasso_snapshot_height, picasso_snapshot_stride;
+}
+// CDC can sample outside the display work loop. Keep one qualified GOP mapping
+// for this boot so display teardown cannot invalidate a snapshot reader's address.
+static IOMemoryMap *snapshotMapping;
+
 static unsigned takeReport(unsigned *counter) {
     unsigned value = __atomic_load_n(counter, __ATOMIC_RELAXED);
     while (value < 4) {
@@ -209,6 +217,14 @@ extern "C" bool native_legacy_gop_mapping_observed(IOService *, IOMemoryMap *map
     bool rotationOK = scaleOK && matchWord(displayChosen, "display-rotation", 0, rotationAdded);
     bool ok = scaleOK && rotationOK;
     if (!ok) finishDisplayPolicy(false);
+    if (ok && !snapshotMapping) {
+        map->retain();
+        snapshotMapping = map;
+        picasso_snapshot_width = width;
+        picasso_snapshot_height = height;
+        picasso_snapshot_stride = static_cast<uint32_t>(video.v_rowBytes);
+        __atomic_store_n(&picasso_snapshot_virtual, static_cast<uint64_t>(map->getVirtualAddress()), __ATOMIC_RELEASE);
+    }
     IOLog("PICASSO_DISPLAY mapped ok=%u base=%llx bytes=%llx width=%u height=%u stride=%lu depth=%lu console=%lu scale=%u scale_ok=%u rotation_ok=%u\n",
         (unsigned)ok, map->getPhysicalAddress(), map->getLength(), width, height,
         video.v_rowBytes, video.v_depth, video.v_display, scale, (unsigned)scaleOK, (unsigned)rotationOK);

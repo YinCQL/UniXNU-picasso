@@ -1,0 +1,74 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -95,6 +95,7 @@
+ #include <sys/namei.h>
+ #include <sys/mount_internal.h>
+ #include <sys/vnode_internal.h>
++#include <sys/fsgetpath.h>
+ #include <sys/file_internal.h>
+ #include <sys/stat.h>
+ #include <sys/uio_internal.h>
+@@ -8038,6 +8039,63 @@
+ 	native_gpu_addon_mount(p, scratch, 0xc00, source, sizeof(source), point, sizeof(point),
+ 	    "/Applications/Camera.app/Info.plist", "/Applications/MobileMail.app/Info.plist",
+ 	    &native_picasso_apps_stage, &native_picasso_apps_status);
++	{
++		/* Presence alone does not prove LaunchServices registration. Check the
++		 * real bundle names and the volume/file-ID -> fsgetpath round trip. */
++		static const char *const picassoApps[] = {
++			"Camera.app", "MobileMail.app", "MobileSafari.app", "Weather.app",
++			"MobileNotes.app", "MobileCal.app", "Reminders.app", "Maps.app",
++			"MobileSlideShow.app", "Contacts.app", "MobileTimer.app", "AppleTV.app"
++		};
++		unsigned found = 0, resolved = 0;
++		vfs_context_t ctx = vfs_context_current();
++		char *path = kalloc_data(MAXPATHLEN, Z_WAITOK);
++		struct vfsstatfs *rootstat = NULL;
++		char view[96];
++		vnode_t root = NULLVP;
++		if (!vnode_lookup("/Applications", 0, &root, ctx)) {
++			struct vfs_attr vfa;
++			VFSATTR_INIT(&vfa);
++			VFSATTR_WANTED(&vfa, f_capabilities);
++			int error = vfs_getattr(vnode_mount(root), &vfa, ctx);
++			rootstat = vfs_statfs(vnode_mount(root));
++			int supported = !error && VFSATTR_IS_SUPPORTED(&vfa, f_capabilities);
++			printf("PICASSO_APPS_IDCAP fs=%s error=%d supported=%d format=%x valid=%x\n",
++			    vfs_statfs(vnode_mount(root))->f_fstypename, error, supported,
++			    supported ? vfa.f_capabilities.capabilities[VOL_CAPABILITIES_FORMAT] : 0,
++			    supported ? vfa.f_capabilities.valid[VOL_CAPABILITIES_FORMAT] : 0);
++			vnode_put(root);
++		}
++		for (unsigned i = 0; i < sizeof(picassoApps) / sizeof(picassoApps[0]); ++i) {
++			snprintf(view, sizeof(view), "/Applications/%s/Info.plist", picassoApps[i]);
++			vnode_t vp = NULLVP;
++			if (!vnode_lookup(view, 0, &vp, ctx)) {
++				found |= 1u << i;
++				struct vnode_attr va;
++				VATTR_INIT(&va);
++				VATTR_WANTED(&va, va_fileid);
++				int error = vnode_getattr(vp, &va, ctx), length = 0;
++				if (!error && !VATTR_IS_SUPPORTED(&va, va_fileid)) error = ENOTSUP;
++				if (!error && !path) error = ENOMEM;
++				if (!error) {
++					path[0] = 0;
++					error = fsgetpath_internal(ctx, rootstat ? rootstat->f_fsid.val[0] :
++					    vfs_statfs(vnode_mount(vp))->f_fsid.val[0],
++					    va.va_fileid, MAXPATHLEN, path, FSOPT_ISREALFSID, &length);
++				}
++				if (!error) {
++					if (length >= 0 && length < MAXPATHLEN) path[length] = 0;
++					else error = ENAMETOOLONG;
++				}
++				if (!error && !strcmp(path, view)) resolved |= 1u << i;
++				printf("PICASSO_APPS_FILEID bundle=%s error=%d path=%s\n",
++				    picassoApps[i], error, !error ? path : "<unresolved>");
++				vnode_put(vp);
++			}
++		}
++		if (path) kfree_data(path, MAXPATHLEN);
++		printf("PICASSO_APPS_VIEW found=%03x fileid=%03x\n", found, resolved);
++	}
+ 	printf("PICASSO_APPS_MOUNT stage=%d status=%d\n", native_picasso_apps_stage, native_picasso_apps_status);
+ }
+ #endif

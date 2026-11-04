@@ -1,0 +1,18 @@
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -1,3 +1,4 @@
++#include <pexpert/pexpert.h>
+ /*
+  * Copyright (c) 1998-2019 Apple Inc. All rights reserved.
+  *
+@@ -2760,6 +2761,10 @@
+ static picasso_service_trace
+ picasso_service_begin(unsigned operation, OSDictionary *dict, const char *detail, unsigned type)
+ {
++	unsigned probes = 1;
++	PE_parse_boot_argn("picasso-probes", &probes, sizeof(probes));
++	if (!probes) return {};
++
+ 	picasso_service_trace trace = {};
+ 	static const char * const names[] = {"backboardd", "SpringBoard", "mediaserverd", "audiomxd", "CommCenter"};
+ 	static unsigned counters[5][4];

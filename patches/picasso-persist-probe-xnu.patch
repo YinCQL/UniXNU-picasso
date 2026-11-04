@@ -1,0 +1,52 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8305,6 +8305,39 @@
+ 	printf("PICASSO_CA_PREFS mobile=%d system=%d\n", mobile, system);
+ }
+ #endif
++#if DEVELOPMENT || DEBUG
++/*
++ * Data-store persistence probe: prints, before the one-time staged-app copy, whether the completion
++ * marker, a staged bundle and the MobileInstallation database survived the previous boot. Sizes tell
++ * "exists but empty" from "real content"; a missing marker with present content would explain a copy
++ * that re-runs every boot.
++ */
++static void
++native_picasso_persist_one(const char *label, const char *path)
++{
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	int error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error) {
++		printf("PICASSO_PERSIST %s err=%d\n", label, error);
++		return;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_data_size, 0);
++	int attr = vnode_getattr(vp, &va, ctx);
++	printf("PICASSO_PERSIST %s size=%lld attr=%d\n", label,
++	    attr ? -1LL : (long long)va.va_data_size, attr);
++	vnode_put(vp);
++}
++static void
++native_picasso_persist_probe(void)
++{
++	native_picasso_persist_one("marker", "/private/var/db/.sheng-staged-apps");
++	native_picasso_persist_one("staged", "/private/var/staged_system_apps/MobileMail.app/Info.plist");
++	native_picasso_persist_one("minstall", "/private/var/mobile/Library/MobileInstallation/MobileInstallation.plist");
++}
++#endif
+ static int
+ native_owner_data_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -8374,6 +8407,9 @@
+ 	if (!error) native_owner_data_stage = 4;
+ 	if (!error) native_picasso_ca_prefs(p, scratch);
+ 	if (!error) native_gpu_addon_prepare(p, scratch);
++#if DEVELOPMENT || DEBUG
++	if (!error) native_picasso_persist_probe();
++#endif
+ 	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
+ #if DEVELOPMENT || DEBUG
+ 	if (!error) native_picasso_apps_mount(p, scratch);

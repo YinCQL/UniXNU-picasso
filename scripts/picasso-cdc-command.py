@@ -14,8 +14,8 @@ import termios
 import time
 
 
-COMMANDS = ('help', 'status', 'panic-test', 'reset-test', 'hang-test',
-            'reboot-fastboot')
+COMMANDS = ('help', 'status', 'ps', 'snapshot', 'save-ls', 'panic-test',
+            'reset-test', 'hang-test', 'reboot-fastboot')
 
 
 def serial_ports():
@@ -127,7 +127,8 @@ def write_all(fd, data, timeout):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', help='serial device, e.g. /dev/cu.usbmodem1101')
-    parser.add_argument('--command', required=True, choices=COMMANDS)
+    parser.add_argument('--command', required=True,
+                        choices=COMMANDS)
     parser.add_argument('--output', type=Path,
                         help='log file (defaults to out/picasso/logs)')
     parser.add_argument('--wait', type=float, default=15,
