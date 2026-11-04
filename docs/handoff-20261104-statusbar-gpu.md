@@ -403,3 +403,18 @@ Do not carry its "App normal" conclusion forward.
     inflight=..` plus each thread's user PC and symbol (`WD t<n> <pc> <symbol>`) into the boot log.
   Next: boot wf238, read the `WD` thread PCs at the freeze to name the wedged wait, then remove the dependency
   on the runtime's completion dispatch (or fix it) and use the `i/c/w` split to cut the ~20 ms/frame copy cost.
+- **Root cause of the compositor freeze: a Turnip submit-path self-deadlock (wf239)**: the wf237 freeze left the GPU
+  idle with every fence retired and no swap outstanding, so QuartzCore was waiting on a completion that could never
+  come. The completion chain itself is fine on inspection; the wedge is one layer below it. `tu_QueueSubmit`
+  (`tu_queue.cc`, `pthread_mutex_lock(&device->submit_mutex)` around `tu_queue_submit`) holds the non-recursive
+  `submit_mutex` across `darwin_queue_submit`, which waits on every `vk_sync_wait` with `UINT64_MAX`. When a wait's
+  timeline point is still `DARWIN_SYNC_UNSIGNALED`, `darwin_sync_wait` waited on `timeline_cond` under that same
+  mutex — but the state is posted by *another queue's submission*, which needs the mutex first. Two submit threads
+  deadlock, the GPU stays idle, and the runtime's timeline never advances for anyone (the runtime's queues share one
+  VkQueue on this port). This became reachable when the GPU scan-out copy started submitting a second stream of work
+  (cross-queue timeline waits) on every frame.
+  Fix (commit 629d8c2 in this checkout, `patches/mesa/turnip-darwin-kmd.patch`): the submit-path wait releases
+  `submit_mutex` while it waits for an UNSIGNALED point (polling the state with the deadline) and takes it back
+  before returning; the vk_sync path, which holds no device mutex, keeps the condition-variable wait. wf239 = wf238
+  kernel (4f54815b) + wf238 plugin instrumentation + the fixed Turnip. Acceptance: no freeze past 987 s of uptime,
+  `submit` keeps advancing, `PF` failures 0, and the `WD` sampler stays silent.
