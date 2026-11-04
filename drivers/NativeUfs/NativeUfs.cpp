@@ -1348,8 +1348,14 @@ extern "C" int native_ufs_aux_open (uint64_t blocks, uint64_t *firstLba, const c
       ok = 1;
     }
   }
-  IOLog ("PICASSO_AUX open blocks=%llu first=%llu ok=%d why=%s\n",
-         blocks, ok ? gAuxRegionFirst : 0ULL, ok, reason);
+  // Callers reopen on every operation (the pipeline exporter sends thousands of pieces per boot); log only
+  // state changes so an already-open success does not flood the console.
+  static int lastOk = -1;
+  if (ok != lastOk || !ok) {
+    IOLog ("PICASSO_AUX open blocks=%llu first=%llu ok=%d why=%s\n",
+           blocks, ok ? gAuxRegionFirst : 0ULL, ok, reason);
+    lastOk = ok;
+  }
   if (firstLba) *firstLba = ok ? gAuxRegionFirst : 0;
   if (why) *why = reason;
   return ok;

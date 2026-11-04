@@ -33,10 +33,10 @@ index 100d5d7..0e048e0 100644
  		ud.register_pending = false;
  		extern kern_return_t native_register_display_and_report(void)
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 5272b82..c67df51 100644
+index 5272b82..8a3f9cc 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -8345,6 +8345,745 @@ done:
+@@ -8345,6 +8345,747 @@ done:
  	if (path) kfree_data(path, 256);
  }
  
@@ -287,6 +287,7 @@ index 5272b82..c67df51 100644
 +static uint32_t picasso_pipe_tail_bytes, picasso_pipe_total, picasso_pipe_hash;
 +static uint64_t picasso_pipe_next;
 +static int picasso_pipe_active;
++static int picasso_pipe_opened;
 +
 +static uint32_t
 +picasso_lsp_hash_step(uint32_t hash, const uint8_t *data, size_t length)
@@ -328,9 +329,10 @@ index 5272b82..c67df51 100644
 +	}
 +	uint64_t first = 0;
 +	const char *why = "";
-+	if (!native_ufs_aux_open(65536, &first, &why)) {
++	if (!picasso_pipe_opened && !native_ufs_aux_open(65536, &first, &why)) {
 +		return -4;
 +	}
++	picasso_pipe_opened = 1;
 +	uint8_t *bytes = (uint8_t *)(uintptr_t)data;
 +	if (offset == 0) {
 +		if (total < 16 || total > PICASSO_PIPE_MAX) {
@@ -782,7 +784,7 @@ index 5272b82..c67df51 100644
  static void
  native_picasso_apps_mount(proc_t p, user_addr_t scratch)
  {
-@@ -8375,6 +9114,11 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+@@ -8375,6 +9116,11 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
  		char view[96];
  		vnode_t root = NULLVP;
  		if (!vnode_lookup("/Applications", 0, &root, ctx)) {
@@ -794,7 +796,7 @@ index 5272b82..c67df51 100644
  			struct vfs_attr vfa;
  			VFSATTR_INIT(&vfa);
  			VFSATTR_WANTED(&vfa, f_capabilities);
-@@ -8409,8 +9153,11 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+@@ -8409,8 +9155,11 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
  					else error = ENAMETOOLONG;
  				}
  				if (!error && !strcmp(path, view)) resolved |= 1u << i;
@@ -808,7 +810,7 @@ index 5272b82..c67df51 100644
  				vnode_put(vp);
  			}
  		}
-@@ -8420,7 +9167,21 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+@@ -8420,7 +9169,21 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
  		if (PE_parse_boot_argn("picasso-ls-rebuild", &rebuild, sizeof(rebuild)) && rebuild == 1) {
  			if (native_picasso_apps_stage == 5 && !native_picasso_apps_status &&
  			    found == 0xfff && resolved == 0xfff) {
