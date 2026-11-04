@@ -213,6 +213,23 @@ def build_verified_root_policy(record: dict, out: Path, extra_flags: list):
     return objects
 
 
+def check_adreno_integration(archive: Path):
+    # Compatibility aliases can name an upstream A740 recipe. Bind its
+    # success to the Picasso source and archive that this kernel links.
+    report_path = ROOT / 'build/native-adreno-accelerator/build-report.json'
+    if not report_path.is_file():
+        raise SystemExit('Missing Picasso NativeAdreno accelerator integration report')
+    report = json.loads(report_path.read_text())
+    source = ROOT / 'drivers/NativeAdreno/NativeAdrenoAccelerator.cpp'
+    header = source.parent / 'OriginalAcceleratorABI.h'
+    expected = {'drivers/NativeAdreno/NativeAdrenoAccelerator.cpp': hashlib.sha256(source.read_bytes()).hexdigest(),
+                'OriginalAcceleratorABI.h': hashlib.sha256(header.read_bytes()).hexdigest()}
+    if (report.get('source_sha256') != expected or
+            report.get('linked_archive') != str(archive) or
+            report.get('linked_archive_sha256') != hashlib.sha256(archive.read_bytes()).hexdigest()):
+        raise SystemExit('Picasso NativeAdreno accelerator source or linked archive differs from its report')
+
+
 def build_adreno(record: dict):
     out = ROOT / 'build/native-adreno'
     out.mkdir(parents=True, exist_ok=True)
@@ -271,6 +288,7 @@ def build_adreno(record: dict):
         if res.returncode != 0:
             raise SystemExit(f'build-native-adreno-accelerator.py failed:\n{res.stdout}\n{res.stderr}')
         else:
+            check_adreno_integration(archive)
             print('NativeAdreno: integrated staged AGXAccelerator and original IOAcceleratorES imports')
 
 
