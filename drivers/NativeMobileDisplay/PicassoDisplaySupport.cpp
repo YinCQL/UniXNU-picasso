@@ -56,6 +56,10 @@ static struct {
 
 extern "C" bool native_legacy_display_probe_ready(void);
 extern "C" bool native_legacy_surface_ready(void);
+// GPU scanout hand-off counters (NativeGOPPresenter.cpp): offers the presenter took, completions it got back, failed
+// copies, and swaps taken back by the flip timeout (the display then falls back to its own copy for that frame).
+extern "C" {extern volatile uint64_t native_gop_gpu_offers,native_gop_gpu_completions,native_gop_gpu_failures,native_gop_gpu_abandoned;
+extern volatile uint64_t native_gop_wait_stats[7];}
 extern "C" int boot_progress_prepare_scanout(void) __attribute__((weak_import));
 
 extern "C" kern_return_t native_start_kext_and_report(const char *identifier,
@@ -264,12 +268,18 @@ static void reportDisplayState(const char *trigger) {
     const uint64_t lastFrame = __atomic_load_n(&displayStats.lastFrameTick, __ATOMIC_RELAXED);
     const uint64_t lastTransfer = __atomic_load_n(&displayStats.lastTransferTick, __ATOMIC_RELAXED);
     const uint64_t lastRetire = __atomic_load_n(&displayStats.lastRetireTick, __ATOMIC_RELAXED);
+    // Short line first: the long one is long enough that another core's printf can split it and drop the hand-off
+    // counters. waits/timeouts come from the presenter's waitSwap stats ([0] calls, [1] timeouts).
+    printf("PICASSO_DISPLAY_GPU offers=%llu done=%llu fail=%llu abandoned=%llu waits=%llu wait_to=%llu\n",
+        (unsigned long long)native_gop_gpu_offers, (unsigned long long)native_gop_gpu_completions,
+        (unsigned long long)native_gop_gpu_failures, (unsigned long long)native_gop_gpu_abandoned,
+        (unsigned long long)native_gop_wait_stats[0], (unsigned long long)native_gop_wait_stats[1]);
     printf("PICASSO_DISPLAY_STATE trigger=%s now_ns=%llu submit=%llu accept=%llu reject=%llu "
         "reasons=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu scans=%llu blank=%llu nonblack=%llu "
         "transfer=%llu transfer_fail=%llu retire=%llu retire_fail=%llu copies=%llu copy_bytes=%llu "
         "last_submit_ns=%llu last_frame_ns=%llu last_transfer_ns=%llu last_retire_ns=%llu "
         "last_copy_ticks=%llu last_copy_bytes=%llu last_pixels=%llu bbox=%llu,%llu-%llu,%llu "
-        "last_status=%x vsync_ticks=%llu\n",
+        "last_status=%x vsync_ticks=%llu gpu_offers=%llu gpu_done=%llu gpu_fail=%llu gpu_abandoned=%llu\n",
         trigger, (unsigned long long)absoluteNanoseconds(now),
         (unsigned long long)__atomic_load_n(&displayStats.submissions, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&displayStats.accepted, __ATOMIC_RELAXED),
@@ -303,7 +313,9 @@ static void reportDisplayState(const char *trigger) {
         (unsigned long long)__atomic_load_n(&displayStats.lastMaxX, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&displayStats.lastMaxY, __ATOMIC_RELAXED),
         __atomic_load_n(&displayStats.lastTransferStatus, __ATOMIC_RELAXED),
-        (unsigned long long)__atomic_load_n(&displayStats.vsyncTicks, __ATOMIC_RELAXED));
+        (unsigned long long)__atomic_load_n(&displayStats.vsyncTicks, __ATOMIC_RELAXED),
+        (unsigned long long)native_gop_gpu_offers, (unsigned long long)native_gop_gpu_completions,
+        (unsigned long long)native_gop_gpu_failures, (unsigned long long)native_gop_gpu_abandoned);
 }
 
 extern "C" void native_legacy_display_state_report(void) {

@@ -368,3 +368,38 @@ Do not carry its "App normal" conclusion forward.
   shows `pid=185 name=installd` together with lsd/backboardd/SpringBoard, yet the next boot's
   `PICASSO_PERSIST minstall` still reports `err=2`. Treat the plist as absent until a trigger that makes
   installd scan /Applications is found; that is the path to dropping the per-boot csstore drop.
+- **GPU scanout copy enabled, and the freeze it exposed (wf236..wf238)**: with `sheng-fb-gpu=1` the display
+  driver hands each finished frame to the GPU client instead of copying it (`copies=0`, `copy_bytes=0`), and the
+  GPU blits the 1080x2340 canvas into the scanout at a 60-row letterbox offset (`destY`, NGPSwap.reserved).
+  wf236 (kernel 6639c21a, 660-byte command line identical to wf234 plus GPU copy) reached the desktop and served
+  `PF 246/0` frames at ~20 ms each (~30-35 fps), then **froze at 293 s**: `submit` stopped at 1560,
+  `last_submit_ns` frozen, `reject=0`, GPU `hangcheck fence=3193 hang_fence=3193 state=0` (all GPU work retired,
+  GPU idle), and the userspace serve loop printed nothing more. The display's single-outstanding latch
+  (`transferred`) never cleared because the userspace `completeSwap` never came: the serving thread sat in the
+  Metal `[commandBuffer waitUntilCompleted]`, which has no timeout. The `PICASSO_GPU stall` dumps in that window
+  are *poll* timeouts (the sampled fence page is already ahead), not a hung GPU.
+  Fixes in wf237 (kernel 8ff58c5f, plugin 1361e2c3, command line byte-identical to wf236):
+  1. **Kernel flip timeout** (NativeGOPPresenter, 500 ms IOTimerEventSource): a frame offered but not completed is
+     taken back, the display driver is told it failed and uses its own copy for that frame; late completions are
+     idempotent so the serve loop survives. `PICASSO_DISPLAY gpu flip timeout: seq=.. delivered=.. waited_ms=..`.
+  2. **One scanout owner**: only the first task that waits owns the scanout (2 s lapse allows takeover); a second
+     process's serve thread gets `kIOReturnNotReady` and stops. wf236 showed backboardd *and* SpringBoard each
+     running a presenter over the same scanout (`opens=4`).
+  3. **Bounded userspace wait**: present() waits on a completion semaphore for 400 ms instead of
+     `waitUntilCompleted`; three consecutive timeouts stop commits and every frame falls back to the CPU copy
+     for 30 s, so a wedged runtime can never freeze the display.
+  wf237 result: **no freeze at the wf236 point**; 15 min stable, `submit=6172 accept=6172 reject=0 copies=0`,
+  `PF 241/0` (0 failures), `gpu flip timeout=0`, no panic, no service exit, ~34 fps. It then froze at 987 s with
+  the *same* signature but **no flip timeout fired and no swap outstanding** (`transfer=6287 retire=6266`):
+  the compositor itself stopped submitting frames. So the remaining root cause is in the userspace Metal
+  runtime's command-buffer completion path (CA's own render waits have no timeout), not in the display latch.
+  wf238 (kernel 4f54815b, plugin 45197d55, same 660-byte command line) is built and ready to boot; it adds:
+  * kernel: a short `PICASSO_DISPLAY_GPU offers/done/fail/abandoned/waits/wait_to` line (the long state line is
+    split by other cores' printf and loses its tail), and the console text-mirror cap 64 -> 256 lines
+    (the self-test had consumed the budget, which is why PF lines stopped at frame 241 in wf237);
+  * plugin: `PF ... i<import> c<commit> w<gpu wait> s<MTLCommandBufferStatus> d<distinct sources> <stride>/<stride>`
+    every 30 frames (the per-frame cost breakdown and whether imports can be cached), and a **progress watchdog**
+    that, when command-buffer completions stop for 5 s with buffers still in flight, streams `WD stall done=..
+    inflight=..` plus each thread's user PC and symbol (`WD t<n> <pc> <symbol>`) into the boot log.
+  Next: boot wf238, read the `WD` thread PCs at the freeze to name the wedged wait, then remove the dependency
+  on the runtime's completion dispatch (or fix it) and use the `i/c/w` split to cut the ~20 ms/frame copy cost.

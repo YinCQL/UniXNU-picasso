@@ -38,7 +38,7 @@ extern "C" void native_legacy_retirement_observed(IOService *);
 // to the privileged GPU client instead of being copied. The presenter's offer
 // either takes the frame or refuses it, in which case this file keeps the CPU
 // path unchanged. A failed GPU copy falls back for the rest of the kick.
-extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height,uint32_t destY);
 extern "C" void native_legacy_swap_stage(unsigned stage);
 extern "C" void native_legacy_gpu_fallback_observed(int status);
 extern "C" {extern volatile uint64_t native_legacy_early_retires,native_legacy_early_failures;}
@@ -336,7 +336,11 @@ public:
         if(!gpuBypass) {
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
         }
-        if(!gpuBypass && sourceHeight==height && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
+        /* The phone canvas is shorter than the panel: hand the GPU the source height and the top-bar row
+         * offset and let the presenter fill both bars, instead of copying 10 MB per frame on the CPU. */
+        const uint32_t gpuBarRows=sourceHeight<height?(height-sourceHeight>=60?60:height-sourceHeight):0;
+        if(!gpuBypass && sourceHeight<=height && sourceWidth>=width &&
+           native_legacy_gpu_offer(this,memory,sourceStride,width,sourceHeight,gpuBarRows)) {
             // The GPU writes the scanout memory behind the CPU's back: the
             // differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
