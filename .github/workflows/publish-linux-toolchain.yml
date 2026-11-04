@@ -1,0 +1,134 @@
+name: Publish Picasso Linux Toolchain
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: New immutable Ubuntu24 x86_64 toolchain version
+        default: picasso-linux-toolchain-v1-ubuntu24-x86_64
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: picasso-linux-toolchain-release
+  cancel-in-progress: false
+
+jobs:
+  guidance:
+    if: github.ref_name == 'main'
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo 'Select a Linux build branch with a qualified toolchain cache, such as test/pr17.'
+
+  package:
+    if: github.ref_name != 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      manifest_sha256: ${{ steps.package.outputs.manifest_sha256 }}
+      tag: ${{ steps.package.outputs.tag }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: device
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare the pinned toolchain recipe and host dependencies
+        id: identity
+        run: |
+          TREE=$(python3 ./unixnu --prepare)
+          echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
+          sudo python3 "$TREE/scripts/linux/setup-toolchain.py" --host-only
+          KEY=$(python3 scripts/linux-toolchain-release.py identity --tree "$TREE")
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+      - name: Restore the already qualified toolchain for packaging
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/work/_temp/unixnu-linux
+          key: ${{ steps.identity.outputs.key }}
+          fail-on-cache-miss: true
+      - name: Qualify and package the toolchain with licenses and provenance
+        id: package
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          sudo --preserve-env=GITHUB_OUTPUT,GITHUB_RUN_ID,GITHUB_REPOSITORY \
+            python3 scripts/linux-toolchain-release.py package --tree "$UNIXNU_TREE" \
+            --output out/toolchain-release --tag "$RELEASE_TAG"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: staged-linux-toolchain
+          path: device/out/toolchain-release/
+          retention-days: 7
+
+  verify_and_publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: device
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: staged-linux-toolchain
+          path: device/out/toolchain-release
+      - name: Install and verify on a fresh runner without a toolchain cache
+        env:
+          MANIFEST_SHA: ${{ needs.package.outputs.manifest_sha256 }}
+        run: |
+          TREE=$(python3 ./unixnu --prepare)
+          sudo python3 "$TREE/scripts/linux/setup-toolchain.py" --host-only
+          sudo python3 scripts/linux-toolchain-release.py install --tree "$TREE" \
+            --bundle out/toolchain-release --manifest-sha256 "$MANIFEST_SHA"
+      - name: Publish the verified immutable Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.package.outputs.tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists; use a new version instead of replacing assets." >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          m = json.loads(Path('out/toolchain-release/linux-toolchain-manifest.json').read_text())
+          Path('out/toolchain-release/notes.md').write_text(
+              'Pinned Ubuntu 24.04 x86_64 UniXNU toolchain for Picasso Linux builds.\n\n'
+              'Validated on a fresh runner: XNU builtins, ARM64 compile/link, Mach-O symbol editing, '
+              'host wrapper, shared libraries and LZFSE. No kernel or APFS seed is included.\n\n'
+              f'Source revision: {m["source_revision"]}\nRecipe SHA256: {m["recipe_sha256"]}\n'
+              f'Archive SHA256: {m["archive_sha256"]}\n\n'
+              'Licenses, recipe sources and corresponding cctools sources are included in the archive.\n',
+              encoding='utf-8')
+          PY
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --prerelease --latest=false \
+            --title "Picasso Linux toolchain: $RELEASE_TAG" \
+            --notes-file out/toolchain-release/notes.md \
+            out/toolchain-release/picasso-linux-toolchain-ubuntu24-x86_64.tar.gz \
+            out/toolchain-release/linux-toolchain-manifest.json \
+            out/toolchain-release/linux-toolchain-release.json
