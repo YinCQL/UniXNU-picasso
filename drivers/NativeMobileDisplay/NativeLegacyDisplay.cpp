@@ -77,6 +77,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     uint64_t gpuLength=0;
     bool gpuBypass=false;
     bool gpuRetired=false;
+    uint64_t gpuStartTick=0;
     // Preserve every accepted request until the original family retires it.
     // A full table rejects the new request without evicting a live entry.
     const OriginalLegacySwapRequest *validated[8]={};
@@ -171,7 +172,7 @@ public:
     void stop(IOService *provider) override {
         stopVsync();
         releaseCopyShadow();
-        transferred=false;gpuRequest=nullptr;gpuRetired=false;for(auto &entry: validated)entry=nullptr;
+        transferred=false;gpuRequest=nullptr;gpuRetired=false;gpuStartTick=0;for(auto &entry: validated)entry=nullptr;
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
     }
@@ -270,6 +271,16 @@ public:
         kicking=false;
     }
     void kickOnce() {
+        // The GPU client owns one frame until it completes it; the presenter's flip timeout normally takes a
+        // stalled frame back. If that timer was never created (no work loop) or the completion never reached this
+        // driver, do not wait forever: take the frame back here and use the CPU path for this kick.
+        if(transferred && gpuStartTick) {
+            uint64_t held=0;absolutetime_to_nanoseconds(mach_absolute_time()-gpuStartTick,&held);
+            if(held>=1500000000ull) {
+                gpuRequest=nullptr;gpuLength=0;gpuRetired=false;transferred=false;gpuBypass=true;gpuStartTick=0;
+                native_legacy_gpu_fallback_observed(kIOReturnTimeout);
+            }
+        }
         unsigned enabled=1;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
@@ -345,6 +356,7 @@ public:
             // differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
             copyShadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
+            gpuStartTick=mach_absolute_time();
             // Retire as soon as the client owns the frame (the presenter retains
             // it); the next frame waits for the copy because transferred stays
             // set until finishGpuSwap.
@@ -488,6 +500,7 @@ public:
     // CPU copy for the next kick.
     void finishGpuSwap(int status) {
         const OriginalLegacySwapRequest *request=gpuRequest;
+        gpuStartTick=0;
         if(!request)return;
         gpuRequest=nullptr;
         if(gpuRetired) {
