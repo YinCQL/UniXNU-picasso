@@ -40,6 +40,7 @@ def prepare(device=DEVICE, source=None):
     quiet_boot2_patch = device / 'patches/picasso-quiet-boot2-xnu.patch'
     defer_ps_patch = device / 'patches/picasso-defer-ps-xnu.patch'
     ls_persist_patch = device / 'patches/picasso-ls-persist-xnu.patch'
+    ram_block_patch = device / 'patches/picasso-native-ram-block-mode1-guard.patch'
     fingerprint = hashlib.sha256(patch.read_bytes() + b'\0' + usb_patch.read_bytes() +
                                  b'\0' + cpu_idle_patch.read_bytes() +
                                  b'\0' + topology_patch.read_bytes() +
@@ -62,7 +63,8 @@ def prepare(device=DEVICE, source=None):
                                  b'\0' + quiet_boot_patch.read_bytes() +
                                  b'\0' + quiet_boot2_patch.read_bytes() +
                                  b'\0' + defer_ps_patch.read_bytes() +
-                                 b'\0' + ls_persist_patch.read_bytes()).hexdigest()
+                                 b'\0' + ls_persist_patch.read_bytes() +
+                                 b'\0' + ram_block_patch.read_bytes()).hexdigest()
     cache = device / '.cache'
     target = cache / f'upstream-{revision[:12]}-{fingerprint[:12]}'
     if target.is_dir():
@@ -91,6 +93,10 @@ def prepare(device=DEVICE, source=None):
                 if local and (source / path / '.git').exists():
                     git('config', key.removesuffix('.path') + '.url', source / path, cwd=tree)
             git('-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', '--recursive', cwd=tree)
+        # The read-only Data-store probe (sheng-data-persist=1) must not index the RAM page table of a
+        # >2 GiB disk, which does not exist; the guard lives in the NativeRamBlock submodule.
+        subprocess.run(['git', 'apply', '-p1', str(ram_block_patch)],
+                       cwd=tree / 'drivers/NativeRamBlock', check=True)
         git('apply', '--check', patch, cwd=tree)
         git('apply', patch, cwd=tree)
         embedded_usb_patch = tree / 'patches/xnu/zzz-picasso-usb-console.patch'

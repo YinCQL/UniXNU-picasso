@@ -1249,6 +1249,13 @@ extern "C" int native_ufs_store_open (uint64_t blocks, uint64_t *firstLba, const
   else if (!gStoreGeometry.valid || !gHost.ready) reason = "no root layout";
   else if (gStoreRegionBlocks) reason = "already open";
   else {
+    // Stage-1 geometry probe: the whole layout in one console line, so "refused" and "not opened"
+    // (mode 0 / already open) are told apart without guessing. Read-only modes still reach here.
+    IOLog ("PICASSO_STORE probe mode=%u blocks=%llu partition=%llu..%llu partitionBlocks=%llu imageBlocks=%llu reserve=%llu "
+           "gpt=%x/%x\n",
+           storeMode (), blocks, gStoreGeometry.first, gStoreGeometry.last,
+           gStoreGeometry.last - gStoreGeometry.first + 1, (gStoreGeometry.imageBytes + 4095) / 4096, reserveBlocks (),
+           gStoreGeometry.headerCrc, gStoreGeometry.entriesCrc);
     uint64_t partition = gStoreGeometry.last - gStoreGeometry.first + 1;
     uint64_t imageBlocks = (gStoreGeometry.imageBytes + 4095) / 4096;
     const uint64_t reserve = reserveBlocks ();
@@ -1266,6 +1273,13 @@ extern "C" int native_ufs_store_open (uint64_t blocks, uint64_t *firstLba, const
         ok = 1;
       }
     }
+  }
+  if (ok) {
+    const uint64_t partition = gStoreGeometry.last - gStoreGeometry.first + 1;
+    IOLog ("PICASSO_STORE open first=%llu blocks=%llu quarter=%llu lowGuard=%llu\n",
+           gStoreRegionFirst, gStoreRegionBlocks, partition / 4, gStoreRegionFirst - gStoreGeometry.first);
+  } else {
+    IOLog ("PICASSO_STORE refused blocks=%llu why=%s\n", blocks, reason);
   }
   if (why) *why = reason;
   return ok;
@@ -1302,6 +1316,71 @@ extern "C" int native_ufs_store_write (uint64_t rel, uint32_t blocks, const void
 extern "C" int native_ufs_store_sync (void)
 {
   return storeMode () == 2 && gStoreRegionBlocks && hostSyncCache () == kIOReturnSuccess;
+}
+
+// ---- Board auxiliary window (directly below the Data store) -----------------------------------------
+// A small raw region for board-owned blobs (the LaunchServices cache today, the pipeline cache later) that
+// must survive an unclean reboot without the file system's checkpoint. It sits just below the Data store
+// window and passes the same geometry checks (inside userdata, clear of the flashed root image plus the
+// 4 MiB guard). Writes are WRITE(10) with FUA, so a blob written here is on the medium when the call returns.
+uint64_t gAuxRegionFirst, gAuxRegionBlocks;
+
+extern "C" int native_ufs_aux_open (uint64_t blocks, uint64_t *firstLba, const char **why)
+{
+  const char *reason = "";
+  int ok = 0;
+  if (storeMode () != 2) reason = "not writable";
+  else if (!gStoreRegionBlocks) reason = "store not open";
+  else if (gAuxRegionBlocks) { reason = "already open"; ok = 1; }
+  else if (!blocks || gStoreRegionFirst < gStoreGeometry.first + blocks) reason = "size";
+  else {
+    uint64_t first = gStoreRegionFirst - blocks;
+    uint64_t imageBlocks = (gStoreGeometry.imageBytes + 4095) / 4096;
+    if (first < gStoreGeometry.first + imageBlocks + 1024) reason = "overlaps the root image";
+    else if (!hostAuxOpen (first, blocks)) reason = "window refused";
+    else {
+      gAuxRegionFirst = first;
+      gAuxRegionBlocks = blocks;
+      ok = 1;
+    }
+  }
+  IOLog ("PICASSO_AUX open blocks=%llu first=%llu ok=%d why=%s\n",
+         blocks, ok ? gAuxRegionFirst : 0ULL, ok, reason);
+  if (firstLba) *firstLba = ok ? gAuxRegionFirst : 0;
+  if (why) *why = reason;
+  return ok;
+}
+
+extern "C" int native_ufs_aux_read (uint64_t rel, uint32_t blocks, void *dst)
+{
+  if (!gAuxRegionBlocks || !dst || !blocks || rel >= gAuxRegionBlocks || blocks > gAuxRegionBlocks - rel) return 0;
+  while (blocks) {
+    uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
+    if (hostRead4k (0, gAuxRegionFirst + rel, chunk, dst) != kIOReturnSuccess) return 0;
+    dst = static_cast<uint8_t *> (dst) + chunk * 4096ULL;
+    rel += chunk;
+    blocks -= chunk;
+  }
+  return 1;
+}
+
+extern "C" int native_ufs_aux_write (uint64_t rel, uint32_t blocks, const void *src)
+{
+  if (storeMode () != 2 || !gAuxRegionBlocks || !src || !blocks || rel >= gAuxRegionBlocks ||
+      blocks > gAuxRegionBlocks - rel) return 0;
+  while (blocks) {
+    uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
+    if (hostWrite4k (0, gAuxRegionFirst + rel, chunk, src, true) != kIOReturnSuccess) return 0;
+    src = static_cast<const uint8_t *> (src) + chunk * 4096ULL;
+    rel += chunk;
+    blocks -= chunk;
+  }
+  return 1;
+}
+
+extern "C" int native_ufs_aux_sync (void)
+{
+  return storeMode () == 2 && gAuxRegionBlocks && hostSyncCache () == kIOReturnSuccess;
 }
 
 // ---- Diagnostic log window (sheng-log=1) --------------------------------------------------------------------------
