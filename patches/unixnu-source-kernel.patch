@@ -7758,7 +7758,7 @@ index 2bbb6edeed91d725594b8c3a498686aca5c9781d..b4cbf6a918a3b74d377153ae2e4fe96a
          src = work / 'llvm-project'
 -        git_checkout(src, 'https://github.com/llvm/llvm-project', LLVM_COMMIT)
 +        git_checkout(src, 'https://github.com/llvm/llvm-project', LLVM_COMMIT,
-+                     paths=('llvm', 'clang', 'cmake', 'third-party'))
++                     paths=('llvm', 'clang', 'cmake', 'third-party', 'libc'))
          run(['git', '-C', src, 'apply', HERE / 'llvm-xnu-builtin-type.patch'])
          run(['cmake', '-G', 'Ninja', '-S', src / 'llvm', '-B', src / 'build',
               '-DLLVM_ENABLE_PROJECTS=clang', '-DLLVM_TARGETS_TO_BUILD=AArch64',
