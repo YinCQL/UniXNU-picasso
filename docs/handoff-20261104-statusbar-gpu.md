@@ -364,3 +364,7 @@ Do not carry its "App normal" conclusion forward.
   GPU submissions=385, **vnode jetsam=0, service exits=0, no panic**; the desktop and apps are back.
   The proper long-term fix is still to have installd maintain MobileInstallation.plist (or to keep the
   bindfs volume/file IDs stable) so the per-boot LaunchServices rescan can be dropped.
+- **installd runs but does not write its database**: the CDC `ps` command (now in `scripts/picasso-cdc-command.py`)
+  shows `pid=185 name=installd` together with lsd/backboardd/SpringBoard, yet the next boot's
+  `PICASSO_PERSIST minstall` still reports `err=2`. Treat the plist as absent until a trigger that makes
+  installd scan /Applications is found; that is the path to dropping the per-boot csstore drop.
