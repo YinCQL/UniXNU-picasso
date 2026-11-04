@@ -74,10 +74,16 @@ cmd += ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-c99-design
 # The exported XNU OSSymbol header declares virtual methods in a final class.
 # Both Apple clang and the pinned Linux clang diagnose this harmless declaration.
 warning = '-Wno-unnecessary-virtual-specifier'
-if subprocess.run([cmd[0], '-Werror=unknown-warning-option', warning,
-                   '-x', 'c++', '-fsyntax-only', '-'], input='', text=True,
-                  capture_output=True).returncode == 0:
+# Query clang's warning table in the kernel target context. A failed probe is a
+# toolchain error, not evidence that the warning is unsupported.
+support = run([cmd[0], '-target', TRIPLE, '-E', '-P', '-x', 'c++', '-'],
+              input='#if __has_warning("-Wunnecessary-virtual-specifier")\n1\n#else\n0\n#endif\n',
+              text=True, cwd=record['directory']).strip()
+if support not in ('0', '1'):
+    sys.exit(f'Unexpected clang warning query result for {TRIPLE}: {support!r}')
+if support == '1':
     cmd.append(warning)
+print(f'Clang {warning} for {TRIPLE}: {"enabled" if support == "1" else "unsupported"}', flush=True)
 subprocess.run(cmd, cwd=record['directory'], check=True)
 
 raw = obj.read_bytes()

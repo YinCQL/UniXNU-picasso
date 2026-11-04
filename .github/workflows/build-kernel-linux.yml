@@ -5,9 +5,6 @@ name: Build Picasso Kernel (Linux)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [test/pr17]
-    paths: [.github/workflows/build-kernel-linux.yml]
 
 permissions:
   contents: read
@@ -18,16 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  register_workflow:
-    name: Register the Linux workflow on the test branch
-    if: github.event_name == 'push'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - run: echo 'Linux workflow registered. Select test/pr17 for a manual kernel build.'
-
   kernel_linux:
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     defaults:
