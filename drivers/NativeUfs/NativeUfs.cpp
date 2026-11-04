@@ -1332,11 +1332,15 @@ extern "C" int native_ufs_aux_open (uint64_t blocks, uint64_t *firstLba, const c
   if (storeMode () != 2) reason = "not writable";
   else if (!gStoreRegionBlocks) reason = "store not open";
   else if (gAuxRegionBlocks) { reason = "already open"; ok = 1; }
-  else if (!blocks || gStoreRegionFirst < gStoreGeometry.first + blocks) reason = "size";
+  else if (!blocks) reason = "size";
   else {
+    // One fixed window for every aux user: the LaunchServices blob (16 MiB) and the pipeline pack (240 MiB).
+    // Opening it at the caller's size would let the first opener undersize it for the other.
+    blocks = 65536;   // 256 MiB
     uint64_t first = gStoreRegionFirst - blocks;
     uint64_t imageBlocks = (gStoreGeometry.imageBytes + 4095) / 4096;
-    if (first < gStoreGeometry.first + imageBlocks + 1024) reason = "overlaps the root image";
+    if (gStoreRegionFirst < gStoreGeometry.first + blocks) reason = "size";
+    else if (first < gStoreGeometry.first + imageBlocks + 1024) reason = "overlaps the root image";
     else if (!hostAuxOpen (first, blocks)) reason = "window refused";
     else {
       gAuxRegionFirst = first;
