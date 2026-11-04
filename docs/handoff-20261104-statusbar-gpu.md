@@ -446,3 +446,84 @@ Do not carry its "App normal" conclusion forward.
   remaining findings (fence waits under the global device lock with no pacing, sticky poison with an unreachable
   restart, SMC probes inside the restart under the lock, TTBR0 switch without the ring's idle check, the
   stranded-ring job fabricated as completed, VM teardown leaks) are recorded here as the next GPU-stability round.
+
+## wf242: the freeze after 44 minutes, and what the counters say
+
+wf242 (kernel 9472d3c5, the wf241 addon with the fixed Turnip) ran from boot to `now_ns=2770 s`; the last
+display submission was at `now_ns=2670 s`, so the compositor stopped 100 s before the capture ended:
+
+```
+PICASSO_DISPLAY_STATE trigger=vsync ... submit=896 accept=896 reject=0 reasons=896/0/... transfer=897
+    transfer_fail=3 retire=894 retire_fail=0 copies=0 copy_bytes=0 last_submit_ns=2670021557083
+PICASSO_DISPLAY_GPU offers=894 done=894 fail=0 abandoned=0 waits=1393 wait_to=498
+PICASSO_GPU hangcheck: polls=712 fence=1825 hang_fence=1825 retries=0 state=0 trylock=19 same=0
+```
+
+No flip-timeout line, no `WD` line, no panic; the vsync tick kept printing every 10 s to the end, so the
+display's work loop was alive. Reads:
+
+* The GPU had finished everything it was given (`fence=1825` static, state 0, no client in flight). This is not a
+  GPU wedge and it is not a Turnip wait: the bridge's watchdog stayed silent because `inflight=0`.
+* `offers=done=894` and `abandoned=0`: every frame the presenter accepted was also completed; no swap was
+  outstanding in the presenter at the freeze. The presenter's flip-timeout timer existed all boot (wf243 prints
+  `PICASSO_DISPLAY gpu watchdog loop=<loop> own=0 timer=<timer>`), so the 500 ms path simply had nothing to
+  take back.
+* `accept=896` vs `retire=894`: two swaps were validated by the display but never transferred and never
+  retired. With `sheng-early-retire=1` retirement happens when the GPU client takes a frame, so those two were
+  never offered at all. The compositor's swap queue then waits for a retirement that no path can perform, the
+  render server blocks once its queue is full, and no later submission arrives to drive another kick. The three
+  `transfer_fail` entries are `kIOReturnNotReady` (`e00002d8`), not the display's own 1.5 s timeout fallback.
+
+The kick state (`kicking`/`rekick`) is a plain pair of bools shared by the compositor's submission thread, the
+presenter-completion run action and (from wf243) the refresh tick. Two of them could observe `kicking==false`
+together and run `kickOnce` concurrently, or one could consume the other's `rekick`; either way a validated
+request can be left with nobody to kick it. wf243 closes this from both sides:
+
+* `kickSwapQueue` is serialized with an `IORecursiveLock` (recursive because `finishTransfer` re-enters it from
+  inside `kickOnce`), so a kick either fully runs or records `rekick` for the running one.
+* the refresh tick, the display's only periodic heartbeat, pumps the queue about once a second whenever
+  `transferred` or any validated request says work remains. It also prints
+  `PICASSO_DISPLAY gpu latch held_ms=.. pending=.. recovered by tick` when it recovers a latch held over 1 s.
+* `finishGpuSwap` with no request left (the display already took the frame back) now still kicks instead of only
+  clearing `transferred`.
+
+Diagnostics added for the next freeze: the plugin's serve loop samples its own process's threads after 60 s
+without a served frame (`S n.. frames=.. pid=..` then `S t<i> <pc> <symbol>`), which is exactly the case the
+existing `WD` watchdog cannot report (`inflight=0`). kernel `threads <pid>` in the CDC console was prototyped and
+dropped: in the BSD build `struct task`/`machine_thread_get_state` are behind `MACH_KERNEL_PRIVATE`, and the
+userspace sampler inside the plugin has the same information for the processes of interest.
+
+## wf243/wf244: the identity slip and the phone-layout re-run
+
+wf243 (the first image with the kick serialization and the tick recovery) was built without `IPHONE_IDENTITY=1`, so
+`make-picasso-adt.py` fell back to the board's `ipad_identity` and `AMFI` read `iPad7,1`: the device came up in the
+iPad layout and the App icons were gone again. This is the documented identity lesson, not a regression from the
+GPU changes; the DTB `dtb_sha256` was identical to wf242, only the ADT's `/model`, `/target-type` and product
+nodes differed. wf244 rebuilds the same kernel/addon with `IPHONE_IDENTITY=1`; its image contains `D52g` and
+`iPhone13,1` and no `iPad7,1`, and the boot log reports `AMFI: queried model name from device tree: iPhone13,1`
+with `mapped ... width=1080 height=2400 stride=4320 scale=3`.
+
+The wf243 iPad run is still useful as a serving check: it reached `submit=1150`, `offers=1150 done=1148 fail=1`,
+`PF 1207/1` with no freeze, no flip timeout and no latch line, so the new serialization did not disturb normal
+service. The one `WD stall done=7 inflight=3` dump was a transient early stall (threads in `mach_msg`/`semwait`)
+that cleared by itself; it is the new 60 s `S` sampler, not the freeze path. GPU stability on the phone identity is
+now being validated on wf244.
+
+### How to get an icon probe inside Preferences.app
+
+The SpringBoard injection hook (`patches/picasso-springboard-inject-xnu.patch`) matches the exec'd image's
+**basename**: `SpringBoard`/`PosterBoard` in `picasso_inject_program()` (patch lines 39-48), plus an optional
+app-bundle mode (`picasso_inject_apps=1`) that accepts any `/Applications/*.app`,
+`/System/Applications/*.app` or `/private/var/containers/Bundle/Application/<uuid>/*.app` main executable. The
+same helper gates the AMFI call-90 `AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS` grant, so extending it extends both gates
+at once. Trust is a global owner trust cache entry for the dylib's CDHash, not per-process. Three routes:
+
+1. `picasso_inject_sb=1 picasso_inject_apps=1` (24 bytes of command line) injects into every app bundle.
+2. Add `"Preferences"` to `picasso_inject_program()`; this is the targeted route (basename match, not path).
+3. The hook runs for the exec'ing image regardless of which process performs the exec (launchd/runningboardd),
+   so a fresh Settings launch is covered; an already-running Preferences process is not (no exec).
+
+Caveats: the existing library's constructor has never been observed to run even in SpringBoard (dyld opens and
+AMFI-validates it; no marker), and the library path (`/private/var/mobile/Library/picasso/libpicasso-sb.dylib`)
+was chosen for SpringBoard's sandbox, so Preferences' dyld open may be denied. The existing open probe
+(`libpicasso-sb.dylib` by basename, any pid) and the signature probe are the instruments to tell those apart.
