@@ -126,7 +126,13 @@ idle at ~1 GHz, the two widget extensions each holding a little core flat out wh
 screen shows them. That is the next lever if idle heat still matters; it is widget content, not the
 system.
 
-The remaining pid-1 traffic (≈4–8/s) is ordinary XPC: chronod, contextstored, remoted,
+`wait 217` (MusicWidgets) shows three threads, all blocked at the sample, the main one inside
+SwiftUI/AttributeGraph (`AGGraphGetWeakValue` and AttributeGraph frames over SwiftUI) waiting on a
+synchronous XPC reply port. The widget cost is SwiftUI content rendering in bursts (one full core
+in the busy window, 0.34 core in the next), not a spin — the extensions are SwiftUI render
+servers and their home-screen content is simply expensive on this port.
+
+The remaining pid-1 traffic (≈2–8/s) is ordinary XPC: chronod, contextstored, remoted,
 UserEventAgent, sharingd, mediaserverd. `0x40000324` is evidently the common libxpc request id,
 not an audiomxd-specific one.
 
