@@ -1,0 +1,132 @@
+diff --git a/GpuScanoutClient.h b/GpuScanoutClient.h
+index cfa0337..6f11765 100644
+--- a/GpuScanoutClient.h
++++ b/GpuScanoutClient.h
+@@ -34,6 +34,7 @@ struct Stats {
+     uint32_t lastMs;    // the GPU copy's time for the last frame
+     uint64_t totalMs;   // and for all frames (the mean is totalMs / (frames + failures))
+     uint32_t importUs, commitUs, waitUs;   // the last frame's cost breakdown (import, encode+commit, GPU wait)
++    uint32_t buildUs, encodeUs, submitUs;  // the commit span split: command-buffer creation, encode, the commit call
+     int bufferStatus;                      // its MTLCommandBufferStatus (2 committed, 3 scheduled, 4 completed, 5 error)
+     uint32_t sources;                      // distinct source allocations served so far
+     size_t surfaceStride, scanoutStride;   // the last frame's pitch and the panel's: equal pitches take the single-run blit
+@@ -100,6 +101,9 @@ public:
+         stats_->importUs = presenter_->lastImportUs;
+         stats_->commitUs = presenter_->lastCommitUs;
+         stats_->waitUs = presenter_->lastWaitUs;
++        stats_->buildUs = presenter_->lastCreateUs;
++        stats_->encodeUs = presenter_->lastEncodeUs;
++        stats_->submitUs = presenter_->lastSubmitUs;
+         stats_->bufferStatus = presenter_->lastStatus;
+         stats_->sources = presenter_->distinctSources();
+         stats_->surfaceStride = swap.stride;
+diff --git a/GpuScanoutPresenter.h b/GpuScanoutPresenter.h
+index 40ec78c..4d8dd63 100644
+--- a/GpuScanoutPresenter.h
++++ b/GpuScanoutPresenter.h
+@@ -6,12 +6,26 @@
+ #pragma once
+ #import <Metal/Metal.h>
+ #include <mach/mach_time.h>
++#include <sys/sysctl.h>
+ #include <unistd.h>
+ #include <stdint.h>
+ #include <string.h>
+ 
+ namespace gpupresent {
+ 
++// sheng-present-nonblock=1 in the kernel command line (read through sysctl, the boot-argument channel the plugin
++// already uses): the non-blocking-present experiment, commit and return without waiting for the GPU.
++inline bool nonblocking() {
++    static int enabled = -1;
++    if (enabled < 0) {
++        char args[1024] = {};
++        size_t size = sizeof args;
++        enabled = sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0 &&
++                  strstr(args, "sheng-present-nonblock=1") != nullptr;
++    }
++    return enabled != 0;
++}
++
+ struct Scanout {
+     void *base;       // writable mapping of the firmware framebuffer (page aligned)
+     size_t bytes;     // whole extent, a multiple of the page size
+@@ -38,8 +52,11 @@ public:
+     }
+     bool ready() const { return target_ != nil; }
+     // Per-frame cost breakdown of the last present(): importing the frame's pages into the runtime, encoding and
+-    // committing the blit, and waiting for it. Evidence only; the copy is still the GPU's.
++    // committing the blit, and waiting for it. Evidence only; the copy is still the GPU's. The commit span is split
++    // further (command-buffer creation, texture/copy encoding, the commit call itself) so a slow present can be
++    // attributed to the Metal API side or to the runtime's queue submission.
+     uint32_t lastImportUs = 0, lastCommitUs = 0, lastWaitUs = 0;
++    uint32_t lastCreateUs = 0, lastEncodeUs = 0, lastSubmitUs = 0;
+     int lastStatus = 0;
+     // How many distinct source allocations were served so far (a small pool means the imports can be cached).
+     uint32_t distinctSources() const { return sourceCount_; }
+@@ -73,7 +90,10 @@ public:
+         noteSource((uintptr_t)frame.base);
+         lastImportUs = micros(mach_absolute_time() - phase);
+         phase = mach_absolute_time();
++        const uint64_t commitStart = phase;
+         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
++        lastCreateUs = micros(mach_absolute_time() - phase);
++        phase = mach_absolute_time();
+         id<MTLBlitCommandEncoder> blit = commands ? [commands blitCommandEncoder] : nil;
+         if (!blit) return kNoResource;
+         if (frame.stride == scanout_.stride) {
+@@ -97,17 +117,26 @@ public:
+             }
+         }
+         [blit endEncoding];
+-        // A bounded wait, not waitUntilCompleted: if the Metal runtime's completion thread wedges (one stalled GPU
+-        // submission did this on the Picasso port), an unbounded wait stopped every later frame and froze the
+-        // compositor with it. Timing out reports a failed copy, the display driver uses its own path for that frame,
+-        // and serving continues.
+-        dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+-        if (!finished) return kNoResource;
+-        [commands addCompletedHandler:^(id<MTLCommandBuffer>) {dispatch_semaphore_signal(finished);}];
++        lastEncodeUs = micros(mach_absolute_time() - phase);
++        phase = mach_absolute_time();
++        // sheng-present-nonblock=1 (experiment): commit and return without waiting for the GPU. The completion handler
++        // still runs; the caller treats the frame as served. Judges whether the bounded wait is on the frame's
++        // critical path at all.
++        const bool nonblock = nonblocking();
++        dispatch_semaphore_t finished = nonblock ? nil : dispatch_semaphore_create(0);
++        if (!nonblock && !finished) return kNoResource;
++        if (finished) [commands addCompletedHandler:^(id<MTLCommandBuffer>) {dispatch_semaphore_signal(finished);}];
+         [commands commit];
+-        lastCommitUs = micros(mach_absolute_time() - phase);
++        lastSubmitUs = micros(mach_absolute_time() - phase);
++        lastCommitUs = micros(mach_absolute_time() - commitStart);
++        if (nonblock) {
++            lastWaitUs = 0;
++            lastStatus = (int)commands.status;
++            consecutiveTimeouts_ = 0;
++            return kOk;
++        }
+         const long waited = dispatch_semaphore_wait(finished, dispatch_time(DISPATCH_TIME_NOW, (int64_t)400 * NSEC_PER_MSEC));
+-        lastWaitUs = micros(mach_absolute_time() - phase) - lastCommitUs;
++        lastWaitUs = micros(mach_absolute_time() - commitStart) - lastCommitUs;
+         lastStatus = (int)commands.status;
+         if (waited != 0) {
+             // Three timeouts in a row: stop committing (each commit would pin another frame's pages behind the wedged
+diff --git a/NativeMetalBridgePhase.h b/NativeMetalBridgePhase.h
+index 037c94a..6d00639 100644
+--- a/NativeMetalBridgePhase.h
++++ b/NativeMetalBridgePhase.h
+@@ -202,11 +202,12 @@ static void serveScanout(Gpu &gpu, id device) {
+                     reportedFrames = st.frames ? st.frames : reportedFrames;
+                     reportedFailures = st.failures ? st.failures : reportedFailures;
+                     const uint64_t served = st.frames + st.failures;
+-                    snprintf(line, sizeof line, "PF %llu/%llu r%d v%llu/%llu t%u a%llu i%u c%u w%u s%d d%u %zu/%zu",
++                    snprintf(line, sizeof line, "PF %llu/%llu r%d v%llu/%llu t%u a%llu i%u c%u w%u s%d d%u %zu/%zu b%u e%u u%u",
+                              (unsigned long long)st.frames, (unsigned long long)st.failures,
+                              st.lastResult, (unsigned long long)st.verified, (unsigned long long)st.mismatchRows, st.lastMs,
+                              (unsigned long long)(served ? st.totalMs / served : 0),
+-                             st.importUs, st.commitUs, st.waitUs, st.bufferStatus, st.sources, st.surfaceStride, st.scanoutStride);
++                             st.importUs, st.commitUs, st.waitUs, st.bufferStatus, st.sources, st.surfaceStride, st.scanoutStride,
++                             st.buildUs, st.encodeUs, st.submitUs);
+                     streamText7(gpu, line);
+                 }
+             }

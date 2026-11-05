@@ -217,3 +217,33 @@ GPU work as-is.
   fastboot.
 - `scripts/build-wf-payload.sh` strips `offline-hid-swipe=16` from `board.toml`; pass swipe args as
   extra kernel arguments.
+
+## Later on 2026-11-05 — present path measured end to end (wf302–wf306)
+
+The frame-timeline work continued after the first handoff; the full record is
+`docs/experiment-20261105-gpu-frame-trace.md` stages 9–11.
+
+- **Repeatable animation stimulus found**: synthetic Home (Consumer Menu) reports ARE consumed
+  (`offline-hid-auto-home=N`, 8 presses clamped, interval ≥5 s). Synthetic *digitizer* contacts are
+  still not; that remains a touch-admission bug, not a GPU one.
+- **GPU clock A/B (same kernel, 500 vs 625 MHz)**: present 9.8→9.5 ms, GPU wait 2.51→2.40 ms,
+  burst cadence 33.0 ms in both. Not the lever.
+- **Present split** (PF now carries `b` create, `e` encode, `u` submit; `c = b+e+u`): import 40 µs,
+  create 32 µs, **encode 2.95 ms**, **submit 4.0 ms**, wait 2.3 ms. The encode is m2v's
+  texture-over-buffer creation (shadow-image fallback, one copy becomes two); the submit is the
+  m2v scheduler hand-off + inline `vkQueueSubmit`.
+- **`sheng-present-nonblock=1`** (new plugin boot arg): present 7.3 ms, wait 0, cadence unchanged.
+  Opt-in only — it gives up the per-frame copy-failure detection.
+- **Kernel is not the cost**: `wc_us=0` for the write-combine re-assertion, ~1.0 ms/submission of
+  cache maintenance (`PICASSO_GPU submits live … wc_us=… cache_us=…`, kernel `143f7526…`).
+- **Plugin rebuild was needed** for the PF fields and the new arg. Recipe that worked:
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer python3 scripts/build-adreno-metal-plugin.py`
+  then `python3 scripts/make-owner-trust-bundle.py` then
+  `python3 scripts/make-gpu-addon.py --publish --clients backboardd,SpringBoard <out.bin>`, pack with
+  the fresh trust. Shipped pair: plugin CDHash `71d7e9b7…`, trust `9a8c6509…`, addon `c1a8c2b3…`
+  (`build/ngpu-addon-nbpresent-20261105.bin`). The diff is kept as
+  `patches/native-metal-present-split.patch` (the plugin tree itself is UniXNU's working tree).
+- **Text stream limit**: `streamText7` sends 63 characters per line; longer telemetry lines are
+  silently cut (cost one misread of `e3` vs `e3024`).
+- Images: wf304/wf305 = instrumented plugin (non-block off/on); wf306 = instrumented kernel with
+  the wc counters. wf302/wf303 = clock A/B. The device is left in fastboot.
