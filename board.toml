@@ -153,6 +153,9 @@ volume = "PICASSOESP"
 # Volatile Data disables the jobs matched by the offline DENY policy.
 # Exact 20H392 labels, selected by job label, plist name or executable name.
 # watchdogd stays disabled; wdt=0 disables its checkin policy below.
+# com.apple.bluetoothd is deliberately NOT disabled: the iPadOS line measured
+# that audiomxd then storms launchd's BTAudioHALPlugin.xpc lookup (~1 core at
+# idle, b41bce2/ffc849f), and it is part of the lock-screen touch path.
 offline_disabled_jobs = [
   "com.apple.BTServer.avrcp",
   "com.apple.BTServer.le",
@@ -171,7 +174,6 @@ offline_disabled_jobs = [
   "com.apple.backupd",
   "com.apple.biometrickitd.pearl",
   "com.apple.bird",
-  "com.apple.bluetoothd",
   "com.apple.bluetoothuserd",
   "com.apple.companioncamerad",
   "com.apple.dietapplecamerad",
