@@ -38,12 +38,19 @@ Boot images:
 4. `2686825 usb: drop the DWC3 pull-up before a warm reset`
    — ports the iPadOS `2906fa3` fix so CDC `reboot-fastboot` gives the host a
    clean disconnect and the boot loader's fastboot gadget re-enumerates.
+5. `a7ecd94 board: keep com.apple.bluetoothd enabled for the audiomxd touch path`
+   — removes it from the offline DENY list (iPadOS `b41bce2`/`ffc849f`).
+6. `157ae5a keystore: absorb the iPadOS selector surface and descriptor fix`
+   — ports `f29f391`: bookkeeping selectors 4/5/9/12/13/26/27/55/101/102,
+   keybag handle 0 for 14, empty configuration for 31, any context for
+   7/17/31/35, and `prepare`/`complete` around the out-of-line output
+   descriptor. Host check passes.
 
-Final kernel with all four changes:
-sha256 `adb58af78249af9b802bcd77c8918f80c05696012ba0a8593b314a15366297d3`.
+Final kernel with all changes:
+sha256 `c49616bc62c65814fd083aa63c1366dd95f771b5f51747840b49fbfc4cf383d4`.
 Final boot images: `out/picasso/boot/boot-latest.img` (60 MiB) and
-`out/ios16-gpu2/picasso/boot/ios16-gpu2.img` (80 MiB, addon
-`32cde9b0...`).
+`out/ios16-gpu3/picasso/boot/ios16-gpu3.img` (80 MiB, addon
+`32cde9b0...`, 960-byte cmdline).
 
 ## iOS16 GPU addon (experiment)
 
@@ -71,9 +78,12 @@ followed by ~75 s of settling returns the boot loader's protocol, and small
 `fastboot flash`/`getvar` commands then work. The raw 8.4 GiB userdata image
 cannot be flashed with fastboot 34/37: the size check reaches
 `copy_avb_footer()`, which reads the whole image into memory and dies with
-`Failed reading from userdata`. `out/picasso/userdata/userdata-root.sparse.img`
-is the Android-sparse conversion of the same image (6.5 GiB, includes FILL
-chunks) so that fastboot takes the sparse path and skips the AVB footer copy.
+`Failed reading from userdata`. Two independent fixes are prepared:
+`out/picasso/userdata/userdata-root.sparse.img` (Android-sparse, 7.3 GiB,
+2,045,952 blocks) takes fastboot's sparse path and skips the AVB footer copy,
+and `temp/pt28/platform-tools/fastboot` (28.0.1) predates `copy_avb_footer`
+entirely. The watcher tries the raw image with fastboot 28 first, then the
+sparse image.
 
 A `fastboot boot temp/tiny-boot.img` (2.1 MiB, no payload) then booted the UEFI
 firmware successfully, but that image has no payload in its ramdisk, so the
