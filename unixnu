@@ -43,6 +43,7 @@ def prepare(device=DEVICE, source=None):
     ls_dirty_patch = device / 'patches/picasso-ls-dirty-marker-xnu.patch'
     ls_scan_patch = device / 'patches/picasso-ls-scan-xnu.patch'
     gpu_table_patch = device / 'patches/picasso-gpu-table-xnu.patch'
+    census_patch = device / 'patches/picasso-ipc-census-xnu.patch'
     ram_block_patch = device / 'patches/picasso-native-ram-block-mode1-guard.patch'
     fingerprint = hashlib.sha256(patch.read_bytes() + b'\0' + usb_patch.read_bytes() +
                                  b'\0' + cpu_idle_patch.read_bytes() +
@@ -70,6 +71,7 @@ def prepare(device=DEVICE, source=None):
                                  b'\0' + ls_dirty_patch.read_bytes() +
                                  b'\0' + ls_scan_patch.read_bytes() +
                                  b'\0' + gpu_table_patch.read_bytes() +
+                                 b'\0' + census_patch.read_bytes() +
                                  b'\0' + ram_block_patch.read_bytes()).hexdigest()
     cache = device / '.cache'
     target = cache / f'upstream-{revision[:12]}-{fingerprint[:12]}'
@@ -214,6 +216,11 @@ def prepare(device=DEVICE, source=None):
         # runs. Applies after the CDC console patch that owns the command dispatcher.
         (tree / 'patches/xnu' / (('z' * 57) + '-picasso-gpu-table.patch')).write_bytes(
             gpu_table_patch.read_bytes())
+        # IPC census (read-only): counts the kernel IPC traffic by port and name so the
+        # launchd/audiomxd storm can be attributed. BootProgress.c calls its row exporter; the
+        # function must be linked in even when no census boot argument is present. Applies last.
+        (tree / 'patches/xnu' / (('z' * 60) + '-picasso-ipc-census.patch')).write_bytes(
+            census_patch.read_bytes())
         tree.rename(target)
     return target
 
