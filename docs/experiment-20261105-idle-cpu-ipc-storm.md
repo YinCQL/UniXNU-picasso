@@ -140,6 +140,28 @@ Consequence: the phone's idle heat source is gone; the performance cores are no 
 2.1–2.35 GHz by pid 1, which is also the headroom the compositor needs to hold 60 Hz while swiping
 (see the present-path record in `experiment-20261105-gpu-frame-trace.md`).
 
+## The disable is not shippable as-is: touch depends on audiomxd
+
+A/B on the same kernel (`a5ce6d42…`), only the job list differing:
+
+- **wf316** (`sheng-disable-jobs=…,com.apple.audiomxd`): the lock screen is up, the panel driver
+  logs the finger's contacts (`PICASSO_NVT point id=1 x=420 y=21510 …`), the HID digitizer reports
+  `event driver ready`, and SpringBoard is not blocked (21 threads in normal `mach_msg2_trap` /
+  `workq_kernreturn` waits) — but the UI does not react. SpringBoard spent 5.6 s of CPU over the
+  following 9.5 minutes while the finger kept swiping (0.01 core): the injected touches are never
+  processed.
+- **wf317** (same line without `audiomxd`, i.e. the job running): **touch works**; the storm is
+  back (launchd 124.2 s of CPU at 4.5 min, d1 57–70 % @ 1.89–2.01 GHz, d2 58–68 % @ 2.01–2.06 GHz).
+
+The sync-IPC trace of a boot with audiomxd running (wf313) shows `mediaremoted → audiomxd` sync
+links (275 in ~7 minutes) and clients reaching audiomxd's other services, so audiomxd's Mach
+services are registered and are part of the lock screen's touch path (audio session/system-sound
+feedback). Disabling the job removes the storm but also removes those services, and touch dies.
+
+So the fix has to keep audiomxd serving while stopping its launchd loop. wf318 samples the message
+body with a name-like-string scan (XPC strings are length-prefixed, not NUL-terminated) to name
+what audiomxd keeps asking launchd for.
+
 ## Reproduce
 
 The probe patch lives at `patches/picasso-ipc-census-xnu.patch` and was applied through the prepared
