@@ -1,0 +1,41 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5971,4 +5971,38 @@
+ SYSCTL_PROC(_kern, OID_AUTO, picasso_metrics_unavailable, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 3, picasso_inject_ack_sysctl, "I", "picasso: reports status bar metrics unavailable");
++/* Read-only, bounded acknowledgements from the existing UI injection scope.
++ * These report userspace observations, not GPU/texture qualification. */
++static int
++picasso_astc_status_sysctl SYSCTL_HANDLER_ARGS
++{
++	static unsigned counts[6];
++	static const char *const reasons[] = {
++		"installed", "unavailable", "no_device", "no_layout", "invalid", "restore_failed"
++	};
++	if ((unsigned)arg2 >= 6 || !picasso_dyld_inject_target(current_proc())) return EPERM;
++	unsigned count = os_atomic_load(&counts[arg2], relaxed);
++	while (count < 12) {
++		if (os_atomic_cmpxchg(&counts[arg2], count, count + 1, relaxed)) {
++			char name[32] = "?";
++			proc_name(proc_selfpid(), name, sizeof(name));
++			printf("PICASSO_ASTC_GUARD pid=%d name=%s reason=%s sample=%u\n",
++			    proc_selfpid(), name, reasons[arg2], count + 1);
++			break;
++		}
++		count = os_atomic_load(&counts[arg2], relaxed);
++	}
++	int value = 1;
++	return SYSCTL_OUT(req, &value, sizeof(value));
++}
++#define PICASSO_ASTC_STATUS(name, reason) \
++	SYSCTL_PROC(_kern, OID_AUTO, name, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, \
++	    0, reason, picasso_astc_status_sysctl, "I", "picasso: userspace ASTC guard acknowledgement")
++PICASSO_ASTC_STATUS(picasso_astc_installed, 0);
++PICASSO_ASTC_STATUS(picasso_astc_unavailable, 1);
++PICASSO_ASTC_STATUS(picasso_astc_no_device, 2);
++PICASSO_ASTC_STATUS(picasso_astc_no_layout, 3);
++PICASSO_ASTC_STATUS(picasso_astc_invalid, 4);
++PICASSO_ASTC_STATUS(picasso_astc_restore_failed, 5);
++#undef PICASSO_ASTC_STATUS
+ #endif
+ 

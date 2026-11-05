@@ -42,6 +42,8 @@ def recipe(tree):
                  'check-picasso-data-artifacts.py'):
         sha.update(name.encode() + b'\0' + (ROOT / 'scripts' / name).read_bytes() + b'\0')
     for path in (ROOT / 'package/picasso-springboard/picasso-springboard-probe.m',
+                 ROOT / 'package/picasso-springboard/picasso-astc-guard.m',
+                 ROOT / 'package/picasso-springboard/picasso-astc-guard-core.h',
                  tree / 'drivers/DarwinBoot/Test/packed_ramdisk.py',
                  tree / 'scripts/seed-data-skip-setup.py'):
         sha.update(path.name.encode() + b'\0' + path.read_bytes() + b'\0')

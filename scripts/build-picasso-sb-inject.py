@@ -8,8 +8,9 @@ signs it (codesign -s -). prepare-picasso-ui-trust.py qualifies its signed code
 pages and adds its exact CDHash to the owner trust module. The kernel inserts
 it into SpringBoard (boot-arg picasso_inject_sb).
 
-SOURCE is the library's single Objective-C source. The default source supplies
-the Picasso status bar metric. picasso_inject_apps=1 also inserts it into
+SOURCE is the library's Objective-C entry point. The default source includes
+the Picasso status bar metric and the version-qualified ASTC preflight.
+picasso_inject_apps=1 also inserts it into
 application bundle executables, so app and SpringBoard metrics agree.
 """
 import subprocess
@@ -30,7 +31,7 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
     compile_cmd = [clang, '-arch', 'arm64', '-isysroot', sdk, '-miphoneos-version-min=16.0',
                    '-dynamiclib', '-fobjc-arc', '-framework', 'Foundation',
-                   '-framework', 'UIKit', '-O2',
+                   '-framework', 'UIKit', '-framework', 'Metal', '-O2', '-Wall', '-Wextra', '-Werror',
                    '-o', str(output), str(source)]
     subprocess.run(compile_cmd, check=True)
     # The payload's scoped UI trust module must match this final signature.

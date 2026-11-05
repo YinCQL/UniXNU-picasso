@@ -24,6 +24,8 @@ static void picasso_ack(const char *name)
     (void)sysctlbyname(name, &value, &size, NULL, 0);
 }
 
+#include "picasso-astc-guard.m"
+
 // DevicesOverlay.apk: 34.259979 px / 3, plus the requested 2 pt downward shift.
 static const CGFloat picasso_top_padding = 13.42;
 
@@ -96,6 +98,7 @@ static BOOL picasso_install_statusbar(void)
 __attribute__((constructor))
 static void picasso_springboard_probe(void)
 {
+    picasso_install_astc_guard();
     BOOL installed = picasso_install_statusbar();
     // Either logging path can be denied by a process sandbox. A kernel exec
     // environment message alone does not establish that this constructor ran.

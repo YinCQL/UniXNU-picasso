@@ -73,6 +73,11 @@ jobs:
           python3 scripts/check-picasso-zva.py --output out/picasso/host-checks/zva
           cp out/picasso/host-checks/zva/results.json out/picasso/logs/zva-host.json
 
+      - name: Check ASTC decode preflight
+        run: |
+          python3 scripts/check-picasso-astc-guard.py --output out/picasso/host-checks/astc-guard
+          cp out/picasso/host-checks/astc-guard/results.json out/picasso/logs/astc-guard-host.json
+
       - name: Check PR13 WLAN firmware and handshake
         if: github.ref_name == 'feat/ios16-gpu'
         run: make -C drivers/NativeWlan/Test test CC=clang CXX=clang++
@@ -158,4 +163,31 @@ jobs:
             device/out/picasso/host-checks/ufs-persistence/*.log
             device/out/picasso/host-checks/novatek/*.log
           if-no-files-found: warn
+          retention-days: 7
+
+  ui-library:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and sign the iOS UI library
+        run: |
+          python3 scripts/build-picasso-sb-inject.py \
+            package/picasso-springboard/picasso-springboard-probe.m out/libpicasso-sb.dylib
+          python3 scripts/check-picasso-ui-trust.py --output out/ui-trust \
+            --signed-library out/libpicasso-sb.dylib
+      - name: Exercise the Objective-C ASTC failure boundary
+        run: |
+          xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -framework Foundation -framework Metal -I package/picasso-springboard \
+            scripts/tests/picasso-astc-guard-objc.m -o out/astc-guard-objc
+          out/astc-guard-objc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: picasso-ui-library-${{ github.run_id }}
+          path: |
+            out/libpicasso-sb.dylib
+            out/ui-trust/results.json
           retention-days: 7
