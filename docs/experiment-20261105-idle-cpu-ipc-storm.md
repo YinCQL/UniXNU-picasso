@@ -229,6 +229,56 @@ the service is missing because Bluetooth is not initialised on this port (no BT 
 this kernel) or because bluetoothd's check-in is rejected; either way the lever is to make the
 look-up succeed (or stop the client from retrying), not to disable audiomxd.
 
+## Root cause: `sheng-lite=1` disables bluetoothd
+
+`com.apple.BTAudioHALPlugin.xpc` is a MachService of `com.apple.bluetoothd`
+(`/System/Library/LaunchDaemons/com.apple.bluetoothd.plist`), and its HAL driver lives in
+`/System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver`. The board's own "lite" job list
+(`drivers/NativeMobileDisplay/boot-progress/BootWatchdogPolicy.c`, `lite_jobs`) **disables
+`com.apple.bluetoothd`** as a radio-less daemon. The lookup therefore fails with the demux `error`
+entry seen in the sandbox above, and CoreAudio's Bluetooth-audio HAL client retries it without
+backoff for the whole boot: the measured 1,800–8,400 requests/s against launchd, and the ~1 core of
+launchd system time that heats the phone.
+
+So the storm is not a system defect but the consequence of a bring-up job policy: a daemon disabled
+for having "no radios" is the exact Mach service the audio daemon waits on. The fix is to keep the
+job enabled (`lite_jobs` no longer lists `com.apple.bluetoothd`); the lookup then resolves and the
+retry loop ends.
+
+### Measured: wf332, the wf298 image with bluetoothd re-enabled
+
+wf331 (rebuilt kernel, `bluetoothd` enabled) confirmed the lookup stops appearing in the IPC samples,
+but wf330 and wf331 both panicked before the lock screen in `task_restartable_ranges_synchronize`
+(`wait_while_equals32` timing out with `trr_ipi_ack_pending=0x00010000`, the same signature as the
+2026-11-02 GIC SPI-IPI bug in `docs/handoff-20261102-ui-frame-cpu-topology.md` §10.4), so the fix was
+re-tested on the last known-good image: wf332 = wf298 (kernel `29f21e4f`, addon `b70d0fb1`, trust
+`75bea288`, all args identical) with only the 20 bytes of the `lite_jobs` `com.apple.bluetoothd`
+label overwritten with commas, in both the payload and the boot image's copy of the kernel
+(`out/wf332/README-patch.txt`). The desktop came up, touch worked, no panic.
+
+Two `ps` samples 60 s apart:
+
+| process | Δ / 60 s | cores |
+|---|---|---|
+| launchd | 786 ms | **0.013** |
+| audiomxd | 150 ms | **0.0025** |
+| MusicWidgets | 54.5 s | 0.91 |
+| backboardd | 51.9 s | 0.87 |
+| SpringBoard | 8.1 s | 0.13 |
+
+The governor's A76 domains read 20–23 % busy @ 1.9–2.2 GHz at idle (70–90 % @ 2.2–2.35 GHz with the
+storm). That closes the idle-heat question.
+
+Swipe frame rate is unchanged, though: 160 frames in 4.27 s = **37.5 fps**, and the frame trace splits
+each frame's 24.0 ms present into 1.1 ms scheduling, ≈7.6 ms commit and ≈13.3 ms fence wait (the
+plugin's own PF row: `t20 a19 i36 c7565 w13319`). The compositor's full-frame copy waits behind
+SpringBoard's own GPU render during the swipe; the CPU-side storm was never on the frame path.
+
+A second, independent failure mode found the same evening: with `com.apple.audiomxd` itself
+disabled, its MachServices stay registered with launchd, so clients block forever waiting for the
+audio daemon and the compositor stops submitting frames (4 frames, then nothing, display `wait_to`
+≈ every wait). That is why "disable audiomxd" is not a usable mitigation; see the A/B above.
+
 ## Operational hazard found the hard way: `wait <name>` wedges the console
 
 `wait SpringBoard` on wf320 ran `picasso_live_named_state()` inline in the CDC command handler;

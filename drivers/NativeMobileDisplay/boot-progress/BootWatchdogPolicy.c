@@ -22,7 +22,11 @@ static const char policy_tail[]="</dict></plist>\n";
 // all of which start at the first boot of a fresh Data and compete with SpringBoard for the CPU and for memory. The first four are the
 // cycle of synchronous XPC waits the isolation work found. Labels are the ones in the target's own LaunchDaemons.
 static const char lite_jobs[]=
- "com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd,"
+ // bluetoothd stays enabled: audiomxd's CoreAudio Bluetooth-audio HAL client looks up
+ // com.apple.BTAudioHALPlugin.xpc, a MachService of this job. With the job disabled the lookup
+ // fails and CoreAudio retries it thousands of times per second against launchd, which is the
+ // idle heat source the IPC census found (docs/experiment-20261105-idle-cpu-ipc-storm.md).
+ "com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,"
  "com.apple.photoanalysisd,com.apple.mediaanalysisd,com.apple.mediastream.mstreamd,com.apple.icloud.searchpartyd,"
  "com.apple.findmy.findmybeaconingd,com.apple.familycircled,com.apple.financed,com.apple.softwareupdateservicesd,"
  "com.apple.ndoagent,com.apple.biomesyncd,com.apple.email.maild,com.apple.amsengagementd,com.apple.adid,com.apple.eyereliefd,"
