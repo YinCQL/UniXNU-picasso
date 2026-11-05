@@ -170,3 +170,50 @@ GPU work as-is.
 - `/tmp/wf282-probe.log` — the AMFI rejection regression
 - `/tmp/wf291-probe.log` — drop path, all 12 staged apps enumerated
 - `/tmp/wf278b-probe.log` — the pre-regression working GPU (old addon/trust)
+
+## Later on 2026-11-05 (same worktree, after the wf292 handoff)
+
+**New read-only probes (both default off; details in `docs/experiment-20261105-gpu-frame-trace.md`).**
+
+- `picasso-frame-trace=1`: one `PICASSO_FRAME` line per GPU-served frame with
+  `offer_ns/done_ns/svc_us/gap_us/take_us/comp_us/hand_us`. The split is produced by new
+  `native_gop_last_take_tick`/`native_gop_last_complete_tick` in `NativeGOPPresenter.cpp` plus the
+  display driver's offer tick; the userspace side stays uninstrumented.
+- CDC `gpu-table`: dumps the Metal bridge's 48 telemetry rows (per-command-buffer commit times,
+  commit-to-callback, pipeline/library compile totals, waits, Vulkan pipeline + shader-cache
+  hit/miss/write) into the boot log. New patch `patches/picasso-gpu-table-xnu.patch`, registered in
+  `unixnu`.
+- `offline-hid-swipe-force=1` and `offline-hid-swipe-interval=<s>` for unattended touch tests
+  (`package/HidInputProbe.cpp`).
+
+**Verified results.**
+
+- IR3 cache on the wf292 second boot: `PICASSO_M2V dir files=1154 bytes=16674043`,
+  `import files=0 skipped=1154`, export converged to `total=16868211 blocks=4120`; telemetry
+  `V cache hit49 miss0` and `V vkpipe n=49 total=118ms`. The cache is effective (all hits), and it
+  keeps growing as new UI variants appear (18,413,808 B / 4497 blocks after the wf298 animation).
+- Frame timing (wf292/298): idle frames present in 9.8 ms (import 44 µs, encode+commit ≈ 6 ms CPU,
+  GPU wait ≈ 2.5 ms); the idle 100 ms interval is the lock-screen clock's own cadence. During the
+  SpringBoard startup animation, present rises to 33.8 ms, of which the **GPU wait is 26–33 ms** —
+  animation is GPU-bound, not CPU-bound. This refines GPU优化.txt: the GPU is idle on average but
+  saturated during every animated interval.
+- USB: the CDC descriptor now asks for 500 mA instead of 200 mA
+  (`patches/picasso-usb-console-xnu.patch`); macOS reports `UsbPowerSinkAllocation = 500` (2.5 W).
+- Speed bin: this unit reports `bin=84` in the HFI log, table 625/500/400/275 MHz. Default perf
+  index 3 = 500 MHz; index 4 = 625 MHz (the bin's top). `sheng-gpu-perf-index=7` is out of range
+  and silently ignored (prints `boot index=7 nominal`). Use index 4 for clock A/Bs.
+- Synthetic touch: swipes publish and reach `IOHIDEventDriver` (`moved=1`, +26 reports,
+  dispatch=26/26) but the lock screen does not act on them, while a physical finger works — a
+  touch-path issue, not the GPU; see `picasso-synthetic-touch-not-consumed` in the session memory.
+  Do not trust `moved=1` as evidence of a working gesture; require a `PICASSO_FRAME` burst.
+
+**Operational notes.**
+
+- The 5-minute battery budget is counted **from the lock screen**, not from boot; a capture may run
+  ~9 minutes total (boot ~4–5 min + 5 min of UI).
+- Start the CDC capture before `fastboot boot`; opening a stale port later triggers a gadget reset
+  and the capture misses everything. If the device stays booted past the window, a raw
+  `os.open` + drain + `reboot-fastboot` write (no modem-line changes) reliably returns it to
+  fastboot.
+- `scripts/build-wf-payload.sh` strips `offline-hid-swipe=16` from `board.toml`; pass swipe args as
+  extra kernel arguments.
