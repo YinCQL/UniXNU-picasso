@@ -23,6 +23,9 @@ WEAK void native_hid_input_probe(void) {}
 WEAK void native_hid_swipe_tick(unsigned now) { (void)now; }
 WEAK void native_novatek_touch_probe(void) {}
 WEAK void native_novatek_touch_boot_report(unsigned now) { (void)now; }
+// WLAN bring-up probe (sheng-wlan / sheng-wlan-smem); the archive overrides this when
+// CONFIG_XNU_NATIVE_WLAN=1, and the weak stub keeps the call site linkable when it is off.
+WEAK void native_wlan_probe(void) {}
 WEAK volatile uint32_t native_hid_stage, native_hid_resource_found;
 WEAK volatile int native_hid_load_status, native_hid_input_meta_status;
 WEAK volatile uint64_t native_hid_input_object;

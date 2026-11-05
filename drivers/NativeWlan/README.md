@@ -159,6 +159,23 @@ and uses only bounded MMIO reads — there are no `IOSleep`/`IOPause` loops, no 
 The entry point `native_wlan_probe()` depends only on IOKit and its own helpers; a boot monitor should declare it
 `weak_import` so the image links whether or not `NativeWlan` is included.
 
+### SMEM table-of-contents probe: `sheng-wlan-smem=1`
+
+Independent of the staged sequence: maps the SMEM region (`smem_region@80900000`, 2 MiB, picasso.dts:397) read-only,
+reads the modern table of contents at its base (identifier `"$TOC"` = 0x434F5424, version, entry count, then 48-byte
+`{offset, size, flags, host0, host1, cacheline, reserved[3], exclusions[4]}` entries; QcomPkg `SmemLib/inc/smem_toc.h`),
+and prints the first 16 entries as `PICASSO_WLAN_SMEM toc/entry` lines. A missing or foreign ToC means the boot chain
+did not initialise SMEM, and GLINK/SMP2P/QMI — and therefore WLFW — cannot work. `sheng-wlan-start=<seconds>`
+(default 90) delays the probe on the boot-monitor clock so clocks and the monitor have settled.
+
+### Build gate
+
+`CONFIG_XNU_NATIVE_WLAN=y` in `configs/picasso_defconfig` builds `build/native-wlan/libNativeWlan.a` via
+`scripts/build-native-wlan.py` and force-loads it; `BootProgress.c` calls `native_wlan_probe()` through a weak
+import, with a weak stub in `PicassoBootProgressStubs.c` so a build without the archive still links. Without a
+`sheng-wlan...` argument the probe returns immediately, so enabling it does not change default behaviour.
+
+
 Published globals (C linkage): `native_wlan_stage_req/stage/step`, `native_wlan_error`,
 `native_wlan_transport/attach`, `native_wlan_regs[8]`, `native_wlan_rails`, `native_wlan_smmu_idr[3]`,
 `native_wlan_smmu_slot/smr/s2cr`, `native_wlan_sid`, `native_wlan_msa_base/size/pages/word`,

@@ -169,6 +169,9 @@ extern void native_hid_swipe_tick(unsigned) __attribute__((weak_import));
 // sheng-touch-start=<seconds> delays the start on the monitor clock, so a faulting
 // probe cannot take the display and the CDC console down with it.
 extern void native_novatek_touch_probe(void) __attribute__((weak_import));
+// WLAN bring-up probe (sheng-wlan=<1..5>, sheng-wlan-smem=1); inert without an argument.
+// sheng-wlan-start=<seconds> delays it on the monitor clock like the touch probe.
+extern void native_wlan_probe(void) __attribute__((weak_import));
 // Prints (once, early) the IMEM step marker the probe left when it died on the previous boot.
 extern void native_novatek_touch_boot_report(unsigned) __attribute__((weak_import));
 extern volatile uint32_t native_hid_stage,native_hid_resource_found __attribute__((weak_import));
@@ -1279,6 +1282,16 @@ static void monitor(void *arg, wait_result_t result) {
           PE_parse_boot_argn("sheng-touch-start",&touch_start_at,sizeof(touch_start_at));
         }
         if(native_novatek_touch_probe && now>=touch_start_at)native_novatek_touch_probe();
+      }
+      {
+        // sheng-wlan-start=<seconds>: the WLAN probe maps MMIO, so give clocks and the
+        // monitor a settled boot first. Default 90 s; inert without sheng-wlan* arguments.
+        static unsigned wlan_start_at,wlan_start_set;
+        if(!wlan_start_set) {
+          wlan_start_set=1;wlan_start_at=90;
+          PE_parse_boot_argn("sheng-wlan-start",&wlan_start_at,sizeof(wlan_start_at));
+        }
+        if(native_wlan_probe && now>=wlan_start_at)native_wlan_probe();
       }
     }
     // Secondary-CPU progress over CDC: the panel row only exists on the screen, and
