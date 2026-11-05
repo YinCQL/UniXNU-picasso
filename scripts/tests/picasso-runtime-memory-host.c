@@ -35,7 +35,7 @@ static int vnode_size(vnode_t v,off_t *size,vfs_context_t c) { (void)c;*size=v->
 static int vfs_getattr(mount_t m,struct vfs_attr *a,vfs_context_t c) {
  (void)c;a->f_bavail=m->blocks;a->f_bsize=m->blocksize;a->supported=m->supported;return m->error;
 }
-static unsigned gets,puts_count,queries,log_count;
+static unsigned vnode_get_count,puts_count,queries,log_count;
 static struct vnode_model node;
 static struct proc_regioninfo_internal {
  uint32_t pri_protection,pri_max_protection,pri_flags,pri_user_tag,pri_pages_resident,pri_pages_swapped_out;
@@ -46,7 +46,7 @@ static void *current_task(void) { return &node; }
 static int fill_procregioninfo(void *task,uint64_t a,struct proc_regioninfo_internal *i,uintptr_t *v,uint32_t *vid) {
  assert(task==&node);(void)a;++queries;*i=region;*v=region_vnode;*vid=123;return region_found;
 }
-static int vnode_getwithvid(vnode_t v,uint32_t vid) { assert(v==&node && vid==123);++gets;return node.get_error; }
+static int vnode_getwithvid(vnode_t v,uint32_t vid) { assert(v==&node && vid==123);++vnode_get_count;return node.get_error; }
 static void vnode_put(vnode_t v) { assert(v==&node);++puts_count; }
 static int vn_getpath(vnode_t v,char *p,int *length) {
  assert(v==&node && *length==256);memset(p,'X',255);p[255]=0;return node.path_error;
@@ -61,7 +61,7 @@ static int report(const char *fmt,...) {
 #define printf report
 #include "runtime-memory.inc"
 #undef printf
-static void reset_log(void) { output_size=log_count=0;output[0]=0;gets=puts_count=queries=0; }
+static void reset_log(void) { output_size=log_count=0;output[0]=0;vnode_get_count=puts_count=queries=0; }
 int main(void) {
  const uint64_t addresses[]={0,0xc007bfff,0xc007c000,0x1b9d55b00,0x20007bfff,0x20007c000,UINT64_MAX};
  for(unsigned k=0;k<sizeof(addresses)/sizeof(addresses[0]);++k)for(unsigned m=0;m<256;++m)for(unsigned flags=0;flags<2;++flags) {
@@ -84,16 +84,16 @@ int main(void) {
  node.bytes=-1;assert(picasso_swap_headroom(&node,amount,NULL)==EINVAL);reset_log();node.bytes=0;
  strcpy(mp.stat.f_mntonname,"/System/Volumes/VM");assert(!picasso_swap_headroom(&node,UINT64_MAX,NULL));assert(!log_count);
  region_found=1;region.pri_address=0x20000;region.pri_size=0x1000;region_vnode=(uintptr_t)&node;
- picasso_image_mapping("fault",0x1ffff);assert(!gets && strstr(output,"contains=0"));reset_log();
- picasso_image_mapping("fault",0x21000);assert(!gets && strstr(output,"contains=0"));reset_log();
- picasso_image_mapping("fault",0x20000);assert(gets==1 && puts_count==1 && strstr(output,"contains=1"));reset_log();
- node.get_error=ENOENT;picasso_image_mapping("fault",0x20001);assert(gets==1 && puts_count==0 && strstr(output,"vnode_error="));reset_log();node.get_error=0;
+ picasso_image_mapping("fault",0x1ffff);assert(!vnode_get_count && strstr(output,"contains=0"));reset_log();
+ picasso_image_mapping("fault",0x21000);assert(!vnode_get_count && strstr(output,"contains=0"));reset_log();
+ picasso_image_mapping("fault",0x20000);assert(vnode_get_count==1 && puts_count==1 && strstr(output,"contains=1"));reset_log();
+ node.get_error=ENOENT;picasso_image_mapping("fault",0x20001);assert(vnode_get_count==1 && puts_count==0 && strstr(output,"vnode_error="));reset_log();node.get_error=0;
  node.path_error=ENOSPC;node.size_error=EIO;picasso_image_mapping("fault",0x20fff);
- assert(gets==1 && puts_count==1 && strstr(output,"<unavailable>") && strstr(output,"size_error="));reset_log();
- region_found=0;picasso_image_mapping("fault",0);assert(!gets && strstr(output,"contains=0"));reset_log();
- region_found=1;region_vnode=0;picasso_image_mapping("fault",0x20000);assert(!gets && log_count==2);reset_log();
+ assert(vnode_get_count==1 && puts_count==1 && strstr(output,"<unavailable>") && strstr(output,"size_error="));reset_log();
+ region_found=0;picasso_image_mapping("fault",0);assert(!vnode_get_count && strstr(output,"contains=0"));reset_log();
+ region_found=1;region_vnode=0;picasso_image_mapping("fault",0x20000);assert(!vnode_get_count && log_count==2);reset_log();
  region.pri_address=UINT64_MAX-5;region.pri_size=5;picasso_image_mapping("fault",UINT64_MAX);
- assert(!gets && strstr(output,"contains=0"));
+ assert(!vnode_get_count && strstr(output,"contains=0"));
  puts("PASS: 3584 DRAM/flag/boundary cases, swap growth/shrink/error reserve, region holes/stale vnode/path errors/balanced refs/bounded logs");
  return 0;
 }
