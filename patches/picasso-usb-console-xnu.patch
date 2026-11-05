@@ -1430,7 +1430,7 @@ index 0000000..2237fb2
 +	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
 +};
 +static const uint8_t ud_cfg_desc[67] = {
-+	9, 2, 67, 0, 2, 1, 0, 0x80, 100,                /* config: 2 interfaces, 200 mA */
++	9, 2, 67, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA (2.5 W at 5 V) */
 +	9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 0,             /* control iface 0: CDC ACM */
 +	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
 +	5, 0x24, 0x01, 0x00, 1,                         /* call management: data iface 1 */
