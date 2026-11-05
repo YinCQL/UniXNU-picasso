@@ -34,8 +34,29 @@ the display driver.
 `getRefreshAttributes` reports `IOMFBDisplayRefresh` min 1/60 s and max 1/24 s (the family's
 default; `sheng-vsync` above 60 overrides it). The render server paces its display timer inside
 that range and settles near 40 Hz, which is the observed 24-25 ms cadence - not a render time.
-wf342 keeps the same kernel and boots with `sheng-vsync=120 sheng-vsync-fixed=1` (one fixed 120 Hz
-interval) to test whether the render server then presents at 50-60 fps.
+
+## Measured (wf342, same kernel, `sheng-vsync=120 sheng-vsync-fixed=1`)
+
+The override is visible at boot: `PICASSO_DISPLAY event=11 sample=1 a=5 b=78` (refresh properties
+reported at 0x78 = 120 Hz) and `sample=2 a=4 b=78` (the refresh tick starts at 120). Direct
+scanout stays on (`smmu state=80000002`, bank 2, flips=2640 maps=3 mapfails=0 fallbacks=0
+latch_timeouts=0, latch mean 4.2 ms / max 13.9 ms, copies=0, fence wait 1 us, no panic).
+
+| frame interval | wf341 (60 Hz attrs) | wf342 (120 Hz attrs) |
+|---|---|---|
+| median | 25.2 ms (40 fps) | **22.0 ms (45 fps)** |
+| fastest 10% | 17.3 ms (58 fps) | **12.2 ms (82 fps)** |
+| share <=16.7 ms | 5% | **16%** |
+| minimum | 16.1 ms | **4.7 ms** |
+
+During the lock-screen appearance the 120 Hz build runs 14.2 / 14.0 / 11.0 ms intervals
+(70-90 fps); wf341 never went below 16.1 ms. The idle lock screen holds 30-40 fps (5 s submit
+buckets), and the submit counters track accept exactly (submit=2176 accept=2176 reject=0
+retire_fail=0). The remaining median is the compositor's own frame production, not the display
+path: the swap arrives every 20-25 ms at idle and every 11-15 ms while the UI animates.
+
+Keep `sheng-vsync=120 sheng-vsync-fixed=1` in the experiment command line (the build script does
+not remember extra kernel args; a rebuild without them silently boots the copy path).
 
 ## Measured (wf339, kernel 901f0baa, `sheng-dpu-scanout=2`)
 
