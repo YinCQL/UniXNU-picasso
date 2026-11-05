@@ -1,0 +1,48 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 5602e7c..5f34df0 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8432,24 +8432,25 @@ picasso_lsp_owner(const char *path, uint32_t uid, uint32_t gid, vfs_context_t ct
+ 	vnode_put(vp);
+ }
+ 
+-/* Remove the LaunchServices "last session did not finish" marker beside a restored store. lsd opens it
+- * before the store; the marker describes the interrupted session, not the consistent snapshot in the
+- * aux window, and leaving it makes lsd prune the restored application records. */
++/* Remove the LaunchServices session markers beside a restored store. lsd opens them before the
++ * store; they describe the interrupted session, not the consistent snapshot in the aux window, and
++ * leaving them makes lsd prune the restored application records. The unlink result is the
++ * inventory: 0 means the marker existed, ENOENT means the previous session left none. */
+ static void
+-picasso_lsp_clear_marker(proc_t p, user_addr_t scratch, const char *path, vfs_context_t ctx)
++picasso_lsp_clear_marker(proc_t p, user_addr_t scratch, const char *path, const char *suffix,
++    vfs_context_t ctx)
+ {
+ 	char sibling[320];
+ 	const char *slash = strrchr(path, '/');
+-	static const char marker[] = "/com.apple.LaunchServices.error";
+ 	if (!slash) {
+ 		return;
+ 	}
+ 	const size_t dir = (size_t)(slash - path);
+-	if (dir + sizeof marker > sizeof sibling) {
++	const int n = snprintf(sibling, sizeof sibling, "%.*s/com.apple.LaunchServices.%s",
++	    (int)dir, path, suffix);
++	if (n < 0 || (size_t)n >= sizeof sibling) {
+ 		return;
+ 	}
+-	memcpy(sibling, path, dir);
+-	memcpy(sibling + dir, marker, sizeof marker);
+ 	struct unlink_args request = {.path = scratch + 0xc00};
+ 	int32_t result = 0;
+ 	const int copy = copyout(sibling, request.path, strlen(sibling) + 1);
+@@ -8533,7 +8534,8 @@ picasso_lsp_restore(proc_t p, user_addr_t scratch)
+ 		if (werr == 0 || werr == -1) {
+ 			if (!strncmp(path, "/private/var/mobile/", 20)) {
+ 				picasso_lsp_owner(path, 501, 501, ctx);
+-				picasso_lsp_clear_marker(p, scratch, path, ctx);
++				picasso_lsp_clear_marker(p, scratch, path, "error", ctx);
++				picasso_lsp_clear_marker(p, scratch, path, "dirty", ctx);
+ 			}
+ 			++restored;
+ 		} else {

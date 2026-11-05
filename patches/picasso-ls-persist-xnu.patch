@@ -33,10 +33,10 @@ index 100d5d7..0e048e0 100644
  		ud.register_pending = false;
  		extern kern_return_t native_register_display_and_report(void)
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 5272b82..8a3f9cc 100644
+index 5272b82..5602e7c 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -8345,6 +8345,747 @@ done:
+@@ -8345,6 +8345,804 @@ done:
  	if (path) kfree_data(path, 256);
  }
  
@@ -105,6 +105,56 @@ index 5272b82..8a3f9cc 100644
 +	return error;
 +}
 +
++/* Give a restored cache file back to its runtime owner (see the restore loop). */
++static void
++picasso_lsp_owner(const char *path, uint32_t uid, uint32_t gid, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, 0, &vp, ctx)) {
++		printf("PICASSO_LSP owner=lookup-failed %s\n", path);
++		return;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_uid, uid);
++	VATTR_SET(&va, va_gid, gid);
++	const int error = vnode_setattr(vp, &va, ctx);
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_uid, 0);
++	VATTR_SET(&va, va_gid, 0);
++	(void)vnode_getattr(vp, &va, ctx);
++	printf("PICASSO_LSP owner=%u:%u set=%d path=%s\n", va.va_uid, va.va_gid, error, path);
++	vnode_put(vp);
++}
++
++/* Remove the LaunchServices "last session did not finish" marker beside a restored store. lsd opens it
++ * before the store; the marker describes the interrupted session, not the consistent snapshot in the
++ * aux window, and leaving it makes lsd prune the restored application records. */
++static void
++picasso_lsp_clear_marker(proc_t p, user_addr_t scratch, const char *path, vfs_context_t ctx)
++{
++	char sibling[320];
++	const char *slash = strrchr(path, '/');
++	static const char marker[] = "/com.apple.LaunchServices.error";
++	if (!slash) {
++		return;
++	}
++	const size_t dir = (size_t)(slash - path);
++	if (dir + sizeof marker > sizeof sibling) {
++		return;
++	}
++	memcpy(sibling, path, dir);
++	memcpy(sibling + dir, marker, sizeof marker);
++	struct unlink_args request = {.path = scratch + 0xc00};
++	int32_t result = 0;
++	const int copy = copyout(sibling, request.path, strlen(sibling) + 1);
++	(void)ctx;
++	if (!copy) {
++		const int error = unlink(p, &request, &result);
++		printf("PICASSO_LSP marker path=%s error=%d\n", sibling, error);
++	}
++}
++
 +static int
 +picasso_lsp_restore(proc_t p, user_addr_t scratch)
 +{
@@ -170,9 +220,16 @@ index 5272b82..8a3f9cc 100644
 +		}
 +		at += path_bytes;
 +		/* native_gpu_addon_write returns 0 on a write, -1 when the file already
-+		 * matched; both mean the cache is in place. */
++		 * matched; both mean the cache is in place. The exporter hard-coded mode
++		 * 0644 and recorded no owner, so the file lands root-owned; lsd runs as the
++		 * mobile user and must be able to write its store, so hand the mobile tree
++		 * back to 501:501. */
 +		const int werr = native_gpu_addon_write(path, blob + at, data_bytes, mode & 0777, ctx);
 +		if (werr == 0 || werr == -1) {
++			if (!strncmp(path, "/private/var/mobile/", 20)) {
++				picasso_lsp_owner(path, 501, 501, ctx);
++				picasso_lsp_clear_marker(p, scratch, path, ctx);
++			}
 +			++restored;
 +		} else {
 +			printf("PICASSO_LSP restore=write-failed err=%d path=%s\n", werr, path);
@@ -784,7 +841,7 @@ index 5272b82..8a3f9cc 100644
  static void
  native_picasso_apps_mount(proc_t p, user_addr_t scratch)
  {
-@@ -8375,6 +9116,11 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+@@ -8375,6 +9173,11 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
  		char view[96];
  		vnode_t root = NULLVP;
  		if (!vnode_lookup("/Applications", 0, &root, ctx)) {
@@ -796,7 +853,7 @@ index 5272b82..8a3f9cc 100644
  			struct vfs_attr vfa;
  			VFSATTR_INIT(&vfa);
  			VFSATTR_WANTED(&vfa, f_capabilities);
-@@ -8409,8 +9155,11 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+@@ -8409,8 +9212,11 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
  					else error = ENAMETOOLONG;
  				}
  				if (!error && !strcmp(path, view)) resolved |= 1u << i;
@@ -810,7 +867,7 @@ index 5272b82..8a3f9cc 100644
  				vnode_put(vp);
  			}
  		}
-@@ -8420,7 +9169,21 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+@@ -8420,7 +9226,28 @@ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
  		if (PE_parse_boot_argn("picasso-ls-rebuild", &rebuild, sizeof(rebuild)) && rebuild == 1) {
  			if (native_picasso_apps_stage == 5 && !native_picasso_apps_status &&
  			    found == 0xfff && resolved == 0xfff) {
@@ -824,11 +881,18 @@ index 5272b82..8a3f9cc 100644
 +				 * (picasso-ls-restore=1). */
 +				uint32_t restore = 0;
 +				PE_parse_boot_argn("picasso-ls-restore", &restore, sizeof(restore));
-+				const int restored = restore ? picasso_lsp_restore(p, scratch) : 0;
-+				if (restored > 0) {
-+					printf("PICASSO_LS_REBUILD restored=%d\n", restored);
++				/* Mode 2 (experiment): neither restore nor drop. lsd sees whatever store the
++				 * Data overlay kept from the previous session, so this separates a rebuild our
++				 * forced drop causes from one lsd decides on its own (unclean boot). */
++				if (restore == 2) {
++					printf("PICASSO_LS_REBUILD left=1\n");
 +				} else {
-+					native_picasso_ls_store_drop(p, scratch);
++					const int restored = restore ? picasso_lsp_restore(p, scratch) : 0;
++					if (restored > 0) {
++						printf("PICASSO_LS_REBUILD restored=%d\n", restored);
++					} else {
++						native_picasso_ls_store_drop(p, scratch);
++					}
 +				}
  			} else {
  				printf("PICASSO_LS_REBUILD skipped stage=%d status=%d found=%03x fileid=%03x\n",

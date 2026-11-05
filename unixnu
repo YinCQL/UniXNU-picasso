@@ -40,6 +40,8 @@ def prepare(device=DEVICE, source=None):
     quiet_boot2_patch = device / 'patches/picasso-quiet-boot2-xnu.patch'
     defer_ps_patch = device / 'patches/picasso-defer-ps-xnu.patch'
     ls_persist_patch = device / 'patches/picasso-ls-persist-xnu.patch'
+    ls_dirty_patch = device / 'patches/picasso-ls-dirty-marker-xnu.patch'
+    ls_scan_patch = device / 'patches/picasso-ls-scan-xnu.patch'
     ram_block_patch = device / 'patches/picasso-native-ram-block-mode1-guard.patch'
     fingerprint = hashlib.sha256(patch.read_bytes() + b'\0' + usb_patch.read_bytes() +
                                  b'\0' + cpu_idle_patch.read_bytes() +
@@ -64,6 +66,8 @@ def prepare(device=DEVICE, source=None):
                                  b'\0' + quiet_boot2_patch.read_bytes() +
                                  b'\0' + defer_ps_patch.read_bytes() +
                                  b'\0' + ls_persist_patch.read_bytes() +
+                                 b'\0' + ls_dirty_patch.read_bytes() +
+                                 b'\0' + ls_scan_patch.read_bytes() +
                                  b'\0' + ram_block_patch.read_bytes()).hexdigest()
     cache = device / '.cache'
     target = cache / f'upstream-{revision[:12]}-{fingerprint[:12]}'
@@ -191,6 +195,18 @@ def prepare(device=DEVICE, source=None):
         # on the next boot (NativeRamBlock's overlay carries the write across reboots).
         (tree / 'patches/xnu' / 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-picasso-ls-persist.patch').write_bytes(
             ls_persist_patch.read_bytes())
+        # lsd's session markers (`com.apple.LaunchServices.error` and `.dirty`) are not part of the
+        # aux blob, so a restored store would sit beside markers from an interrupted session and be
+        # recovered into a compacted database without the application records. Clear both right
+        # after the restore, and let the unlink result inventory which ones existed. Applies after
+        # ls-persist.
+        (tree / 'patches/xnu' / (('z' * 55) + '-picasso-ls-dirty-marker.patch')).write_bytes(
+            ls_dirty_patch.read_bytes())
+        # Read-only LaunchServices store inventory over the CDC console (`ls-scan`). It runs the
+        # exporter's byte scan without touching the aux window, so the store can be sampled before
+        # and after lsd opens it and the application-registration counts compared. Applies last.
+        (tree / 'patches/xnu' / (('z' * 56) + '-picasso-ls-scan.patch')).write_bytes(
+            ls_scan_patch.read_bytes())
         tree.rename(target)
     return target
 

@@ -1,0 +1,124 @@
+diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
+index 0e048e0..a3ea1ab 100644
+--- a/bsd/dev/picasso_usb.c
++++ b/bsd/dev/picasso_usb.c
+@@ -383,6 +383,7 @@ static struct {
+ 	bool        start_kext_pending;
+ 	unsigned    ps_pending;
+ 	bool        save_ls_pending;
++	bool        ls_scan_pending;
+ 	bool        register_pending;
+ 	int         publish_pending;
+ 	bool        watchdog;
+@@ -2457,6 +2458,9 @@ ud_process_command(void)
+ 	} else if (ud_command_is(ud.cmd, "save-ls")) {
+ 		printf("PICASSO CDC: save-ls requested; exporting after the lock\n");
+ 		ud.save_ls_pending = true;
++	} else if (ud_command_is(ud.cmd, "ls-scan")) {
++		printf("PICASSO CDC: ls-scan requested; scanning after the lock\n");
++		ud.ls_scan_pending = true;
+ 	} else if (ud_command_is(ud.cmd, "panic-test")) {
+ 		printf("PICASSO CDC: panic-test requested; emitting marker now\n");
+ 		/*
+@@ -2667,6 +2671,11 @@ ud_poll_serialized(void)
+ 		extern int picasso_ls_export(void);
+ 		printf("PICASSO_LSP export files=%d\n", picasso_ls_export());
+ 	}
++	if (ud.ls_scan_pending && !ud.panic_mode) {
++		ud.ls_scan_pending = false;
++		extern int picasso_ls_scan(void);
++		printf("PICASSO_LSScan files=%d\n", picasso_ls_scan());
++	}
+ 	if (ud.register_pending && !ud.panic_mode) {
+ 		ud.register_pending = false;
+ 		extern kern_return_t native_register_display_and_report(void)
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 5f34df0..250d60e 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9145,6 +9145,85 @@ done:
+ 	return (int)count;
+ }
+ 
++/* Read-only inventory of the LaunchServices stores: the same byte scan the exporter prints,
++ * without touching the aux window. A CDC "ls-scan" before and after lsd's store open shows
++ * whether its rewrite keeps the application registrations. */
++int
++picasso_ls_scan(void)
++{
++	static const char *const parents[] = {
++		"/private/var/mobile/Containers/Data/InternalDaemon",
++		"/private/var/containers/Data/InternalDaemon",
++		"/private/var/containers/Data/System"
++	};
++	static const char prefix[] = "com.apple.LaunchServices-";
++	static const char *const lsIds[] = {
++		"com.apple.camera", "com.apple.mobilesafari", "com.apple.mobilemail",
++		"Camera.app", "MobileSafari.app", "MobileMail.app"
++	};
++	char (*containers)[64] = kalloc_data(128 * 64, Z_WAITOK);
++	char (*files)[8][64] = kalloc_data(8 * 64, Z_WAITOK);
++	char *path = kalloc_data(256, Z_WAITOK);
++	uint8_t *data = NULL;
++	int scanned = 0;
++	vfs_context_t ctx = vfs_context_current();
++	if (!containers || !files || !path) {
++		goto done;
++	}
++	data = kalloc_data(PICASSO_LSP_MAX, Z_WAITOK | Z_ZERO);
++	if (!data) {
++		goto done;
++	}
++	for (size_t k = 0; k < sizeof(parents) / sizeof(parents[0]); ++k) {
++		unsigned container_count = 0;
++		if (native_picasso_ls_names(parents[k], "", containers, 128, &container_count)) {
++			continue;
++		}
++		for (unsigned i = 0; i < container_count; ++i) {
++			snprintf(path, 256, "%s/%s/Library/Caches", parents[k], containers[i]);
++			unsigned file_count = 0;
++			if (native_picasso_ls_names(path, prefix, *files, 8, &file_count)) {
++				continue;
++			}
++			for (unsigned j = 0; j < file_count; ++j) {
++				uint64_t bytes = 0;
++				char full[320];
++				snprintf(full, sizeof full, "%s/%s", path, (*files)[j]);
++				if (picasso_lsp_read_file(full, data, PICASSO_LSP_MAX, &bytes, ctx)) {
++					continue;
++				}
++				uint32_t hits[6] = {0};
++				for (unsigned id = 0; id < sizeof(lsIds) / sizeof(lsIds[0]); ++id) {
++					const size_t n = strlen(lsIds[id]);
++					for (uint64_t pos = 0; pos + n <= bytes; ++pos) {
++						if (!memcmp(data + pos, lsIds[id], n)) {
++							++hits[id];
++						}
++					}
++				}
++				printf("PICASSO_LSScan file=%s bytes=%llu camera=%u safari=%u mail=%u "
++				    "CameraApp=%u SafariApp=%u MailApp=%u\n", full, (unsigned long long)bytes,
++				    hits[0], hits[1], hits[2], hits[3], hits[4], hits[5]);
++				++scanned;
++			}
++		}
++	}
++done:
++	if (data) {
++		kfree_data(data, PICASSO_LSP_MAX);
++	}
++	if (containers) {
++		kfree_data(containers, 128 * 64);
++	}
++	if (files) {
++		kfree_data(files, 8 * 64);
++	}
++	if (path) {
++		kfree_data(path, 256);
++	}
++	return scanned;
++}
++
+ static void
+ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+ {
