@@ -1,8 +1,8 @@
 diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
-index 390f5c3..95d6210 100644
+index 390f5c3..e38bf4e 100644
 --- a/osfmk/ipc/ipc_kmsg.c
 +++ b/osfmk/ipc/ipc_kmsg.c
-@@ -5201,6 +5201,339 @@ ipc_kmsg_copyin_from_kernel(
+@@ -5201,6 +5201,452 @@ ipc_kmsg_copyin_from_kernel(
  	return MACH_MSG_SUCCESS;
  }
  
@@ -30,8 +30,41 @@ index 390f5c3..95d6210 100644
 +static uint32_t picasso_ipc_id_key[PICASSO_IPC_IDS];
 +static uint32_t picasso_ipc_id_seen[PICASSO_IPC_IDS];
 +/* Body samples: bounded, only after the first two minutes, so the explicit examples are the
-+ * steady-state loop and not the boot's own traffic. */
++ * steady-state loop and not the boot's own traffic. The sampler runs with the destination
++ * port's mqueue lock held, so it must not print: it copies what it wants to show into these
++ * records, and picasso_ipc_census_dump() prints them from the profile thread, which holds no
++ * IPC lock. (v5 printed from inside the lock; the console path could then hold a hot IPC
++ * spinlock long enough to starve the compositor and to let an unrelated thread's AST IPI ack
++ * time out.) */
++#define PICASSO_IPC_SAMPLE_RECORDS 8
++#define PICASSO_IPC_REPLY_RECORDS 4
++#define PICASSO_IPC_SAMPLE_RAW 128
++
++struct picasso_ipc_sample_record {
++	uint32_t taken;         /* 0 free, 3 filling, 1 ready */
++	uint32_t no;
++	int32_t from, to;
++	uint32_t id, size, bits, type;
++	char text[96];
++	char bare[120];
++	uint32_t raw_bytes;
++	uint8_t raw[PICASSO_IPC_SAMPLE_RAW];
++};
++
++struct picasso_ipc_reply_record {
++	uint32_t taken;
++	uint32_t no;
++	int32_t from, to;
++	uint32_t id, size, bits, type;
++	uint32_t words[8];
++	uint32_t raw_bytes;
++	uint8_t raw[PICASSO_IPC_SAMPLE_RAW];
++};
++
++static struct picasso_ipc_sample_record picasso_ipc_samples[PICASSO_IPC_SAMPLE_RECORDS];
++static struct picasso_ipc_reply_record picasso_ipc_replies[PICASSO_IPC_REPLY_RECORDS];
 +static unsigned picasso_ipc_sample_count;
++static unsigned picasso_ipc_reply_samples;
 +static uint64_t picasso_ipc_first_tick;
 +
 +static bool
@@ -47,12 +80,27 @@ index 390f5c3..95d6210 100644
 +	return elapsed >= 120ull * 1000000000ull;
 +}
 +
++static bool
++picasso_ipc_sample_slot(struct picasso_ipc_sample_record **out)
++{
++	for (unsigned i = 0; i < PICASSO_IPC_SAMPLE_RECORDS; i++) {
++		uint32_t expected = 0;
++		if (__atomic_compare_exchange_n(&picasso_ipc_samples[i].taken, &expected, 3,
++		    false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
++			*out = &picasso_ipc_samples[i];
++			return true;
++		}
++	}
++	return false;
++}
++
 +/* Printable NUL-terminated runs in the message body, at most three of them. A bootstrap
 + * lookup carries its service name as such a string; the row then names what is being asked
-+ * for instead of only who asks. */
++ * for instead of only who asks. Copies only: the caller holds the destination port's lock. */
 +static void
 +picasso_ipc_sample(ipc_kmsg_t kmsg, int sender, int receiver)
 +{
++	struct picasso_ipc_sample_record *record = NULL;
 +	if (picasso_ipc_sample_count >= 24 || !picasso_ipc_sample_ready()) {
 +		return;
 +	}
@@ -118,31 +166,36 @@ index 390f5c3..95d6210 100644
 +		}
 +		i += len ? len : 1;
 +	}
-+	const unsigned sample_no = ++picasso_ipc_sample_count;
-+	printf("PICASSO_IPC msg s=%u from=%d to=%d id=%x size=%u bits=%x type=%u "
-+	    "body=%.80s bare=%.100s\n", sample_no, sender, receiver, (unsigned)hdr->msgh_id,
-+	    size, (unsigned)hdr->msgh_bits, (unsigned)kmsg->ikm_type, text, bare);
-+	/* The first samples also dump the payload words: a binary RPC carries its command in the
-+	 * first words and needs no strings at all. */
-+	if (sample_no <= 4) {
-+		for (uint32_t i = 0; i < body_size && i < 256; i += 16) {
-+			uint32_t words[4] = {};
-+			const uint32_t n = body_size - i < sizeof words ? body_size - i :
-+			    (uint32_t)sizeof words;
-+			memcpy(words, body + i, n);
-+			printf("PICASSO_IPC dump s=%u o=%u %08x %08x %08x %08x\n", sample_no, i,
-+			    words[0], words[1], words[2], words[3]);
-+		}
++	if (!picasso_ipc_sample_slot(&record)) {
++		return;
 +	}
++	record->no = ++picasso_ipc_sample_count;
++	record->from = sender;
++	record->to = receiver;
++	record->id = (uint32_t)hdr->msgh_id;
++	record->size = size;
++	record->bits = (uint32_t)hdr->msgh_bits;
++	record->type = (uint32_t)kmsg->ikm_type;
++	memcpy(record->text, text, sizeof text);
++	memcpy(record->bare, bare, sizeof bare);
++	record->raw_bytes = 0;
++	if (record->no <= 4) {
++		uint32_t n = body_size < PICASSO_IPC_SAMPLE_RAW ? body_size :
++		    PICASSO_IPC_SAMPLE_RAW;
++		if (n) {
++			memcpy(record->raw, body, n);
++		}
++		record->raw_bytes = n;
++	}
++	__atomic_store_n(&record->taken, 1, __ATOMIC_RELEASE);
 +}
 +
 +/* The reply direction (launchd -> client), eight samples after the same gate: the reply's first
 + * words carry the result of the repeated request. */
-+static unsigned picasso_ipc_reply_samples;
-+
 +static void
 +picasso_ipc_sample_reply(ipc_kmsg_t kmsg, int sender, int receiver)
 +{
++	struct picasso_ipc_reply_record *record = NULL;
 +	if (picasso_ipc_reply_samples >= 8 || !picasso_ipc_sample_ready()) {
 +		return;
 +	}
@@ -153,24 +206,83 @@ index 390f5c3..95d6210 100644
 +	}
 +	const uint8_t *body = (const uint8_t *)ikm_udata_from_header(kmsg);
 +	const uint32_t body_size = size - (uint32_t)sizeof(*hdr);
-+	const unsigned sample_no = ++picasso_ipc_reply_samples;
-+	uint32_t words[8] = {};
-+	if (body_size >= sizeof words) {
-+		memcpy(words, body, sizeof words);
++	for (unsigned i = 0; i < PICASSO_IPC_REPLY_RECORDS; i++) {
++		uint32_t expected = 0;
++		if (__atomic_compare_exchange_n(&picasso_ipc_replies[i].taken, &expected, 3,
++		    false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
++			record = &picasso_ipc_replies[i];
++			break;
++		}
 +	}
-+	printf("PICASSO_IPC reply s=%u from=%d to=%d id=%x size=%u bits=%x type=%u "
-+	    "%08x %08x %08x %08x %08x %08x %08x %08x\n", sample_no,
-+	    sender, receiver, (unsigned)hdr->msgh_id, size, (unsigned)hdr->msgh_bits,
-+	    (unsigned)kmsg->ikm_type,
-+	    words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
-+	if (sample_no <= 2) {
-+		for (uint32_t i = 0; i < body_size && i < 256; i += 16) {
-+			uint32_t w[4] = {};
-+			const uint32_t n = body_size - i < sizeof w ? body_size - i :
-+			    (uint32_t)sizeof w;
-+			memcpy(w, body + i, n);
-+			printf("PICASSO_IPC rdump s=%u o=%u %08x %08x %08x %08x\n", sample_no, i,
-+			    w[0], w[1], w[2], w[3]);
++	if (record == NULL) {
++		return;
++	}
++	record->no = ++picasso_ipc_reply_samples;
++	record->from = sender;
++	record->to = receiver;
++	record->id = (uint32_t)hdr->msgh_id;
++	record->size = size;
++	record->bits = (uint32_t)hdr->msgh_bits;
++	record->type = (uint32_t)kmsg->ikm_type;
++	memset(record->words, 0, sizeof record->words);
++	if (body_size >= sizeof record->words) {
++		memcpy(record->words, body, sizeof record->words);
++	}
++	record->raw_bytes = 0;
++	{
++		uint32_t n = body_size < PICASSO_IPC_SAMPLE_RAW ? body_size :
++		    PICASSO_IPC_SAMPLE_RAW;
++		if (n) {
++			memcpy(record->raw, body, n);
++		}
++		record->raw_bytes = n;
++	}
++	__atomic_store_n(&record->taken, 1, __ATOMIC_RELEASE);
++}
++
++/* Profile-thread side: print the records the in-lock sampler filled. No IPC lock is held
++ * here, so printf is safe. */
++static void
++picasso_ipc_census_dump(void)
++{
++	for (unsigned i = 0; i < PICASSO_IPC_SAMPLE_RECORDS; i++) {
++		struct picasso_ipc_sample_record copy;
++		if (__atomic_load_n(&picasso_ipc_samples[i].taken, __ATOMIC_ACQUIRE) != 1) {
++			continue;
++		}
++		copy = picasso_ipc_samples[i];
++		__atomic_store_n(&picasso_ipc_samples[i].taken, 0, __ATOMIC_RELEASE);
++		printf("PICASSO_IPC msg s=%u from=%d to=%d id=%x size=%u bits=%x type=%u "
++		    "body=%.80s bare=%.100s\n", copy.no, copy.from, copy.to, copy.id,
++		    copy.size, copy.bits, copy.type, copy.text, copy.bare);
++		for (uint32_t at = 0; at < copy.raw_bytes && at < 256; at += 16) {
++			uint32_t words[4] = {};
++			const uint32_t n = copy.raw_bytes - at < sizeof words ?
++			    copy.raw_bytes - at : (uint32_t)sizeof words;
++			memcpy(words, copy.raw + at, n);
++			printf("PICASSO_IPC dump s=%u o=%u %08x %08x %08x %08x\n", copy.no, at,
++			    words[0], words[1], words[2], words[3]);
++		}
++	}
++	for (unsigned i = 0; i < PICASSO_IPC_REPLY_RECORDS; i++) {
++		struct picasso_ipc_reply_record copy;
++		if (__atomic_load_n(&picasso_ipc_replies[i].taken, __ATOMIC_ACQUIRE) != 1) {
++			continue;
++		}
++		copy = picasso_ipc_replies[i];
++		__atomic_store_n(&picasso_ipc_replies[i].taken, 0, __ATOMIC_RELEASE);
++		printf("PICASSO_IPC reply s=%u from=%d to=%d id=%x size=%u bits=%x type=%u "
++		    "%08x %08x %08x %08x %08x %08x %08x %08x\n", copy.no, copy.from, copy.to,
++		    copy.id, copy.size, copy.bits, copy.type, copy.words[0], copy.words[1],
++		    copy.words[2], copy.words[3], copy.words[4], copy.words[5], copy.words[6],
++		    copy.words[7]);
++		for (uint32_t at = 0; at < copy.raw_bytes && at < 256; at += 16) {
++			uint32_t words[4] = {};
++			const uint32_t n = copy.raw_bytes - at < sizeof words ?
++			    copy.raw_bytes - at : (uint32_t)sizeof words;
++			memcpy(words, copy.raw + at, n);
++			printf("PICASSO_IPC rdump s=%u o=%u %08x %08x %08x %08x\n", copy.no, at,
++			    words[0], words[1], words[2], words[3]);
 +		}
 +	}
 +}
@@ -291,6 +403,7 @@ index 390f5c3..95d6210 100644
 +	if (!picasso_ipc_census_enabled() || cap < 160) {
 +		return 0;
 +	}
++	picasso_ipc_census_dump();
 +	size_t at = 0;
 +	size_t used = picasso_ipc_rank_row(out, cap, "to1", picasso_ipc_to1,
 +	    picasso_ipc_to1_seen, picasso_ipc_to1_key,
@@ -342,7 +455,7 @@ index 390f5c3..95d6210 100644
  /*
   *	Routine:	ipc_kmsg_send
   *	Purpose:
-@@ -5366,6 +5699,9 @@ retry:
+@@ -5366,6 +5812,9 @@ retry:
  		 */
  		ipc_special_reply_port_msg_sent(port);
  
