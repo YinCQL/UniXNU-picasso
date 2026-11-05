@@ -2,13 +2,22 @@
 // Adapted from AppleKeyStoreState 42ff83e08b2265fe741d4adaf084bebe003452ba.
 // State queries for Picasso's unprotected, ephemeral Data environment only.
 // No keybag exists here. No selector creates, loads, unlocks or returns one.
+// Contract mirrored from UniXNU/NativeKeyStoreEvents:
+//   0, 4, 5, 9, 12, 13, 26, 27, 55, 101, 102: no-output bookkeeping
+//   14: synthetic system keybag handle 0
+//   7: unlocked since boot
+//   17, 35: truthful device-state DER
+//   31: empty configuration DER for the no-keybag environment
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 
 extern "C" bool picasso_aks_state_enabled(void);
-extern "C" void picasso_aks_observed(unsigned selector, IOReturn result, bool hasContext, uint64_t context);
+extern "C" void picasso_aks_observed(unsigned selector, IOReturn result,
+    unsigned scalar_input_count, unsigned scalar_output_count,
+    unsigned structure_input_size, unsigned structure_output_size,
+    uint64_t context);
 
 // The original 21H461 decoder accepts a SET of UTF8String/INTEGER pairs.
 // ss=4: unlocked since boot; sls=3: no passcode. Remaining state is absent.
@@ -43,9 +52,15 @@ public:
     IOReturn externalMethod(uint32_t selector,IOExternalMethodArguments *args,
         IOExternalMethodDispatch *,OSObject *,void *) override {
         IOReturn rc=query(selector,args);
-        bool state=selector==7 || selector==17 || selector==35;
-        bool hasContext=state && args && args->scalarInputCount==1 && args->scalarInput;
-        picasso_aks_observed(selector,rc,hasContext,hasContext?args->scalarInput[0]:0);return rc;
+        const unsigned inputCount=args?args->scalarInputCount:0;
+        const unsigned outputCount=args?args->scalarOutputCount:0;
+        const unsigned inputSize=args?args->structureInputSize:0;
+        const unsigned outputSize=args?args->structureOutputSize:0;
+        const uint64_t context=args && inputCount && args->scalarInput ?
+            args->scalarInput[0] : 0;
+        picasso_aks_observed(selector,rc,inputCount,outputCount,inputSize,
+            outputSize,context);
+        return rc;
     }
 private:
     IOReturn query(uint32_t selector,IOExternalMethodArguments *args) {
@@ -61,22 +76,53 @@ private:
             __atomic_store_n(&handshaken,1,__ATOMIC_RELEASE);return kIOReturnSuccess;
         }
         if(!__atomic_load_n(&handshaken,__ATOMIC_ACQUIRE))return kIOReturnNotOpen;
-        if(selector!=7 && selector!=17 && selector!=35)return kIOReturnUnsupported;
+        switch(selector) {
+        case 4: case 5: case 9: case 12: case 13: case 26: case 27:
+        case 55: case 101: case 102:
+            args->scalarOutputCount=0;
+            return kIOReturnSuccess;
+        default:
+            break;
+        }
+        if(selector==14) {
+            if(args->scalarOutputCount!=1 || !args->scalarOutput)return kIOReturnBadArgument;
+            // keybagd accepts this upstream-compatible handle without systembag.kb.
+            args->scalarOutput[0]=0;
+            return kIOReturnSuccess;
+        }
+        const uint64_t supportedSelectors=(1ull<<7)|(1ull<<17)|
+            (1ull<<31)|(1ull<<35);
+        if(selector>=64 || ((supportedSelectors>>selector)&1)==0)
+            return kIOReturnUnsupported;
         if(args->scalarInputCount!=1 || !args->scalarInput)return kIOReturnBadArgument;
-        // MKB's default device context is zero. Refuse explicit bag/persona handles.
-        if(args->scalarInput[0]!=0)return kIOReturnUnsupported;
         if(selector==7) {
             if(args->scalarOutputCount!=1 || !args->scalarOutput || args->structureOutputSize ||
                 args->structureOutputDescriptor)return kIOReturnBadArgument;
             args->scalarOutput[0]=4;return kIOReturnSuccess;
         }
         if(args->scalarOutputCount)return kIOReturnBadArgument;
-        uint8_t der[128];size_t length=encodeState(der,sizeof(der));
-        if(!length)return kIOReturnError;
+        // Selector 31 is a configuration query, not a device-state query.
+        // With no persistent keybag policy, its truthful result is an empty DER SET.
+        static const uint8_t emptyConfiguration[]={0x31,0x00};
+        uint8_t stateDer[128];
+        const uint8_t *der=emptyConfiguration;
+        size_t length=sizeof(emptyConfiguration);
+        if(selector!=31) {
+            der=stateDer;
+            length=encodeState(stateDer,sizeof(stateDer));
+            if(!length)return kIOReturnError;
+        }
         if(args->structureOutputDescriptor) {
             IOMemoryDescriptor *memory=args->structureOutputDescriptor;
             if(length>args->structureOutputDescriptorSize || length>memory->getLength())return kIOReturnNoSpace;
-            if(memory->writeBytes(0,der,length)!=length)return kIOReturnUnderrun;
+            // Out-of-line userclient arguments arrive as an address-range
+            // descriptor that is not wired. writeBytes() walks physical
+            // segments and panics unless this descriptor is prepared first.
+            IOReturn rc=memory->prepare(kIODirectionIn);
+            if(rc!=kIOReturnSuccess)return rc;
+            const bool copied=memory->writeBytes(0,der,length)==length;
+            memory->complete(kIODirectionIn);
+            if(!copied)return kIOReturnUnderrun;
             args->structureOutputDescriptorSize=(uint32_t)length;
         } else {
             if(!args->structureOutput || length>args->structureOutputSize)return kIOReturnNoSpace;
@@ -112,7 +158,9 @@ public:
         registerService();return true;
     }
     IOReturn newUserClient(task_t t,void *s,UInt32 type,OSDictionary *p,IOUserClient **out) override {
-        IOReturn rc=openState(t,s,type,p,out);picasso_aks_observed(256,rc,false,0);return rc;
+        IOReturn rc=openState(t,s,type,p,out);
+        picasso_aks_observed(256,rc,0,0,0,0,type);
+        return rc;
     }
     IOReturn newUserClient(task_t t,void *s,UInt32 type,IOUserClient **out) override {
         return newUserClient(t,s,type,nullptr,out);

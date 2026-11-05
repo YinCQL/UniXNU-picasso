@@ -10,14 +10,17 @@ while SpringBoard boots. Picasso now publishes this service with the explicit
 original AppleKeyStore class is absent. It describes the selected unprotected
 RAM Data environment. It cannot be used with persistent or protected Data.
 
-The client establishes a real session with selector 0. For device context 0,
-selector 7 returns the unlocked-since-boot state and selectors 17/35 return the
-original DER state layout, including no passcode. Other contexts and operations
-return errors. In particular, selector 14 does **not** manufacture a system
-keybag handle, and bag creation, loading, saving, unlocking, key operations,
-assertions and asynchronous notifications are unsupported. Matching publication
-uses ordinary IOKit. `KeyOperationsAvailable=false` and `StateQueriesOnly=true`
-describe this boundary in the registry.
+The client establishes a real session with selector 0. Selectors 4/5/9/12/13/
+26/27/55/101/102 are no-output bookkeeping calls. Selector 14 returns the
+upstream-compatible synthetic system keybag handle 0 so keybagd can continue
+without a `systembag.kb`; it does not create or load a keybag. Selector 7
+returns the unlocked-since-boot state, and selectors 17/35 return the original
+DER state layout, including no passcode. Selector 31 is the libaks device
+configuration query (`aks_get_configuration`); it returns an empty DER
+dictionary because this environment has no persistent keybag policy. Key
+operations, bag contents and asynchronous notifications remain unsupported.
+Matching publication uses ordinary IOKit. `KeyOperationsAvailable=false` and
+`StateQueriesOnly=true` describe this boundary in the registry.
 
 `scripts/build-picasso-display.py` compiles the component with the real platform
 SDK command into the existing late archive and removes its automatic initializer

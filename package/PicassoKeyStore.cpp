@@ -18,7 +18,10 @@ static bool enabled;
 static IOService *stateService;
 extern "C" bool picasso_aks_state_enabled(void) {return enabled;}
 
-extern "C" void picasso_aks_observed(unsigned selector,IOReturn result,bool hasContext,uint64_t context) {
+extern "C" void picasso_aks_observed(unsigned selector,IOReturn result,
+    unsigned scalar_input_count,unsigned scalar_output_count,
+    unsigned structure_input_size,unsigned structure_output_size,
+    uint64_t context) {
     // Keep SpringBoard observations separate from the earlier system daemons.
     // State-query context is an integer ABI argument, never key/bag contents.
     // Unknown selector values share a single bucket. Never log key material.
@@ -38,10 +41,11 @@ extern "C" void picasso_aks_observed(unsigned selector,IOReturn result,bool hasC
                 if(__atomic_compare_exchange_n(total,&used,used+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED))break;
             }
             char stateContext[24]="<absent>";
-            if(hasContext && (selector==7 || selector==17 || selector==35))
+            if(scalar_input_count && (selector==7 || selector==17 || selector==35))
                 snprintf(stateContext,sizeof(stateContext),"0x%llx",(unsigned long long)context);
-            IOLog("PICASSO_AKS pid=%d name=%s selector=%u sample=%u result=%x state_context=%s\n",
-                pid,name,selector,count+1,result,stateContext);break;
+            IOLog("PICASSO_AKS pid=%d name=%s selector=%u sample=%u result=%x in=%u out=%u sin=%u sout=%u state_context=%s\n",
+                pid,name,selector,count+1,result,scalar_input_count,scalar_output_count,
+                structure_input_size,structure_output_size,stateContext);break;
         }
     }
 }
