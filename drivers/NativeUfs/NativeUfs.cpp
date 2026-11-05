@@ -1235,7 +1235,7 @@ extern "C" int native_ufs_store_open (uint64_t blocks, uint64_t *firstLba, const
     uint64_t partition = gStoreGeometry.last - gStoreGeometry.first + 1;
     uint64_t imageBlocks = (gStoreGeometry.imageBytes + 4095) / 4096;
     const uint64_t reserve = reserveBlocks ();
-    if (!blocks || reserve >= partition || blocks > partition - reserve) reason = "size";
+    if (!blocks || blocks > partition / 4 || reserve >= partition || blocks > partition - reserve) reason = "size";
     else if (partition - blocks - reserve < imageBlocks + 1024) reason = "overlaps the root image";
     else {
       // The reserve at the end of the partition belongs to the diagnostic log (its last 32 MiB, with the export region below them);
@@ -1307,8 +1307,8 @@ extern "C" int native_ufs_aux_open (uint64_t blocks, uint64_t *firstLba, const c
   int ok = 0;
   if (storeMode () != 2) reason = "not writable";
   else if (!gStoreRegionBlocks) reason = "store not open";
+  else if (!blocks || blocks > 65536) reason = "size";
   else if (gAuxRegionBlocks) { reason = "already open"; ok = 1; }
-  else if (!blocks) reason = "size";
   else {
     // One fixed window for every aux user: the LaunchServices blob (16 MiB) and the pipeline pack (240 MiB).
     // Opening it at the caller's size would let the first opener undersize it for the other.
@@ -1395,6 +1395,7 @@ extern "C" int native_ufs_log_open (uint64_t *firstLba, uint64_t *blocks, const 
     uint64_t partition = gStoreGeometry.last - gStoreGeometry.first + 1;
     uint64_t imageBlocks = (gStoreGeometry.imageBytes + 4095) / 4096;
     if (reserveBlocks () < kLogReserveBlocks + kExportBlocks) reason = "reserve too small for the log";
+    else if (reserveBlocks () >= partition) reason = "reserve exceeds the partition";
     else if (partition - reserveBlocks () < imageBlocks + 1024) reason = "overlaps the root image";
     else {
       uint64_t first = gStoreGeometry.last + 1 - kLogReserveBlocks;

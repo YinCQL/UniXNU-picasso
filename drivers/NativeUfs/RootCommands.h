@@ -392,7 +392,7 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
 }
 
 // ---- Persistent store and log windows ------------------------------------------------------------------------------
-// The only place this driver writes. At most two windows of 4096-byte LBAs on LUN 0 (the Data store and the diagnostic log),
+// The only place this driver writes. Three windows of 4096-byte LBAs on LUN 0 (Data, aux and diagnostic log/export),
 // each opened once by its integration after it has proved that the window lies inside the userdata partition and clear of the
 // root image; every write is checked against them again here, so nothing outside them can be written even if a caller is wrong.
 static bool gStoreOpen = false, gLogOpen = false, gAuxOpen = false;
@@ -403,6 +403,7 @@ static bool hostLogOpen (uint64_t first, uint64_t blocks)
 {
   if (gLogOpen || !blocks || first > 0xffffffffULL || blocks > 0xffffffffULL - first) return false;
   if (gStoreOpen && first < gStoreFirst + gStoreBlocks && gStoreFirst < first + blocks) return false;
+  if (gAuxOpen && first < gAuxFirst + gAuxBlocks && gAuxFirst < first + blocks) return false;
   gLogFirst = first;
   gLogBlocks = blocks;
   gLogOpen = true;
@@ -433,6 +434,7 @@ static bool hostStoreOpen (uint64_t first, uint64_t blocks)
 {
   if (gStoreOpen || !blocks || first > 0xffffffffULL || blocks > 0xffffffffULL - first) return false;
   if (gLogOpen && first < gLogFirst + gLogBlocks && gLogFirst < first + blocks) return false;
+  if (gAuxOpen && first < gAuxFirst + gAuxBlocks && gAuxFirst < first + blocks) return false;
   gStoreFirst = first;
   gStoreBlocks = blocks;
   gStoreOpen = true;

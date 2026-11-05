@@ -470,4 +470,5 @@ int main(int argc, char **argv)
   reset(); assert(ufs_test_stop_queue() && ufs_test_start_queue());
   assert(registers[0x50/4]==0xcb5e9000 && registers[0x54/4]==8);
   puts("PASS: bounded production pause without clock/legacy wait dependencies; NOP/Query then delayed TUR, timeout/fatal quarantine, no resubmission, DMA ownership and command/queue regressions");
+  return 0;
 }

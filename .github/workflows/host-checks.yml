@@ -108,6 +108,11 @@ jobs:
           python3 scripts/check-picasso-ufs-cache.py --output out/picasso/host-checks/ufs-cache
           cp out/picasso/host-checks/ufs-cache/results.json out/picasso/logs/ufs-cache-host.json
 
+      - name: Check UFS persistence window boundaries
+        run: |
+          python3 scripts/check-picasso-ufs-persistence.py --output out/picasso/host-checks/ufs-persistence
+          cp out/picasso/host-checks/ufs-persistence/results.json out/picasso/logs/ufs-persistence-host.json
+
       - name: Check physical and virtual touch handoff
         run: |
           python3 scripts/check-picasso-novatek.py --output out/picasso/host-checks/novatek
@@ -150,6 +155,7 @@ jobs:
             device/out/picasso/host-checks/hid-plan/*.log
             device/out/picasso/host-checks/keystore/*.log
             device/out/picasso/host-checks/ufs-cache/*.log
+            device/out/picasso/host-checks/ufs-persistence/*.log
             device/out/picasso/host-checks/novatek/*.log
           if-no-files-found: warn
           retention-days: 7

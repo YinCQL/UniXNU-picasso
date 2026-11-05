@@ -83,7 +83,8 @@ void ufs_test_reset(Callback cb, uint64_t physical) {
   gRootDiagnosticEnabled=gRootTransportFailureReported=false;
   failureLogs=0; failureLog[0]=0;
   gRootReadTraceCount=0;
-  gStoreOpen=gLogOpen=false; gStoreFirst=gStoreBlocks=gLogFirst=gLogBlocks=0;
+  gStoreOpen=gLogOpen=gAuxOpen=false;
+  gStoreFirst=gStoreBlocks=gLogFirst=gLogBlocks=gAuxFirst=gAuxBlocks=0;
 #ifdef NATIVE_UFS_TEST_TRACE
   traceCalls=0;
 #endif
