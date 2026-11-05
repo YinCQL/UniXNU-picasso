@@ -59,6 +59,7 @@ jobs:
           python3 scripts/check-picasso-ui-replay.py --tree "$UNIXNU_TREE" --output out/picasso/host-checks/ui-runtime
           cp out/picasso/host-checks/ui-runtime/replay.json out/picasso/logs/ui-runtime-replay.json
           cp out/picasso/host-checks/ui-runtime/runtime/results.json out/picasso/logs/ui-runtime-host.json
+          cp out/picasso/host-checks/ui-runtime/nvram/results.json out/picasso/logs/nvram-host.json
           cp out/picasso/host-checks/ui-runtime/surface/results.json out/picasso/logs/ui-surface-host.json
 
       - name: Check exact status bar library trust
@@ -149,6 +150,15 @@ jobs:
           mkdir -p out/picasso/logs
           cp out/picasso/host-checks/data/results.json out/picasso/logs/data-host-check.json
           cp out/picasso/host-checks/payload-seed/results.json out/picasso/logs/payload-seed-host.json
+
+      - name: Check persistent Data and dual record recovery
+        run: |
+          python3 scripts/check-picasso-persistence.py --tree "$UNIXNU_TREE" --output out/picasso/host-checks/persistent-data
+          cp out/picasso/host-checks/persistent-data/results.json out/picasso/logs/persistent-data-host.json
+          python3 scripts/check-picasso-record-reader.py --output out/picasso/host-checks/record-reader
+          cp out/picasso/host-checks/record-reader/results.json out/picasso/logs/record-reader-host.json
+          python3 scripts/check-picasso-seed-reuse.py --output out/picasso/host-checks/seed-reuse
+          cp out/picasso/host-checks/seed-reuse/results.json out/picasso/logs/seed-reuse-host.json
 
       - name: Check staged apps runtime reserve
         run: |

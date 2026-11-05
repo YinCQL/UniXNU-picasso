@@ -78,7 +78,7 @@ def main():
         board_args += ['--iphone-identity']
     results = []
     for name, extra in [('minimal', []), ('board', board_args),
-                        ('board-with-data', board_args + ['--packed-data-ramdisk'])]:
+                        ('board-with-data', board_args + ['--packed-data-ramdisk', '--persistent-data'])]:
         target = out / (name + '.adt')
         subprocess.run([sys.executable, str(args.generator.resolve()), '--output', str(target),
                         '--dram-size', str(board['dram_size']), *extra], check=True)
@@ -93,7 +93,8 @@ def main():
         if name == 'board-with-data':
             assert memory_map.get('PackedRAMDisk') == bytes(16)
             assert 'RAMDisk' not in memory_map
-            assert nodes['/chosen'].get('ephemeral-storage') == struct.pack('<I', 1)
+            assert nodes['/chosen'].get('picasso-unprotected-data') == struct.pack('<I', 1)
+            assert 'ephemeral-storage' not in nodes['/chosen']
         else:
             assert 'PackedRAMDisk' not in memory_map and 'RAMDisk' not in memory_map
             assert 'ephemeral-storage' not in nodes['/chosen']

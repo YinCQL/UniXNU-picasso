@@ -139,12 +139,15 @@ def main():
                              'SM7250 numbers its cores 0x000..0x700 in Affinity1. More than one adds /psci')
     parser.add_argument('--psci-method', choices=['smc', 'hvc'], default='smc',
                         help='/psci method used by the secondary-CPU start (the board DT declares smc)')
+    parser.add_argument('--persistent-data', action='store_true', help='Unencrypted developer Data on the guarded UFS store')
     parser.add_argument('--packed-data-ramdisk', action='store_true', help='Hand off validated DBRDISK1 bytes to the native sparse block driver, without a dense memdev alias')
     parser.add_argument('--data-ramdisk', action='store_true',
                         help='/chosen/memory-map RAMDisk placeholder; the loader fills in the real range for a scratch Data seed')
     parser.add_argument('--trust-cache', action='store_true', help='Zeroed TrustCache sidecar handoff placeholder')
     parser.add_argument('--gpu-addon', action='store_true', help='Zeroed GpuAddon sidecar handoff placeholder')
     args = parser.parse_args()
+    if args.persistent_data and not args.packed_data_ramdisk:
+        parser.error("--persistent-data requires the packed developer seed")
     if (args.unique_chip_id is None) != (args.chip_id is None):
         parser.error('--unique-chip-id and --chip-id must be supplied together')
     if args.unique_chip_id is not None and not (0 < args.unique_chip_id < 1 << 64 and 0 < args.chip_id < 1 << 32):
@@ -208,7 +211,7 @@ def main():
                         # uses 3. This is not the physical scanout stride or size.
                         *([('display-scale', struct.pack('<I', 3))] if args.iphone_identity else []),
                         # This property describes the actual volatile Data RAM disk.
-                        *([('ephemeral-storage', struct.pack('<I', 1))] if (args.data_ramdisk or args.packed_data_ramdisk) else []),
+                        *([('picasso-unprotected-data' if args.persistent_data else 'ephemeral-storage', struct.pack('<I', 1))] if (args.data_ramdisk or args.packed_data_ramdisk) else []),
                         *( [('darwinboot-memory-size', struct.pack('<Q', args.owned_memory_size))]
                            if args.owned_memory_size else [] ),
                         ('dram-base', struct.pack('<Q', DRAM_BASE)),

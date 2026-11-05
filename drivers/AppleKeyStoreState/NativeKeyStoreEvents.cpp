@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Adapted from AppleKeyStoreState 42ff83e08b2265fe741d4adaf084bebe003452ba.
-// State queries for Picasso's unprotected, ephemeral Data environment only.
+// State queries for Picasso's unprotected developer Data environment only.
 // No keybag exists here. No selector creates, loads, unlocks or returns one.
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
@@ -104,9 +104,9 @@ class AppleKeyStore final : public IOService {
 public:
     bool start(IOService *provider) override {
         if(!picasso_aks_state_enabled() || !IOService::start(provider))return false;
-        setName("Picasso ephemeral keystore state");
+        setName("Picasso unprotected keystore state");
         if(!setProperty("NativeKeyStoreEvents",true) || !setProperty("KeyOperationsAvailable",false) ||
-            !setProperty("EphemeralStorageOnly",true) || !setProperty("StateQueriesOnly",true)) {
+            !setProperty("UnprotectedStorageOnly",true) || !setProperty("StateQueriesOnly",true)) {
             IOService::stop(provider);return false;
         }
         registerService();return true;

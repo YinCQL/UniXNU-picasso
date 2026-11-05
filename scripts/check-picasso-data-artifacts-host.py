@@ -55,6 +55,7 @@ def main():
                 + content)
         return raw, blob, dict(logical_bytes=len(raw), packed_bytes=len(blob),
                               raw_sha256=hashlib.sha256(raw).hexdigest(),
+                              seed_identity_sha256=hashlib.sha256(raw).hexdigest(),
                               packed_sha256=hashlib.sha256(blob).hexdigest(),
                               page_size=4096, extent_count=1)
 

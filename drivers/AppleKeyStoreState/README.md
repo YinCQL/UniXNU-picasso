@@ -1,14 +1,14 @@
-# Picasso ephemeral keystore state
+# Picasso unprotected keystore state
 
 Adapted from [UniXNU/AppleKeyStoreState](https://github.com/UniXNU/AppleKeyStoreState)
 at `42ff83e08b2265fe741d4adaf084bebe003452ba`, retaining its runtime class and
 source filename. See [LICENSE](LICENSE).
 
-The fixed iPad7,1 / 21H461 userland queries the `AppleKeyStore` matching class
+The selected iPhone10,3 / 20H392 userland queries the `AppleKeyStore` matching class
 while SpringBoard boots. Picasso now publishes this service with the explicit
-`picasso-aks-state=1` argument and `/chosen/ephemeral-storage=1`, provided an
-original AppleKeyStore class is absent. It describes the selected unprotected
-RAM Data environment. It cannot be used with persistent or protected Data.
+`picasso-aks-state=1` and either volatile `/chosen/ephemeral-storage=1` with store mode 0, or `/chosen/picasso-unprotected-data=1` with store mode 2, provided an
+original AppleKeyStore class is absent. It describes the selected
+unprotected developer Data environment. Persistent mode remains unencrypted and without password/keybag protection. Protected Data is unsupported.
 
 The client establishes a real session with selector 0. For device context 0,
 selector 7 returns the unlocked-since-boot state and selectors 17/35 return the

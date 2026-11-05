@@ -1,27 +1,73 @@
-diff --git a/NativeRamBlock.cpp b/NativeRamBlock.cpp
-index 4b96ff8..86189e1 100644
 --- a/NativeRamBlock.cpp
 +++ b/NativeRamBlock.cpp
-@@ -89,6 +89,8 @@ public:
-       const char *why = "";
+@@ -15,4 +15,5 @@
+ #include <vm/vm_kern.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include "SparseDisk.h"
+@@ -24,4 +25,5 @@
+ int native_ram_block_volume_device(const char *, dev_t *, char *, size_t);
+ volatile uint32_t native_ram_block_ready = 0;
++static uint32_t native_ram_block_attach_requested = 0;
+ volatile uint64_t native_ram_block_bytes = 0;
+ volatile uint64_t native_ram_block_reads = 0;
+@@ -33,4 +35,5 @@
+ // Optional persistence of the changed pages through a board-provided store window (see PersistOverlay.h). All weak: a build
+ // without the provider keeps the volatile disk.
++unsigned native_ufs_store_ready(void) __attribute__((weak_import));
+ unsigned native_ufs_store_mode(void) __attribute__((weak_import));
+ int native_ufs_store_open(uint64_t, uint64_t *, const char **) __attribute__((weak_import));
+@@ -53,5 +56,5 @@
+   uint8_t *memory = nullptr;
+   uint64_t capacity = 0;
+-  bool online = false;
++  bool online = false, stopping = false;
+   RamSparseDisk sparse = {};
+   // A disk above 2 GiB keeps only the nonzero pages of its seed (SeedDisk.h), in memory proportional to the content, and is served by the
+@@ -75,14 +78,14 @@
+ public:
+   // Called once, before the Data volume is mounted (native_ram_block_volume_seed): open the store window, put the pages that
+-  // earlier boots changed back into the sparse disk, and from then on write changed pages through. The seed identity
+-  // (seedHash) is not affected. Any refusal or error leaves the disk volatile, exactly as without persistence.
+-  // sheng-data-reset=1 or 2 (the boot menu's Install and boot) starts the overlay over (the old pages are dropped, not applied); 2 also
+-  // asks for Setup (BootWatchdogPolicy.c). It is the only way the store is made anew: a store of another seed, a blank or a damaged one
+-  // is kept as it is on any other boot.
+-  static bool discardRequested() { uint32_t v = 0; return PE_parse_boot_argn("sheng-data-reset", &v, sizeof v) && (v == 1 || v == 2); }
++  // earlier boots changed back into the sparse disk, and from then on write changed pages through.
++  // Large Data is unavailable on refusal: there is no 4 GiB volatile fallback.
++  // Only an entirely zero window may be initialized; nonempty stores are preserved.
++  // Picasso never replaces a nonempty store, even if a stale reset bootarg is supplied.
++  static bool discardRequested() { return false; }
++  static bool initializeBlankRequested() { uint32_t v=0; return PE_parse_boot_argn("picasso-data-init-blank", &v, sizeof v) && v==1; }
+   void attachStore() {
+     if (!gate) return;
+     IOLockLock(gate);
+-    if (storeAttached) { IOLockUnlock(gate); return; }
++    if (storeAttached || stopping) { IOLockUnlock(gate); return; }
+     storeAttached = true;
+     unsigned mode = &native_ufs_store_mode ? native_ufs_store_mode() : 0;
+@@ -93,5 +96,7 @@
        native_data_persist_pages = pages;
        native_data_persist_gpt = native_ufs_store_gpt_check();
+-      if (!native_ufs_store_open(persist::windowBlocks(pages), &first, &why)) {
 +      IOLog("PICASSO_DATASTORE geometry mode=%u pages=%llu windowBlocks=%llu gpt=%u\n",
 +            mode, pages, persist::windowBlocks(pages), native_data_persist_gpt);
-       if (!native_ufs_store_open(persist::windowBlocks(pages), &first, &why)) {
++      if (native_data_persist_gpt || !native_ufs_store_open(persist::windowBlocks(pages), &first, &why)) {
          native_data_persist_state = 4;
          IOLog("NativeRamBlock: persistent store refused: %s\n", why);
-@@ -101,6 +103,8 @@ public:
-         persist::Open result = overlayBits && stage ? overlay.open(ops, pages, seedHash, mode == 1, overlayBits, discardRequested())
+@@ -102,7 +107,9 @@
+         stage = static_cast<uint8_t *>(IOMallocZero(kStagePages * persist::kBlock));
+         StoreOps ops;
+-        persist::Open result = overlayBits && stage ? overlay.open(ops, pages, seedHash, mode == 1, overlayBits, discardRequested())
++        persist::Open result = overlayBits && stage ? overlay.open(ops, pages, seedHash, mode == 1, overlayBits, discardRequested(), mode == 2 && initializeBlankRequested(), stage, kStagePages)
                                                            : persist::Open::Failed;
          native_data_persist_header = static_cast<uint32_t>(overlay.header);
 +        IOLog("PICASSO_DATASTORE overlay first=%llu windowBlocks=%llu open=%d header=%d present=%llu\n",
 +              first, persist::windowBlocks(pages), static_cast<int>(result), overlay.header, overlay.present);
          if (result == persist::Open::Failed) {
            native_data_persist_state = 4;
-           overlay.active = false;
-@@ -113,6 +117,12 @@ public:
-           // Resumed read-write: nothing is copied into RAM. The window answers for every page whose bit is set.
+@@ -122,4 +129,10 @@
            direct = true;
            native_data_persist_state = 2;
 +        } else if (isBig) {
@@ -29,12 +75,10 @@ index 4b96ff8..86189e1 100644
 +          // indexes sparse.pages, which this disk does not have. A read-only probe keeps the seed and stays volatile.
 +          native_data_persist_state = 4;
 +          overlay.active = false;
-+          IOLog("PICASSO_DATASTORE mode=%u isBig=1: no RAM-resident resume, volatile disk\n", mode);
++          IOLog("PICASSO_DATASTORE mode=%u isBig=1: no RAM-resident resume; large Data unavailable\n", mode);
          } else {
            struct Loader {
-             NativeRamBlock *self;
-@@ -139,6 +149,12 @@ public:
-             overlay.active = false;
+@@ -148,6 +161,15 @@
            }
          }
 +        if (isBig && mode != 2) {
@@ -45,4 +89,164 @@ index 4b96ff8..86189e1 100644
 +        }
          native_data_persist_present = overlay.present;
          native_data_persist_gpt_after = native_ufs_store_gpt_check();
++        if (native_data_persist_gpt_after) { directFailed=true; direct=false; persistFailed(); }
++        IOLog("PICASSO_DATASTORE ready=%u failed=%u gpt_after=%u bytes=%llu\n",
++              direct, directFailed, native_data_persist_gpt_after, pages * 4096);
        }
+     }
+@@ -158,7 +180,30 @@
+   bool seedInfo(uint64_t *base,uint64_t *bytes,uint8_t hash[32]) {
+     if(!gate || !base || !bytes || !hash)return false;
+-    IOLockLock(gate);bool ready=available();
++    IOLockLock(gate);bool ready=available() && (!isBig || (direct && !directFailed));
+     if(ready){*base=(sparse.pages||isBig)?0:reinterpret_cast<uint64_t>(memory);*bytes=capacity*512;memcpy(hash,seedHash,32);}
+     IOLockUnlock(gate);return ready;
++  }
++  static void startPersistent(void *argument, wait_result_t) {
++    NativeRamBlock *self=static_cast<NativeRamBlock *>(argument);
++    // Publish only AFTER overlay attachment; APFS must never cache seed-only
++    // metadata and then have its underlying blocks replaced by resumed Data.
++    // Root authentication/owner setup precedes selectVolumeSeed. Do not open
++    // any write window merely because UFS geometry became available.
++    for(;;) {
++      IOLockLock(self->gate);bool stop=self->stopping;IOLockUnlock(self->gate);
++      if(stop){self->release();thread_terminate(current_thread());return;}
++      if(__atomic_load_n(&native_ram_block_attach_requested,__ATOMIC_ACQUIRE))break;
++      IOSleep(100);
++    }
++    unsigned waited=0;
++    while(waited<120 && (!&native_ufs_store_ready || !native_ufs_store_ready())) {IOSleep(500);++waited;}
++    self->attachStore();
++    IOLockLock(self->gate);
++    bool publish=self->direct && !self->directFailed && !self->stopping;
++    if(publish)self->online=true;
++    IOLockUnlock(self->gate);
++    if(publish) {__atomic_store_n(&native_ram_block_ready,1U,__ATOMIC_RELEASE);self->registerService();} else {__atomic_store_n(&native_ram_block_ready,2U,__ATOMIC_RELEASE);IOLog("PICASSO_DATASTORE refused publication state=%u; old contents preserved\n",native_data_persist_state);}
++    self->release();
++    thread_terminate(current_thread());
+   }
+   bool start(IOService *) override;
+@@ -171,5 +216,5 @@
+   char *getProductString() override { return const_cast<char *>("Owned RAM block storage"); }
+   char *getRevisionString() override { return const_cast<char *>("1.0"); }
+-  char *getAdditionalDeviceInfoString() override { return const_cast<char *>("volatile storage; no persistent trust claim"); }
++  char *getAdditionalDeviceInfoString() override { return const_cast<char *>(direct ? "unprotected developer persistent storage; no key operations" : "volatile storage; no persistent trust claim"); }
+   IOReturn reportBlockSize(UInt64 *value) override { *value = 512; return kIOReturnSuccess; }
+   IOReturn reportEjectability(bool *value) override { *value = false; return kIOReturnSuccess; }
+@@ -181,7 +226,14 @@
+   IOReturn reportWriteProtection(bool *value) override { *value = false; return kIOReturnSuccess; }
+   IOReturn doSynchronizeCache() override {
+-    if (!online) return kIOReturnNotReady;
+-    // Every changed page is on the medium, with its bitmap bit, before its write completed (PersistOverlay.h): nothing to flush.
+-    return kIOReturnSuccess;
++    if (!gate) return kIOReturnNotReady;
++    IOLockLock(gate);
++    IOReturn result = !online || (isBig && !direct) ? kIOReturnNotReady : kIOReturnSuccess;
++    if (!result && direct) {
++      if (directFailed || !native_ufs_store_sync()) {
++        directFailed=true; persistFailed(); result=kIOReturnIOError;
++      } else __atomic_fetch_add(&native_data_persist_syncs,1,__ATOMIC_RELAXED);
++    }
++    IOLockUnlock(gate);
++    return result;
+   }
+   IOReturn doSynchronize(UInt64, UInt64, IOOptionBits) override { return doSynchronizeCache(); }
+@@ -250,7 +302,9 @@
+   native_ram_block_sparse=(sparse.pages||isBig)?1:0;
+   native_ram_block_resident_bytes=isBig?big.resident:sparse.pages?sparse.resident:logical;
+-  online = true;
+-  native_ram_block_ready = 1;
+-  registerService();
++  if(isBig) {
++    thread_t worker=THREAD_NULL;retain();
++    if(kernel_thread_start(startPersistent,this,&worker)!=KERN_SUCCESS){release();return false;}
++    thread_deallocate(worker);
++  } else { online=true;native_ram_block_ready=1;registerService(); }
+   return true;
+ }
+@@ -308,9 +362,9 @@
+       } bops={buffer};
+       StoreOps store;bool storeError=false;
+-      if(write && directFailed)actual=0;
++      if(directFailed)actual=0;
+       else actual=isBig?directDiskIO(big,overlay,store,stage,kStagePages,write,block*512,bytes,bops,&storeError)
+                        :directDiskIO(sparse,overlay,store,stage,kStagePages,write,block*512,bytes,bops,&storeError);
+       if(storeError){
+-        if(write)directFailed=true;
++        directFailed=true;overlay.active=false;
+         native_data_persist_state=5;__atomic_fetch_add(&native_data_persist_errors,1,__ATOMIC_RELAXED);
+       }
+@@ -351,5 +405,5 @@
+ void NativeRamBlock::stop(IOService *provider)
+ {
+-  if (gate) { IOLockLock(gate); online = false; IOLockUnlock(gate); }
++  if (gate) { IOLockLock(gate); stopping=true; online = false; IOLockUnlock(gate); }
+   IOBlockStorageDevice::stop(provider);
+ }
+@@ -357,5 +411,5 @@
+ void NativeRamBlock::free()
+ {
+-  if (overlayBits) { IOFree(overlayBits, persist::bitmapBlocks(sparse.bytes / 4096) * persist::kBlock); overlayBits = nullptr; }
++  if (overlayBits) { IOFree(overlayBits, persist::bitmapBlocks((isBig ? big.bytes : sparse.bytes) / 4096) * persist::kBlock); overlayBits = nullptr; }
+   if (stage) { IOFree(stage, kStagePages * persist::kBlock); stage = nullptr; }
+   if (isBig) {
+@@ -380,4 +434,12 @@
+   *device = NODEV;
+   path[0] = 0;
++  // The persistence worker must finish before UUID matching. Its blank scan is
++  // bounded by the physical window and may outlast the root volume mount.
++  if (&native_ufs_store_mode && native_ufs_store_mode()==2) {
++    __atomic_store_n(&native_ram_block_attach_requested,1U,__ATOMIC_RELEASE);
++    unsigned waited=0;
++    while(!__atomic_load_n(&native_ram_block_ready,__ATOMIC_ACQUIRE) && waited++<2400)IOSleep(100);
++    if(__atomic_load_n(&native_ram_block_ready,__ATOMIC_ACQUIRE)!=1)return 0;
++  }
+   OSDictionary *matching = IOService::serviceMatching("IOMedia");
+   OSDictionary *properties = OSDictionary::withCapacity(1);
+@@ -389,4 +451,8 @@
+   bool ready = properties->setObject("UUID", wanted) && matching->setObject("IOPropertyMatch", properties);
+   wanted->release(); properties->release();
++  if(ready && &native_ufs_store_mode && native_ufs_store_mode()==2) {
++    IOService *found=IOService::waitForMatchingService(matching,240000000000ULL);
++    if(found)found->release();else ready=false;
++  }
+   OSIterator *iterator = ready ? IOService::getMatchingServices(matching) : nullptr;
+   matching->release();
+--- a/PersistOverlay.h
++++ b/PersistOverlay.h
+@@ -10,5 +10,5 @@
+ // Ops write through: write() returns only when the blocks are on the medium (the UFS store uses WRITE(10) with FUA). A run of pages
+ // is written first and the bitmap blocks that gained a bit after it, both before the caller's write completes, so a bit never
+-// promises a page that did not reach the medium, and a page the system was told is written is never lost to a crash. An
++// promises a page that did not reach the medium, and completed writes are ordered through the medium. Sector atomicity and APFS recovery still depend on the device. An
+ // overwrite of a page whose bit is set changes only that page.
+ // An overlay is only ever applied on top of the exact seed it was made against. A window that holds no overlay of this seed (blank,
+@@ -80,5 +80,5 @@
+   // overlay is initialised only with `reset` (bitmap first, header last, so a tear leaves no valid header), and kept as it is
+   // without (Kept). `reset` also drops this seed's own overlay.
+-  template <class Ops> Open open (Ops &ops, uint64_t pageCount, const uint8_t seed[32], bool ro, uint8_t *bits, bool reset = false)
++  template <class Ops> Open open (Ops &ops, uint64_t pageCount, const uint8_t seed[32], bool ro, uint8_t *bits, bool reset = false, bool initializeBlank = false, uint8_t *scratch = nullptr, uint32_t scratchBlocks = 0)
+   {
+     pages = pageCount; bitmap = bits; readOnly = ro; present = 0; active = false;
+@@ -98,6 +98,21 @@
+     memset (bitmap, 0, bb * kBlock);
+     if (ro) return Open::Blank;
++    if (!reset && initializeBlank) {
++      // An empty header alone is not ownership. Read EVERY block of the exact
++      // window before its first write. Any foreign byte or read failure refuses.
++      if (!scratch || !scratchBlocks) return Open::Failed;
++      for (uint64_t at=0, end=windowBlocks(pages); at<end;) {
++        uint32_t n = end-at < scratchBlocks ? uint32_t(end-at) : scratchBlocks;
++        if (!ops.read(at,n,scratch)) return Open::Failed;
++        for (uint64_t j=0; j<uint64_t(n)*kBlock; ++j) if (scratch[j]) return Open::Kept;
++        at += n;
++      }
++      reset=true;
++    }
+     if (!reset) return Open::Kept;
+     uint8_t zero[kBlock] = {};
++    // Invalidate the OLD header durably before touching its bitmap. Otherwise
++    // a reset interrupted halfway could attach the old header to a new bitmap.
++    if (!ops.write(0,1,zero) || !ops.sync()) return Open::Failed;
+     for (uint64_t b = 0; b < bb; ++b) if (!ops.write (1 + b, 1, zero)) return Open::Failed;
+     if (!ops.sync ()) return Open::Failed;

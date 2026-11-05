@@ -1,0 +1,317 @@
+--- a/iokit/Kernel/IONVRAMCHRPHandler.cpp
++++ b/iokit/Kernel/IONVRAMCHRPHandler.cpp
+@@ -70,4 +70,5 @@
+ 	NVRAMVersion      _version;
+ 	uint32_t          _generation;
++	bool _picassoRestoring=false;
+ 
+ 	uint8_t           *_nvramImage;
+@@ -115,4 +116,5 @@
+ 	virtual bool     setController(IONVRAMController *controller) APPLE_KEXT_OVERRIDE;
+ 	virtual IOReturn sync(void) APPLE_KEXT_OVERRIDE;
++	IOReturn restorePicasso(const uint8_t *image,uint32_t bytes);
+ 	virtual IOReturn flush(const uuid_t guid, IONVRAMOperation op) APPLE_KEXT_OVERRIDE;
+ 	virtual void     reload(void) APPLE_KEXT_OVERRIDE;
+@@ -377,4 +379,5 @@
+ IONVRAMCHRPHandler::reloadInternal(void)
+ {
++	if(picasso_nvram_active)return kIOReturnSuccess;
+ 	uint32_t controllerBank;
+ 	uint32_t controllerGen;
+@@ -556,5 +559,6 @@
+ 
+ 				DEBUG_INFO("adding %s, dataLength=%u\n", varName, propDataLength);
+-				_varDict->setObject(canonicalKey.get(), propObject.get());
++				if (_picassoRestoring && (!canonicalKey || !_varDict->setObject(canonicalKey.get(), propObject.get()))) return kIOReturnNoMemory;
++				if (!_picassoRestoring) _varDict->setObject(canonicalKey.get(), propObject.get());
+ 				if (_provider->_diags) {
+ 					_provider->_diags->logVariable(currentRegion->type,
+@@ -568,5 +572,5 @@
+ 					_commonUsed += variableLength;
+ 				}
+-			}
++			} else if (_picassoRestoring) return kIOReturnNoMemory;
+ 		}
+ 	}
+@@ -583,5 +587,5 @@
+ 
+ 	// Create the boot-args property if it is not in the dictionary.
+-	if (_provider->getProperty(kIONVRAMBootArgsKey) == nullptr) {
++	if (!_picassoRestoring && _provider->getProperty(kIONVRAMBootArgsKey) == nullptr) {
+ 		propSymbol = OSSymbol::withCString(kIONVRAMBootArgsKey);
+ 		propObject = OSString::withCStringNoCopy("");
+@@ -613,5 +617,6 @@
+ 								{ kIONVRAMPartitionSystem, _systemPartitionOffset, _systemPartitionSize} };
+ 
+-	require_action(_nvramController != nullptr, exit, (ret = kIOReturnNotReady, DEBUG_ERROR("No _nvramController\n")));
++	extern bool picasso_nvram_active;
++	require_action(_nvramController != nullptr || picasso_nvram_active, exit, (ret = kIOReturnNotReady, DEBUG_ERROR("No _nvramController\n")));
+ 	require_action(_newData == true, exit, (ret = kIOReturnSuccess, DEBUG_INFO("No _newData to sync\n")));
+ 	require_action(_bankSize != 0, exit, (ret = kIOReturnSuccess, DEBUG_INFO("No nvram size info\n")));
+@@ -703,4 +708,8 @@
+ 	nvram_set_apple_header(nvramImage, _bankSize, ++_generation, _version);
+ 
++	if (picasso_nvram_active) {
++		ret=picasso_nvram_save(nvramImage,_bankSize)?kIOReturnSuccess:kIOReturnIOError;
++		if(ret!=kIOReturnSuccess) { --_generation;IODeleteData(nvramImage,uint8_t,_bankSize);goto exit; }
++	} else {
+ 	_currentBank = (_currentBank + 1) % _bankCount;
+ 
+@@ -715,4 +724,6 @@
+ 
+ 	_nvramController->sync();
++
++	}
+ 
+ 	if (_nvramImage) {
+@@ -1227,2 +1238,40 @@
+ 	return true;
+ }
++
++// Restore only a complete CHRP bank produced by this board's unchanged serializer.
++// Validate before unserializeImage(), which otherwise panics on an invalid Adler.
++IOReturn IONVRAMCHRPHandler::restorePicasso(const uint8_t *image,uint32_t bytes) {
++	if(bytes!=8192 || !image || !isValidImage(image,bytes))return kIOReturnBadArgument;
++	int version=validateNVRAMVersion(image,bytes,nullptr);
++	if(version!=kNVRAMVersion1 || nvram_get_adler(const_cast<uint8_t *>(image),version)!=adler32_with_version(image,bytes,version))return kIOReturnIOError;
++	// Exact board proxy layout: nvram(32), common(2064), free(6096).
++	// No new system partition or alternate controller format may be introduced.
++	const uint32_t offsets[]={0,32,2096},lengths[]={32,2064,6096};
++	const char names[3][12]={"nvram","common","free"};
++	for(unsigned i=0;i<3;++i) {
++		const auto *h=reinterpret_cast<const chrp_nvram_header *>(image+offsets[i]);
++		if(uint32_t(h->len)*16!=lengths[i] || memcmp(h->name,names[i],12) || chrp_checksum(h)!=h->cksum)return kIOReturnIOError;
++	}
++	if(_bankSize!=bytes || _commonPartitionOffset!=48 || _commonPartitionSize!=2048 || _systemPartitionSize)return kIOReturnBadArgument;
++	// Allocate a replacement before changing the live proxy. Keep its old
++	// dictionary/image intact if allocation or property conversion fails.
++	uint8_t *replacement=IONewData(uint8_t,bytes);
++	auto dictionary=OSDictionary::withCapacity(1);
++	if(!replacement || !dictionary) {if(replacement)IODeleteData(replacement,uint8_t,bytes);return kIOReturnNoMemory;}
++	memcpy(replacement,image,bytes);
++	auto previousDictionary=_varDict;
++	uint8_t *previousImage=_nvramImage;
++	uint32_t previousGeneration=_generation,previousCommon=_commonUsed,previousSystem=_systemUsed;
++	bool previousDirty=_newData;
++	_varDict=dictionary;_nvramImage=replacement;
++	validateNVRAMVersion(image,bytes,&_generation);
++	_commonUsed=_systemUsed=0;
++	// Caller holds NVRAMWRITELOCK: avoid recursive provider get/setProperty.
++	_picassoRestoring=true;IOReturn ret=unserializeVariables();_picassoRestoring=false;
++	if(ret) {
++		_varDict=previousDictionary;_nvramImage=previousImage;_generation=previousGeneration;
++		_commonUsed=previousCommon;_systemUsed=previousSystem;_newData=previousDirty;
++		IODeleteData(replacement,uint8_t,bytes);
++	} else if(previousImage) IODeleteData(previousImage,uint8_t,bytes);
++	return ret;
++}
+--- a/iokit/Kernel/IONVRAM.cpp
++++ b/iokit/Kernel/IONVRAM.cpp
+@@ -1248,4 +1248,8 @@
+ }
+ 
++extern "C" int picasso_nvram_load(void *,uint32_t) __attribute__((weak_import));
++extern "C" int picasso_nvram_save(const void *,uint32_t) __attribute__((weak_import));
++bool picasso_nvram_active=false;
++static IODTNVRAM *picasso_nvram_service=nullptr;
+ #include "IONVRAMCHRPHandler.cpp"
+ 
+@@ -1347,4 +1351,5 @@
+ 	// IODTNVRAM for the variable sets which will also update the system/common services
+ 	initImageFormat();
++	if(_format && _format->getVersion()==1)picasso_nvram_service=this;
+ 
+ 	version = OSNumber::withNumber(_format->getVersion(), 32);
+@@ -2130,2 +2135,24 @@
+ 	return 0;
+ }
++
++IOReturn IODTNVRAM::restorePicassoStorage(void) {
++	if(!picasso_nvram_load || !picasso_nvram_save || !_format || _format->getVersion()!=1)return kIOReturnUnsupported;
++	uint8_t *image=IONewZeroData(uint8_t,8192);
++	if(!image)return kIOReturnNoMemory;
++	int restored=picasso_nvram_load(image,8192);
++	IOReturn result=restored<0?kIOReturnNotReady:kIOReturnSuccess;
++	NVRAMWRITELOCK();CONTROLLERLOCK();
++	if(restored==1) result=static_cast<IONVRAMCHRPHandler *>(_format)->restorePicasso(image,8192);
++	__atomic_store_n(&picasso_nvram_active,result==kIOReturnSuccess,__ATOMIC_RELEASE);
++	CONTROLLERUNLOCK();NVRAMUNLOCK();
++	IODeleteData(image,uint8_t,8192);
++	IOLog("PICASSO_NVRAM restore=%d result=%x active=%u\n",restored,result,picasso_nvram_active);
++	return result;
++}
++extern "C" void picasso_nvram_restore_before_launchd(void) {
++	if(picasso_nvram_service)picasso_nvram_service->restorePicassoStorage();
++}
++
++extern "C" void picasso_nvram_periodic_sync(void) {
++	if(__atomic_load_n(&picasso_nvram_active,__ATOMIC_ACQUIRE) && picasso_nvram_service)picasso_nvram_service->sync();
++}
+--- a/iokit/IOKit/IONVRAM.h
++++ b/iokit/IOKit/IONVRAM.h
+@@ -123,4 +123,5 @@
+ 	virtual void registerNVRAMController(IONVRAMController *controller);
+ 
++	IOReturn restorePicassoStorage(void);
+ 	virtual IOReturn sync(void);
+ 	virtual void reload(void);
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8268,4 +8268,6 @@
+ extern int native_ufs_aux_read(uint64_t, uint32_t, void *) __attribute__((weak_import));
+ extern int native_ufs_aux_write(uint64_t, uint32_t, const void *) __attribute__((weak_import));
++extern int native_ufs_aux_sync(void) __attribute__((weak_import));
++static LCK_MTX_DECLARE_ATTR(picasso_cache_lock, &proc_lck_grp, &proc_lck_attr);
+ 
+ static uint32_t
+@@ -8345,5 +8347,5 @@
+ 		goto done;
+ 	}
+-	blob = kalloc_data((size_t)total, Z_WAITOK | Z_ZERO);
++	blob = kalloc_data((size_t)((total+4095)&~4095ULL), Z_WAITOK | Z_ZERO);
+ 	if (!blob) {
+ 		goto done;
+@@ -8389,5 +8391,5 @@
+ done:
+ 	if (blob) {
+-		kfree_data(blob, (size_t)total);
++		kfree_data(blob, (size_t)((total+4095)&~4095ULL));
+ 	}
+ 	if (header) {
+@@ -8496,4 +8498,5 @@
+ static int picasso_pipe_active;
+ static int picasso_pipe_opened;
++static uint32_t picasso_pipe_received, picasso_pipe_generation;
+ 
+ static uint32_t
+@@ -8529,8 +8532,8 @@
+  * order; the tail of a block is kept until the next piece completes it, and the header becomes valid only
+  * when the announced total has arrived. A torn export therefore reads as absent, never as a short stream. */
+-int
+-boot_log_export_put(uint32_t generation, uint32_t total, uint32_t offset, const void *data, uint32_t size)
+-{
+-	if (native_ufs_aux_open == NULL || native_ufs_aux_write == NULL || !generation || !data || !size) {
++static int
++picasso_cache_export_put(uint32_t generation, uint32_t total, uint32_t offset, const void *data, uint32_t size)
++{
++	if (native_ufs_aux_open == NULL || native_ufs_aux_write == NULL || native_ufs_aux_sync == NULL || !generation || !data || !size) {
+ 		return -1;
+ 	}
+@@ -8543,17 +8546,20 @@
+ 	uint8_t *bytes = (uint8_t *)(uintptr_t)data;
+ 	if (offset == 0) {
++		picasso_pipe_active=0;
+ 		if (total < 16 || total > PICASSO_PIPE_MAX) {
+ 			return -5;
+ 		}
+ 		picasso_pipe_total = total;
++		picasso_pipe_received=0;picasso_pipe_generation=generation;
+ 		picasso_pipe_hash = 2166136261u;
+ 		picasso_pipe_tail_bytes = 0;
+ 		picasso_pipe_next = PICASSO_PIPE_BLOCK + 1;
+-		if (!picasso_pipe_header_write(total, 0, generation, 0)) {
++		if (!picasso_pipe_header_write(total, 0, generation, 0) || !native_ufs_aux_sync()) {
+ 			return -6;
+ 		}
+ 		picasso_pipe_active = 1;
+ 	}
+-	if (!picasso_pipe_active || total != picasso_pipe_total || offset > total || size > total - offset) {
++	if (!picasso_pipe_active || generation!=picasso_pipe_generation || offset!=picasso_pipe_received || total != picasso_pipe_total || offset > total || size > total - offset) {
++		picasso_pipe_active=0;
+ 		return -3;
+ 	}
+@@ -8577,4 +8583,5 @@
+ 		}
+ 	}
++	picasso_pipe_received=offset;
+ 	if (offset == total) {
+ 		if (picasso_pipe_tail_bytes) {
+@@ -8585,7 +8592,7 @@
+ 			}
+ 		}
+-		if (!picasso_pipe_header_write(total, picasso_pipe_hash, generation, 1)) {
++		if (!native_ufs_aux_sync() || !picasso_pipe_header_write(total, picasso_pipe_hash, generation, 1) || !native_ufs_aux_sync()) {
+ 			picasso_pipe_active = 0;
+-			return 0;
++			return -6;
+ 		}
+ 		picasso_pipe_active = 0;
+@@ -8594,4 +8601,12 @@
+ 	}
+ 	return 0;
++}
++
++int boot_log_export_put(uint32_t generation,uint32_t total,uint32_t offset,const void *data,uint32_t size)
++{
++	lck_mtx_lock(&picasso_cache_lock);
++	int result=picasso_cache_export_put(generation,total,offset,data,size);
++	lck_mtx_unlock(&picasso_cache_lock);
++	return result;
+ }
+ 
+@@ -8963,7 +8978,14 @@
+ 	uint64_t first = 0;
+ 	const char *why = "";
+-	if (blocks > PICASSO_LSP_BLOCKS || native_ufs_aux_write == NULL ||
+-	    !native_ufs_aux_open(PICASSO_LSP_BLOCKS, &first, &why) ||
+-	    !native_ufs_aux_write(0, (uint32_t)blocks, blob)) {
++	uint8_t *invalid=kalloc_data(4096,Z_WAITOK|Z_ZERO);
++	lck_mtx_lock(&picasso_cache_lock);
++	int saved=invalid && blocks<=PICASSO_LSP_BLOCKS && native_ufs_aux_write && native_ufs_aux_sync &&
++	    native_ufs_aux_open(PICASSO_LSP_BLOCKS,&first,&why) &&
++	    native_ufs_aux_write(0,1,invalid) && native_ufs_aux_sync() &&
++	    (blocks==1 || native_ufs_aux_write(1,(uint32_t)blocks-1,blob+4096)) &&
++	    native_ufs_aux_sync() && native_ufs_aux_write(0,1,blob) && native_ufs_aux_sync();
++	lck_mtx_unlock(&picasso_cache_lock);
++	if(invalid)kfree_data(invalid,4096);
++	if (!saved) {
+ 		printf("PICASSO_LSP export=write-failed bytes=%llu blocks=%llu why=%s\n",
+ 		    (unsigned long long)at, (unsigned long long)blocks, why);
+@@ -9072,5 +9094,7 @@
+ 		printf("PICASSO_APPS_VIEW found=%03x fileid=%03x\n", found, resolved);
+ 		uint32_t rebuild = 0;
+-		if (PE_parse_boot_argn("picasso-ls-rebuild", &rebuild, sizeof(rebuild)) && rebuild == 1) {
++		extern volatile uint32_t native_data_persist_state;
++		if(native_data_persist_state==2)printf("PICASSO_CACHE restored Data: keep LaunchServices and MobileGestalt files\n");
++		if (PE_parse_boot_argn("picasso-ls-rebuild", &rebuild, sizeof(rebuild)) && rebuild == 1 && native_data_persist_state != 2) {
+ 			if (native_picasso_apps_stage == 5 && !native_picasso_apps_status &&
+ 			    found == 0xfff && resolved == 0xfff) {
+@@ -9332,4 +9356,7 @@
+ 	SHA256_Final(native_owner_data_seed_sha256, &context);
+ #endif
++	extern int picasso_persistence_start(void) __attribute__((weak_import));
++	extern void picasso_nvram_restore_before_launchd(void);
++	if(picasso_persistence_start && picasso_persistence_start())picasso_nvram_restore_before_launchd();
+ 	native_owner_data_seed_base = base;
+ 	native_owner_data_seed_size = size;
+@@ -9543,5 +9570,6 @@
+ 		extern void vm_swap_retry_create(void);
+ 		vm_swap_retry_create();
+-		picasso_clear_mobilegestalt_cache();
++		extern volatile uint32_t native_data_persist_state;
++		if(native_data_persist_state!=2)picasso_clear_mobilegestalt_cache();
+ 	}
+ #if defined(XNU_BOOT_PROGRESS) && XNU_BOOT_PROGRESS
+--- a/bsd/dev/picasso_usb.c
++++ b/bsd/dev/picasso_usb.c
+@@ -3240,2 +3240,20 @@
+ 	picasso_usb_park(hold);
+ }
++
++/* A separate reader of the console ring. No UFS, waits or printf under pur_lock. */
++uint32_t picasso_console_snapshot(void *out,uint32_t capacity,uint64_t *total,uint64_t *dropped);
++uint32_t picasso_console_snapshot(void *out,uint32_t capacity,uint64_t *total,uint64_t *dropped) {
++	if(!out || !total || !dropped || !os_atomic_cmpxchg(&pur_lock,0,1,acquire))return 0;
++	uint64_t end=pur_ring.total;
++	uint32_t n=(uint32_t)MIN((uint64_t)MIN(capacity,PURing_SIZE),end);
++	*total=end;*dropped=os_atomic_load(&pur_dropped,relaxed);
++	os_atomic_store(&pur_lock,0,release);
++	for(uint32_t at=0;at<n;) {
++		if(!os_atomic_cmpxchg(&pur_lock,0,1,acquire))return 0;
++		if(pur_ring.total-(end-n+at)>PURing_SIZE) {os_atomic_store(&pur_lock,0,release);return 0;}
++		uint32_t chunk=MIN(n-at,4096U);
++		for(uint32_t i=0;i<chunk;++i)((char *)out)[at+i]=pur_ring.buffer[(end-n+at+i)&PURing_MASK];
++		os_atomic_store(&pur_lock,0,release);at+=chunk;
++	}
++	return n;
++}

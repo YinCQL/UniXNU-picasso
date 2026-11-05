@@ -218,9 +218,10 @@ def build_profile(board):
         device_class=target.DEVICE_CLASS, chip_id=target.CHIP_ID, board_id=target.BOARD_ID).items()),
         'Unsupported display/state userland profile')
     require(board['payload']['adt'].get('packed_data_ramdisk') is True and
-            not board['payload']['adt'].get('persistent_data') and
+            board['payload']['adt'].get('persistent_data') is True and
+            board['payload']['adt'].get('unprotected_developer_data') is True and
             'picasso-aks-state=1' in board['payload']['kernel_args'],
-            'State service requires explicit RAM Data policy')
+            'State service requires explicit unprotected developer Data policy')
     return dict(userland_product=target.PRODUCT, userland_build=target.BUILD,
                 backend_build=target.BACKEND_IPSW['build'], runtime_qualified=False,
                 pending_runtime_validation=list(target.RUNTIME_VALIDATION_PENDING))

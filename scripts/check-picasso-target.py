@@ -22,6 +22,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def check_board(root=ROOT):
     board = tomllib.loads((root / 'board.toml').read_text(encoding='utf-8'))
+    arguments=board['payload']['kernel_args']
+    if len(' '.join(arguments).encode())>1000:
+        raise ValueError('Kernel arguments exceed the DarwinBoot 1000-byte budget')
+    if any(a.startswith(('sheng-data-reset=', 'sheng-log=')) for a in arguments):
+        raise ValueError('Legacy reset/log arguments conflict with guarded persistent storage')
     spec = board['ipsw']
     expected = dict(product=target.PRODUCT, device_class=target.DEVICE_CLASS,
                     version=target.VERSION, build=target.BUILD, chip_id=target.CHIP_ID,

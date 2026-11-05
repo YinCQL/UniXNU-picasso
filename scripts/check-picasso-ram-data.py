@@ -68,6 +68,7 @@ def main():
         result = data.inspect_packed(packed, raw)
         assert result == dict(logical_bytes=len(raw_bytes), packed_bytes=len(packed_bytes),
                               raw_sha256=hashlib.sha256(raw_bytes).hexdigest(),
+                              seed_identity_sha256=hashlib.sha256(raw_bytes).hexdigest(),
                               packed_sha256=hashlib.sha256(packed_bytes).hexdigest(),
                               page_size=page, extent_count=2)
 
@@ -95,7 +96,7 @@ def main():
     mutate('wrong page size', 12, '<I', 16384)
     mutate('zero logical size', 16, '<Q', 0)
     mutate('unaligned logical size', 16, '<Q', len(raw_bytes) + 1)
-    mutate('persistent-only logical size', 16, '<Q', 2 * 1024**3 + page)
+    mutate('oversized logical size', 16, '<Q', 4 * 1024**3 + page)
     mutate('extent count overflow', 24, '<Q', 65537)
     mutate('extent table truncated', 24, '<Q', 4096)
     mutate('zero extent length', 40, '<Q', 0)
@@ -130,7 +131,7 @@ def main():
         assert result['logical_bytes'] == data.DATA_BYTES
         assert result['raw_sha256'] == digest.hexdigest()
 
-    passes('2 GiB logical empty disk hashes without dense allocation', verify_sparse)
+    passes('4 GiB logical empty disk hashes without dense allocation', verify_sparse)
 
     staged = out / 'staged-budget'
     staged.mkdir()
@@ -148,7 +149,7 @@ def main():
         rejected('build153 sized staged tree exceeds old 512 MiB Data',
                  lambda: data.staged_apps_budget(staged, 1024**2))
     with app.open('wb') as stream:
-        stream.truncate(1600 * 1024**2)
+        stream.truncate(3700 * 1024**2)
     rejected('oversized staged apps fail before Data image creation',
              lambda: data.staged_apps_budget(staged, 1024**2))
     rejected('missing staged source', lambda: data.staged_apps_budget(out / 'missing-apps', 0))

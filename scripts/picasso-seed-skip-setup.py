@@ -43,7 +43,7 @@ def consume_statusbar_provider(arguments):
 
 
 def main():
-    if sys.platform.startswith('linux'):
+    if sys.platform.startswith('linux') or os.environ.get('PICASSO_LINUX_INPUTS'):
         from picasso_linux_inputs import stage_setup
         stage_setup(Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3:], HERE.parent)
         return

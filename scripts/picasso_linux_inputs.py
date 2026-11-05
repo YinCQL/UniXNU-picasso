@@ -50,7 +50,7 @@ def recipe(tree):
         sha.update(path.name.encode() + b'\0' + path.read_bytes() + b'\0')
     spec = board()['payload']
     settings = {key: spec.get(key) for key in ('skip_setup_tool', 'skip_setup_args',
-                'offline_disabled_jobs', 'owned_trust_library', 'size_mib', 'adt')}
+                'offline_disabled_jobs', 'owned_trust_library', 'size_mib', 'adt', 'kernel_args')}
     sha.update(json.dumps(settings, sort_keys=True).encode())
     return sha.hexdigest()
 
@@ -112,7 +112,7 @@ def validate(directory, tree):
     require(audit['packed'] == packed and prepare.canonical_uuid(audit['volume_uuid']) == identity,
             'macOS audit has another base seed or Data UUID')
     require(audit['payload_packed'] == setup and audit['payload_seed_transformation'] == transform and
-            audit['persistent'] is False, 'Actual macOS payload audit differs')
+            audit['persistent'] is True and audit.get('encrypted') is False, 'Actual macOS payload audit differs')
     require(audit['offline_launch_policy'] == seed['offline_launch_policy'] and
             audit['payload_offline_launch_policy'] == seed['offline_launch_policy'], 'Offline launch policy differs')
     jobs = prepare.offline_jobs(board()['payload'])
@@ -218,10 +218,12 @@ def acquire(repository, branch, tree, output):
                             'Compose archive hash/size mismatch')
                     staged = Path(temporary) / 'inputs'
                     extract(archive, staged)
-                    try:
-                        validate(staged, tree)
-                    except ValueError:
+                    candidate = json.loads((staged / 'manifest.json').read_text(encoding='utf-8'))
+                    if candidate.get('recipe_sha256') != recipe(tree):
                         continue  # A matching exporter can serve another iOS16 seed recipe.
+                    # A compatible but damaged bundle is an error, not permission
+                    # to format a new seed and strand an existing Data overlay.
+                    validate(staged, tree)
                     shutil.copytree(staged, output)
                 provenance = dict(schema=SCHEMA, repository=repository, recipe_sha256=recipe(tree),
                     producer_run_id=run['id'], producer_revision=run['head_sha'], producer_branch=run['head_branch'],
@@ -269,7 +271,7 @@ def stage_setup(base, output, arguments, tree):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('key', 'export', 'reuse'))
+    parser.add_argument('command', choices=('key', 'export', 'reuse', 'reuse-optional'))
     parser.add_argument('--tree', type=Path, required=True)
     parser.add_argument('--work', type=Path, default=ROOT / 'out/picasso')
     parser.add_argument('--output', type=Path, default=ROOT / 'out/picasso/linux-inputs')
@@ -280,6 +282,15 @@ def main():
         print(recipe(args.tree.resolve()))
     elif args.command == 'export':
         export(args.tree.resolve(), args.work.resolve(), args.output.resolve())
+    elif args.command == 'reuse-optional':
+        try:
+            reuse(args.tree.resolve(), args.output.resolve(), args.work.resolve(), args.repository, args.branch)
+        except ValueError as error:
+            # Only an absent compatible seed permits new formatting; IO/provenance
+            # failures remain fatal and never silently replace an existing seed.
+            if str(error).startswith('No compatible iOS16 Compose input bundle'):
+                print('No reusable seed for this recipe; first Compose will create one.')
+            else: raise
     else:
         reuse(args.tree.resolve(), args.output.resolve(), args.work.resolve(), args.repository, args.branch)
 

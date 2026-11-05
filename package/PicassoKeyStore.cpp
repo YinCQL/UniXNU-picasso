@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Publish state only when the boot actually selected unprotected ephemeral Data.
+// Publish state only when the boot actually selected unprotected developer Data.
 #include <IOKit/IOService.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
@@ -56,12 +56,17 @@ extern "C" void picasso_keystore_probe(void) {
     OSData *data=chosen?OSDynamicCast(OSData,chosen->getProperty("ephemeral-storage")):nullptr;
     uint32_t ephemeral=0;
     if(data && data->getLength()==sizeof(ephemeral))memcpy(&ephemeral,data->getBytesNoCopy(),sizeof(ephemeral));
+    OSData *persistentData=chosen?OSDynamicCast(OSData,chosen->getProperty("picasso-unprotected-data")):nullptr;
+    uint32_t unprotected=0, mode=0;
+    if(persistentData && persistentData->getLength()==sizeof(unprotected))memcpy(&unprotected,persistentData->getBytesNoCopy(),sizeof(unprotected));
+    PE_parse_boot_argn("sheng-data-persist",&mode,sizeof(mode));
+    const bool policy=(ephemeral==1 && unprotected==0 && mode==0) || (ephemeral==0 && unprotected==1 && mode==2);
     OSSafeReleaseNULL(chosen);
     const OSSymbol *name=OSSymbol::withCString("AppleKeyStore");
     bool absent=name && !OSMetaClass::getMetaClassWithName(name);
     OSSafeReleaseNULL(name);
     IOService *provider=IOService::getResourceService();
-    if(ephemeral!=1 || !absent || !provider) {
+    if(!policy || !absent || !provider) {
         IOLog("PICASSO_AKS publish refused ephemeral=%u class_absent=%u provider=%u\n",ephemeral,absent,provider!=nullptr);return;
     }
     void *handle=OSMetaClass::preModLoad(g_kernel_kmod_info.name);
@@ -80,5 +85,5 @@ extern "C" void picasso_keystore_probe(void) {
         if(attached)service->detach(provider);
         OSSafeReleaseNULL(service);
     } else stateService=service;
-    IOLog("PICASSO_AKS started=%u ephemeral=%u state_only=1 key_operations=0\n",started,ephemeral);
+    IOLog("PICASSO_AKS started=%u ephemeral=%u unprotected_persistent=%u state_only=1 key_operations=0\n",started,ephemeral,unprotected);
 }

@@ -1180,6 +1180,8 @@ struct StoreGeometry {
   uint32_t headerCrc, entriesCrc, entryCount;
 };
 StoreGeometry gStoreGeometry;
+static unsigned gStoreReady;
+extern "C" unsigned native_ufs_store_ready(void) {return __atomic_load_n(&gStoreReady,__ATOMIC_ACQUIRE);}
 uint64_t gStoreRegionFirst, gStoreRegionBlocks;
 // The diagnostic log (sheng-log=1): always the last 32 MiB of userdata, so the Data store's place does not depend on logging.
 constexpr uint64_t kLogReserveBlocks = 8192;
@@ -1241,7 +1243,9 @@ extern "C" int native_ufs_store_open (uint64_t blocks, uint64_t *firstLba, const
       // The reserve at the end of the partition belongs to the diagnostic log (its last 32 MiB, with the export region below them);
       // the store ends just below it.
       uint64_t first = gStoreGeometry.last + 1 - reserve - blocks;
-      if (storeMode () == 2 && !hostStoreOpen (first, blocks)) reason = "window refused";
+      bool writable=true;
+      if(storeMode()==2) {IOLockLock(gHost.lock);writable=hostStoreOpen(first,blocks);IOLockUnlock(gHost.lock);}
+      if (!writable) reason = "window refused";
       else {
         gStoreRegionFirst = first;
         gStoreRegionBlocks = blocks;
@@ -1300,6 +1304,7 @@ extern "C" int native_ufs_store_sync (void)
 // window and passes the same geometry checks (inside userdata, clear of the flashed root image plus the
 // 4 MiB guard). Writes are WRITE(10) with FUA, so a blob written here is on the medium when the call returns.
 uint64_t gAuxRegionFirst, gAuxRegionBlocks;
+static bool picassoAuxClaim(uint64_t first, uint64_t blocks);
 
 extern "C" int native_ufs_aux_open (uint64_t blocks, uint64_t *firstLba, const char **why)
 {
@@ -1308,7 +1313,7 @@ extern "C" int native_ufs_aux_open (uint64_t blocks, uint64_t *firstLba, const c
   if (storeMode () != 2) reason = "not writable";
   else if (!gStoreRegionBlocks) reason = "store not open";
   else if (!blocks || blocks > 65536) reason = "size";
-  else if (gAuxRegionBlocks) { reason = "already open"; ok = 1; }
+  else if (__atomic_load_n(&gAuxRegionBlocks,__ATOMIC_ACQUIRE)) { reason = "already open"; ok = 1; }
   else {
     // One fixed window for every aux user: the LaunchServices blob (16 MiB) and the pipeline pack (240 MiB).
     // Opening it at the caller's size would let the first opener undersize it for the other.
@@ -1317,10 +1322,8 @@ extern "C" int native_ufs_aux_open (uint64_t blocks, uint64_t *firstLba, const c
     uint64_t imageBlocks = (gStoreGeometry.imageBytes + 4095) / 4096;
     if (gStoreRegionFirst < gStoreGeometry.first + blocks) reason = "size";
     else if (first < gStoreGeometry.first + imageBlocks + 1024) reason = "overlaps the root image";
-    else if (!hostAuxOpen (first, blocks)) reason = "window refused";
+    else if (!picassoAuxClaim(first,blocks)) reason = "nonempty, foreign, failed or unqualified aux region";
     else {
-      gAuxRegionFirst = first;
-      gAuxRegionBlocks = blocks;
       ok = 1;
     }
   }
@@ -1453,16 +1456,22 @@ extern "C" int native_ufs_log_sync (void)
 extern "C" unsigned native_ufs_store_gpt_check (void)
 {
   if (!gStoreGeometry.valid || !gHost.ready) return 1;
-  static uint8_t block[4096];
+  uint8_t block[4096];
   if (hostRead4k (0, 1, 1, block) != kIOReturnSuccess) return 2;
   uint32_t headerBytes = le32 (block + 12);
   if (headerBytes < 92 || headerBytes > 4096 || rootCrc32 (block, headerBytes, true) != le32 (block + 16) ||
       le32 (block + 16) != gStoreGeometry.headerCrc) return 3;
   uint32_t blocks = (gStoreGeometry.entryCount * 128 + 4095) / 4096;
-  static uint8_t entries[4096 * 4];
-  if (blocks > 4 || hostRead4k (0, gStoreGeometry.entriesLba, blocks, entries) != kIOReturnSuccess) return 4;
-  return rootCrc32 (entries, gStoreGeometry.entryCount * 128) == gStoreGeometry.entriesCrc ? 0 : 5;
+  if (blocks > 4) return 4;
+  uint8_t *entries=static_cast<uint8_t *>(IOMalloc(4096 * 4));
+  if (!entries) return 4;
+  unsigned result=hostRead4k(0,gStoreGeometry.entriesLba,blocks,entries)!=kIOReturnSuccess?4:
+      rootCrc32(entries,gStoreGeometry.entryCount*128)==gStoreGeometry.entriesCrc?0:5;
+  IOFree(entries,4096 * 4);
+  return result;
 }
+
+#include "PicassoPersistence.h"
 
 // One read-only window of the root image as a block device: 512-byte sectors on top of 4096-byte
 // UFS blocks, so the unchanged dmg disk images (GPT with 512-byte sectors) parse as they do on
@@ -2670,6 +2679,7 @@ bool NativeUfs::startRoot (IOService *provider)
   }
   gStoreGeometry = { true, layout->userdataFirst, layout->userdataLast, layout->imageBytes, layout->gptEntriesLba,
                      layout->gptHeaderCrc, layout->gptEntriesCrc, layout->gptEntryCount };
+  __atomic_store_n(&gStoreReady,1U,__ATOMIC_RELEASE);
   const char *names[4] = {};
   for (unsigned i = 0; i < layout->windows; ++i) names[i] = layout->window[i].name;
   if (!ufsBuildRootPlan (names, layout->windows, gPublicationPlan)) {

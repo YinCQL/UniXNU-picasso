@@ -53,7 +53,7 @@ archives = [
   "build-picasso-aes.py",
   # UFS physical windows are defined in the board driver.
   "build-arm-driver.py NativeUfs",
-  # Volatile APFS Data; shares NativeUfs's exact original IOStorage bindings.
+  # Persistent developer APFS Data; shares NativeUfs's exact original IOStorage bindings.
   "build-arm-driver.py NativeRamBlock",
   # Publishes the power-management nub, watchdog and volatile boot-stage storage.
   "build-picasso-pmgr.py",
@@ -249,8 +249,7 @@ kernel_args = [
   "native-ufs-start-delay=5",
   # Use timebase/yield waits and bounded scan batches during early UFS startup.
   "native-ufs-delay-yield=1",
-  # Keep verbose UFS command tracing disabled during system boot.
-  "native-ufs-diagnostics=0",
+  # Verbose UFS tracing uses its disabled default.
   # Allow interrupt-context diagnostics to reach the USB console.
   "nointr_consio=1",
   # Also allow IOLog diagnostics in interrupt context.
@@ -259,8 +258,7 @@ kernel_args = [
   "picasso_usb=2",
   # Apply the guarded USB stream 0xe0 bypass before controller startup.
   "picasso_usb_smmu=6",
-  # Continue to root mounting after the console starts.
-  "picasso_usb_hold=0",
+  # USB hold uses its disabled default; continue to root mounting.
   # Keep a 1-second synchronous command window after the USB enumeration handoff.
   "picasso_usb_control_ms=1000",
   # Arm the Fastboot reason and use PSHOLD as the reset fallback.
@@ -281,8 +279,11 @@ kernel_args = [
   "sheng-staged-apps=1",
   # Keep boot diagnostic painters from covering the system UI.
   "sheng-banner=0",
-  # State queries only for unprotected RAM Data; no keybag/key operations.
+  # State queries only for unprotected developer Data; no keybag/key operations.
   "picasso-aks-state=1",
+  "sheng-data-persist=2",
+  "picasso-data-init-blank=1",
+  "picasso-persist-records=1",
   # Software refresh notifications only; panel timing remains firmware-owned.
   "sheng-vsync=60",
   # Virtual input: after HID and two frames are ready, wake at 5 s and swipe at 8 s.
@@ -308,8 +309,11 @@ owned_trust_library = "out/picasso/libpicasso-sb.dylib"
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"
 chip_id = "7250"
-# Pass packed nonzero Data pages; allocate writes on demand with ephemeral storage.
+# Pass packed nonzero Data pages; persist changed pages in the guarded UFS Data window.
 packed_data_ramdisk = true
+persistent_data = true
+# Explicit unencrypted developer storage; does not claim keybag/password support.
+unprotected_developer_data = true
 # Use the original iPhone X identity and phone/2436/3/P3 artwork.
 iphone_identity = true
 # Select the authenticated OS volume by UUID; verify its signed image independently.

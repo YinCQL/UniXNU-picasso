@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a volatile APFS Data seed from the unchanged iPhone X OS (macOS/root).
+"""Prepare the immutable base of unprotected persistent APFS Data from the unchanged iPhone X OS (macOS/root).
 
 Copies original private/var, adds empty runtime directories and the board's
 explicit offline launch policy. The original OS remains mounted read-only.
@@ -25,13 +25,13 @@ from picasso_target import OS_SHA256, LAUNCHD_SHA256, BUILD
 
 # build154 restored 487 MiB of apps, then exhausted its 1 GiB Data volume.
 # Allow the five 128 MiB swap files plus wallpaper/LS caches and transactions.
-# Sparse pages still allocate only on writes; this is not a RAM reservation.
-DATA_BYTES = 2 * 1024**3
+# Changed pages live in UFS; the 4 GiB logical size is not a RAM reservation.
+DATA_BYTES = 4 * 1024**3
 STAGED_RUNTIME_RESERVE = 512 * 1024**2
 STAGED_METADATA_BYTES = 8192
 PAGE = 4096
 MAX_PACKED = 4 * 1024**2
-MAX_LOGICAL = 2 * 1024**3  # Larger disks select the persistent-store driver path.
+MAX_LOGICAL = 4 * 1024**3  # Above 2 GiB requires the guarded persistent store.
 DATA_UUID_KEY = 'CONFIG_XNU_OWNER_DATA_VOLUME_UUID'
 OFFLINE_POLICY_DIR = 'db/com.apple.xpc.launchd'
 # Jobs the offline policy may never disable: what the path to SpringBoard waits on or what many
@@ -257,8 +257,8 @@ def offline_jobs(payload):
         if job in PROTECTED_JOBS:
             raise ValueError(f'Offline policy may not disable {job}')
     adt = payload.get('adt', {})
-    if jobs and (adt.get('packed_data_ramdisk') is not True or adt.get('persistent_data')):
-        raise ValueError('Offline launch policy requires packed volatile Data')
+    if jobs and (adt.get('packed_data_ramdisk') is not True or (adt.get('persistent_data') and adt.get('unprotected_developer_data') is not True)):
+        raise ValueError('Offline launch policy requires packed unprotected developer Data')
     return jobs
 
 
@@ -332,7 +332,7 @@ def inspect_packed(path, raw=None):
     """Validate DBRDISK1 and hash its reconstruction, optionally checking raw bytes.
 
     The 4 MiB input cap reserves space in Picasso's 60 MiB FAT payload. Logical
-    media above 2 GiB is rejected because the pinned driver needs persistent I/O.
+    media above 2 GiB uses the guarded persistent store, up to 4 GiB.
     """
     path = Path(path)
     size = path.stat().st_size
@@ -343,7 +343,7 @@ def inspect_packed(path, raw=None):
     if (magic != b'DBRDISK1' or version != 1 or page != PAGE or
             not 0 < logical <= MAX_LOGICAL or logical % PAGE or
             count > 65536 or count > (size - 32) // 16):
-        raise ValueError('Invalid packed Data header or volatile logical capacity')
+        raise ValueError('Invalid packed Data header or logical capacity')
     cursor, end = 32 + 16 * count, 0
     extents = []
     for index in range(count):
@@ -380,7 +380,17 @@ def inspect_packed(path, raw=None):
     finally:
         if raw_stream is not None:
             raw_stream.close()
-    return dict(logical_bytes=logical, packed_bytes=size, raw_sha256=digest.hexdigest(),
+    identity = digest.hexdigest()
+    if logical > 2 * 1024**3:
+        sparse_hash = hashlib.sha256(b'SHNGSEED2' + struct.pack('<Q', logical))
+        for offset, data in extents:
+            for at in range(0, len(data), PAGE):
+                block = data[at:at + PAGE]
+                if any(block):
+                    sparse_hash.update(struct.pack('<Q', (offset + at) // PAGE))
+                    sparse_hash.update(block)
+        identity = sparse_hash.hexdigest()
+    return dict(seed_identity_sha256=identity, logical_bytes=logical, packed_bytes=size, raw_sha256=digest.hexdigest(),
                 packed_sha256=hashlib.sha256(blob).hexdigest(), page_size=page,
                 extent_count=count)
 
@@ -480,7 +490,7 @@ def prepare(tree, source, output, config):
     pack(image, packed)
     packed_info = inspect_packed(packed, raw=image)
     if packed_info['logical_bytes'] != DATA_BYTES:
-        raise ValueError('Expected exactly 1 GiB of logical volatile Data')
+        raise ValueError('Expected exactly 4 GiB of logical developer Data')
     manifest_path = output / 'source-var-manifest.json'
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8')
     files = [entry for entry in manifest.values() if entry['type'] == 'file']

@@ -139,10 +139,13 @@ def check(work, tree, output):
     spec = board['payload']
     require(spec['size_mib'] == 60, 'Picasso payload must be 60 MiB')
     require(spec['adt'].get('packed_data_ramdisk') is True, 'Packed Data ADT mode required')
-    require(not spec['adt'].get('persistent_data'), 'Data must remain volatile')
+    require(spec['adt'].get('persistent_data') is True and spec['adt'].get('unprotected_developer_data') is True,
+            'Require explicit unprotected developer Data')
+    require('sheng-data-persist=2' in spec['kernel_args'] and 'picasso-data-init-blank=1' in spec['kernel_args'],
+            'Missing persistent Data policy')
     for argument in spec['kernel_args']:
-        require(argument.split('=')[0] not in ('sheng-data-persist', 'sheng-log'),
-                'Persistent UFS store must remain disabled')
+        require(argument.split('=')[0] not in ('sheng-data-reset', 'sheng-log'),
+                'Reset and legacy unguarded log are forbidden')
 
     seed_dir = work / 'ram-data'
     seed = json.loads((seed_dir / 'seed.json').read_text())
@@ -151,9 +154,9 @@ def check(work, tree, output):
     packed = inspect(seed_dir / 'data.dbrdisk')
     require(seed['schema'] == 'picasso-ram-data-v1', 'Unknown Data report')
     for key in ('logical_bytes', 'packed_bytes', 'packed_sha256', 'raw_sha256',
-                'page_size', 'extent_count'):
+                'page_size', 'extent_count', 'seed_identity_sha256'):
         require(seed[key] == packed[key], f'Data report mismatch: {key}')
-    require(packed['logical_bytes'] == preparation['DATA_BYTES'], 'Expected 2 GiB sparse logical disk')
+    require(packed['logical_bytes'] == preparation['DATA_BYTES'], 'Expected 4 GiB sparse logical disk')
     require(packed['packed_bytes'] <= 4 * 1024**2, 'Packed seed exceeds its memory/payload budget')
     require(seed['persistent'] is False and seed['ownership_preserved'] is True
             and seed['os_inputs_modified'] is False, 'Unsafe seed provenance')
@@ -165,7 +168,7 @@ def check(work, tree, output):
             'Source manifest hash mismatch')
     jobs = preparation['offline_jobs'](spec)
     linux_inputs = None
-    if sys.platform.startswith('linux'):
+    if sys.platform.startswith('linux') or os.environ.get('PICASSO_LINUX_INPUTS'):
         from picasso_linux_inputs import validate
         os_inputs = os.environ.get('PICASSO_LINUX_INPUTS')
         require(os_inputs,
@@ -263,8 +266,8 @@ def check(work, tree, output):
     memory_map = nodes['/chosen/memory-map']
     require(memory_map.get('PackedRAMDisk') == bytes(16) and 'RAMDisk' not in memory_map,
             'ADT must use exactly one packed placeholder')
-    require(nodes['/chosen'].get('ephemeral-storage') == struct.pack('<I', 1),
-            'ADT does not declare ephemeral Data')
+    require(nodes['/chosen'].get('picasso-unprotected-data') == struct.pack('<I', 1),
+            'ADT does not declare unprotected persistent Data')
     content = sum(p.stat().st_size for p in extracted.rglob('*') if p.is_file())
     require(content * 100 <= payload.stat().st_size * 95, 'FAT content exceeds 95% budget')
     report = dict(scope='Actual build artifacts; no device execution or peak RAM qualification',
@@ -276,7 +279,7 @@ def check(work, tree, output):
                   offline_launch_policy=policy,
                   payload_packed=payload_packed, payload_seed_transformation=transformation,
                   payload_offline_launch_policy=payload_policy, payload_setup_settings=setup_settings,
-                  persistent=False, hardware_tested=False)
+                  persistent=True, encrypted=False, hardware_tested=False)
     output.write_text(json.dumps(report, indent=2) + '\n')
     return report
 
