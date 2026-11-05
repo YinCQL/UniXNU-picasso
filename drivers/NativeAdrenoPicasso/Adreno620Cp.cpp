@@ -56,6 +56,10 @@
 extern "C" int (*native_adreno_dram_read32)(uint64_t physical, uint32_t *value);
 extern "C" int (*native_adreno_cached_read32)(uint64_t physical, uint32_t *value);
 extern "C" int (*native_adreno_dram_read_words)(uint64_t physical, uint32_t *out, size_t count);
+/* Write-combine maintenance cost (NativeAdrenoCpu.cpp) and the audit's reset count (NativeAdrenoSubmit.cpp). */
+extern "C" volatile uint64_t native_adreno_reassert_ticks;
+extern "C" volatile uint64_t native_adreno_cache_stats[5];
+extern "C" volatile uint32_t native_adreno_wc_audit[6];
 /* One fresh mapping per page, kIOMapInhibitCache: a default-cache mapping of a physical page is cacheable, so it would both read a
  * stale cache line and leave one behind for the next reader (the earlier form omitted the flag and could report a zero the CPU had
  * cached, which is exactly the diagnostic this reader exists to answer). */
@@ -1982,13 +1986,22 @@ void addonReport(void *, wait_result_t)
      * compositor's later frames are GPU work shows up here as the counter growing. */
     for (unsigned round = 1;; ++round) {
         IOSleep(30000);
+        /* Write-combine maintenance cost, cumulative: the per-submission re-assertion walks every page of every write-combined
+         * mapping (the fix for XNU resetting attributes on a view teardown), and the cache-maintenance passes. A submission's
+         * share of these is the suspect when a client's submit call is slower than the work it describes. */
+        uint64_t freq = 0;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+        if (!freq) freq = 19200000;
         printf("PICASSO_GPU submits live %u: submissions=%u ibs=%u max=%u many=%u "
-               "opens=%u report=%s apps=%d/%d/%d/%d/%x\n", round,
+               "opens=%u report=%s apps=%d/%d/%d/%d/%x wc_us=%llu wc_reset=%u cache_us=%llu\n", round,
             native_adreno_submit_ibs[0], native_adreno_submit_ibs[1],
             native_adreno_submit_ibs[2], native_adreno_submit_ibs[3],
             native_adreno_metal_opens(), native_adreno_metal_report(),
             native_staged_apps_stage, native_staged_apps_dirs, native_staged_apps_files,
-            native_staged_apps_mib, native_staged_apps_error);
+            native_staged_apps_mib, native_staged_apps_error,
+            (unsigned long long)(&native_adreno_reassert_ticks ? native_adreno_reassert_ticks * 1000000 / freq : 0),
+            &native_adreno_wc_audit ? native_adreno_wc_audit[5] : 0,
+            (unsigned long long)(&native_adreno_cache_stats ? native_adreno_cache_stats[0] * 1000000 / freq : 0));
     }
 }
 
