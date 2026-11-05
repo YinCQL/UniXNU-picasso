@@ -224,3 +224,128 @@ made wf299 a **repeat of the 500 MHz baseline** and gives the run-to-run varianc
 
 
 
+
+## Stage 9 — wf301: Home-button discriminator for the touch device
+
+The physical finger works and both physical and synthetic contacts share one HID device, so the
+next question is whether the device's **non-digitizer** reports are consumed. `offline-hid-auto-home`
+sends Consumer/Menu (Home, report 2 bit 0) through the same device's keyboard collection.
+
+Args (793 B): `picasso-frame-trace=1 offline-hid-start=250 offline-hid-auto-home=300
+offline-hid-auto-home-count=8 offline-hid-auto-home-interval=20`; capture 560 s from before boot,
+`gpu-table` at port+150/320/440.
+
+- Home presses (`PICASSO_HID home report down=… value=…`) starting at monitor ≈300 s.
+- PASS (device consumed): the UI reacts — app switcher/home animation, frames burst.
+- FAIL (device reports ignored): no reaction at all → the HID device is not what delivers the
+  working physical touch, and the physical path must be re-traced (the shared-sink assumption is
+  wrong).
+
+**Result — PASS.** One Home press produced `PICASSO_HID home report down=1 value=1 result=0` at
+log line 5362 and frames jumped 9 → 234: **218 frames followed the press**. The device's
+non-digitizer reports ARE consumed by the UI, so the HID device path (device → event driver →
+backboardd → SpringBoard) is sound and only digitizer contacts are dropped — that narrows the
+synthetic-touch bug to the touch-specific admission path, not the transport. It also gives the
+autonomous animation stimulus the clock A/B needed.
+
+## Stage 10 — wf302/wf303: GPU clock A/B on Home-press animation
+
+Same image as wf301 except `offline-hid-auto-home=60` (presses at attach+60 s, then every 20 s;
+8 presses clamped by the probe's `count>8` limit). Both runs use the identical capture: port open
+from before boot, `gpu-table` at port+150/320/440, `reboot-fastboot` at 455/465 s.
+
+### wf302 — index 3, 500 MHz (baseline)
+
+HFI log: `initial perf index=3 (nominal)`. 2437 frames, 16 `home report` lines = 8 press+release
+pairs; every press was followed by an animation burst (windows after each `down=1` line):
+
+| press (kernel s) | frames | fast intervals | fast p50 |
+|---|---|---|---|
+| 300 (wake) | 259 | 80 | 20.1 ms |
+| 375..496 (7×) | 228–232 | 41–46 | 33.3 ms |
+
+- burst frames (interval <60 ms): n=381, service p50 **10.0 ms**, take 0.22, present 9.8,
+  completion 0.01 ms — **identical to idle** (9.9/0.14/9.7).
+- PF while presses run: commit p50 6.92 ms, **wait p50 2.51 ms, max 16.24 ms**.
+- Thus the Home animation is paced at 30 fps by the compositor's own offer cadence
+  (interval 33.3 ms, ~23 ms of it *after* the previous present finished = gap), not by the GPU:
+  per-frame GPU work is the idle 10 ms. This contrasts with the wf298 SpringBoard launch bursts
+  (present 33.8 ms, GPU wait 26–33 ms): heavy multi-layer animations are GPU-bound, the simple
+  Home animation is CA-paced.
+
+### wf303 — index 4, 625 MHz
+
+Same capture; only `sheng-gpu-perf-index=4` added. HFI: `initial perf index=4 (dt level=3 of 5, boot
+index=4 from boot arg)` — the 625 MHz clock was applied.
+
+| | wf302 (500 MHz) | wf303 (625 MHz) | delta |
+|---|---|---|---|
+| burst frames | 381 | 391 | — |
+| burst service p50 | 10.0 ms | 9.7 ms | −0.3 ms (3%) |
+| burst present p50 | 9.8 ms | 9.5 ms | −0.3 ms |
+| fast interval p50 | 33.0 ms | 33.0 ms | 0 |
+| PF commit p50 | 6.92 ms | 6.90 ms | 0 (CPU) |
+| PF wait p50 / max | 2.51 / 16.24 ms | 2.40 / 16.10 ms | −0.11 ms |
+
+All 8 Home presses were consumed in both runs with the same frame counts per window (±2%). The
+25% clock increase bought 4% of the GPU wait and nothing of the cadence: the 33 ms burst interval
+is the compositor's animation rate, not a GPU limit. **The clock is not the lever for this
+workload**; per-frame GPU work is ~2.4 ms at either clock.
+
+## Stage 11 — wf304/wf305: where the commit span goes, and non-blocking present
+
+One plugin build (`adreno-metal-plugin` rebuilt; owner trust `9a8c6509…`, addon `c1a8c2b3…`,
+CDHash `71d7e9b7…`), same kernel `29f21e4f…`, same args as wf303. Two changes, both off by
+default except the new PF fields:
+
+- The PF line now carries `b<create> e<encode> u<submit>` next to `i`/`c`/`w`; `c = b + e + u`.
+  (`NativeLegacyDisplay` line; the bridge's text stream truncates at 63 characters, so `u` is
+  derived as `c − b − e` — the first run's `e3` was a truncated `e3024`.)
+- `sheng-present-nonblock=1`: commit the scanout blit and return without the completion wait.
+
+### wf304/wf305 — split (wf305's lines are complete; the split does not depend on the wait mode)
+
+| field | p50 | p90 | max |
+|---|---|---|---|
+| import | 0.040 ms | 0.065 | 0.092 |
+| command-buffer creation (`b`) | 0.032 ms | 0.052 | 0.083 |
+| **encode (`e`)** | **2.95 ms** | 3.05 | 25.9 |
+| **submit (`u = c − b − e`)** | **4.02 ms** | 4.21 | 24.7 |
+| commit (`c`) | 7.03 ms | 9.07 | 40.8 |
+| GPU wait (`w`) | 0 (non-block) / 2.32 (wf304) | — | 15.1 |
+
+The Metal-side encode is not free: **3 ms to create the linear texture over the surface pages and
+encode the one copy** — m2v's `newTextureWithDescriptor:offset:bytesPerRow:` path (a 2D texture over
+a buffer is a linear image where the device lays one out as Metal does, else a shadow image the
+encoders copy through; Turnip takes the fallback — the DRM-modifier warning in the same telemetry).
+The submit call is another **4.0 ms**, of which the kernel's per-submission write-combine
+re-assertion is the next suspect (wf306 adds its cost to the 30 s console line).
+
+### wf305 — non-blocking present
+
+PF `w0` on every frame; present service 9.8–9.9 → **7.3–7.5 ms**, and the animation cadence is
+unchanged (burst interval p50 32.7 vs 33.0 ms, same press windows). The 2.3 ms wait is therefore
+off the frame's critical path at this pacing — it is wasted CPU, not a pacer. AMFI clean, plugin
+opened 4×, no display failures (`failures=0`).
+
+### wf306 — kernel-side submit attribution (result)
+
+Kernel `143f7526…` adds `wc_us` / `wc_reset` / `cache_us` (cumulative) to the 30 s
+`PICASSO_GPU submits live` line: time in `NativeAdrenoReassertWriteCombined`, pages it reset, and
+cache-maintenance time. Same addon/trust/args as wf304.
+
+**The write-combine re-assertion is not the cost: `wc_us=0 wc_reset=0` for the whole run** — the
+submitted BOs are not on the write-combined path, so the walk never runs. Cache maintenance is
+~1.0 ms per submission (`cache_us` 3.52→4.12 s over 600 submissions between two samples); the
+rest of the 4.0 ms submit is in m2v/Turnip user space (scheduler hand-off and the inline
+`vkQueueSubmit`; FAST-PATHS documents that handing the submission to the scheduler thread "is not
+built").
+
+### What the present path costs, and what it does not
+
+Per frame at either clock: import 40 µs + create 32 µs + **encode 2.95 ms** (linear-texture
+creation over the surface + one copy; Turnip takes m2v's shadow-image fallback) + **submit
+4.0 ms** + wait 2.3 ms (removable with `sheng-present-nonblock=1`). None of it paces the UI: the
+idle screen updates at 10 fps by content, animations at 33 ms by CA's own schedule. The measured
+levers, in order of size, would be m2v's texture-over-buffer encode and its inline submission —
+both outside this tree — not the kernel, not the GPU clock.
