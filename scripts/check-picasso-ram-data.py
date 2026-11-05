@@ -119,18 +119,18 @@ def main():
     short_raw = out / 'short.cdr'
     short_raw.write_bytes(raw_bytes[:-1])
     rejected('raw size mismatch', lambda: data.inspect_packed(packed, short_raw))
-    empty_data = out / 'empty1g.dbrdisk'
-    empty_data.write_bytes(struct.pack('<8sIIQQ', b'DBRDISK1', 1, page, 1024 * 1024**2, 0))
+    empty_data = out / 'empty2g.dbrdisk'
+    empty_data.write_bytes(struct.pack('<8sIIQQ', b'DBRDISK1', 1, page, data.DATA_BYTES, 0))
 
     def verify_sparse():
         result = data.inspect_packed(empty_data)
         digest = hashlib.sha256()
-        for _ in range(1024):
+        for _ in range(data.DATA_BYTES // 1024**2):
             digest.update(bytes(1024**2))
         assert result['logical_bytes'] == data.DATA_BYTES
         assert result['raw_sha256'] == digest.hexdigest()
 
-    passes('1 GiB logical empty disk hashes without dense allocation', verify_sparse)
+    passes('2 GiB logical empty disk hashes without dense allocation', verify_sparse)
 
     staged = out / 'staged-budget'
     staged.mkdir()
@@ -142,13 +142,13 @@ def main():
     assert budget['files'] == 1 and budget['directories'] == 2
     assert budget['logical_bytes'] == 499 * 1024**2 + 1
     assert budget['rounded_bytes'] == 499 * 1024**2 + 4096
-    assert budget['runtime_reserve_bytes'] == 256 * 1024**2
+    assert budget['runtime_reserve_bytes'] == 512 * 1024**2
     cases.append({'case': 'budget decompressed staged apps and retain runtime reserve', 'result': 'pass'})
     with mock.patch.object(data, 'DATA_BYTES', 512 * 1024**2):
         rejected('build153 sized staged tree exceeds old 512 MiB Data',
                  lambda: data.staged_apps_budget(staged, 1024**2))
     with app.open('wb') as stream:
-        stream.truncate(800 * 1024**2)
+        stream.truncate(1600 * 1024**2)
     rejected('oversized staged apps fail before Data image creation',
              lambda: data.staged_apps_budget(staged, 1024**2))
     rejected('missing staged source', lambda: data.staged_apps_budget(out / 'missing-apps', 0))

@@ -1,0 +1,72 @@
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1411,4 +1411,43 @@
+ void picasso_user_abort(void *, uint32_t, uint64_t, int, uint32_t, uint64_t);
++#if defined(XNU_PICASSO_IMAGE_MAPPING) && XNU_PICASSO_IMAGE_MAPPING
++/* PICASSO_IMAGE_MAPPING_BEGIN: current-task metadata, no image data copies. */
++static void
++picasso_image_mapping(const char *kind, uint64_t address)
++{
++	struct proc_regioninfo_internal info = {0};
++	uintptr_t vnode_address = 0;
++	uint32_t vid = 0;
++	int found = fill_procregioninfo(current_task(), address, &info, &vnode_address, &vid);
++	/* The API returns the next region for a hole. Do not claim that region
++	 * contains the failed address, or report its unrelated file as the source. */
++	bool contains = found && address >= info.pri_address &&
++	    address - info.pri_address < info.pri_size;
++	printf("PICASSO_MAP kind=%s address=%llx found=%d contains=%u start=%llx bytes=%llx offset=%llx\n",
++	    kind, (unsigned long long)address, found, contains, (unsigned long long)info.pri_address,
++	    (unsigned long long)info.pri_size, (unsigned long long)info.pri_offset);
++	printf("PICASSO_MAP kind=%s prot=%x max=%x flags=%x tag=%u resident=%u swapped=%u\n",
++	    kind, info.pri_protection, info.pri_max_protection, info.pri_flags,
++	    info.pri_user_tag, info.pri_pages_resident, info.pri_pages_swapped_out);
++	if (!contains || !vnode_address) return;
++	vnode_t vp = (vnode_t)vnode_address;
++	int error = vnode_getwithvid(vp, vid);
++	if (error) {
++		printf("PICASSO_MAP kind=%s vnode_error=%d\n", kind, error);
++		return;
++	}
++	char path[256] = {0};
++	int length = sizeof(path);
++	int path_error = vn_getpath(vp, path, &length);
++	path[sizeof(path) - 1] = 0;
++	off_t bytes = 0;
++	int size_error = vnode_size(vp, &bytes, vfs_context_current());
++	vnode_put(vp);
++	printf("PICASSO_MAP kind=%s file_bytes=%lld size_error=%d path_error=%d\n",
++	    kind, (long long)bytes, size_error, path_error);
++	printf("PICASSO_MAP path kind=%s path=%.176s\n", kind, path_error ? "<unavailable>" : path);
++}
++/* PICASSO_IMAGE_MAPPING_END */
++#endif
+ void
+ picasso_user_abort(void *saved, uint32_t esr, uint64_t far, int error,
+     uint32_t shared_cache_slide, uint64_t main_header)
+@@ -1455,5 +1505,8 @@
+         (unsigned long long)get_saved_state_reg(state, 26), (unsigned long long)get_saved_state_reg(state, 27),
+         (unsigned long long)get_saved_state_reg(state, 28));
++#if defined(XNU_PICASSO_IMAGE_MAPPING) && XNU_PICASSO_IMAGE_MAPPING
++    picasso_image_mapping("fault", far);
++#endif
+     /* Failed access is already final. copyin uses the current task and fails
+      * safely; no remote-task walk, texture writes or suppression of the fault. */
+     uint64_t frame = get_saved_state_fp(state);
+@@ -1477,5 +1530,16 @@
+         int copied = copyin((user_addr_t)get_saved_state_reg(state, 19), data, sizeof(data));
+         if (copied) bzero(data, sizeof(data));
++#if defined(XNU_PICASSO_IMAGE_MAPPING) && XNU_PICASSO_IMAGE_MAPPING
++        if (!copied && data[4]) {
++            picasso_image_mapping("astc-src", data[4]);
++            /* All build154 descriptors are 1080x2400, 4x4 blocks, 4320B rows.
++             * Only qualify this exact layout when inspecting the final block. */
++            if (data[6] == 0x96000000438ULL && data[7] == 0x400000001ULL &&
++                data[8] == 0x100000004ULL && data[13] == 4320 && data[14] == 0 &&
++                data[4] <= UINT64_MAX - 2592000)
++                picasso_image_mapping("astc-last", data[4] + 2592000 - 16);
++        }
++#endif
+         printf("PICASSO_ASTC descriptor copy_error=%d dst=%llx src=%llx size=%llx/%llx block=%llx\n",
+             copied, (unsigned long long)data[3], (unsigned long long)data[4],
+             (unsigned long long)data[6], (unsigned long long)data[7], (unsigned long long)data[8]);

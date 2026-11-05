@@ -149,6 +149,8 @@ jobs:
           python3 scripts/check-picasso-fb-method-trace.py --xnu out/picasso/tree/.cache/xnu-work --output out/picasso/host-checks/fb-method-trace
           python3 scripts/check-picasso-ios16-surface-abi.py --xnu out/picasso/tree/.cache/xnu-work --output out/picasso/host-checks/ios16-surface-abi
           python3 scripts/check-picasso-microtime.py --xnu out/picasso/tree/.cache/xnu-work --output out/picasso/host-checks/microtime
+          python3 scripts/check-picasso-runtime-memory.py --xnu out/picasso/tree/.cache/xnu-work --output out/picasso/host-checks/runtime-memory
+          cp out/picasso/host-checks/runtime-memory/results.json out/picasso/logs/runtime-memory-host.json
 
       - name: Verify AES, watchdog and CPU GOP against the original donor
         run: |

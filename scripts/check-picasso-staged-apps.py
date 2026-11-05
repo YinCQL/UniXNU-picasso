@@ -50,22 +50,22 @@ static int stat_error; static unsigned supported;
 #define VFSATTR_f_bavail 1
 #define VFSATTR_f_bsize 2
 #define VFSATTR_IS_SUPPORTED(v,k) ((v)->supported & VFSATTR_##k)
-#define PICASSO_STAGED_RESERVE (256ULL * 1024 * 1024)
-#define PICASSO_STAGED_TX_ALLOWANCE (64ULL * 1024)
 static void *vfs_context_current(void) { return NULL; }
 static int vfs_getattr(mount_t mp, struct vfs_attr *v, void *ctx) {
     (void)mp; (void)ctx; v->f_bavail=available; v->f_bsize=(uint32_t)blocksize;
     v->supported=supported; return stat_error;
 }
 '''
+    prefix += '\n'.join(line for line in source.splitlines()
+                        if line.startswith('#define PICASSO_STAGED_')) + '\n'
     main_body = r'''
     blocksize=4096; supported=3; stat_error=0;
     available=2625; assert(picasso_staged_headroom(NULL,1048576)==ENOSPC);
     available=130381+131072; assert(!picasso_staged_headroom(NULL,1048576));
-    available=65536+16; assert(!picasso_staged_headroom(NULL,0));
+    available=131072+16; assert(!picasso_staged_headroom(NULL,0));
     assert(picasso_staged_headroom(NULL,1)==ENOSPC);
     assert(picasso_staged_headroom(NULL,UINT64_MAX)==ENOSPC);
-    available=65535; assert(picasso_staged_headroom(NULL,0)==ENOSPC);
+    available=131071; assert(picasso_staged_headroom(NULL,0)==ENOSPC);
     supported=0; assert(picasso_staged_headroom(NULL,0)==EINVAL);
     supported=1; assert(picasso_staged_headroom(NULL,0)==EINVAL);
     supported=2; assert(picasso_staged_headroom(NULL,0)==EINVAL);

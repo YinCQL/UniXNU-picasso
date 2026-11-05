@@ -182,6 +182,12 @@ jobs:
           python3 scripts/check-picasso-data-artifacts.py --tree out/picasso/tree --work out/picasso \
             --output out/picasso/logs/data-artifacts.json
 
+      - name: Check runtime memory and swap boundaries
+        if: ${{ !inputs.fast }}
+        run: |
+          python3 scripts/check-picasso-runtime-memory.py --xnu out/picasso/tree/.cache/xnu-work --output out/picasso/host-checks/runtime-memory
+          cp out/picasso/host-checks/runtime-memory/results.json out/picasso/logs/runtime-memory-host.json
+
       - name: Check display policy against the payload ADT
         if: ${{ !inputs.fast }}
         run: |

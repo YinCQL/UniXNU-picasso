@@ -6,7 +6,7 @@
  #define NATIVE_STAGED_APPS_OWNER 501
 +/* Preserve swap/LaunchServices and APFS transaction space while restoring apps.
 + * This is a volatile sparse Data disk; the limit is not a RAM reservation. */
-+#define PICASSO_STAGED_RESERVE (256ULL * 1024 * 1024)
++#define PICASSO_STAGED_RESERVE (512ULL * 1024 * 1024)
 +#define PICASSO_STAGED_TX_ALLOWANCE (64ULL * 1024)
 +static int
 +picasso_staged_free_bytes(mount_t mp, uint64_t *bytes)

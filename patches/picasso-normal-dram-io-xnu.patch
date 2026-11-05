@@ -1,0 +1,35 @@
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -5820,5 +5820,23 @@
+ }
+ 
++#if defined(XNU_PICASSO_NORMAL_DRAM_IO) && XNU_PICASSO_NORMAL_DRAM_IO && !defined(APPLE_ARM64_ARCH_FAMILY)
++/* Managed RAM image buffers are ordinary memory on Qualcomm. Apple's
++ * Device mappings reject the unaligned pair/vector reads in CoreGraphics
++ * and DC ZVA, even though these pages have no register side effects.
++ * Keep all unmanaged/MMIO apertures and every cached mode unchanged.
++ * The WCOMB case below retains NX/PNX and selects Normal non-cacheable. */
++static unsigned
++picasso_dram_io_wimg(unsigned wimg, pmap_paddr_t pa)
++{
++	unsigned mode = wimg & VM_WIMG_MASK;
++	if (pa_valid(pa) && (mode == VM_WIMG_IO || mode == VM_WIMG_POSTED ||
++	    mode == VM_WIMG_POSTED_REORDERED || mode == VM_WIMG_POSTED_COMBINED_REORDERED || mode == VM_WIMG_RT)) {
++		return (wimg & ~VM_WIMG_MASK) | VM_WIMG_WCOMB;
++	}
++	return wimg;
++}
++#endif
++
+ MARK_AS_PMAP_TEXT static pt_entry_t
+ wimg_to_pte(unsigned int wimg, __unused pmap_paddr_t pa)
+ {
+@@ -5825,5 +5847,8 @@
+ 	pt_entry_t pte;
+ 
++#if defined(XNU_PICASSO_NORMAL_DRAM_IO) && XNU_PICASSO_NORMAL_DRAM_IO && !defined(APPLE_ARM64_ARCH_FAMILY)
++	wimg = picasso_dram_io_wimg(wimg, pa);
++#endif
+ 	switch (wimg & (VM_WIMG_MASK)) {
+ 	case VM_WIMG_IO:
+ 		// Map DRAM addresses with VM_WIMG_IO as Device-GRE instead of

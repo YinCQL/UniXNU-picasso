@@ -128,6 +128,11 @@ jobs:
           python3 scripts/check-picasso-staged-apps.py --output out/picasso/host-checks/staged-apps
           cp out/picasso/host-checks/staged-apps/results.json out/picasso/logs/staged-apps-host.json
 
+      - name: Check runtime memory and swap boundaries
+        run: |
+          python3 scripts/check-picasso-runtime-memory.py --output out/picasso/host-checks/runtime-memory
+          cp out/picasso/host-checks/runtime-memory/results.json out/picasso/logs/runtime-memory-host.json
+
       - name: Check ephemeral keystore state boundaries
         run: |
           python3 scripts/check-picasso-keystore.py --output out/picasso/host-checks/keystore

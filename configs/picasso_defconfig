@@ -29,6 +29,10 @@ CONFIG_XNU_NATIVE_AES=y
 # CONFIG_XNU_NATIVE_VIRTIO_BLOCK is not set
 # CONFIG_XNU_NATIVE_VIRTIO_CONSOLE is not set
 CONFIG_XNU_NATIVE_RAM_BLOCK=y
+# Qualcomm CPU image copies require Normal memory for managed DRAM buffers.
+# Register apertures and bootloader carveouts keep their Device attributes.
+CONFIG_XNU_PICASSO_NORMAL_DRAM_IO=y
+CONFIG_XNU_PICASSO_IMAGE_MAPPING=y
 # CONFIG_XNU_NATIVE_MOBILE_DISPLAY is not set
 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
 CONFIG_XNU_NOVATEK_TOUCH=y

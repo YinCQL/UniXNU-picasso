@@ -1,0 +1,58 @@
+--- a/bsd/vm/vm_compressor_backing_file.c
++++ b/bsd/vm/vm_compressor_backing_file.c
+@@ -117,6 +117,44 @@
+ #endif
+ }
+ 
++/* Bound swap growth on the volatile Data mount, not on unrelated VM disks.
++ * This preserves runtime headroom against swap allocation; other writers can
++ * still consume it. A stat failure must not silently allocate through it. */
++#if defined(XNU_OWNER_DATA_MOUNT) && XNU_OWNER_DATA_MOUNT && !XNU_TARGET_OS_OSX
++static int
++picasso_swap_headroom(vnode_t vp, uint64_t requested, vfs_context_t ctx)
++{
++	mount_t mp = vnode_mount(vp);
++	if (strcmp(vfs_statfs(mp)->f_mntonname, "/private/var")) return 0;
++	uint64_t reserve = 512ULL * 1024 * 1024 + 64ULL * 1024;
++	uint64_t free_bytes = 0, growth = 0;
++	off_t existing = 0;
++	int error = vnode_size(vp, &existing, ctx);
++	if (!error && existing < 0) error = EINVAL;
++	if (!error && requested > (uint64_t)existing) growth = requested - (uint64_t)existing;
++	/* Shrinks cannot consume the reserve and must remain available at ENOSPC. */
++	if (!error && !growth) return 0;
++	struct vfs_attr va;
++	VFSATTR_INIT(&va);
++	VFSATTR_WANTED(&va, f_bavail);
++	VFSATTR_WANTED(&va, f_bsize);
++	if (!error) error = vfs_getattr(mp, &va, ctx);
++	if (!error && (!VFSATTR_IS_SUPPORTED(&va, f_bavail) ||
++	    !VFSATTR_IS_SUPPORTED(&va, f_bsize) || !va.f_bsize ||
++	    va.f_bavail > UINT64_MAX / va.f_bsize)) error = EINVAL;
++	if (!error) {
++		free_bytes = va.f_bavail * va.f_bsize;
++		if (growth > free_bytes || free_bytes - growth < reserve) error = ENOSPC;
++	}
++	static unsigned reports;
++	if (__atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED) < 24)
++		printf("PICASSO_SWAP requested=%llu existing=%lld growth=%llu free_bytes=%llu reserve=%llu error=%d\n",
++		    (unsigned long long)requested, (long long)existing, (unsigned long long)growth,
++		    (unsigned long long)free_bytes, (unsigned long long)reserve, error);
++	return error;
++}
++#endif
++
+ int
+ vm_swapfile_preallocate(vnode_t vp, uint64_t *size, boolean_t *pin)
+ {
+@@ -130,6 +172,10 @@
+ 
+ 	ctx = vfs_context_kernel();
+ 
++#if defined(XNU_OWNER_DATA_MOUNT) && XNU_OWNER_DATA_MOUNT && !XNU_TARGET_OS_OSX
++	error = picasso_swap_headroom(vp, *size, ctx);
++	if (error) goto done;
++#endif
+ 	error = vnode_setsize(vp, *size, IO_NOZEROFILL, ctx);
+ 
+ 	if (error) {

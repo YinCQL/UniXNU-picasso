@@ -566,6 +566,24 @@ if [ "$(cat "$NATIVE_AIR_STAMP" 2>/dev/null || echo 0)" != "$NATIVE_AIR_INIT" ];
   printf '%s\n' "$NATIVE_AIR_INIT" > "$NATIVE_AIR_STAMP"
 fi
 EXTRA_MAKE_ARGS+=("kern_exec.o_CFLAGS_ADD=-DXNU_NATIVE_AIR_INIT=$NATIVE_AIR_INIT -DXNU_OWNER_CACHE_MOUNT=$OWNER_CACHE_MOUNT -DXNU_OWNER_CACHE_STARTUP=$OWNER_CACHE_STARTUP -DXNU_OWNER_BOOT_MANIFEST=$OWNER_BOOT_MANIFEST -DXNU_OWNER_DATA_MOUNT=$OWNER_DATA_MOUNT -DXNU_NATIVE_RAM_BLOCK=$NATIVE_RAM_BLOCK -DXNU_OWNER_CRYPTEX_FILES=$OWNER_CRYPTEX_FILES -DXNU_OWNER_UNION_SYSTEMOS=$OWNER_UNION_SYSTEMOS -include $OWNER_DATA_HEADER")
+for PICASSO_OPTION in XNU_PICASSO_NORMAL_DRAM_IO XNU_PICASSO_IMAGE_MAPPING; do
+  if [ "${!PICASSO_OPTION:-0}" != 0 ] && [ "${!PICASSO_OPTION:-0}" != 1 ]; then
+    echo "$PICASSO_OPTION must be 0 or 1" >&2
+    exit 1
+  fi
+done
+EXTRA_MAKE_ARGS+=("pmap.o_CFLAGS_ADD=-DXNU_PICASSO_NORMAL_DRAM_IO=${XNU_PICASSO_NORMAL_DRAM_IO:-0}")
+EXTRA_MAKE_ARGS+=("kern_exit.o_CFLAGS_ADD=-DXNU_PICASSO_IMAGE_MAPPING=${XNU_PICASSO_IMAGE_MAPPING:-0}")
+EXTRA_MAKE_ARGS+=("vm_compressor_backing_file.o_CFLAGS_ADD=-DXNU_OWNER_DATA_MOUNT=$OWNER_DATA_MOUNT")
+PICASSO_MEMORY_MODE="${XNU_PICASSO_NORMAL_DRAM_IO:-0}:${XNU_PICASSO_IMAGE_MAPPING:-0}:$OWNER_DATA_MOUNT"
+PICASSO_MEMORY_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.picasso-memory-mode
+if [ "$(cat "$PICASSO_MEMORY_STAMP" 2>/dev/null || echo unset)" != "$PICASSO_MEMORY_MODE" ]; then
+  # Make does not track changes to object-specific compiler command arguments.
+  # Refresh only these source mtimes so mode changes cannot reuse stale objects.
+  touch .cache/xnu-work/osfmk/arm/pmap/pmap.c .cache/xnu-work/bsd/kern/kern_exit.c \
+    .cache/xnu-work/bsd/vm/vm_compressor_backing_file.c
+  printf '%s\n' "$PICASSO_MEMORY_MODE" > "$PICASSO_MEMORY_STAMP"
+fi
 OWNER_CACHE_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-cache-mount-mode
 if [ "$(cat "$OWNER_CACHE_STAMP" 2>/dev/null || echo 0:0)" != "$OWNER_CACHE_MOUNT:$OWNER_CACHE_STARTUP" ]; then
   rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o"

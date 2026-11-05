@@ -23,11 +23,11 @@ import uuid
 from picasso_target import OS_SHA256, LAUNCHD_SHA256, BUILD
 
 
-# build153 copied about 499 MiB of staged apps before launchd into a 512 MiB
-# volume. Leave space for swap, LaunchServices and APFS deletion transactions.
+# build154 restored 487 MiB of apps, then exhausted its 1 GiB Data volume.
+# Allow the five 128 MiB swap files plus wallpaper/LS caches and transactions.
 # Sparse pages still allocate only on writes; this is not a RAM reservation.
-DATA_BYTES = 1024 * 1024**2
-STAGED_RUNTIME_RESERVE = 256 * 1024**2
+DATA_BYTES = 2 * 1024**3
+STAGED_RUNTIME_RESERVE = 512 * 1024**2
 STAGED_METADATA_BYTES = 8192
 PAGE = 4096
 MAX_PACKED = 4 * 1024**2
