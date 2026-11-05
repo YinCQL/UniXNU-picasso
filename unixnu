@@ -42,6 +42,7 @@ def prepare(device=DEVICE, source=None):
     ls_persist_patch = device / 'patches/picasso-ls-persist-xnu.patch'
     ls_dirty_patch = device / 'patches/picasso-ls-dirty-marker-xnu.patch'
     ls_scan_patch = device / 'patches/picasso-ls-scan-xnu.patch'
+    gpu_table_patch = device / 'patches/picasso-gpu-table-xnu.patch'
     ram_block_patch = device / 'patches/picasso-native-ram-block-mode1-guard.patch'
     fingerprint = hashlib.sha256(patch.read_bytes() + b'\0' + usb_patch.read_bytes() +
                                  b'\0' + cpu_idle_patch.read_bytes() +
@@ -68,6 +69,7 @@ def prepare(device=DEVICE, source=None):
                                  b'\0' + ls_persist_patch.read_bytes() +
                                  b'\0' + ls_dirty_patch.read_bytes() +
                                  b'\0' + ls_scan_patch.read_bytes() +
+                                 b'\0' + gpu_table_patch.read_bytes() +
                                  b'\0' + ram_block_patch.read_bytes()).hexdigest()
     cache = device / '.cache'
     target = cache / f'upstream-{revision[:12]}-{fingerprint[:12]}'
@@ -207,6 +209,11 @@ def prepare(device=DEVICE, source=None):
         # and after lsd opens it and the application-registration counts compared. Applies last.
         (tree / 'patches/xnu' / (('z' * 56) + '-picasso-ls-scan.patch')).write_bytes(
             ls_scan_patch.read_bytes())
+        # CDC `gpu-table`: dump the Metal bridge's telemetry table (the rows the plugin sends as markers
+        # for the diagnostics page) into the boot log. Read-only; the table exists only while the plugin
+        # runs. Applies after the CDC console patch that owns the command dispatcher.
+        (tree / 'patches/xnu' / (('z' * 57) + '-picasso-gpu-table.patch')).write_bytes(
+            gpu_table_patch.read_bytes())
         tree.rename(target)
     return target
 

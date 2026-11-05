@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
+index a3ea1ab..263b4d1 100644
+--- a/bsd/dev/picasso_usb.c
++++ b/bsd/dev/picasso_usb.c
+@@ -384,6 +384,7 @@ static struct {
+ 	unsigned    ps_pending;
+ 	bool        save_ls_pending;
+ 	bool        ls_scan_pending;
++	bool        gpu_table_pending;
+ 	bool        register_pending;
+ 	int         publish_pending;
+ 	bool        watchdog;
+@@ -2461,6 +2462,9 @@ ud_process_command(void)
+ 	} else if (ud_command_is(ud.cmd, "ls-scan")) {
+ 		printf("PICASSO CDC: ls-scan requested; scanning after the lock\n");
+ 		ud.ls_scan_pending = true;
++	} else if (ud_command_is(ud.cmd, "gpu-table")) {
++		printf("PICASSO CDC: gpu-table requested; dumping after the lock\n");
++		ud.gpu_table_pending = true;
+ 	} else if (ud_command_is(ud.cmd, "panic-test")) {
+ 		printf("PICASSO CDC: panic-test requested; emitting marker now\n");
+ 		/*
+@@ -2676,6 +2680,24 @@ ud_poll_serialized(void)
+ 		extern int picasso_ls_scan(void);
+ 		printf("PICASSO_LSScan files=%d\n", picasso_ls_scan());
+ 	}
++	if (ud.gpu_table_pending && !ud.panic_mode) {
++		ud.gpu_table_pending = false;
++		/* The Metal bridge's telemetry table as the plugin last sent it (marker rows 0xC000/0x8000
++		 * through the publish channel): per-command-buffer commit times and commit-to-callback,
++		 * the GPU's commit counters, pipeline/library/function compile counts and totals, waits,
++		 * and the runtime's Vulkan pipeline count plus shader-cache hits/misses/writes. It is the
++		 * same table the diagnostics page renders; dumping it over CDC makes it readable in a
++		 * boot log at the moment the command arrives. */
++		extern char native_adreno_metal_rows[48][96];
++		extern volatile uint32_t native_adreno_metal_rows_seq;
++		printf("PICASSO_GPU_TABLE begin seq=%u\n", native_adreno_metal_rows_seq);
++		for (unsigned row = 0; row < 48; ++row) {
++			if (native_adreno_metal_rows[row][0]) {
++				printf("PICASSO_GPU_TABLE %u %s\n", row, native_adreno_metal_rows[row]);
++			}
++		}
++		printf("PICASSO_GPU_TABLE end\n");
++	}
+ 	if (ud.register_pending && !ud.panic_mode) {
+ 		ud.register_pending = false;
+ 		extern kern_return_t native_register_display_and_report(void)

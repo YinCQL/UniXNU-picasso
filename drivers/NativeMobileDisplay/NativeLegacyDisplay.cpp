@@ -56,6 +56,39 @@ extern "C" void native_legacy_vsync_notify(void *display,uint64_t timestamp,uint
 extern "C" bool native_legacy_set_refresh_properties(void *display);
 extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
 extern "C" uint64_t mach_continuous_time(void);
+/* Per-frame timeline for the GPU scanout hand-off (boot arg picasso-frame-trace=1; default off, no output
+ * and no work when absent). One line per completed GPU-served frame:
+ *   offer_ns  when the compositor's swap became an offer to the GPU client (kickOnce)
+ *   done_ns   when the client reported the copy complete (finishGpuSwap)
+ *   svc_us    done - offer: how long the frame was in the GPU path
+ *   gap_us    offer - the previous frame's done: how long the display had no frame to serve
+ * The userspace side of the same frames (import/encode+commit/GPU wait) is in the plugin's PF line and the
+ * telemetry table's per-command-buffer rows (CDC `gpu-table`). */
+static void picasso_frame_trace(uint64_t offer_ticks)
+{
+    extern volatile uint64_t native_gop_last_take_tick,native_gop_last_complete_tick;
+    static int enabled=-1;
+    if(enabled<0){uint32_t value=0;enabled=(PE_parse_boot_argn("picasso-frame-trace",&value,sizeof value)&&value)?1:0;}
+    if(!enabled || !offer_ticks)return;
+    static uint64_t lastDone=0,count=0;
+    const uint64_t done=mach_absolute_time();
+    const uint64_t take=native_gop_last_take_tick,complete=native_gop_last_complete_tick;
+    uint64_t offer_ns=0,done_ns=0,svc_ns=0,gap_ns=0,take_ns=0,comp_ns=0,hand_ns=0;
+    absolutetime_to_nanoseconds(offer_ticks,&offer_ns);
+    absolutetime_to_nanoseconds(done,&done_ns);
+    absolutetime_to_nanoseconds(done-offer_ticks,&svc_ns);
+    if(lastDone && offer_ns>lastDone)gap_ns=offer_ns-lastDone;
+    lastDone=done_ns;
+    /* Split offer-to-done: scheduling (offer to the client taking it, including the page mapping), the client's
+     * present (take to its completion), and this handler (completion to the display driver seeing it). */
+    if(take>offer_ticks)absolutetime_to_nanoseconds(take-offer_ticks,&take_ns);
+    if(complete>take)absolutetime_to_nanoseconds(complete-take,&comp_ns);
+    if(done>complete)absolutetime_to_nanoseconds(done-complete,&hand_ns);
+    printf("PICASSO_FRAME n=%llu offer_ns=%llu done_ns=%llu svc_us=%llu gap_us=%llu take_us=%llu comp_us=%llu hand_us=%llu\n",
+        (unsigned long long)++count,(unsigned long long)offer_ns,(unsigned long long)done_ns,
+        (unsigned long long)(svc_ns/1000),(unsigned long long)(gap_ns/1000),
+        (unsigned long long)(take_ns/1000),(unsigned long long)(comp_ns/1000),(unsigned long long)(hand_ns/1000));
+}
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
@@ -544,17 +577,19 @@ public:
     // CPU copy for the next kick.
     void finishGpuSwap(int status) {
         const OriginalLegacySwapRequest *request=gpuRequest;
+        const uint64_t offer=gpuStartTick;
         gpuStartTick=0;
         if(!request) {transferred=false;kickSwapQueue();return;}
         gpuRequest=nullptr;
         if(gpuRetired) {
             gpuRetired=false;
-            if(status==0)native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
+            if(status==0){native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);picasso_frame_trace(offer);}
             else {native_legacy_early_failures=native_legacy_early_failures+1;native_legacy_gpu_fallback_observed(status);gpuBypass=true;}
             transferred=false;kickSwapQueue();return;
         }
         if(status==0) {
             native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
+            picasso_frame_trace(offer);
             finishTransfer(request,true);return;
         }
         native_legacy_gpu_fallback_observed(status);

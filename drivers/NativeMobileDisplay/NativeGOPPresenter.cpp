@@ -18,6 +18,10 @@ volatile uint64_t native_gop_gpu_offers,native_gop_gpu_completions,native_gop_gp
 /* waitSwap: [0] calls, [1] timeouts, [2] the requested timeout of the last call (ms), [3] time the last timed-out call really waited (ns), [4] the shortest
  * and [5] the longest such wait (ns), [6] total ns waited in timed-out calls. A timed wait that returns long before its deadline shows here. */
 volatile uint64_t native_gop_wait_stats[7];
+/* Round-trip timestamps of the last swap, for the display driver's PICASSO_FRAME trace: when the waiting client took
+ * the frame (after its pages were mapped into the client) and when its completion arrived. With the display driver's
+ * offer tick this splits offer-to-done into scheduling, userspace present and completion handling. */
+volatile uint64_t native_gop_last_take_tick,native_gop_last_complete_tick;
 IOService *native_gop_presenter_create(void);
 bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height,uint32_t destY);
 void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
@@ -235,6 +239,7 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     swap.map=map;
     out->sequence=sequence;out->address=map->getVirtualAddress();out->bytes=map->getLength();out->stride=stride;
     out->width=width;out->height=height;out->format=NGP_BGRX8888;out->reserved=destY;
+    native_gop_last_take_tick=mach_absolute_time();
     IOLockUnlock(gate);return kIOReturnSuccess;
 }
 IOReturn NativeGOPPresenter::completeSwap(uint64_t sequence,int status) {
@@ -243,6 +248,7 @@ IOReturn NativeGOPPresenter::completeSwap(uint64_t sequence,int status) {
     // a frame it finished too late, or the hand-off never resumes after one timeout.
     if(!swap.offered) {IOLockUnlock(gate);return kIOReturnSuccess;}
     if(!swap.delivered || swap.sequence!=sequence) {IOLockUnlock(gate);return kIOReturnBadArgument;}
+    native_gop_last_complete_tick=mach_absolute_time();
     auto done=swap;swap={};
     cancelWatchdog();
     IOLockUnlock(gate);
