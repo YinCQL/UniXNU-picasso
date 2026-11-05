@@ -8,108 +8,66 @@
 #import <objc/runtime.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <dispatch/dispatch.h>
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
-typedef NSDirectionalEdgeInsets (*PicassoEdgeInsets)(id, SEL);
-typedef CGFloat (*PicassoMetric)(id, SEL);
-static PicassoEdgeInsets original_edge_insets;
-static PicassoMetric original_height, original_baseline;
-
+// Read-only diagnostics also use a nonexistent marker path. The bounded namei
+// probe records the attempt before lookup, so no file needs to be created and
+// no sandbox/AMFI policy is relaxed when a sysctl or console open is denied.
 static void picasso_ack(const char *name)
 {
     int value = 0;
     size_t size = sizeof(value);
-    (void)sysctlbyname(name, &value, &size, NULL, 0);
+    // Height and baseline have marker-only acknowledgements; the original
+    // kernel ABI has one generic metrics-used sysctl for edgeInsets.
+    if (strcmp(name, "kern.picasso_metrics_height_used") &&
+        strcmp(name, "kern.picasso_metrics_baseline_used"))
+        (void)sysctlbyname(name, &value, &size, NULL, 0);
+    static const char prefix[] = "kern.picasso_";
+    if (strncmp(name, prefix, sizeof(prefix) - 1)) return;
+    char marker[160];
+    int length = snprintf(marker, sizeof(marker), "/private/var/picasso/picasso-marker-%s",
+                          name + sizeof(prefix) - 1);
+    if (length <= 0 || (size_t)length >= sizeof(marker)) return;
+    int fd = open(marker, O_RDONLY);
+    if (fd >= 0) close(fd);
 }
 
 #include "picasso-astc-guard.m"
+#include "picasso-statusbar-metrics.m"
 
-// DevicesOverlay.apk: 34.259979 px / 3, plus the requested 2 pt downward shift.
-static const CGFloat picasso_top_padding = 13.42;
-
-static CGFloat picasso_statusbar_offset(CGSize size)
+static void picasso_statusbar_start(void)
 {
-    // G7A panel: approximately 69.5 x 154.4 mm, 1080 x 2400 pixels.
-    // Vendor DTS reports 695 x 1544 in fields named mm (a tenfold metadata
-    // error); do not use those values as literal millimetres. At 360 x 800
-    // points this moves the battery 75.1 points, about 225 panel pixels.
-    CGFloat millimetres = size.width > size.height ? 154.4 : 69.5;
-    return size.width > 0 && size.height > 0 ? size.width * 14.5 / millimetres : 0;
-}
-
-static NSDirectionalEdgeInsets picasso_edge_insets(id receiver, SEL selector)
-{
-    static unsigned acknowledged;
-    if (!__atomic_exchange_n(&acknowledged, 1, __ATOMIC_RELAXED))
-        picasso_ack("kern.picasso_metrics_used");
-    NSDirectionalEdgeInsets insets = original_edge_insets(receiver, selector);
-    // Vendor 26.729980 px / 3, plus the requested 2 pt clock shift to the right.
-    insets.leading = 10.91;
-    // Pad's native trailing margin is 5 pt; the previous LegacyPhone margin
-    // was 5.5 pt. Keep that origin and move the battery another 4 pt left.
-    insets.trailing += 4.5 + picasso_statusbar_offset(UIScreen.mainScreen.bounds.size);
-    return insets;
-}
-
-static CGFloat picasso_height(id receiver, SEL selector)
-{
-    return original_height(receiver, selector) + picasso_top_padding;
-}
-
-static CGFloat picasso_baseline(id receiver, SEL selector)
-{
-    return original_baseline(receiver, selector) + picasso_top_padding;
-}
-
-static BOOL picasso_metric_compatible(Method method, const char *expected)
-{
-    if (!method || method_getNumberOfArguments(method) != 2) return NO;
-    char *return_type = method_copyReturnType(method);
-    BOOL compatible = return_type && !strcmp(return_type, expected);
-    free(return_type);
-    return compatible;
-}
-
-static BOOL picasso_install_statusbar(void)
-{
-    Class provider = objc_getClass("_UIStatusBarVisualProvider_Pad_ForcedNoCell");
-    Method method = class_getClassMethod(provider, @selector(edgeInsets));
-    Method height = class_getClassMethod(provider, @selector(height));
-    Method baseline = class_getClassMethod(provider, @selector(baselineOffset));
-    // 20H392 returns NSDirectionalEdgeInsets in d0-d3, not CGRect or an
-    // instance metric. Refuse an incompatible UIKit rather than guessing ABI.
-    if (!picasso_metric_compatible(method, @encode(NSDirectionalEdgeInsets)) ||
-        !picasso_metric_compatible(height, @encode(CGFloat)) ||
-        !picasso_metric_compatible(baseline, @encode(CGFloat))) return NO;
-    original_edge_insets = (PicassoEdgeInsets)method_getImplementation(method);
-    original_height = (PicassoMetric)method_getImplementation(height);
-    original_baseline = (PicassoMetric)method_getImplementation(baseline);
-    class_replaceMethod(object_getClass(provider), @selector(edgeInsets),
-                        (IMP)picasso_edge_insets, method_getTypeEncoding(method));
-    class_replaceMethod(object_getClass(provider), @selector(height),
-                        (IMP)picasso_height, method_getTypeEncoding(height));
-    class_replaceMethod(object_getClass(provider), @selector(baselineOffset),
-                        (IMP)picasso_baseline, method_getTypeEncoding(baseline));
-    return YES;
-}
-
-__attribute__((constructor))
-static void picasso_springboard_probe(void)
-{
-    picasso_install_astc_guard();
     BOOL installed = picasso_install_statusbar();
-    // Either logging path can be denied by a process sandbox. A kernel exec
-    // environment message alone does not establish that this constructor ran.
-    picasso_ack("kern.picasso_inject_ack");
     picasso_ack(installed ? "kern.picasso_metrics_installed" : "kern.picasso_metrics_unavailable");
-
-    const char *line = installed ? "PICASSO_SBINJECT statusbar metrics installed (left 10.91 pt, down 13.42 pt, battery shift 14.5 mm + 4 pt)\n"
+    const char *line = installed ? "PICASSO_SBINJECT statusbar metrics installed (left 8.91 pt, down 11.42 pt, battery shift 14.5 mm)\n"
                                  : "PICASSO_SBINJECT statusbar metric unavailable\n";
     int fd = open("/dev/console", O_WRONLY);
     if (fd >= 0) {
         (void)write(fd, line, strlen(line));
         close(fd);
+    }
+    if (!installed) {
+        // UIKit is a linked dependency, but a missing runtime class must not
+        // turn the sole constructor attempt into a permanent silent failure.
+        // One main-queue retry, no polling and no metric calls faking "used".
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BOOL ready = picasso_install_statusbar();
+            picasso_ack(ready ? "kern.picasso_metrics_installed" : "kern.picasso_metrics_unavailable");
+        });
+    }
+}
+
+__attribute__((constructor))
+static void picasso_springboard_probe(void)
+{
+    // Record entry before either installation path can fail.
+    picasso_ack("kern.picasso_inject_ack");
+    @autoreleasepool {
+        picasso_statusbar_start();
+        picasso_install_astc_guard();
     }
 }

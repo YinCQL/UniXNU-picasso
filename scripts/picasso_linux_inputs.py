@@ -43,6 +43,7 @@ def recipe(tree):
         sha.update(name.encode() + b'\0' + (ROOT / 'scripts' / name).read_bytes() + b'\0')
     for path in (ROOT / 'package/picasso-springboard/picasso-springboard-probe.m',
                  ROOT / 'package/picasso-springboard/picasso-astc-guard.m',
+                 ROOT / 'package/picasso-springboard/picasso-statusbar-metrics.m',
                  ROOT / 'package/picasso-springboard/picasso-astc-guard-core.h',
                  tree / 'drivers/DarwinBoot/Test/packed_ramdisk.py',
                  tree / 'scripts/seed-data-skip-setup.py'):

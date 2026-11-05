@@ -1,31 +1,38 @@
 --- a/bsd/vfs/vfs_lookup.c	2026-11-04 08:26:22
 +++ b/bsd/vfs/vfs_lookup.c	2026-11-04 08:29:14
-@@ -142,6 +142,24 @@
+@@ -142,6 +142,31 @@
  		    (unsigned long long)thread_tid(vfs_context_thread(ndp->ni_cnd.cn_context)), path);
  	}
  }
 +/* Does dyld actually open the injected library, and in which process? AMFI's
 + * accepted signature says nothing about the load; a path copy for OP_OPEN is
-+ * the first proof the insertion reached the filesystem. Bounded to 64 lines. */
++ * evidence of a request, not a successful open. Bounded to 64 lines. */
++extern bool picasso_dyld_inject_target(proc_t);
 +static void
 +picasso_inject_open_probe(struct nameidata *ndp, proc_t p, const char *path)
 +{
 +	static unsigned probe_count;
-+	if (!p || ndp->ni_op != OP_OPEN) return;
++	if (!p || p != current_proc() || ndp->ni_op != OP_OPEN ||
++	    !picasso_dyld_inject_target(p)) return;
 +	const char *base = strrchr(path, '/');
 +	base = base ? base + 1 : path;
 +	if (strcmp(base, "libpicasso-sb.dylib") && strncmp(base, "picasso-marker-", 15)) return;
-+	unsigned ticket = picasso_pid1_trace_ticket(&probe_count, 64);
-+	if (!ticket) return;
++	/* Independent of picasso-probes: quiet boot must not hide the only
++	 * read-only constructor/metric acknowledgement when sysctl is denied. */
++	unsigned ticket = __atomic_load_n(&probe_count, __ATOMIC_RELAXED);
++	do {
++		if (ticket >= 64) return;
++	} while (!__atomic_compare_exchange_n(&probe_count, &ticket, ticket + 1,
++	    false, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
 +	char name[MAXCOMLEN + 1] = "?";
 +	proc_name(proc_getpid(p), name, sizeof name);
 +	printf("PICASSO_INJECT open=%u pid=%d name=%s path=%.160s\n",
-+	    ticket, proc_getpid(p), name, path);
++	    ticket + 1, proc_getpid(p), name, path);
 +}
  #endif
  
  #include <sys/paths.h>
-@@ -340,6 +358,7 @@
+@@ -340,6 +365,7 @@
  	/* Independent path samples correlate with open begin/end by thread. A
  	 * copied path is not a successful lookup or a successful open. */
  	picasso_pid1_cache_path(ndp, p, cnp->cn_pnbuf);

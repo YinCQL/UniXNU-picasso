@@ -183,6 +183,16 @@ jobs:
             -framework Foundation -framework Metal -I package/picasso-springboard \
             scripts/tests/picasso-astc-guard-objc.m -o out/astc-guard-objc
           out/astc-guard-objc
+      - name: Exercise status bar installation and inherited dispatch
+        run: |
+          set -o pipefail
+          xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -framework Foundation -framework CoreGraphics -I package/picasso-springboard \
+            scripts/tests/picasso-statusbar-objc.m -o out/statusbar-objc
+          out/statusbar-objc | tee out/statusbar-objc.log
+          out/statusbar-objc return | tee -a out/statusbar-objc.log
+          out/statusbar-objc argument | tee -a out/statusbar-objc.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -190,4 +200,5 @@ jobs:
           path: |
             out/libpicasso-sb.dylib
             out/ui-trust/results.json
+            out/statusbar-objc.log
           retention-days: 7

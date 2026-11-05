@@ -19,12 +19,17 @@ def main():
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     fixtures = [ROOT / 'scripts/tests' / name for name in
-                ('picasso-astc-guard-host.c', 'picasso-astc-status-host.c')]
+                ('picasso-astc-guard-host.c', 'picasso-astc-status-host.c', 'picasso-inject-probe-host.c')]
     patch = ROOT / 'patches/picasso-astc-status-xnu.patch'
     added = '\n'.join(row[1:] for row in patch.read_text().splitlines()
                       if row.startswith('+') and not row.startswith('+++'))
     handler = re.search(r'static int\npicasso_astc_status_sysctl.*?\n}', added, re.S)[0]
     (out / 'astc-status.inc').write_text(handler + '\n', encoding='utf-8')
+    probe_patch = ROOT / 'patches/picasso-inject-open-probe-xnu.patch'
+    probe = '\n'.join(row[1:] for row in probe_patch.read_text().splitlines()
+                      if row.startswith('+') and not row.startswith('+++'))
+    probe = re.search(r'static void\npicasso_inject_open_probe.*?\n}', probe, re.S)[0]
+    (out / 'inject-probe.inc').write_text(probe + '\n', encoding='utf-8')
     include = ROOT / 'package/picasso-springboard'
     compiler = os.environ.get('CC') or shutil.which('clang')
     if not compiler:
@@ -47,8 +52,8 @@ def main():
         if ran.returncode:
             raise RuntimeError(ran.stdout + ran.stderr)
         runs.append(dict(fixture=fixture.name, sanitized=sanitized, passed=True, output=ran.stdout))
-    inputs = [*fixtures, patch, include / 'picasso-astc-guard-core.h', include / 'picasso-astc-guard.m',
-              include / 'picasso-springboard-probe.m', Path(__file__)]
+    inputs = [*fixtures, patch, probe_patch, include / 'picasso-astc-guard-core.h', include / 'picasso-astc-guard.m',
+              include / 'picasso-springboard-probe.m', include / 'picasso-statusbar-metrics.m', Path(__file__)]
     (out / 'results.json').write_text(json.dumps(dict(passed=True, scope=__doc__, runs=runs,
         inputs={str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}),
         indent=2) + '\n', encoding='utf-8')
