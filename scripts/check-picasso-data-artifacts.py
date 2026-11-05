@@ -49,14 +49,16 @@ def payload_seed(work, spec, report, base, inspect):
     require(path.is_file() and path.with_suffix('.json').is_file(),
             'Missing payload Setup seed or transformation report')
     transform = json.loads(path.with_suffix('.json').read_text())
-    require(transform['base_sha256'] == base['raw_sha256'], 'Setup seed has the wrong base')
+    # Upstream packed_ramdisk uses SHNGSEED2 above 2 GiB, as RamBlock does.
+    # Keep raw_sha256 for full-byte audits; it is not the Setup report identity.
+    require(transform['base_sha256'] == base['seed_identity_sha256'], 'Setup seed has the wrong base')
     require(transform['build'] == firmware.BUILD, 'Setup seed has the wrong iOS build')
     require(transform['no_auto_dim'] is ('--no-auto-dim' in arguments),
             'Setup seed dim policy differs from board')
     packed = inspect(path)
     output = transform['output']
     require(output['packed'] is True, 'Setup seed must remain packed')
-    for name, field in (('logical_bytes', 'bytes'), ('raw_sha256', 'sha256'),
+    for name, field in (('logical_bytes', 'bytes'), ('seed_identity_sha256', 'sha256'),
                         ('packed_bytes', 'encoded_bytes'), ('packed_sha256', 'encoded_sha256')):
         require(packed[name] == output[field], f'Setup seed report mismatch: {name}')
     require(packed['logical_bytes'] == base['logical_bytes'], 'Setup seed changed Data capacity')

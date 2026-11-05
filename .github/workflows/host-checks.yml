@@ -147,9 +147,13 @@ jobs:
           python3 scripts/check-picasso-ram-data.py --output out/picasso/host-checks/data \
             --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py"
           python3 scripts/check-picasso-data-artifacts-host.py --output out/picasso/host-checks/payload-seed
+          python3 scripts/check-picasso-setup-identity.py \
+            --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py" \
+            --output out/picasso/host-checks/setup-identity
           mkdir -p out/picasso/logs
           cp out/picasso/host-checks/data/results.json out/picasso/logs/data-host-check.json
           cp out/picasso/host-checks/payload-seed/results.json out/picasso/logs/payload-seed-host.json
+          cp out/picasso/host-checks/setup-identity/results.json out/picasso/logs/setup-identity-host.json
 
       - name: Check persistent Data and dual record recovery
         run: |

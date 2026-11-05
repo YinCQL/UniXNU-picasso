@@ -94,13 +94,13 @@ def validate(directory, tree):
     setup = prepare.inspect_packed(directory / 'setup.dbr')
     transform = json.loads((directory / 'setup.json').read_text())
     target = load_script('picasso_target')
-    require(transform['base_sha256'] == packed['raw_sha256'] and transform['build'] == target.BUILD,
+    require(transform['base_sha256'] == packed['seed_identity_sha256'] and transform['build'] == target.BUILD,
             'Setup seed has another base or iOS build')
     arguments = board()['payload']['skip_setup_args']
     require(transform['no_auto_dim'] is ('--no-auto-dim' in arguments), 'Setup dim policy differs')
     require(transform['output']['packed'] is True and setup['logical_bytes'] == packed['logical_bytes'],
             'Setup seed is not the same packed logical volume')
-    for key, field in (('logical_bytes', 'bytes'), ('raw_sha256', 'sha256'),
+    for key, field in (('logical_bytes', 'bytes'), ('seed_identity_sha256', 'sha256'),
                        ('packed_bytes', 'encoded_bytes'), ('packed_sha256', 'encoded_sha256')):
         require(setup[key] == transform['output'][field], 'Setup report hash/geometry mismatch: ' + key)
     audit = json.loads((directory / 'data-audit.json').read_text())
