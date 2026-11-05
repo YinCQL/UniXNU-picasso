@@ -1,7 +1,62 @@
 # Zero-copy scanout: the DPU fetches the compositor's surface through the display SMMU
 
-Status: in progress. The CDC warm-reboot bug that blocked autonomous iteration is fixed (wf338);
-the display SMMU bank is measured (wf338); the direct scanout port is in wf339.
+Status: working on hardware (wf339/wf341). The CDC warm-reboot bug that blocked autonomous
+iteration is fixed (wf338); the display SMMU bank is measured (wf338); the direct scanout port is
+in wf339 and wf341 adds early retirement of the swap plus per-frame stage timing.
+
+## Measured (wf341, kernel f246a71f, early retire)
+
+```
+PICASSO_DPU smmu state=80000002
+PICASSO_DPU direct scanout on bank=2 window=10000000 boot=a0000000 stride=4320
+PICASSO_DPU flips=360 maps=3 mapfails=0 fallbacks=0 latch_timeouts=0 latch_us_max=10556
+PICASSO_DISPLAY_STATE ... submit=N accept=N reject=0 ... copies=0
+PICASSO_DPU_FRAME n=30 period_us=22459 fence_us=0 latch_us=5146
+```
+
+On the home screen while interacting:
+
+- `copies=0`, `offers=0` (the GPU presenter never sees a frame).
+- Fence wait at the swap: **mean 0.3-0.5 us, max 19 us** - by the time the swap reaches the
+  driver the GPU work for that frame is already retired, so the display path adds nothing.
+- Latch: **mean 4.5 ms, p95 8.4 ms, max 11.2 ms** (panel frame boundary every 8.3 ms at 120 Hz).
+- Frame interval over 111 samples: **median 25.2 ms (~40 fps)**, fastest 10% at 17.3 ms (58 fps),
+  p95 49.5 ms (idle gaps included), 5% of frames at <=16.7 ms.
+- 5 s submit-rate buckets during interaction: **42-46 fps** (wf339 baseline: 31-33 fps).
+
+So early retirement removed the latch from the frame period (wf339 retired after the latch) and
+the display no longer limits the rate: frames arrive at the driver every ~22-24 ms and each is on
+screen within one latch. The remaining limit is the compositor's own frame production, upstream of
+the display driver.
+
+### Why ~40 fps and not 60
+
+`getRefreshAttributes` reports `IOMFBDisplayRefresh` min 1/60 s and max 1/24 s (the family's
+default; `sheng-vsync` above 60 overrides it). The render server paces its display timer inside
+that range and settles near 40 Hz, which is the observed 24-25 ms cadence - not a render time.
+wf342 keeps the same kernel and boots with `sheng-vsync=120 sheng-vsync-fixed=1` (one fixed 120 Hz
+interval) to test whether the render server then presents at 50-60 fps.
+
+## Measured (wf339, kernel 901f0baa, `sheng-dpu-scanout=2`)
+
+```
+PICASSO_DPU smmu state=80000002
+PICASSO_DPU direct scanout on bank=2 window=10000000 boot=a0000000 stride=4320
+PICASSO_DPU flips=1200 maps=3 mapfails=0 fallbacks=0 latch_timeouts=0
+              latch_us_total=5467013 latch_us_max=12419
+PICASSO_DISPLAY_STATE ... submit=6720 accept=6720 reject=0 ... copies=0
+```
+
+- Every compositor frame is scanned out by the DPU: flips track accept, `copies=0`, the GPU
+  presenter is never offered a frame (`offers=0`).
+- Three surfaces rotate through the four windows; no map failures, no fallbacks, no latch
+  timeouts. Latch mean 4.4 ms, max 12.4 ms.
+- The compositor's submit rate measured from the state counter: **31-33 fps average** while the
+  user was interacting, with bursts to 50-60. The swap was retired only after the latch, so the
+  latch sat in the frame period; wf341 retires the swap at the flip instead and keeps the latch
+  off the retirement path (it only gates the next flip). `PICASSO_DPU_FRAME` now prints
+  `period_us/fence_us/latch_us` every 30 flips to show where the frame period goes.
+
 
 ## Why the first flip attempt could not work
 

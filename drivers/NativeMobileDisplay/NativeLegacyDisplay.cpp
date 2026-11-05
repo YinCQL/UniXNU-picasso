@@ -241,6 +241,8 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     uint64_t fenceSince=0;
     unsigned directFlips=0,directMaps=0,directMapFails=0,directLatchTimeouts=0,directFallbacks=0;
     uint64_t directLatchUs=0,directLatchMax=0;
+    uint64_t directLastFlip=0,directFenceUs=0,directPeriodUs=0,directLatchLastUs=0;
+    bool latchNeedsFinish=false;
     uint32_t bootStride=0;
     // The GOP panel's geometry, fixed from the boot video mode in startDisplay(). This line publishes
     // the full panel height (2400 rows) as the mode, so there are no bars and the surface matches it.
@@ -657,22 +659,37 @@ public:
         if(!gpuBypass) {
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
         }
-        /* sheng-dpu-scanout=2: the display fetches the compositor's surface itself. The swap is held
-         * until the GPU finished the frame and until the pipe latched the new base; the copy, its
-         * commit and its fence wait leave the frame entirely. */
+        /* sheng-dpu-scanout=2: the display fetches the compositor's surface itself. The swap waits
+         * for the GPU to finish the frame (the compositor submits when its command buffer is
+         * scheduled), flips, and retires at once; the pipe's latch completes asynchronously and
+         * only gates the next flip, so the compositor can commit on the next vsync instead of
+         * waiting for the latch. */
         if(directOn && !gpuBypass && native_legacy_surface_width(surface)>=width && native_legacy_surface_height(surface)>=height) {
-            if(!latchRequest) {
+            if(latchRequest && !(sdeRegs[0x2000/4+0x18/4]&1u)) completeLatch();
+            if(latchRequest) {transferred=true;return;}
+            {
+                const uint64_t fenceStart=mach_absolute_time();
                 if(!gpuWrote(request)) {transferred=true;return;}
+                uint64_t fenceNs=0;absolutetime_to_nanoseconds(mach_absolute_time()-fenceStart,&fenceNs);
                 const int slot=directSlot(surface,memory);
                 if(slot>=0) {
                     sdeFlipTo(directSlots[slot].iova,(uint32_t)sourceStride);
                     shownStride=(uint32_t)sourceStride;
-                    directBoot=false;pendingSlot=slot;latchRequest=request;transferred=true;
+                    directBoot=false;pendingSlot=slot;latchRequest=request;
                     latchStart=mach_absolute_time();latchTimer->setTimeoutUS(500);
-                    ++directFlips;
+                    ++directFlips;directFenceUs=fenceNs/1000;
+                    const uint64_t now=mach_absolute_time();
+                    if(directLastFlip){uint64_t ns=0;absolutetime_to_nanoseconds(now-directLastFlip,&ns);directPeriodUs=ns/1000;}
+                    directLastFlip=now;
                     native_legacy_swap_stage(1);
                     native_legacy_frame_observed(3,0,0,0,0,0);
-                    if((directFlips%60)==0)directStats();
+                    /* Early retire: the surface on screen stays mapped in its slot and the
+                     * compositor's other drawables are free, so the next frame may commit now. */
+                    if(retireSwap(request,true)) {transferred=false;native_legacy_early_retires=native_legacy_early_retires+1;}
+                    else {transferred=true;latchNeedsFinish=true;}
+                    if((directFlips%30)==0)directFrameStats();
+                    if((directFlips%120)==0)directStats();
+                    if(!transferred)kickSwapQueue();
                     return;
                 }
                 ++directFallbacks;
@@ -1144,17 +1161,26 @@ public:
         return false;
     }
     static void latchFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->latchTick();}
+    /* Finish a latch whose flush bit has cleared (or that timed out). The swap was already retired
+     * when the flip was written; this only advances the shown slot and releases a held swap. */
+    void completeLatch() {
+        if(!latchRequest)return;
+        uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-latchStart,&ns);
+        if(ns>=50000000ull)++directLatchTimeouts;
+        const uint32_t us=uint32_t(ns/1000);
+        if(us>directLatchMax)directLatchMax=us;
+        directLatchUs+=us;directLatchLastUs=us;
+        shownSlot=pendingSlot;pendingSlot=-1;
+        const OriginalLegacySwapRequest *request=latchRequest;latchRequest=nullptr;
+        if(latchNeedsFinish) {latchNeedsFinish=false;finishTransfer(request,true);return;}
+        transferred=false;
+        kickSwapQueue();
+    }
     void latchTick() {
         if(!latchRequest)return;
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-latchStart,&ns);
         if((sdeRegs[0x2000/4+0x18/4]&1u) && ns<50000000ull){latchTimer->setTimeoutUS(500);return;}
-        if(ns>=50000000ull)++directLatchTimeouts;
-        const uint32_t us=uint32_t(ns/1000);
-        if(us>directLatchMax)directLatchMax=us;
-        directLatchUs+=us;
-        shownSlot=pendingSlot;pendingSlot=-1;
-        const OriginalLegacySwapRequest *request=latchRequest;latchRequest=nullptr;
-        finishTransfer(request,true);
+        completeLatch();
     }
     static void fenceFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->fenceTick();}
     void fenceTick() {transferred=false;kickSwapQueue();}
@@ -1196,9 +1222,14 @@ public:
         if(directPages){IOFreeData(directPages,8192*sizeof(uint64_t));directPages=nullptr;}
         latchRequest=nullptr;pendingSlot=-1;shownSlot=-1;directOn=false;gDirectDisplay=nullptr;
     }
+    void directFrameStats() {
+        printf("PICASSO_DPU_FRAME n=%u period_us=%llu fence_us=%llu latch_us=%llu flips=%u\n",
+            directFlips,(unsigned long long)directPeriodUs,(unsigned long long)directFenceUs,
+            (unsigned long long)directLatchLastUs,directFlips);
+    }
     void directStats() {
         static unsigned prints;
-        if(prints>=20)return;
+        if(prints>=200)return;
         ++prints;
         printf("PICASSO_DPU flips=%u maps=%u mapfails=%u fallbacks=%u latch_timeouts=%u latch_us_total=%llu latch_us_max=%llu\n",
             directFlips,directMaps,directMapFails,directFallbacks,directLatchTimeouts,
