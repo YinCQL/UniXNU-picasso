@@ -26,39 +26,45 @@ template<class Read> int find_apid(Read read, unsigned ppid) {
 }
 struct State {
     bool ready = false, on = false, failed = false;
-    uint8_t module = 0;
+    uint8_t module = 0, source = 0;
     // No brightness/current/voltage/IRQ changes during adoption. The shipped
-    // g7a DT selects MOD_A, 12-bit brightness, CABC1, strings 0..2.
+    // g7a DT selects MOD_A, 12-bit brightness, strings 0..2. Boot160 uses HIGH, not DT CABC1.
     template<class Bus> int adopt(Bus &bus) {
         const struct { bool sink; uint8_t reg, mask, value; } checks[] = {
             {false,0x08,0x07,0}, {false,0x46,0x80,0x80},
             {true,0x46,0xf0,0x70}, {true,0x50,0x80,0x80},
-            {true,0x51,0x03,1}, {true,0x52,0x01,0},
+            {true,0x52,0x01,0},
             {true,0x73,0x01,0}, {true,0x83,0x01,0}, {true,0x93,0x01,0},
             {true,0xb0,0xc0,0},
         };
+        bool invalid = false;
+        ready = false;
         for (const auto &check : checks) {
             uint8_t value = 0;
             int error = bus.read(check.sink, check.reg, value);
             if (error) return error;
-            if ((value & check.mask) != check.value) return configuration;
+            if ((value & check.mask) != check.value) invalid = true;
             if (!check.sink && check.reg == 0x46) module = value;
         }
         uint8_t lo = 0, hi = 0;
-        int error = bus.read(true, 0x53, lo);
+        int error = bus.read(true, 0x51, source);
+        // Preserve HIGH (0) or CABC1 (1); CABC2/EXT are not qualified.
+        if (!error && (source & 3) > 1) invalid = true;
+        if (!error) error = bus.read(true, 0x53, lo);
         if (!error) error = bus.read(true, 0x54, hi);
         if (error) return error;
-        if ((hi & 0xf0) || !(lo | hi)) return configuration;
+        if (invalid || (hi & 0xf0) || !(lo | hi)) return configuration;
         ready = on = true;
         return 0;
     }
     template<class Bus> int set(Bus &bus, bool requested) {
         if (!ready || failed) return configuration;
-        uint8_t actual = 0, faults = 0, flash = 0;
+        uint8_t actual = 0, faults = 0, flash = 0, currentSource = 0;
         int error = bus.read(false, 0x46, actual);
         if (!error) error = bus.read(false, 0x08, faults);
         if (!error) error = bus.read(true, 0xb0, flash);
-        if (!error && (actual != uint8_t((module & 0x7f) | (on ? 0x80 : 0)) ||
+        if (!error) error = bus.read(true, 0x51, currentSource);
+        if (!error && (currentSource != source || actual != uint8_t((module & 0x7f) | (on ? 0x80 : 0)) ||
                        (faults & 7) || (flash & 0xc0))) error = configuration;
         if (!error && requested == on) return 0;
         // HFRC off before module gate; clear flash shutdown on enable, then

@@ -41,7 +41,7 @@ int main() {
         Bus bus;State state;bus.fail=n;assert(state.adopt(bus) && !state.ready && !bus.writes);++cases;
     }
     const unsigned bad[][3]={{0,8,1},{0,0x46,0},{1,0x46,0x80},{1,0x50,0},
-        {1,0x51,0},{1,0x52,1},{1,0x73,1},{1,0x83,1},{1,0x93,1},{1,0xb0,0x40},{1,0x54,0xf0}};
+        {1,0x51,2},{1,0x51,3},{1,0x52,1},{1,0x73,1},{1,0x83,1},{1,0x93,1},{1,0xb0,0x40},{1,0x54,0xf0}};
     for(auto &entry:bad) {
         Bus bus;State state;bus.regs[entry[0]][entry[1]]=uint8_t(entry[2]);
         assert(state.adopt(bus) && !state.ready && !bus.writes);++cases;
@@ -50,19 +50,26 @@ int main() {
     // poisons the state; a second request must issue no bus transactions.
     for(unsigned e=0;e<2;++e) {
         bool enable=e!=0;
-        for(unsigned n=1;n<=(enable?10U:7U);++n) {
+        for(unsigned n=1;n<=(enable?11U:8U);++n) {
             Bus bus;State state;assert(!state.adopt(bus));
             if(enable)assert(!state.set(bus,false));
             bus.fail=bus.operations+n;
             assert(state.set(bus,enable) && state.failed);
             unsigned count=bus.operations;assert(state.set(bus,!enable) && bus.operations==count);++cases;
         }
-        for(unsigned n=5;n<=7;n+=2) {
+        for(unsigned n=6;n<=(enable?10U:8U);n+=2) {
             Bus bus;State state;assert(!state.adopt(bus));
             if(enable)assert(!state.set(bus,false));
             bus.mismatch=bus.operations+n;
             assert(state.set(bus,enable)==picasso_backlight::mismatch && state.failed);++cases;
         }
+    }
+    for(unsigned src=0;src<2;++src) {
+        Bus bus;State state;bus.regs[1][0x51]=uint8_t(src);
+        assert(!state.adopt(bus) && !state.set(bus,false) && !state.set(bus,true));
+        assert(bus.regs[1][0x51]==src);++cases;
+        bus.regs[1][0x51]^=1;
+        assert(state.set(bus,false) && state.failed);++cases;
     }
     const unsigned changed[]={8,0x46,0xb0};
     for(unsigned reg:changed) {

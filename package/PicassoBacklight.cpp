@@ -85,7 +85,7 @@ extern "C" void picasso_backlight_start(IOService *display) {
         mapped=next->observer[i].open(0xe600000+unsigned(apid[i])*0x80,0x80) &&
                next->writer[i].open(0xc600000+unsigned(apid[i])*0x10000,0x1000);
     int error=mapped?next->state.adopt(*next):-4;
-    IOLog("PICASSO_WLED adopt version=%08x control_apid=%d sink_apid=%d error=%d\n",version,apid[0],apid[1],error);
+    IOLog("PICASSO_WLED adopt version=%08x control_apid=%d sink_apid=%d source=%u error=%d\n",version,apid[0],apid[1],next->state.source,error);
     if(error) {if(next->lock)IOLockFree(next->lock);delete next;return;}
     next->adopting=false;
     display->retain();
