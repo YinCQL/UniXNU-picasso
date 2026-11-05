@@ -227,6 +227,12 @@ static void install(IORegistryEntry *driver) {
 #else
 static void install(IORegistryEntry *driver) {
     if(originalDispatch || !driver)return;
+    // Only the two original classes whose table this copy was qualified
+    // against. A subclass may have slots past kSlots, which a fixed-size copy
+    // would truncate; refuse it instead of corrupting its dispatch table.
+    const OSMetaClass *meta=driver->getMetaClass();
+    const char *name=meta?meta->getClassName():nullptr;
+    if(!name || (strcmp(name,"IOHIDEventDriver") && strcmp(name,"AppleUserHIDEventService")))return;
     uintptr_t *table=*reinterpret_cast<uintptr_t **>(driver);
     uintptr_t *copy=static_cast<uintptr_t *>(IOMalloc(kSlots*sizeof(uintptr_t)));
     if(!copy)return;
@@ -258,6 +264,7 @@ class NativeHidInput : public IOHIDDevice {
 #endif
     }
     uint32_t lastSeq=0;
+    bool touchRetry=false;
     // Fingers sent as down in the previous report; a vanished identifier gets one explicit tip-up report.
     int prevIds[TOUCH_FINGERS]={-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
     int prevX[TOUCH_FINGERS]={},prevY[TOUCH_FINGERS]={};
@@ -278,16 +285,16 @@ class NativeHidInput : public IOHIDDevice {
     }
     void touchSend() {
         NativeHidInput *self=this;
-        if(!self->hasEventDriverCached())return;
         uint32_t before=native_touch_seq;
-        if((before&1) || before==self->lastSeq)return;
+        if(before==self->lastSeq){self->touchRetry=false;return;}
+        self->touchRetry=true;
+        if(!self->hasEventDriverCached() || (before&1))return;
         __asm__ volatile("dmb ish":::"memory");
         unsigned count=native_touch_count;if(count>TOUCH_FINGERS)count=TOUCH_FINGERS;
         int ids[TOUCH_FINGERS],xs[TOUCH_FINGERS],ys[TOUCH_FINGERS];
         for(unsigned i=0;i<count;++i){ids[i]=native_touch_ids[i];xs[i]=native_touch_xs[i];ys[i]=native_touch_ys[i];}
         __asm__ volatile("dmb ish":::"memory");
         if(native_touch_seq!=before)return;      // torn read: retry on the next tick
-        self->lastSeq=before;
         // Sizes follow the axis maxima of the touch core: 30480 long, 20320 short, mapped to the same 0..32767 range.
         unsigned char report[1+TOUCH_FINGERS*6+1]={3};
         unsigned slot=0;
@@ -316,17 +323,21 @@ class NativeHidInput : public IOHIDDevice {
             f[4]=(unsigned char)self->prevY[j];f[5]=(unsigned char)(self->prevY[j]>>8);
             ++slot;edge::native_touch_hid_multi[2]=edge::native_touch_hid_multi[2]+1;
         }
-        for(unsigned j=0;j<TOUCH_FINGERS;++j) {
-            self->prevIds[j]=j<downCount?nextIds[j]:-1;
-            if(j<downCount){self->prevX[j]=nextX[j];self->prevY[j]=nextY[j];}
-        }
-        if(!slot)return;
+        if(!slot){self->lastSeq=before;self->touchRetry=false;return;}
         report[1+TOUCH_FINGERS*6]=(unsigned char)slot;
         IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
         IOReturn result=buffer?self->submitReport(buffer):kIOReturnNoMemory;
         OSSafeReleaseNULL(buffer);
         native_hid_input_observed(6,result);
         native_touch_hid_reports=native_touch_hid_reports+1;
+        // Commit only reports accepted by the original family. A failed lift
+        // keeps the previous fingers so the next tick still releases them.
+        if(result!=kIOReturnSuccess){self->touchRetry=true;return;}
+        self->lastSeq=before;self->touchRetry=false;
+        for(unsigned j=0;j<TOUCH_FINGERS;++j) {
+            self->prevIds[j]=j<downCount?nextIds[j]:-1;
+            if(j<downCount){self->prevX[j]=nextX[j];self->prevY[j]=nextY[j];}
+        }
     }
     // The button driver's thread calls buttonsNotify on every change of the pressed set.
     static void buttonsNotify(void *context,uint32_t mask) {
@@ -369,6 +380,9 @@ class NativeHidInput : public IOHIDDevice {
     static void tick(OSObject *owner,IOTimerEventSource *source) {
         NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return;
         native_hid_live_checkpoint(self);
+        // Retry one undelivered snapshot per second through the existing timer;
+        // normal reports stay notification-driven.
+        if(self->touchRetry && (self->touchEnabled || self->touchOnly))self->touchSend();
         if(self->touchOnly){source->setTimeoutMS(1000);return;}
         if(!self->down && !hasEventDriver(self,4)) {
             native_hid_input_observed(3,0);
