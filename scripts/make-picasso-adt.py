@@ -205,8 +205,10 @@ def main():
                            ('certificate-security-mode', struct.pack('<I', 1)),
                            ('effective-security-mode-sep', struct.pack('<I', 1))] if apple_identity else []),
                         # Firmware has a placeholder 0; the selected phone artwork
-                        # uses 3. This is not the physical scanout stride or size.
-                        *([('display-scale', struct.pack('<I', 3))] if args.iphone_identity else []),
+                        # uses 3. Match the 1080x2400 panel exactly: 360x800 pt at
+                        # scale 3, so the compositor drawable is the scanout size.
+                        *([('display-scale', struct.pack('<I', 3)),
+                           ('display-height', struct.pack('<I', 2400))] if args.iphone_identity else []),
                         # This property describes the actual volatile Data RAM disk.
                         *([('ephemeral-storage', struct.pack('<I', 1))] if (args.data_ramdisk or args.packed_data_ramdisk) else []),
                         *( [('darwinboot-memory-size', struct.pack('<Q', args.owned_memory_size))]
@@ -249,7 +251,7 @@ def main():
                          ('model', b'xiaomi,picasso\0'),
                          *([('product-description', b'iPhone X\0' if args.iphone_identity else b'iPad Pro (12.9-inch) (2nd generation)\0'),
                             ('artwork-device-idiom', b'phone\0' if args.iphone_identity else b'pad\0'),
-                            ('artwork-device-subtype', struct.pack('<I', 2436 if args.iphone_identity else 2732)),
+                            ('artwork-device-subtype', struct.pack('<I', 2400 if args.iphone_identity else 2732)),
                             ('artwork-scale-factor', struct.pack('<I', 3 if args.iphone_identity else 2)),
                             ('artwork-display-gamut', b'P3\0'),
                             ('compatible-device-fallback', b'iPhone9,2\0' if args.iphone_identity else b'iPad6,7\0')] if apple_identity else []),
