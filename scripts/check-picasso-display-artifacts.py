@@ -60,7 +60,7 @@ def check(tree, work, kernelcache, output):
         'NativeKeyStoreEvents.late.o', 'PicassoKeyStore.o', 'PicassoAccelerator.late.o',
         'original-bindings.o', 'NativeHidInput.late.o', 'PicassoHidInput.o',
         'hid-original-bindings.o', 'NativeGOPPresenter.late.o', 'NativeGOPGlue.o',
-        'PicassoPr13.o'}, 'Wrong display/state/input archive members')
+        'PicassoPr13.o', 'PicassoButtons.o'}, 'Wrong display/state/input archive members')
     kernel = work / 'kernel/kernel.macho'
     plan = json.loads(kernel.with_suffix('.json').read_text())
     report = builder.verify_kernel(aes, native, original, kernel.read_bytes(), plan, audit)

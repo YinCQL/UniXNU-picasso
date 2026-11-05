@@ -23,7 +23,7 @@ extern "C" void native_hid_live_checkpoint(IOService *);
 extern "C" bool native_hid_input_requested(void);
 extern "C" void native_touch_set_sink(void (*)(void *), void *) __attribute__((weak_import));
 // Optional hardware buttons fed by the board button driver: a mask of report 2 bits, sent on every change.
-extern "C" void native_buttons_set_sink(void (*)(void *, uint32_t), void *) __attribute__((weak_import));
+extern "C" void native_buttons_set_sink(bool (*)(void *, uint32_t), void *) __attribute__((weak_import));
 // Optional touch digitizer fed by the board touch probe (kits/sheng/TouchProbe.cpp): finger set published with a seqlock.
 extern "C" {
 extern volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
@@ -245,6 +245,7 @@ class NativeHidInput : public IOHIDDevice {
     IOTimerEventSource *timer=nullptr;
     bool down=false;
     uint8_t buttons=0;   // report 2 bits held by the hardware buttons
+    bool buttonsStopping=false; // serialized by inputLoop
     bool touchEnabled=false;
     // The digitizer is a separate service from the keyboard: backboardd matches digitizers by primary usage page/usage
     // (Digitizer/Touch Screen) and the Built-In flag, which a combined keyboard-first descriptor would not provide.
@@ -329,20 +330,36 @@ class NativeHidInput : public IOHIDDevice {
         native_touch_hid_reports=native_touch_hid_reports+1;
     }
     // The button driver's thread calls buttonsNotify on every change of the pressed set.
-    static void buttonsNotify(void *context,uint32_t mask) {
+    static bool buttonsNotify(void *context,uint32_t mask) {
         NativeHidInput *self=static_cast<NativeHidInput *>(context);
-        if(self && self->inputLoop)self->inputLoop->runAction(&NativeHidInput::buttonsAction,self,reinterpret_cast<void *>(uintptr_t(mask)));
+        return self && self->inputLoop && self->inputLoop->runAction(&NativeHidInput::buttonsAction,self,
+            reinterpret_cast<void *>(uintptr_t(mask)))==kIOReturnSuccess;
     }
     static IOReturn buttonsAction(OSObject *owner,void *mask,void *,void *,void *) {
-        NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return kIOReturnSuccess;
-        self->buttons=static_cast<uint8_t>(uintptr_t(mask)&0xe);
-        if(!self->hasEventDriverCached())return kIOReturnSuccess;
-        unsigned char report[]={2,static_cast<unsigned char>((self->down?1:0)|self->buttons)};
+        NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);
+        if(!self || self->buttonsStopping)return kIOReturnNotReady;
+        // Private producer control bit; never enters the Consumer report.
+        if(uintptr_t(mask)&0x80000000u)return stopButtons(owner,nullptr,nullptr,nullptr,nullptr);
+        const uint8_t next=static_cast<uint8_t>(uintptr_t(mask)&0xe);
+        if(!self->hasEventDriverCached())return kIOReturnNotReady;
+        unsigned char report[]={2,static_cast<unsigned char>((self->down?1:0)|next)};
         IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
         IOReturn result=buffer?self->submitReport(buffer):kIOReturnNoMemory;
         OSSafeReleaseNULL(buffer);
         native_hid_input_observed(4,result);
-        return kIOReturnSuccess;
+        if(result==kIOReturnSuccess)self->buttons=next;
+        return result;
+    }
+    static IOReturn stopButtons(OSObject *owner,void *,void *,void *,void *) {
+        NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);
+        if(!self)return kIOReturnBadArgument;
+        // Explicit device teardown, not a fabricated hardware release.
+        IOReturn result=self->buttons?buttonsAction(self,nullptr,nullptr,nullptr,nullptr):kIOReturnSuccess;
+        // Even if the final submission failed, later Home reports must not
+        // reassert a stale physical hold after the hardware transport stopped.
+        self->buttons=0;
+        self->buttonsStopping=true;
+        return result;
     }
     bool hasEventDriverCached() {
         if(!eventDriverFound) {
@@ -441,6 +458,7 @@ public:
     void stop(IOService *provider) override {
         if((touchOnly||touchEnabled) && &native_touch_set_sink)native_touch_set_sink(nullptr,nullptr);
         if(!touchOnly && &native_buttons_set_sink)native_buttons_set_sink(nullptr,nullptr);
+        if(!touchOnly && inputLoop)inputLoop->runAction(&NativeHidInput::stopButtons,this);
         if(timer){timer->cancelTimeout();inputLoop->removeEventSource(timer);OSSafeReleaseNULL(timer);}
         IOHIDDevice::stop(provider);
     }

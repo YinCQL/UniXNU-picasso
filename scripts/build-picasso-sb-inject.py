@@ -35,7 +35,13 @@ def main():
                    '-o', str(output), str(source)]
     subprocess.run(compile_cmd, check=True)
     # The payload's scoped UI trust module must match this final signature.
-    subprocess.run(['codesign', '--force', '--sign', '-', str(output)], check=True)
+    # This owned library runs on the native-4K kernel. Sign 4K code slots
+    # directly, avoiding the 16K-to-4K preflight/read/allocation path after
+    # AMFI registration. Segment alignment and all signature checks remain.
+    subprocess.run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', str(output)], check=True)
+    from picasso_ui_trust import library_identity
+    if library_identity(output.read_bytes())['code_page_bytes'] != 4096:
+        raise RuntimeError('UI library must be signed with native 4K code slots')
     identity = subprocess.check_output(['codesign', '-dvvv', str(output)], stderr=subprocess.STDOUT).decode()
     print(f'picasso: built {output.name} ({output.stat().st_size} bytes)')
     for key in ('CodeDirectory', 'Signature', 'CDHash'):

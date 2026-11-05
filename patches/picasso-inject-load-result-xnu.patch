@@ -1,0 +1,166 @@
+--- a/bsd/kern/kern_descrip.c
++++ b/bsd/kern/kern_descrip.c
+@@ -2764,6 +2764,28 @@
+ }
+ #endif
+ /* PICASSO_PREFLIGHT_END */
++#if DEVELOPMENT || DEBUG
++extern bool picasso_dyld_inject_target(proc_t);
++/* Read-only load diagnostics: a successful signature check is not a load.
++ * Call with a live vnode; filter the basename before resolving process scope. */
++unsigned
++picasso_inject_load_ticket(proc_t p, vnode_t vp)
++{
++	static unsigned count;
++	if (!vp || p != current_proc()) return 0;
++	const char *name = vnode_getname(vp);
++	bool match = name && !strcmp(name, "libpicasso-sb.dylib");
++	if (name) vnode_putname(name);
++	if (!match || !picasso_dyld_inject_target(p)) return 0;
++	unsigned ticket = __atomic_load_n(&count, __ATOMIC_RELAXED);
++	do {
++		if (ticket >= 96) return 0;
++	} while (!__atomic_compare_exchange_n(&count, &ticket, ticket + 1,
++	    false, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
++	return ticket + 1;
++}
++#endif
++
+ int
+ sys_fcntl_nocancel(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
+ {
+@@ -2787,6 +2809,7 @@
+ 
+ /* PICASSO_PREFLIGHT_BEGIN */
+ #if DEVELOPMENT || DEBUG
++	unsigned inject_ticket = 0;
+ 	static unsigned pid1_fcntl_count;
+ 	unsigned pid1_ticket = (proc_getpid(p) == 1 && cmd == F_ADDFILESIGS_RETURN) ? picasso_pid1_trace_ticket(&pid1_fcntl_count, 64) : 0;
+ 	uint64_t pid1_thread = pid1_ticket ? thread_tid(current_thread()) : 0;
+@@ -2794,6 +2817,8 @@
+ 	    pid1_ticket, (unsigned long long)pid1_thread, fd, cmd);
+ #define PICASSO_PID1_FCNTL_RETURN(value) do { \
+ 	int pid1_error = (value); \
++	if (inject_ticket) printf("PICASSO_INJECT fcntl s=%u pid=%d fd=%d cmd=%d error=%d\n", \
++	    inject_ticket, proc_getpid(p), fd, cmd, pid1_error); \
+ 	if (pid1_ticket) printf("PICASSO_PID1 fcntl end s=%u t=%llu fd=%d errno=%d\n", \
+ 	    pid1_ticket, (unsigned long long)pid1_thread, fd, pid1_error); \
+ 	return pid1_error; \
+@@ -3956,6 +3981,9 @@
+ 		}
+ 		vp = (struct vnode *)fp_get_data(fp);
+ 		proc_fdunlock(p);
++#if DEVELOPMENT || DEBUG
++		if (cmd == F_ADDFILESIGS_RETURN) inject_ticket = picasso_inject_load_ticket(p, vp);
++#endif
+ 
+ 		if (cmd == F_ADDFILESIGS_FOR_DYLD_SIM) {
+ 			blob_add_flags |= MAC_VNODE_CHECK_DYLD_SIM;
+@@ -4113,6 +4141,11 @@
+ 			if (blob) {
+ 				end_offset = blob->csb_end_offset;
+ 			}
++#if DEVELOPMENT || DEBUG
++			if (inject_ticket) printf("PICASSO_INJECT coverage s=%u pid=%d signed_end=%llx signature_offset=%llx\n",
++			    inject_ticket, proc_getpid(p), (unsigned long long)end_offset,
++			    (unsigned long long)fs.fs_blob_start);
++#endif
+ 			error = copyout(&end_offset, argp, sizeof(end_offset));
+ 
+ 			if (error) {
+@@ -4276,6 +4309,9 @@
+ 		}
+ 		fg = fp->fp_glob;
+ 		proc_fdunlock(p);
++#if DEVELOPMENT || DEBUG
++		inject_ticket = picasso_inject_load_ticket(p, (vnode_t)fg_get_data(fg));
++#endif
+ 
+ 		if (IS_64BIT_PROCESS(p)) {
+ 			error = copyin(argp, &lv, sizeof(lv));
+@@ -4294,6 +4330,19 @@
+ #if CONFIG_MACF
+ 		error = mac_file_check_library_validation(p, fg, lv.lv_file_start,
+ 		    (user_long_t)lv.lv_error_message, lv.lv_error_message_size);
++#if DEVELOPMENT || DEBUG
++		if (inject_ticket && error) {
++			char message[160] = {};
++			size_t copied = 0;
++			size_t limit = lv.lv_error_message_size < sizeof(message) ? lv.lv_error_message_size : sizeof(message);
++			int copy_error = limit ? copyinstr((user_addr_t)lv.lv_error_message, message, limit, &copied) : EINVAL;
++			if (copy_error) message[0] = 0;
++			for (size_t i = 0; i < sizeof(message) && message[i]; ++i)
++				if ((unsigned char)message[i] < 32 || (unsigned char)message[i] > 126) message[i] = '?';
++			printf("PICASSO_INJECT library_validation s=%u pid=%d error=%d message_copy=%d message=%.159s\n",
++			    inject_ticket, proc_getpid(p), error, copy_error, message);
++		}
++#endif
+ #endif
+ 
+ 		break;
+--- a/bsd/kern/kern_mman.c
++++ b/bsd/kern/kern_mman.c
+@@ -199,6 +199,9 @@
+ }
+ #endif
+ /* PICASSO_PREFLIGHT_END */
++#if DEVELOPMENT || DEBUG
++extern unsigned picasso_inject_load_ticket(proc_t, vnode_t);
++#endif
+ int
+ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
+ {
+@@ -231,6 +234,7 @@
+ 
+ /* PICASSO_PREFLIGHT_BEGIN */
+ #if DEVELOPMENT || DEBUG
++	unsigned inject_ticket = 0;
+ 	static unsigned pid1_mmap_count;
+ 	unsigned pid1_ticket = (proc_getpid(p) == 1 && fd >= 0 && !(uap->flags & MAP_ANON)) ? picasso_pid1_trace_ticket(&pid1_mmap_count, 64) : 0;
+ 	uint64_t pid1_thread = pid1_ticket ? thread_tid(current_thread()) : 0;
+@@ -238,6 +242,9 @@
+ 	    pid1_ticket, (unsigned long long)pid1_thread, fd, (unsigned long long)uap->pos, (unsigned long long)uap->len, (unsigned)uap->prot, (unsigned)uap->flags);
+ #define PICASSO_PID1_MMAP_RETURN(value) do { \
+ 	int pid1_error = (value); \
++	if (inject_ticket) printf("PICASSO_INJECT mmap s=%u pid=%d off=%llx len=%llu prot=%x error=%d addr=%llx\n", \
++	    inject_ticket, proc_getpid(p), (unsigned long long)uap->pos, (unsigned long long)uap->len, \
++	    (unsigned)uap->prot, pid1_error, pid1_error ? 0ULL : (unsigned long long)*retval); \
+ 	if (pid1_ticket) printf("PICASSO_PID1 mmap end s=%u t=%llu fd=%d errno=%d addr=%llx\n", \
+ 	    pid1_ticket, (unsigned long long)pid1_thread, fd, pid1_error, pid1_error ? 0ULL : (unsigned long long)*retval); \
+ 	return pid1_error; \
+@@ -573,6 +580,9 @@
+ 			goto bad;
+ 		}
+ 
++#if DEVELOPMENT || DEBUG
++		inject_ticket = picasso_inject_load_ticket(p, vp);
++#endif
+ 		if (vp->v_type != VREG && vp->v_type != VCHR) {
+ 			(void)vnode_put(vp);
+ 			error = EINVAL;
+--- a/bsd/kern/kern_newsysctl.c
++++ b/bsd/kern/kern_newsysctl.c
+@@ -1980,6 +1980,23 @@
+ 		return error;
+ 	}
+ 	name[namelen] = '\0';
++#if DEVELOPMENT || DEBUG
++	/* Observe the request even if sandbox/sysctl permissions deny the read.
++	 * No copyout, permission or result is changed by this bounded probe. */
++	if (!uap->new && !uap->newlen && namelen > 13 && namelen < 80 && strlen(name) == namelen && !strncmp(name, "kern.picasso_", 13)) {
++		extern bool picasso_dyld_inject_target(proc_t);
++		static unsigned count;
++		bool valid_name = true;
++		for (size_t i = 13; i < namelen; ++i)
++			if ((name[i] < 'a' || name[i] > 'z') && name[i] != '_') valid_name = false;
++		if (valid_name && picasso_dyld_inject_target(p)) {
++			unsigned ticket = __atomic_load_n(&count, __ATOMIC_RELAXED);
++			do { if (ticket >= 64) break; }
++			while (!__atomic_compare_exchange_n(&count, &ticket, ticket + 1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
++			if (ticket < 64) printf("PICASSO_INJECT sysctl_request=%u pid=%d name=%.79s\n", ticket + 1, proc_getpid(p), name);
++		}
++	}
++#endif
+ 
+ 	/* XXX
+ 	 * AUDIT_ARG(ctlname, name, uap->namelen);

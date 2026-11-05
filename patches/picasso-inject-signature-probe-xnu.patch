@@ -6,7 +6,7 @@
  	VFS_KERNEL_DEBUG_END1(43, vp);
 +#if DEVELOPMENT || DEBUG
 +	/* Did AMFI accept the inserted SpringBoard library? The open probe shows
-+	 * dyld reaching the path; this shows whether validation let it map. */
++	 * dyld reaching the path; this is only the signature-registration stage. */
 +	{
 +		char picasso_name[32] = "?";
 +		proc_name(proc_selfpid(), picasso_name, sizeof picasso_name);

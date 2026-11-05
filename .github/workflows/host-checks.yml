@@ -108,6 +108,11 @@ jobs:
           python3 scripts/check-picasso-hid-plan.py --output out/picasso/host-checks/hid-plan
           cp out/picasso/host-checks/hid-plan/results.json out/picasso/logs/hid-plan-host.json
 
+      - name: Check physical PMIC buttons and HID teardown
+        run: |
+          python3 scripts/check-picasso-buttons.py --output out/picasso/host-checks/buttons
+          cp out/picasso/host-checks/buttons/results.json out/picasso/logs/buttons-host.json
+
       - name: Check authenticated UFS record cache
         run: |
           python3 scripts/check-picasso-ufs-cache.py --output out/picasso/host-checks/ufs-cache

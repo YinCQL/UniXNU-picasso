@@ -291,6 +291,8 @@ kernel_args = [
   "sheng-touch-hid=1",
   # Download the pinned firmware and deliver physical contacts after HID is ready.
   "sheng-touch=4",
+  # PM8150 PON power/down and PM8150L GPIO5 up, SPMI v5 observer reads.
+  "picasso-buttons=1",
   "offline-hid-auto-home=5",
   "offline-hid-swipe-delay=8",
   "offline-hid-auto-home-count=8",

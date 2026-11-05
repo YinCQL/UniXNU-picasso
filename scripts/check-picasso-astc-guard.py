@@ -19,7 +19,8 @@ def main():
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     fixtures = [ROOT / 'scripts/tests' / name for name in
-                ('picasso-astc-guard-host.c', 'picasso-astc-status-host.c', 'picasso-inject-probe-host.c')]
+                ('picasso-astc-guard-host.c', 'picasso-astc-status-host.c', 'picasso-inject-probe-host.c',
+                 'picasso-inject-load-host.c')]
     patch = ROOT / 'patches/picasso-astc-status-xnu.patch'
     added = '\n'.join(row[1:] for row in patch.read_text().splitlines()
                       if row.startswith('+') and not row.startswith('+++'))
@@ -30,6 +31,11 @@ def main():
                       if row.startswith('+') and not row.startswith('+++'))
     probe = re.search(r'static void\npicasso_inject_open_probe.*?\n}', probe, re.S)[0]
     (out / 'inject-probe.inc').write_text(probe + '\n', encoding='utf-8')
+    load_patch = ROOT / 'patches/picasso-inject-load-result-xnu.patch'
+    added_load = '\n'.join(row[1:] for row in load_patch.read_text().splitlines()
+                           if row.startswith('+') and not row.startswith('+++'))
+    ticket = re.search(r'unsigned\npicasso_inject_load_ticket.*?\n}', added_load, re.S)[0]
+    (out / 'inject-load-ticket.inc').write_text(ticket + '\n', encoding='utf-8')
     include = ROOT / 'package/picasso-springboard'
     compiler = os.environ.get('CC') or shutil.which('clang')
     if not compiler:
@@ -52,7 +58,7 @@ def main():
         if ran.returncode:
             raise RuntimeError(ran.stdout + ran.stderr)
         runs.append(dict(fixture=fixture.name, sanitized=sanitized, passed=True, output=ran.stdout))
-    inputs = [*fixtures, patch, probe_patch, include / 'picasso-astc-guard-core.h', include / 'picasso-astc-guard.m',
+    inputs = [*fixtures, patch, probe_patch, load_patch, include / 'picasso-astc-guard-core.h', include / 'picasso-astc-guard.m',
               include / 'picasso-springboard-probe.m', include / 'picasso-statusbar-metrics.m', Path(__file__)]
     (out / 'results.json').write_text(json.dumps(dict(passed=True, scope=__doc__, runs=runs,
         inputs={str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}),

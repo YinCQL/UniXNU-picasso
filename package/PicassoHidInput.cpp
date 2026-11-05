@@ -25,6 +25,7 @@ volatile uint32_t native_hid_input_command;
 volatile uint32_t native_hid_input_events[8];
 volatile uint32_t native_touch_writer_lock;
 void native_novatek_touch_probe(void);
+void picasso_buttons_start(void);
 }
 
 static IOService *inputDevice;
@@ -61,9 +62,46 @@ extern "C" void native_touch_notify(void) {
     if (touchSink) touchSink(touchContext);
 }
 
-// No physical button producer is linked on this board. Resolve its optional
-// HID hook under -no_weak_imports; a future button driver can override it.
-extern "C" __attribute__((weak)) void native_buttons_set_sink(void (*)(void *, uint32_t), void *) {}
+// The producer retains the callback's IOService across dispatch. Clearing the
+// sink stops new dispatches; NativeHidInput serializes its stop with callbacks
+// on the work loop, so a retained in-flight callback cannot access freed state.
+static IOLock *buttonLock;
+static bool (*buttonSink)(void *, uint32_t);
+static IOService *buttonContext;
+extern "C" void native_buttons_set_sink(bool (*sink)(void *, uint32_t), void *context) {
+    // First registration is on the serial board start path, before the worker.
+    if (!buttonLock) buttonLock = IOLockAlloc();
+    if (!buttonLock) { IOLog("PICASSO_BUTTONS refused reason=sink-lock\n"); return; }
+    IOService *next = sink ? static_cast<IOService *>(context) : nullptr;
+    if (next) next->retain();
+    IOLockLock(buttonLock);
+    IOService *old = buttonContext;
+    buttonContext = next; buttonSink = sink;
+    IOLockUnlock(buttonLock);
+    OSSafeReleaseNULL(old);
+}
+extern "C" bool picasso_buttons_available(void) {
+    if (!buttonLock) return false;
+    IOLockLock(buttonLock);
+    bool ready = buttonSink && buttonContext;
+    IOLockUnlock(buttonLock);
+    return ready;
+}
+extern "C" bool picasso_buttons_deliver(uint32_t mask) {
+    if (!buttonLock) return false;
+    IOLockLock(buttonLock);
+    auto sink = buttonSink;
+    IOService *context = buttonContext;
+    if (context) context->retain();
+    IOLockUnlock(buttonLock);
+    bool delivered = sink && context && sink(context, mask);
+    OSSafeReleaseNULL(context);
+    return delivered;
+}
+extern "C" void picasso_hid_physical_button(void) {
+    unsigned expected = 0;
+    __atomic_compare_exchange_n(&autoStop, &expected, 3, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
 
 extern "C" void native_hid_input_observed(unsigned event, int result) {
     if (event >= 8) return;
@@ -169,15 +207,17 @@ static void inputTick(thread_call_param_t, thread_call_param_t) {
     if (!attempted) { attempted = true; attachInput(); }
     if (!inputDevice) return;
     const uint64_t now = milliseconds();
-    const bool ready = touchSink && __atomic_load_n(&native_hid_input_events[3], __ATOMIC_ACQUIRE) &&
+    const bool hidReady = __atomic_load_n(&native_hid_input_events[3], __ATOMIC_ACQUIRE) &&
         __atomic_load_n(&results[3], __ATOMIC_ACQUIRE) == 1;
-    static bool touchStarted, stopPrinted;
+    const bool ready = touchSink && hidReady;
+    static bool touchStarted, buttonsStarted, stopPrinted;
     if (ready && !touchStarted) { touchStarted = true; native_novatek_touch_probe(); }
+    if (hidReady && !buttonsStarted) { buttonsStarted = true; picasso_buttons_start(); }
     unsigned stopped = __atomic_load_n(&autoStop, __ATOMIC_ACQUIRE);
     if (stopped && !stopPrinted) {
         stopPrinted = true;
         IOLog("PICASSO_HID automatic input stopped reason=%s time_ms=%llu\n",
-            stopped == 2 ? "physical-contact" : "visible-content", now);
+            stopped == 2 ? "physical-contact" : stopped == 3 ? "physical-button" : "visible-content", now);
     }
     if (stopped == 2) {
         // The physical report replaces virtual fingers; do not lift the user's contact.

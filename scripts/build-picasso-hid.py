@@ -127,7 +127,8 @@ def build(root, platform, native, record, out, board):
     reference = OriginalReference(os.environ['UNIXNU_KERNELCACHE'], board)
     qualify_hid(reference)
     (out / 'OriginalHidDeviceABI.h').write_text(header(), encoding='utf-8')
-    sources = [root / 'drivers/NativeHidInput/NativeHidInput.cpp', root / 'kits/picasso/PicassoHidInput.cpp']
+    sources = [root / 'drivers/NativeHidInput/NativeHidInput.cpp', root / 'kits/picasso/PicassoHidInput.cpp',
+               root / 'kits/picasso/PicassoButtons.cpp']
     objects = []
     for source in sources:
         obj = out / (source.stem + '.o')
@@ -146,8 +147,9 @@ def build(root, platform, native, record, out, board):
         else:
             _, sections, symbols = platform.inspect_object(obj, native)
             platform.require(not any(s['name'] == '__mod_init_func' for s in sections), 'Input probe must have no automatic initializer')
-            platform.require(any(s['name'] == '_native_buttons_set_sink' and s['kind'] == 15 for s in symbols),
-                             'Input probe must define the optional board-button hook')
+            required = '_native_buttons_set_sink' if source.stem == 'PicassoHidInput' else '_picasso_buttons_start'
+            platform.require(any(s['name'] == required and s['kind'] == 15 for s in symbols),
+                             'Input object must define ' + required)
             objects.append(obj)
     assembly = out / 'hid-original-bindings.S'
     assembly.write_text(''.join(f'.globl {name}\n.set {name}, {va:#x}\n' for name, va in sorted(audit['bindings'].items())), encoding='utf-8')
@@ -156,7 +158,8 @@ def build(root, platform, native, record, out, board):
     _, _, symbols = platform.inspect_object(bindings, native)
     platform.require({s['name']: s['value'] for s in symbols if s['kind'] == 3} == audit['bindings'], 'Exact compiled HID aliases')
     objects.append(bindings)
-    sources += [root / 'kits/picasso/PicassoHidPlan.h', root / 'scripts/build-picasso-hid.py', root / 'scripts/picasso_original_abi.py']
+    sources += [root / 'kits/picasso/PicassoHidPlan.h', root / 'kits/picasso/PicassoButtonsCore.h',
+                root / 'scripts/build-picasso-hid.py', root / 'scripts/picasso_original_abi.py']
     return objects, sources
 
 
@@ -193,6 +196,6 @@ def verify(platform, aes, native, reference, directory, kernel, plan):
             'Wrong linked HID superclass')
     for name in ('_picasso_hid_start_later', '_picasso_hid_frame_presented',
                  '_native_hid_input_requested', '_native_touch_set_sink', '_native_buttons_set_sink',
-                 '_native_hid_input_allocate', initializer):
+                 '_picasso_buttons_start', '_picasso_buttons_deliver', '_native_hid_input_allocate', initializer):
         require(name in names, 'Missing HID lifecycle ' + name)
     return dict(audit, linked_local_methods=sorted(local), matching=matching)
