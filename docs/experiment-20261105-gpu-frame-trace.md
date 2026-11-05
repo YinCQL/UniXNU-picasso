@@ -349,3 +349,57 @@ creation over the surface + one copy; Turnip takes m2v's shadow-image fallback) 
 idle screen updates at 10 fps by content, animations at 33 ms by CA's own schedule. The measured
 levers, in order of size, would be m2v's texture-over-buffer encode and its inline submission —
 both outside this tree — not the kernel, not the GPU clock.
+
+## Stage 12 — wf307/wf308: deferred completion as the present default
+
+The wait measured in stage 11 (2.3 ms p50, 15 ms max) is removed from the frame path by default.
+`GpuScanoutPresenter::present` now commits and returns; at the next present it **settles** the
+previous frame's completion without blocking (`settle()`), with the same 400 ms bound and the same
+three-timeout cooldown as the synchronous path — a wedged runtime is still caught and the display
+driver still gets its own path, one frame later. `sheng-present-blocking=1` restores the old
+synchronous wait for A/B; `sheng-present-nonblock=1` keeps the never-settle variant.
+
+The first frames' CPU verification readback calls `flush()` before `verify()`, so it still reads
+completed pixels.
+
+Same plugin (`01c2d018…`, trust `50d38150…`), same kernel (`143f7526…`), same Home-press schedule:
+
+- **wf307** — deferred (default).
+- **wf308** — the same binary with `sheng-present-blocking=1` (control).
+
+Acceptance: PF `w` is 0 in wf307 and ~2.3 ms in wf308; present `t` drops by that difference;
+burst cadence and per-press frame counts are unchanged; `failures=0`; no AMFI rejection; the
+verification frames still report `v4/0` (no readback mismatches).
+
+### wf307 — deferred (default)
+
+| metric | value |
+|---|---|
+| frames / failures | 2233 / 0 |
+| present service, burst | **7.4 ms** (blocking baseline 9.8–9.9) |
+| present service, idle | 7.5 ms |
+| PF `w` (wait) | **0** on every frame |
+| encode / submit / commit | 2.95 / 4.04 / 7.03 ms (unchanged) |
+| burst interval p50 | 33.0 ms (unchanged) |
+| per-press windows | 8 presses × 227–259 frames |
+| verification | `v4/0` — the flush-before-verify readback matches |
+| CPU fallbacks (`copies=0`) | none; display `submit=accept=transfer=retire`, reject 0 |
+| AMFI / plugin | 4 opens, 0 signature failures, no stalls |
+
+The frame's CPU path loses a quarter of its cost with no cadence change and no fallback frames.
+
+### wf308 — same binary, `sheng-present-blocking=1` (control)
+
+| metric | wf307 deferred | wf308 blocking | delta |
+|---|---|---|---|
+| burst service p50 | **7.4 ms** | **9.8 ms** | −2.4 ms (24%) |
+| idle service p50 | 7.5 ms | 9.7 ms | −2.2 ms |
+| PF `w` p50 / max | 0 / 0 | 2.29 / 14.5 ms | −2.29 ms |
+| burst interval p50 | 33.0 ms | 32.9 ms | 0 |
+| frames / failures | 2233 / 0 | 2234 / 0 | — |
+| verification | `v4/0` | `v4/0` | — |
+
+The deferred completion removes the per-frame wait from the composing thread with the cadence, the
+verification readback and the failure count all unchanged, and keeps the 400 ms wedge bound and the
+three-timeout cooldown by settling one frame later. `sheng-present-blocking=1` restores the old
+behavior for comparison or rollback.

@@ -247,3 +247,20 @@ The frame-timeline work continued after the first handoff; the full record is
   silently cut (cost one misread of `e3` vs `e3024`).
 - Images: wf304/wf305 = instrumented plugin (non-block off/on); wf306 = instrumented kernel with
   the wc counters. wf302/wf303 = clock A/B. The device is left in fastboot.
+
+### Deferred completion is now the present default (wf307/wf308)
+
+`GpuScanoutPresenter` no longer waits for the scanout blit inside `present`: it commits and returns,
+and the **next** present settles the previous frame's completion without blocking
+(`settle()`), with the same 400 ms bound and three-timeout cooldown as before. A wedge is still
+caught and the display driver still gets its own path, one frame later. The first frames' CPU
+verification calls `flush()` so the readback still sees completed pixels.
+
+Same-binary A/B on hardware: burst service **7.4 ms** deferred vs **9.8 ms** with
+`sheng-present-blocking=1` (which restores the old wait); PF wait 0 vs 2.29 ms; burst cadence 33.0
+vs 32.9 ms; failures 0; verification `v4/0`; CPU fallbacks (`copies=0`). `sheng-present-nonblock=1`
+still selects the never-settle variant.
+
+Shipped with this change: plugin CDHash `63626377…`, trust `50d38150…`, addon
+`01c2d018…` (`build/ngpu-addon-asyncpresent-20261105.bin`). Kernel unchanged from wf306
+(`143f7526…`). Stage 12 of `experiment-20261105-gpu-frame-trace.md`.

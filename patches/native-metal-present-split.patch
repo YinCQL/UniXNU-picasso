@@ -1,5 +1,5 @@
 diff --git a/GpuScanoutClient.h b/GpuScanoutClient.h
-index cfa0337..6f11765 100644
+index cfa0337..b687c0a 100644
 --- a/GpuScanoutClient.h
 +++ b/GpuScanoutClient.h
 @@ -34,6 +34,7 @@ struct Stats {
@@ -10,7 +10,7 @@ index cfa0337..6f11765 100644
      int bufferStatus;                      // its MTLCommandBufferStatus (2 committed, 3 scheduled, 4 completed, 5 error)
      uint32_t sources;                      // distinct source allocations served so far
      size_t surfaceStride, scanoutStride;   // the last frame's pitch and the panel's: equal pitches take the single-run blit
-@@ -100,6 +101,9 @@ public:
+@@ -100,11 +101,15 @@ public:
          stats_->importUs = presenter_->lastImportUs;
          stats_->commitUs = presenter_->lastCommitUs;
          stats_->waitUs = presenter_->lastWaitUs;
@@ -20,11 +20,18 @@ index cfa0337..6f11765 100644
          stats_->bufferStatus = presenter_->lastStatus;
          stats_->sources = presenter_->distinctSources();
          stats_->surfaceStride = swap.stride;
+         stats_->scanoutStride = presenter_->scanoutStride();
+-        if (r == gpupresent::kOk && stats_->verified < 4) verify(swap);
++        // The verification reads the scanout on the CPU: the deferred copy has to be complete before it does.
++        if (r == gpupresent::kOk && stats_->verified < 4) {presenter_->flush(); verify(swap);}
+         note(0x6731);   // the GPU copy returned
+         NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
+         const int completed = transport_.call(transport_.context, NGP_METHOD_COMPLETE_SWAP, &done, sizeof done, nullptr, 0);
 diff --git a/GpuScanoutPresenter.h b/GpuScanoutPresenter.h
-index 40ec78c..4d8dd63 100644
+index 40ec78c..b477e35 100644
 --- a/GpuScanoutPresenter.h
 +++ b/GpuScanoutPresenter.h
-@@ -6,12 +6,26 @@
+@@ -6,12 +6,33 @@
  #pragma once
  #import <Metal/Metal.h>
  #include <mach/mach_time.h>
@@ -35,23 +42,30 @@ index 40ec78c..4d8dd63 100644
  
  namespace gpupresent {
  
-+// sheng-present-nonblock=1 in the kernel command line (read through sysctl, the boot-argument channel the plugin
-+// already uses): the non-blocking-present experiment, commit and return without waiting for the GPU.
-+inline bool nonblocking() {
-+    static int enabled = -1;
-+    if (enabled < 0) {
++// How present() treats the GPU copy's completion:
++//   0  blocking (sheng-present-blocking=1): commit and wait, as before — A/B and rollback;
++//   1  deferred (default): commit and return; the previous frame's completion is settled at the next frame, with the
++//      same 400 ms bound and the same cooldown after three timeouts, so a wedged runtime is still caught and the
++//      display driver still gets its own path — one frame later;
++//   2  non-blocking (sheng-present-nonblock=1): never settle; the experiment that judges how much the wait costs.
++// The boot argument channel is kern.bootargs, as the plugin already reads it.
++inline int presentMode() {
++    static int mode = -1;
++    if (mode < 0) {
 +        char args[1024] = {};
 +        size_t size = sizeof args;
-+        enabled = sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0 &&
-+                  strstr(args, "sheng-present-nonblock=1") != nullptr;
++        const bool read = sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0;
++        mode = 1;
++        if (read && strstr(args, "sheng-present-blocking=1")) mode = 0;
++        else if (read && strstr(args, "sheng-present-nonblock=1")) mode = 2;
 +    }
-+    return enabled != 0;
++    return mode;
 +}
 +
  struct Scanout {
      void *base;       // writable mapping of the firmware framebuffer (page aligned)
      size_t bytes;     // whole extent, a multiple of the page size
-@@ -38,8 +52,11 @@ public:
+@@ -38,8 +59,11 @@ public:
      }
      bool ready() const { return target_ != nil; }
      // Per-frame cost breakdown of the last present(): importing the frame's pages into the runtime, encoding and
@@ -64,7 +78,21 @@ index 40ec78c..4d8dd63 100644
      int lastStatus = 0;
      // How many distinct source allocations were served so far (a small pool means the imports can be cached).
      uint32_t distinctSources() const { return sourceCount_; }
-@@ -73,7 +90,10 @@ public:
+@@ -49,6 +73,13 @@ public:
+         if (!ready()) return kBadScanout;
+         if (consecutiveTimeouts_ >= 3 && mach_absolute_time() < pausedUntil_) return kGpuFailed;
+         if (consecutiveTimeouts_ >= 3) consecutiveTimeouts_ = 2;   // cooldown over: this frame probes the runtime again
++        // Deferred mode: the previous frame's GPU copy is settled here, on the composing thread, one frame after it was
++        // committed. A failure or a wedge belongs to that frame; this frame takes the display driver's own path so the
++        // screen still advances.
++        if (presentMode() == 1) {
++            const Result settled = settle();
++            if (settled != kOk) return settled;
++        }
+         const size_t page = (size_t)getpagesize(), row = (size_t)frame.width * 4;
+         if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) ||
+             frame.width != scanout_.width || !frame.height || frame.destY > scanout_.height ||
+@@ -73,7 +104,10 @@ public:
          noteSource((uintptr_t)frame.base);
          lastImportUs = micros(mach_absolute_time() - phase);
          phase = mach_absolute_time();
@@ -75,7 +103,7 @@ index 40ec78c..4d8dd63 100644
          id<MTLBlitCommandEncoder> blit = commands ? [commands blitCommandEncoder] : nil;
          if (!blit) return kNoResource;
          if (frame.stride == scanout_.stride) {
-@@ -97,17 +117,26 @@ public:
+@@ -97,17 +131,29 @@ public:
              }
          }
          [blit endEncoding];
@@ -88,21 +116,24 @@ index 40ec78c..4d8dd63 100644
 -        [commands addCompletedHandler:^(id<MTLCommandBuffer>) {dispatch_semaphore_signal(finished);}];
 +        lastEncodeUs = micros(mach_absolute_time() - phase);
 +        phase = mach_absolute_time();
-+        // sheng-present-nonblock=1 (experiment): commit and return without waiting for the GPU. The completion handler
-+        // still runs; the caller treats the frame as served. Judges whether the bounded wait is on the frame's
-+        // critical path at all.
-+        const bool nonblock = nonblocking();
-+        dispatch_semaphore_t finished = nonblock ? nil : dispatch_semaphore_create(0);
-+        if (!nonblock && !finished) return kNoResource;
++        const int mode = presentMode();
++        dispatch_semaphore_t finished = mode == 2 ? nil : dispatch_semaphore_create(0);
++        if (mode != 2 && !finished) return kNoResource;
 +        if (finished) [commands addCompletedHandler:^(id<MTLCommandBuffer>) {dispatch_semaphore_signal(finished);}];
          [commands commit];
 -        lastCommitUs = micros(mach_absolute_time() - phase);
 +        lastSubmitUs = micros(mach_absolute_time() - phase);
 +        lastCommitUs = micros(mach_absolute_time() - commitStart);
-+        if (nonblock) {
++        if (mode != 0) {
++            // Hand the completion to the next present (or drop it in non-blocking mode). A failure or a timeout of this
++            // frame is reported by the next present; the display driver's own path covers that frame.
 +            lastWaitUs = 0;
 +            lastStatus = (int)commands.status;
-+            consecutiveTimeouts_ = 0;
++            if (mode == 1) {
++                pending_ = commands;
++                pendingDone_ = finished;
++                pendingStart_ = mach_absolute_time();
++            }
 +            return kOk;
 +        }
          const long waited = dispatch_semaphore_wait(finished, dispatch_time(DISPATCH_TIME_NOW, (int64_t)400 * NSEC_PER_MSEC));
@@ -111,6 +142,70 @@ index 40ec78c..4d8dd63 100644
          lastStatus = (int)commands.status;
          if (waited != 0) {
              // Three timeouts in a row: stop committing (each commit would pin another frame's pages behind the wedged
+@@ -119,6 +165,38 @@ public:
+         consecutiveTimeouts_ = 0;
+         return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
+     }
++    // The previous deferred frame's completion, as the next present sees it. Never blocks: a copy still in flight is
++    // fine until the 400 ms bound, which is the same bound and the same cooldown the synchronous mode had.
++    Result settle() {
++        if (!pending_) return kOk;
++        if (dispatch_semaphore_wait(pendingDone_, DISPATCH_TIME_NOW) == 0) {
++            const int status = (int)pending_.status;
++            pending_ = nil;
++            pendingDone_ = nil;
++            lastStatus = status;
++            if (status != (int)MTLCommandBufferStatusCompleted) return kGpuFailed;
++            consecutiveTimeouts_ = 0;
++            return kOk;
++        }
++        if (mach_absolute_time() - pendingStart_ > millis(400)) {
++            pending_ = nil;   // the runtime wedged: stop pinning frames behind it
++            pendingDone_ = nil;
++            lastStatus = (int)MTLCommandBufferStatusError;
++            if (consecutiveTimeouts_ < 3) ++consecutiveTimeouts_;
++            if (consecutiveTimeouts_ >= 3) pausedUntil_ = mach_absolute_time() + seconds(30);
++            return kGpuFailed;
++        }
++        return kOk;
++    }
++    // Waits for the deferred copy before its pixels are read back (the first frames' verification): bounded like the
++    // synchronous path, and a timeout leaves the pending frame to the next settle.
++    void flush() {
++        if (!pending_) return;
++        if (dispatch_semaphore_wait(pendingDone_, dispatch_time(DISPATCH_TIME_NOW, (int64_t)400 * NSEC_PER_MSEC)) == 0) {
++            pending_ = nil;
++            pendingDone_ = nil;
++        }
++    }
+ private:
+     static uint32_t micros(uint64_t ticks) {
+         static mach_timebase_info_data_t base = {0, 0};
+@@ -137,6 +215,12 @@ private:
+         const uint64_t ns = (uint64_t)count * 1000000000ull;
+         return base.numer ? ns * base.denom / base.numer : ns;   // nanoseconds to absolute ticks
+     }
++    static uint64_t millis(uint32_t count) {
++        mach_timebase_info_data_t base = {0, 0};
++        mach_timebase_info(&base);
++        const uint64_t ns = (uint64_t)count * 1000000ull;
++        return base.numer ? ns * base.denom / base.numer : ns;
++    }
+     bool validScanout() const {
+         const size_t page = (size_t)getpagesize();
+         return scanout_.base && !((uintptr_t)scanout_.base & (page - 1)) && scanout_.bytes && !(scanout_.bytes & (page - 1)) &&
+@@ -153,6 +237,11 @@ private:
+     // fail-safe): a wedged completion path is reported instead of awaited.
+     int consecutiveTimeouts_ = 0;
+     uint64_t pausedUntil_ = 0;
++    // The deferred frame (mode 1): its command buffer and completion handler stay alive until the next present settles
++    // them. At most one frame is outstanding by construction — the commit happens only after the previous settle.
++    id<MTLCommandBuffer> pending_ = nil;
++    dispatch_semaphore_t pendingDone_ = nil;
++    uint64_t pendingStart_ = 0;
+ };
+ 
+ }  // namespace gpupresent
 diff --git a/NativeMetalBridgePhase.h b/NativeMetalBridgePhase.h
 index 037c94a..6d00639 100644
 --- a/NativeMetalBridgePhase.h
