@@ -1,6 +1,7 @@
 # Idle CPU anomaly: the audiomxd ↔ launchd message storm
 
-Status: **root cause measured on hardware (wf312–wf314); mitigation boot wf315 in progress.**
+Status: **root cause measured and named on hardware (wf312–wf320): a failing bootstrap lookup of
+`com.apple.BTAudioHALPlugin.xpc`, retried without backoff ≈2,200 times/s.**
 
 ## Question
 
@@ -87,6 +88,9 @@ a printable service name in the body).
 Patch `patches/picasso-ipc-census-xnu.patch` (applied through the prepared tree's
 `patches/xnu/`; `osfmk/ipc/ipc_kmsg.c`), gated by boot argument `picasso-ipc-census=1`:
 
+- The v5 sampler takes the payload from `ikm_udata_from_header(kmsg)`, not from `hdr + 1`: a kmsg
+  whose data does not fit its inline buffer keeps it in `ikm_udata` (see "The request, named"),
+  and only `IKM_TYPE_ALL_INLINED` messages have the payload right after the header.
 - `picasso_ipc_census_note(port, kmsg)` — called in `ipc_kmsg_send` before
   `ipc_mqueue_send_locked`, while the port lock is held. Counts per peer pid into 512 buckets for
   both directions of pid-1 traffic, plus a message-id histogram, plus (first 24 after two minutes)
@@ -158,9 +162,82 @@ links (275 in ~7 minutes) and clients reaching audiomxd's other services, so aud
 services are registered and are part of the lock screen's touch path (audio session/system-sound
 feedback). Disabling the job removes the storm but also removes those services, and touch dies.
 
-So the fix has to keep audiomxd serving while stopping its launchd loop. wf318 samples the message
-body with a name-like-string scan (XPC strings are length-prefixed, not NUL-terminated) to name
-what audiomxd keeps asking launchd for.
+So the fix has to keep audiomxd serving while stopping its launchd loop.
+
+## The request, named (wf319/wf320)
+
+The v3/v4 body sampler read the payload at `ikm_header(kmsg) + 1`, which is only the user data of a
+kmsg that kept the message inline (`IKM_TYPE_ALL_INLINED`). A message whose payload does not fit
+`IKM_SMALL_MSG_SIZE` is `IKM_TYPE_UDATA_OOL` and keeps it in `kmsg->ikm_udata`; the bytes after the
+header are zero padding. That is why the storm's request body scanned as all zeros with no strings:
+the sampler was reading the wrong buffer (the 116-byte reply did stay inline, so its first words
+looked sane). v5 samples through `ikm_udata_from_header()`.
+
+wf320 (`2aeb8ca9` + v5 census, audiomxd running) then printed, 120 s into the boot:
+
+```
+PICASSO_IPC msg s=1 from=94 to=1 id=40000324 size=188 bits=111211 type=1
+  body=handle|flags|name bare=handle|com.apple.BTAudioHALPlugin.xpc|lookup-handle
+PICASSO_IPC dump s=1 o=0 40585043 00000005 0000f000 0000008c
+PICASSO_IPC dump s=1 o=16 00000005 646e6168 0000656c 00004000
+PICASSO_IPC dump s=1 o=32 00000000 00000000 67616c66 00000073
+PICASSO_IPC dump s=1 o=48 00004000 00000000 00000000 656d616e
+PICASSO_IPC dump s=1 o=64 00000000 00009000 0000001f 2e6d6f63
+PICASSO_IPC dump s=1 o=80 6c707061 54422e65 69647541 4c41486f
+PICASSO_IPC dump s=1 o=96 67756c50 782e6e69 00006370 65707974
+PICASSO_IPC dump s=1 o=112 00000000 00004000 00000007 00000000
+PICASSO_IPC dump s=1 o=128 6b6f6f6c 682d7075 6c646e61 00000065
+PICASSO_IPC dump s=1 o=144 00004000 00000000 00000000 00000000
+```
+
+and the reply:
+
+```
+PICASSO_IPC rdump s=1 o=0 40585043 00000005 0000f000 00000044
+PICASSO_IPC rdump s=1 o=16 00000003 5f636572 63657865 00746e63     rec_execcnt
+PICASSO_IPC rdump s=1 o=32 00004000 00000100 00000000 5f716572     req_pid
+PICASSO_IPC rdump s=1 o=48 00646970 00004000 0000005e 00000000     0x5e = 94 = audiomxd
+PICASSO_IPC rdump s=1 o=64 6f727265 00000072 00003000 00000003     "error"
+```
+
+Reading the two together:
+
+- `0x40585043` is libxpc's wire magic; the request is an XPC dictionary whose keys are `type`,
+  `handle`, `flags`, `lookup-handle` and `name`, and the name is
+  **`com.apple.BTAudioHALPlugin.xpc`**.
+- Disassembly of `libxpc.dylib` from the device dyld shared cache pins the routine: `msgh_id` is
+  `0x40000000 | routine`, and the dictionary keys and the reply keys (`port`, `non-launching`)
+  belong to the helper at `0x1dd66a0cc` reached from `_bootstrap_look_up3`,
+  `_xpc_endpoint_create_bs_named` and the pipe constructor. `0x324` is the **bootstrap
+  look-up** routine; `0x20000000` is the reply id that `_xpc_pipe_interface_routine` validates.
+- The reply carries the demux envelope (`req_pid`, `rec_execcnt`) and an `error` entry, and **no
+  `port`**, so the lookup failed every time and the client repeated it immediately.
+
+`com.apple.BTAudioHALPlugin.xpc` is declared as a MachService by
+`/System/Library/LaunchDaemons/com.apple.bluetoothd.plist`; no other job provides it. On this boot
+bluetoothd had not checked that service in, so the HAL client inside audiomxd (CoreAudio's
+Bluetooth-audio plug-in lookup) spun on the failure: wf320's blocks read
+
+```
+IP to1 d=66584 94:audiomxd=66441 ...      (≈2,215/s)
+IP to1 d=65843 94:audiomxd=65760 ...
+IP to1 d=65510 94:audiomxd=65447 ...
+```
+
+with launchd at 56.2 s user + 108.6 s system ≈ 4 minutes into the boot. The next question is whether
+the service is missing because Bluetooth is not initialised on this port (no BT firmware path in
+this kernel) or because bluetoothd's check-in is rejected; either way the lever is to make the
+look-up succeed (or stop the client from retrying), not to disable audiomxd.
+
+## Operational hazard found the hard way: `wait <name>` wedges the console
+
+`wait SpringBoard` on wf320 ran `picasso_live_named_state()` inline in the CDC command handler;
+that function calls `proc_iterate(PROC_ALLPROCLIST, …)` while the handler holds the console lock,
+and the process-list lock and the console lock then deadlock. The kernel stays up (USB remains
+enumerated) but the CDC endpoint stops answering and the host cannot open the port again. The
+deferred `ps` path (`ps_pending`, served from `ud_poll_serialized`) exists exactly to avoid this;
+`wait <pid>` has the same hazard through `proc_find`. Do not use `wait` over CDC on a boot that is
+still needed; recover with a power-button reset.
 
 ## Reproduce
 

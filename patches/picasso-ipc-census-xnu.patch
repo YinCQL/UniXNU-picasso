@@ -1,8 +1,8 @@
 diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
-index 390f5c3..5f418e2 100644
+index 390f5c3..95d6210 100644
 --- a/osfmk/ipc/ipc_kmsg.c
 +++ b/osfmk/ipc/ipc_kmsg.c
-@@ -5201,6 +5201,252 @@ ipc_kmsg_copyin_from_kernel(
+@@ -5201,6 +5201,339 @@ ipc_kmsg_copyin_from_kernel(
  	return MACH_MSG_SUCCESS;
  }
  
@@ -58,10 +58,13 @@ index 390f5c3..5f418e2 100644
 +	}
 +	const mach_msg_header_t *hdr = ikm_header(kmsg);
 +	const uint32_t size = hdr->msgh_size;
-+	if (size < sizeof(*hdr) || size > 8192) {
++	if (size < sizeof(*hdr) || size > 8192 || (hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
 +		return;
 +	}
-+	const uint8_t *body = (const uint8_t *)(hdr + 1);
++	/* The user data of a kmsg is not always inline after the header: a message whose data does
++	 * not fit in the kmsg's inline buffer (IKM_SMALL_MSG_SIZE) keeps it in kmsg->ikm_udata, and
++	 * reading hdr + 1 then reads the zero padding after the header instead of the payload. */
++	const uint8_t *body = (const uint8_t *)ikm_udata_from_header(kmsg);
 +	const uint32_t body_size = size - (uint32_t)sizeof(*hdr);
 +	char text[96] = {};
 +	unsigned used = 0, runs = 0;
@@ -84,9 +87,92 @@ index 390f5c3..5f418e2 100644
 +			i++;
 +		}
 +	}
-+	picasso_ipc_sample_count++;
-+	printf("PICASSO_IPC msg s=%u from=%d to=%d id=%x size=%u body=%.80s\n",
-+	    picasso_ipc_sample_count, sender, receiver, (unsigned)hdr->msgh_id, size, text);
++	/* XPC serializes strings with a length prefix and no terminator, so the NUL-run scan above
++	 * misses the service name in an XPC body. The bare scan collects name-like runs (the
++	 * characters of a Mach service name) whether or not they end in a NUL. */
++	char bare[120] = {};
++	unsigned bused = 0, bruns = 0;
++	for (uint32_t i = 0; i < body_size && bused < sizeof bare - 2 && bruns < 4;) {
++		unsigned len = 0;
++		while (i + len < body_size && body[i + len] >= 0x20 && body[i + len] < 0x7f &&
++		    len < 48) {
++			len++;
++		}
++		bool nameish = len >= 6;
++		for (unsigned k = 0; nameish && k < len; k++) {
++			const char c = (char)body[i + k];
++			if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++			    (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_' ||
++			    c == '/' || c == ':' || c == ' ')) {
++				nameish = false;
++			}
++		}
++		if (nameish) {
++			if (bused) {
++				bare[bused++] = '|';
++			}
++			for (unsigned k = 0; k < len && bused < sizeof bare - 1; k++) {
++				bare[bused++] = (char)body[i + k];
++			}
++			bruns++;
++		}
++		i += len ? len : 1;
++	}
++	const unsigned sample_no = ++picasso_ipc_sample_count;
++	printf("PICASSO_IPC msg s=%u from=%d to=%d id=%x size=%u bits=%x type=%u "
++	    "body=%.80s bare=%.100s\n", sample_no, sender, receiver, (unsigned)hdr->msgh_id,
++	    size, (unsigned)hdr->msgh_bits, (unsigned)kmsg->ikm_type, text, bare);
++	/* The first samples also dump the payload words: a binary RPC carries its command in the
++	 * first words and needs no strings at all. */
++	if (sample_no <= 4) {
++		for (uint32_t i = 0; i < body_size && i < 256; i += 16) {
++			uint32_t words[4] = {};
++			const uint32_t n = body_size - i < sizeof words ? body_size - i :
++			    (uint32_t)sizeof words;
++			memcpy(words, body + i, n);
++			printf("PICASSO_IPC dump s=%u o=%u %08x %08x %08x %08x\n", sample_no, i,
++			    words[0], words[1], words[2], words[3]);
++		}
++	}
++}
++
++/* The reply direction (launchd -> client), eight samples after the same gate: the reply's first
++ * words carry the result of the repeated request. */
++static unsigned picasso_ipc_reply_samples;
++
++static void
++picasso_ipc_sample_reply(ipc_kmsg_t kmsg, int sender, int receiver)
++{
++	if (picasso_ipc_reply_samples >= 8 || !picasso_ipc_sample_ready()) {
++		return;
++	}
++	const mach_msg_header_t *hdr = ikm_header(kmsg);
++	const uint32_t size = hdr->msgh_size;
++	if (size < sizeof(*hdr) || size > 8192 || (hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
++		return;
++	}
++	const uint8_t *body = (const uint8_t *)ikm_udata_from_header(kmsg);
++	const uint32_t body_size = size - (uint32_t)sizeof(*hdr);
++	const unsigned sample_no = ++picasso_ipc_reply_samples;
++	uint32_t words[8] = {};
++	if (body_size >= sizeof words) {
++		memcpy(words, body, sizeof words);
++	}
++	printf("PICASSO_IPC reply s=%u from=%d to=%d id=%x size=%u bits=%x type=%u "
++	    "%08x %08x %08x %08x %08x %08x %08x %08x\n", sample_no,
++	    sender, receiver, (unsigned)hdr->msgh_id, size, (unsigned)hdr->msgh_bits,
++	    (unsigned)kmsg->ikm_type,
++	    words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
++	if (sample_no <= 2) {
++		for (uint32_t i = 0; i < body_size && i < 256; i += 16) {
++			uint32_t w[4] = {};
++			const uint32_t n = body_size - i < sizeof w ? body_size - i :
++			    (uint32_t)sizeof w;
++			memcpy(w, body + i, n);
++			printf("PICASSO_IPC rdump s=%u o=%u %08x %08x %08x %08x\n", sample_no, i,
++			    w[0], w[1], w[2], w[3]);
++		}
++	}
 +}
 +
 +static bool
@@ -141,6 +227,7 @@ index 390f5c3..5f418e2 100644
 +		} else {
 +			os_atomic_inc(&picasso_ipc_sink[1], relaxed);
 +		}
++		picasso_ipc_sample_reply(kmsg, sender, receiver);
 +	}
 +}
 +
@@ -255,7 +342,7 @@ index 390f5c3..5f418e2 100644
  /*
   *	Routine:	ipc_kmsg_send
   *	Purpose:
-@@ -5366,6 +5612,9 @@ retry:
+@@ -5366,6 +5699,9 @@ retry:
  		 */
  		ipc_special_reply_port_msg_sent(port);
  
