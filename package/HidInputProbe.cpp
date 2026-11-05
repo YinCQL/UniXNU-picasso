@@ -43,6 +43,20 @@ extern volatile uint32_t native_legacy_transfer_calls;
 static unsigned autoConfigured,autoFirst,autoCount,autoInterval,autoSent;
 static uint64_t autoNext,autoFrequency;
 static uint64_t counterNow(void){uint64_t v;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(v));return v;}
+// offline-hid-swipe-force=1: keep the unattended sequence alive while the physical panel
+// reports a contact. The panel claims the shared sink (native_touch_physical_active==2) on
+// the first real contact, which on a bench run is usually a phantom bottom-edge record from
+// the panel's own startup; unattended UI tests then lose all synthetic input. Opt-in only.
+static int forceConfigured;
+static bool swipeForceOn;
+static bool swipeForced(void) {
+    if(!forceConfigured) {
+        unsigned force=0;
+        forceConfigured=1;
+        swipeForceOn=PE_parse_boot_argn("offline-hid-swipe-force",&force,sizeof(force)) && force==1;
+    }
+    return swipeForceOn;
+}
 bool native_hid_input_requested(void) {
     // picasso: the owned CPU/GOP display path does not export sheng's
     // native_legacy_transfer_calls counter, and this port starts the probe only
@@ -56,7 +70,7 @@ bool native_hid_input_requested(void) {
         __asm__ volatile("mrs %0, cntfrq_el0":"=r"(autoFrequency));
         if(autoFirst && autoFrequency)autoNext=counterNow()+(uint64_t)autoFirst*autoFrequency;
     }
-    if(__atomic_load_n(&native_touch_physical_active,__ATOMIC_ACQUIRE)!=2 &&
+    if((swipeForced() || __atomic_load_n(&native_touch_physical_active,__ATOMIC_ACQUIRE)!=2) &&
        autoFirst && autoFrequency && autoSent<autoCount && counterNow()>=autoNext) {
         ++autoSent;autoNext+=(uint64_t)autoInterval*autoFrequency;return true;
     }
@@ -185,7 +199,7 @@ static bool swipePublish(unsigned count,int id,int x,int y) {
     nvt_touch_publication publication={&native_touch_seq,&native_touch_count,
         native_touch_xs,native_touch_ys,native_touch_ids,12,swipeNotify,&published,&native_touch_writer_lock};
     nvt_touch_publish_if(&publication,&x,&y,&id,count,
-        &native_touch_physical_active);
+        swipeForced()?nullptr:&native_touch_physical_active);
     return published;
 }
 // Publish a frame and wait (bounded) for the event driver to take it; returns false when no report
@@ -194,7 +208,7 @@ static bool swipeFrame(unsigned count,int x,int y) {
     const uint32_t want=native_touch_hid_reports+1;
     if(!swipePublish(count,1,x,y))return false;
     for(unsigned i=0;i<100;++i) {
-        if(__atomic_load_n(&native_touch_physical_active,__ATOMIC_ACQUIRE)==2)return false;
+        if(!swipeForced() && __atomic_load_n(&native_touch_physical_active,__ATOMIC_ACQUIRE)==2)return false;
         if(native_touch_hid_reports>=want)return true;
         IOSleep(2);
     }
@@ -218,11 +232,20 @@ static void swipeGesture(void) {
         (unsigned)native_touch_edge_dispatch[0],(unsigned)native_touch_edge_dispatch[1]);
 }
 void native_hid_swipe_tick(unsigned now) {
+    // offline-hid-swipe-interval=<seconds>: the pause between unattended gestures (default 20, min 5).
+    // An unattended UI test wants gestures in the window after the lock screen is up, which starts
+    // minutes into the boot; a shorter interval puts several of them there.
+    static unsigned intervalConfigured,interval;
+    if(!intervalConfigured) {
+        unsigned value=0;
+        intervalConfigured=1;interval=20;
+        if(PE_parse_boot_argn("offline-hid-swipe-interval",&value,sizeof(value)) && value>=5)interval=value;
+    }
     if(!swipeDue || now<swipeDue)return;
-    if(__atomic_load_n(&native_touch_physical_active,__ATOMIC_ACQUIRE)==2){swipeDue=0;return;}
+    if(!swipeForced() && __atomic_load_n(&native_touch_physical_active,__ATOMIC_ACQUIRE)==2){swipeDue=0;return;}
     if(swipeSent>=swipeTotal) {swipeDue=0;return;}
     ++swipeSent;
-    swipeDue=now+20;
+    swipeDue=now+interval;
     swipeGesture();
 }
 void native_hid_input_probe(void) {
