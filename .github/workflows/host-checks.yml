@@ -54,6 +54,13 @@ jobs:
           echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
           mkdir -p out/picasso/logs
 
+      - name: Replay UI runtime XNU changes and check errors
+        run: |
+          python3 scripts/check-picasso-ui-replay.py --tree "$UNIXNU_TREE" --output out/picasso/host-checks/ui-runtime
+          cp out/picasso/host-checks/ui-runtime/replay.json out/picasso/logs/ui-runtime-replay.json
+          cp out/picasso/host-checks/ui-runtime/runtime/results.json out/picasso/logs/ui-runtime-host.json
+          cp out/picasso/host-checks/ui-runtime/surface/results.json out/picasso/logs/ui-surface-host.json
+
       - name: Check exact status bar library trust
         run: |
           python3 scripts/check-picasso-ui-trust.py --output out/picasso/host-checks/ui-trust
@@ -112,6 +119,11 @@ jobs:
         run: |
           python3 scripts/check-picasso-buttons.py --output out/picasso/host-checks/buttons
           cp out/picasso/host-checks/buttons/results.json out/picasso/logs/buttons-host.json
+
+      - name: Check native HID event dispatch
+        run: |
+          python3 scripts/check-picasso-hid-events.py --output out/picasso/host-checks/hid-events
+          cp out/picasso/host-checks/hid-events/results.json out/picasso/logs/hid-events-host.json
 
       - name: Check authenticated UFS record cache
         run: |

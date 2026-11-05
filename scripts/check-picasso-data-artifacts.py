@@ -99,11 +99,15 @@ def verify_setup_preferences(target, spec):
         source = Path(arguments[index])
         if not source.is_absolute():
             source = ROOT / source
-        path = target / 'picasso/libpicasso-sb.dylib'
+        path = target / 'picasso/usr-lib/libpicasso-sb.dylib'
+        require(all(stat.S_ISDIR(directory.lstat().st_mode) for directory in (target / 'picasso', path.parent)),
+                'UI library directories must not be symlinks')
+        require(sorted(p.name for p in path.parent.iterdir()) == ['libpicasso-sb.dylib'],
+                'UI library view must contain only the owned library')
         require(stat.S_ISREG(path.lstat().st_mode) and stat.S_IMODE(path.lstat().st_mode) == 0o644,
                 'Invalid payload SpringBoard library metadata')
         require(digest(path) == digest(source), 'Payload SpringBoard library differs from build output')
-        injected = dict(path='picasso/libpicasso-sb.dylib', sha256=digest(path))
+        injected = dict(path='picasso/usr-lib/libpicasso-sb.dylib', sha256=digest(path))
     return dict(preferences=list(expected), injected_library=injected)
 
 

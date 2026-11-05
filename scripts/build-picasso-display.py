@@ -245,7 +245,7 @@ def main():
                ROOT / 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp', ROOT / 'kits/picasso/PicassoKeyStore.cpp',
                ROOT / 'kits/picasso/PicassoAccelerator.cpp',
                source_dir / 'NativeGOPPresenter.cpp', source_dir / 'NativeGOPGlue.cpp',
-               ROOT / 'kits/picasso/PicassoPr13.cpp']
+               ROOT / 'kits/picasso/PicassoPr13.cpp', ROOT / 'kits/picasso/PicassoBacklight.cpp']
     audit = None
     for source in sources:
         obj = out / (source.stem + '.o')
@@ -276,6 +276,7 @@ def main():
     objects += hid_objects
     sources += hid_sources
     sources += [ROOT / 'drivers/NativeNovatekTouch/TouchPublish.h']
+    sources += [ROOT / 'kits/picasso/PicassoBacklightCore.h', ROOT / 'kits/picasso/PicassoButtonsCore.h']
     sources += [ROOT / 'drivers/NativeAdreno/OriginalAcceleratorABI.h']
     pending = Path(tempfile.mkdtemp(prefix='qualified-display-', dir=out)) / 'libNativeLegacyDisplay.late.a'
     platform.run(['xcrun', 'ar', 'rcs', pending, *objects], out / 'archive.log')

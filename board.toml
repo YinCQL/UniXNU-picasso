@@ -234,12 +234,12 @@ kernel_args = [
   "armcpu-cpufreq=1",
   "sheng-cpufreq=4",
   # Apply the Picasso status bar metric in SpringBoard and main app executables.
-  "picasso_inject_sb=/private/var/picasso/libpicasso-sb.dylib",
+  "picasso_inject_sb=/usr/lib/libpicasso-sb.dylib",
   "picasso_inject_apps=1",
   # Permit the library signature for bring-up; keep cs_enforcement_disable unset.
   "amfi_allow_any_signature=1",
-  # Reject framebuffer power-off during bring-up; black frames can still be presented.
-  "picasso-fb-reject-off=1",
+  # Gate PM8150L WLED on verified OS display-power requests.
+  "picasso-wled=1",
   # Keep the initial logo through blank swaps until UI pixels arrive (at most 300 s).
   "picasso-boot-logo-hold=1",
   # Start the authenticated UFS root and required power-management nub.

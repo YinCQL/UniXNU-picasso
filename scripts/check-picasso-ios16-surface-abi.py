@@ -32,6 +32,9 @@ def main():
     method = re.sub(r'/\* PICASSO_FB_METHOD_HOOK_BEGIN \*/.*?/\* PICASSO_FB_METHOD_HOOK_END \*/\n', '', methods[0], flags=re.S)
     start = source.rfind('#if DEVELOPMENT || DEBUG', 0, source.index('/* Picasso runs iOS 16 IOMobileFramebuffer'))
     helpers = source[start:source.index(methods[0])]
+    # The host uses a function-pointer fixture; only Mach-O symbol linkage is modeled.
+    method = method.replace(' __asm__("_picasso_backlight_power") __attribute__((weak_import))', '')
+    method = method.replace('extern IOReturn picasso_backlight_power(IOService *, bool);', '')
     actual = helpers + method + '\n'
     (out / 'ios16-surface-abi.inc').write_text(actual, encoding='utf-8', newline='\n')
     fixture = ROOT / 'scripts/tests/picasso-ios16-surface-abi-host.cpp'

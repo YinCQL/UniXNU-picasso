@@ -30,6 +30,7 @@ bool picasso_power_source_publish(void);
 void picasso_keystore_probe(void);
 void picasso_hid_start_later(void);
 void picasso_pr13_start(void);
+void picasso_backlight_start(IOService *);
 void native_gop_presenter_static_init(void) __asm__("__GLOBAL__sub_I_NativeGOPPresenter.cpp");
 bool native_gop_glue_start(IOService *nub);
 void picasso_hid_frame_presented(void);
@@ -369,6 +370,7 @@ extern "C" void native_legacy_display_late_probe(void) {
         publishDisplayModes(display, (uint32_t)video.v_width, (uint32_t)video.v_height);
         publishAcceleratorStub();
         picasso_hid_start_later();
+        picasso_backlight_start(display);
         picasso_pr13_start();
     }
     else {

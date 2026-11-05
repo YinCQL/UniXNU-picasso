@@ -11,7 +11,17 @@
 #define DEBUG 0
 using IOReturn = int;
 constexpr IOReturn kIOReturnSuccess = 0, kIOReturnUnsupported = 1;
-static bool failAllocation, refuseOff;
+static bool failAllocation;
+constexpr IOReturn kIOReturnNotReady=2, kIOReturnIOError=3, kIOReturnNotFound=4;
+struct IOService {};
+static IOService display;
+static IOReturn hardwareResult=kIOReturnNotReady;
+static unsigned hardwareCalls;
+static bool hardwareOn;
+IOReturn fixture_backlight_power(IOService *provider, bool on) {
+    ++hardwareCalls; hardwareOn=on;
+    return provider==&display?hardwareResult:kIOReturnNotFound;
+}
 #if defined(_MSC_VER) && !defined(__clang__)
 #define __ATOMIC_RELAXED 0
 template<class T, class U> static T __atomic_fetch_add(T *p, U amount, int) {
@@ -32,11 +42,8 @@ static void IOFreeData(void *p, size_t n) {
 }
 static int proc_selfpid() { return 42; }
 static void proc_name(int, char *p, size_t n) { snprintf(p, n, "backboardd"); }
-static bool PE_parse_boot_argn(const char *name, void *p, size_t n) {
-    assert(!strcmp(name, "picasso-fb-reject-off") && n == sizeof(unsigned));
-    *static_cast<unsigned *>(p) = refuseOff; return true;
-}
 extern "C" void picasso_notifyd_snapshot_later() { ++snapshots; }
+IOReturn (*picasso_backlight_power)(IOService *,bool)=fixture_backlight_power;
 struct IOExternalMethodArguments {
     uint32_t scalarInputCount = 0, scalarOutputCount = 0;
     const uint64_t *scalarInput = nullptr;
@@ -52,6 +59,8 @@ static std::function<IOReturn(uint32_t, IOExternalMethodArguments *)> handler;
 class IOUserClient {
 public:
     MetaClass meta{"OtherClient"};
+    IOService *provider=&display;
+    IOService *getProvider() { return provider; }
     bool defaultLocking = true, defaultLockingSingleThreadExternalMethod = false, uc2022 = false;
     MetaClass *getMetaClass() { return &meta; }
     void ipcEnter(int) { assert(locks++ == 0); }
@@ -133,9 +142,21 @@ int main() {
     args = {}; client.meta.name = "IOMobileFramebufferUserClient"; uint64_t power = 0;
     args.scalarInput = &power; args.scalarInputCount = 1;
     handler = [](uint32_t, auto *) { return kIOReturnUnsupported; };
-    refuseOff = true; assert(client.callExternalMethod(12, &args) == kIOReturnUnsupported); ++scenarios;
-    power = 1; assert(client.callExternalMethod(12, &args) == kIOReturnSuccess); ++scenarios;
-    power = 0; refuseOff = false; assert(client.callExternalMethod(12, &args) == kIOReturnSuccess); ++scenarios;
+    assert(client.callExternalMethod(12, &args) == kIOReturnUnsupported); ++scenarios;
+    power=1; assert(client.callExternalMethod(12, &args)==0); ++scenarios;
+    hardwareResult=0;
+    for (unsigned p=0;p<2;++p) {power=p;assert(client.callExternalMethod(12,&args)==0 && hardwareOn==(p!=0));++scenarios;}
+    hardwareResult=kIOReturnIOError; assert(client.callExternalMethod(12,&args)==kIOReturnIOError); ++scenarios;
+    client.provider=nullptr; assert(client.callExternalMethod(12,&args)==kIOReturnUnsupported); ++scenarios;
+    client.provider=&display;
+    unsigned before=hardwareCalls;
+    power=2;assert(client.callExternalMethod(12,&args)==kIOReturnUnsupported);
+    power=0;args.scalarInput=nullptr;assert(client.callExternalMethod(12,&args)==kIOReturnUnsupported);
+    args.scalarInput=&power;args.scalarInputCount=2;assert(client.callExternalMethod(12,&args)==kIOReturnUnsupported);
+    args.scalarInputCount=1;client.meta.name="OtherClient";assert(client.callExternalMethod(12,&args)==kIOReturnUnsupported);
+    client.meta.name="IOMobileFramebufferUserClient";assert(client.callExternalMethod(11,&args)==kIOReturnUnsupported);
+    handler=[](uint32_t,auto *){return 7;};assert(client.callExternalMethod(12,&args)==7);
+    assert(hardwareCalls==before);scenarios+=6;
     IOUserClient2022 modern; modern.uc2022 = true;
     handler = [](uint32_t s, auto *) { assert(s == 99); return 6; };
     assert(modern.callExternalMethod(99, &args) == 6); ++scenarios;

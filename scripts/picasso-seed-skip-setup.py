@@ -8,8 +8,8 @@ Runs the upstream scripts/seed-data-skip-setup.py with this board's userland bui
 LastSystemVersion must name the system that boots: a mismatch makes the data migrator run on every
 boot before SpringBoard can show anything. SpringBoard also gets BSUIVibrancyEffectViewDisabled
 for the software renderer. Everything else is the upstream tool unchanged.
-With --inject-lib PATH, that library is also copied into the Data seed at /picasso/ (runtime
-/private/var/picasso/), where the kernel's picasso_inject_sb boot-arg points, so dyld loads it
+With --inject-lib PATH, that library is copied into the Data seed at /picasso/usr-lib/.
+The kernel mounts this single-library directory read-only over /usr/lib before launchd, so dyld loads it
 into SpringBoard and, with picasso_inject_apps=1, main app executables. The argument
 is consumed here; the upstream tool never sees it.
 --statusbar-provider selects the reviewed native UIKit status bar layout for this GOP mode.
@@ -24,7 +24,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import picasso_target as target
 
-INJECT_DIR = 'picasso'
+INJECT_DIR = 'picasso/usr-lib'
 INJECT_NAME = 'libpicasso-sb.dylib'
 STATUSBAR_PROVIDER = '_UIStatusBarVisualProvider_Pad_ForcedNoCell'
 
@@ -89,8 +89,16 @@ def configure_seed(tool, inject_lib=None, statusbar_provider=None):
                                                   'StatusBarHidesDate': True})
             if inject_lib is not None:
                 dest_dir = Path(var) / INJECT_DIR
-                dest_dir.mkdir(parents=True, exist_ok=True)
+                for directory in (Path(var) / 'picasso', dest_dir):
+                    if directory.is_symlink():
+                        raise ValueError('UI library directory must not be a symlink')
+                    directory.mkdir(exist_ok=True)
+                    os.chmod(directory, 0o755)
+                if any(p.name != INJECT_NAME for p in dest_dir.iterdir()):
+                    raise ValueError('UI library view must contain only the owned library')
                 dest = dest_dir / INJECT_NAME
+                if dest.is_symlink():
+                    raise ValueError("UI library must not be a symlink")
                 shutil.copyfile(inject_lib, dest)
                 os.chmod(dest, 0o644)
                 print(f'picasso: inject library placed at /{INJECT_DIR}/{INJECT_NAME} ({dest.stat().st_size} bytes)')

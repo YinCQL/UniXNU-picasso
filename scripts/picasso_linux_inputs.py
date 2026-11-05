@@ -122,7 +122,7 @@ def validate(directory, tree):
             type='file', uid=0, gid=0, mode=0o644, bytes=len(blob), sha256=hashlib.sha256(blob).hexdigest()))
     require(seed['offline_launch_policy'] == expected_policy, 'Offline policy does not match this board')
     settings = audit['payload_setup_settings']
-    require(settings['injected_library'] == {'path': 'picasso/libpicasso-sb.dylib', 'sha256': library['sha256']},
+    require(settings['injected_library'] == {'path': 'picasso/usr-lib/libpicasso-sb.dylib', 'sha256': library['sha256']},
             'The macOS Data seed does not contain the signed UI library')
     require(set(settings['preferences']) == {'com.apple.migration', 'com.apple.purplebuddy',
             'com.apple.springboard', 'com.apple.UIKit'}, 'Missing audited iOS16 Setup preferences')

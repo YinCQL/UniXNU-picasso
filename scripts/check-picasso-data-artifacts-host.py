@@ -156,7 +156,7 @@ def main():
         assert merged.count('com.apple.UIKit') == 1
         assert plistlib.loads((prefs / 'com.apple.springboard.plist').read_bytes()) == {
             'SBDisableAutoDim': True, 'BSUIVibrancyEffectViewDisabled': True}
-        assert (seed_root / 'picasso/libpicasso-sb.dylib').read_bytes() == library.read_bytes()
+        assert (seed_root / 'picasso/usr-lib/libpicasso-sb.dylib').read_bytes() == library.read_bytes()
 
     case('wrapper writes UIKit suite and preserves existing preferences', wrapper_readback)
     assert wrapper.consume_statusbar_provider(['seed.py', 'base', 'output']) is None
@@ -203,10 +203,12 @@ def main():
             if name == 'com.apple.UIKit' and state.get('missing_provider'):
                 values = {}
             (preferences / (name + '.plist')).write_bytes(plistlib.dumps(values))
-        destination = target / 'picasso/libpicasso-sb.dylib'
-        destination.parent.mkdir()
+        destination = target / 'picasso/usr-lib/libpicasso-sb.dylib'
+        destination.parent.mkdir(parents=True)
         destination.write_bytes(b'wrong-library' if state.get('bad_library') else library.read_bytes())
         destination.chmod(0o644)
+        if state.get('extra_library'):
+            (destination.parent / 'dyld').write_bytes(b'unexpected overlay')
         yield dict(VolumeUUID=state.get('uuid', identity))
 
     policy = dict(disabled_jobs=jobs, watchdogd_disabled=False, files=[
@@ -242,6 +244,7 @@ def main():
         ('missing_ui_domain', True, 'Missing Setup preference: com.apple.UIKit'),
         ('bad_library', True, 'library differs'),
         ('bad_library_mode', True, 'library metadata'),
+        ('extra_library', True, 'only the owned library'),
     ):
         state.clear()
         state[name] = value

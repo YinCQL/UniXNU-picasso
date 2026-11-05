@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+// Picasso g7a panel: PM8150L SID5 WLED5, not Sheng's I2C backlight.
+// Only adopt a running, fault-free stock configuration; gate the light on an
+// OS display power request. Panel scanout, rails, brightness and CABC remain
+// owned by firmware. This does not implement deep sleep or brightness fades.
+#include <IOKit/IOLib.h>
+#include <IOKit/IOService.h>
+#include <IOKit/IODeviceMemory.h>
+#include <IOKit/IOMemoryDescriptor.h>
+#include <pexpert/pexpert.h>
+#include "PicassoButtonsCore.h"
+#include "PicassoBacklightCore.h"
+namespace {
+struct Window {
+    IOMemoryMap *map = nullptr;
+    volatile uint32_t *va = nullptr;
+    bool open(uint64_t base, uint64_t size) {
+        IODeviceMemory *memory = IODeviceMemory::withRange(base, size);
+        map = memory ? memory->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+        OSSafeReleaseNULL(memory);
+        va = map ? reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()) : nullptr;
+        return va != nullptr;
+    }
+    ~Window() { OSSafeReleaseNULL(map); }
+};
+struct Channel {
+    volatile uint32_t *va;
+    void write(unsigned offset, uint32_t value) { va[offset/4]=value; __asm__ volatile("dsb sy" ::: "memory"); }
+    uint32_t read(unsigned offset) { uint32_t value=va[offset/4]; __asm__ volatile("dsb sy" ::: "memory"); return value; }
+    void delay() { IODelay(1); }
+};
+// Mapped only once at display startup, published with release/acquire. The
+// mutex serializes all requests and survives until shutdown with these maps.
+struct Backend {
+    Window observer[2], writer[2];
+    IOService *display = nullptr;
+    IOLock *lock = nullptr;
+    picasso_backlight::State state;
+    unsigned reports = 0;
+    bool adopting = true;
+    int read(bool sink, uint8_t reg, uint8_t &value) {
+        Channel channel{observer[sink].va};
+        int error = picasso_buttons::read8(channel, reg, value);
+        if (error || adopting) IOLog("PICASSO_WLED read sink=%u reg=%02x value=%02x error=%d\n",sink,reg,value,error);
+        return error;
+    }
+    int write(bool sink, uint8_t reg, uint8_t value) {
+        Channel channel{writer[sink].va};
+        channel.write(0x10,value);
+        channel.write(0,uint32_t(reg)<<4); // v5 EXT_WRITEL, 1 byte
+        for (unsigned n=0;n<1000;++n) {
+            uint32_t status=channel.read(8);
+            if (status & 1) return int(status & 0xe);
+            channel.delay();
+        }
+        return -1;
+    }
+    void soft_start() { IOSleep(10); }
+};
+Backend *backend;
+}
+extern "C" void picasso_backlight_start(IOService *display) {
+    unsigned enabled=0;
+    PE_parse_boot_argn("picasso-wled",&enabled,sizeof(enabled));
+    if (enabled!=1 || !display || backend) return;
+    Window core, owners;
+    if (!core.open(0xc440000,0x2000) || !owners.open(0xc40a000,0x1000)) {
+        IOLog("PICASSO_WLED refused MMIO mapping\n"); return;
+    }
+    uint32_t version=core.va[0];
+    if (!picasso_buttons::version_supported(version)) {
+        IOLog("PICASSO_WLED refused version=%08x\n",version); return;
+    }
+    auto read=[&](bool owner,uint32_t offset) {return (owner?owners.va:core.va)[offset/4];};
+    int apid[2]={picasso_backlight::find_apid(read,picasso_backlight::control_ppid),
+                 picasso_backlight::find_apid(read,picasso_backlight::sink_ppid)};
+    if (apid[0]<0 || apid[1]<0) {
+        IOLog("PICASSO_WLED refused owner control=%d sink=%d\n",apid[0],apid[1]); return;
+    }
+    Backend *next=new Backend;
+    if (!next) return;
+    next->lock=IOLockAlloc();
+    bool mapped=next->lock!=nullptr;
+    for(unsigned i=0;i<2 && mapped;++i)
+        mapped=next->observer[i].open(0xe600000+unsigned(apid[i])*0x80,0x80) &&
+               next->writer[i].open(0xc600000+unsigned(apid[i])*0x10000,0x1000);
+    int error=mapped?next->state.adopt(*next):-4;
+    IOLog("PICASSO_WLED adopt version=%08x control_apid=%d sink_apid=%d error=%d\n",version,apid[0],apid[1],error);
+    if(error) {if(next->lock)IOLockFree(next->lock);delete next;return;}
+    next->adopting=false;
+    display->retain();
+    next->display=display;
+    __atomic_store_n(&backend,next,__ATOMIC_RELEASE);
+}
+extern "C" IOReturn picasso_backlight_power(IOService *provider, bool on) {
+    Backend *b=__atomic_load_n(&backend,__ATOMIC_ACQUIRE);
+    if(!b)return kIOReturnNotReady;
+    if(provider!=b->display)return kIOReturnNotFound;
+    IOLockLock(b->lock);
+    int error=b->state.set(*b,on);
+    if(b->reports<64) {++b->reports;IOLog("PICASSO_WLED power=%u error=%d verified=%u\n",on,error,!error); }
+    IOLockUnlock(b->lock);
+    return error?kIOReturnIOError:kIOReturnSuccess;
+}

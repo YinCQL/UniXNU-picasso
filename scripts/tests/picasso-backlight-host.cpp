@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#include "PicassoBacklightCore.h"
+using picasso_backlight::State;
+struct Bus {
+    unsigned operations=0, fail=0, mismatch=0, writes=0, sleeps=0;
+    unsigned trace[16]={};
+    uint8_t regs[2][256]={};
+    Bus() {
+        regs[0][0x46]=0x85;
+        regs[1][0x46]=0x70; regs[1][0x50]=0x80; regs[1][0x51]=1;
+        regs[1][0x53]=0x34; regs[1][0x54]=2;
+    }
+    int read(bool sink,uint8_t reg,uint8_t &v) {
+        if(++operations==fail)return -1;
+        v=regs[sink][reg]; if(operations==mismatch)v^=1;
+        return 0;
+    }
+    int write(bool sink,uint8_t reg,uint8_t v) {
+        if(++operations==fail)return -1;
+        trace[writes++]=(unsigned(sink)<<16)|(unsigned(reg)<<8)|v;
+        regs[sink][reg]=v; return 0;
+    }
+    void soft_start() {++sleeps;}
+};
+int main() {
+    unsigned cases=0;
+    Bus b;State s;uint8_t original[2][256];memcpy(original,b.regs,sizeof original);
+    assert(!s.adopt(b) && s.on && s.ready && !b.writes);++cases;
+    assert(!s.set(b,true) && !b.writes);++cases;
+    assert(!s.set(b,false) && !s.on && b.writes==2);
+    assert(b.trace[0]==0xef03 && b.trace[1]==0x4605 && !b.sleeps);++cases;
+    assert(!s.set(b,false) && b.writes==2);++cases;
+    assert(!s.set(b,true) && s.on && b.writes==5 && b.sleeps==1);
+    assert(b.trace[2]==0xef00 && b.trace[3]==0x4685 && b.trace[4]==0x1b600);++cases;
+    assert(!memcmp(original,b.regs,sizeof original));++cases;
+    // Every adoption failure must be read-only, including invalid stock config.
+    for(unsigned n=1;n<=12;++n) {
+        Bus bus;State state;bus.fail=n;assert(state.adopt(bus) && !state.ready && !bus.writes);++cases;
+    }
+    const unsigned bad[][3]={{0,8,1},{0,0x46,0},{1,0x46,0x80},{1,0x50,0},
+        {1,0x51,0},{1,0x52,1},{1,0x73,1},{1,0x83,1},{1,0x93,1},{1,0xb0,0x40},{1,0x54,0xf0}};
+    for(auto &entry:bad) {
+        Bus bus;State state;bus.regs[entry[0]][entry[1]]=uint8_t(entry[2]);
+        assert(state.adopt(bus) && !state.ready && !bus.writes);++cases;
+    }
+    // Exercise every transport operation in both transitions. A partial write
+    // poisons the state; a second request must issue no bus transactions.
+    for(unsigned e=0;e<2;++e) {
+        bool enable=e!=0;
+        for(unsigned n=1;n<=(enable?10U:7U);++n) {
+            Bus bus;State state;assert(!state.adopt(bus));
+            if(enable)assert(!state.set(bus,false));
+            bus.fail=bus.operations+n;
+            assert(state.set(bus,enable) && state.failed);
+            unsigned count=bus.operations;assert(state.set(bus,!enable) && bus.operations==count);++cases;
+        }
+        for(unsigned n=5;n<=7;n+=2) {
+            Bus bus;State state;assert(!state.adopt(bus));
+            if(enable)assert(!state.set(bus,false));
+            bus.mismatch=bus.operations+n;
+            assert(state.set(bus,enable)==picasso_backlight::mismatch && state.failed);++cases;
+        }
+    }
+    const unsigned changed[]={8,0x46,0xb0};
+    for(unsigned reg:changed) {
+        Bus bus;State state;assert(!state.adopt(bus));
+        bus.regs[reg==0xb0][reg]^=reg==0xb0?0x40:1;
+        assert(state.set(bus,false) && state.failed && !bus.writes);++cases;
+    }
+    uint32_t maps[512]={},owners[512]={};
+    auto read=[&](bool owner,uint32_t offset) {return owner?owners[(offset-0x700)/4]:maps[(offset-0x900)/4];};
+    assert(picasso_backlight::find_apid(read,0x5d8)==-1);
+    maps[13]=0x5d800;owners[13]=1;assert(picasso_backlight::find_apid(read,0x5d8)==-1);
+    owners[13]=0;assert(picasso_backlight::find_apid(read,0x5d8)==13);
+    maps[14]=0x5d800;assert(picasso_backlight::find_apid(read,0x5d8)==-2);cases+=4;
+    printf("PASS WLED: %u state, ordering, readback, failure and ownership cases\n",cases);
+}

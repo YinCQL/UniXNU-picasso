@@ -10,7 +10,7 @@ import sys
 # Artifact checks run from the device checkout, while the ABI parser lives in
 # the assembled tree containing this builder.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'kits/XnuPrelink'))
-from picasso_original_abi import OriginalReference, qualify_hid
+from picasso_original_abi import OriginalReference, qualify_hid, qualify_hid_event_driver
 
 OWNED = [0, 1, 7, 14, 86, 87, 111, 171, 173, 180]
 MEMBERS = ['NativeHidInput.late.o', 'PicassoHidInput.o', 'hid-original-bindings.o']
@@ -47,6 +47,14 @@ def verify_matching_metadata(platform, native, original, kernel, plan):
             'HID matching bundle was not selected by prelink')
     require(entry(kernel) == expected, 'Changed original HID matching metadata')
     return dict(identifier=EVENT_DRIVER, personalities=sorted(personalities), original_metadata_preserved=True)
+
+
+def event_header(reference):
+    methods = qualify_hid_event_driver(reference)
+    kernel_methods = set(reference.names.values())
+    return ('// Pinned original IOHIDEventDriver, 220 slots. Zero entries are rebound kernel exports.\n'
+            '#pragma once\nstatic const uintptr_t kOriginalEventDriverMethods[]={\n' +
+            ''.join(f'    {0 if address in kernel_methods else address:#x}ULL,\n' for address in methods) + '};\n')
 
 
 def header():
@@ -126,6 +134,7 @@ def audit_object(platform, native, obj, reference, *, slot_names=None):
 def build(root, platform, native, record, out, board):
     reference = OriginalReference(os.environ['UNIXNU_KERNELCACHE'], board)
     qualify_hid(reference)
+    (out / 'OriginalHidEventABI.h').write_text(event_header(reference), encoding='utf-8', newline='\n')
     (out / 'OriginalHidDeviceABI.h').write_text(header(), encoding='utf-8')
     sources = [root / 'drivers/NativeHidInput/NativeHidInput.cpp', root / 'kits/picasso/PicassoHidInput.cpp',
                root / 'kits/picasso/PicassoButtons.cpp']
@@ -168,6 +177,7 @@ def verify(platform, aes, native, reference, directory, kernel, plan):
     require = platform.require
     matching = verify_matching_metadata(platform, native, reference.data, kernel, plan)
     require((directory / 'OriginalHidDeviceABI.h').read_text(encoding='utf-8') == header(), 'Changed generated HID header')
+    require((directory / 'OriginalHidEventABI.h').read_text(encoding='utf-8') == event_header(reference), 'Changed generated HID event header')
     slot_names = []
     audit = audit_object(platform, native, directory / 'NativeHidInput.o', reference, slot_names=slot_names)
     require(audit == json.loads((directory / 'hid-object-audit.json').read_text()), 'Stale HID object audit')
@@ -179,6 +189,12 @@ def verify(platform, aes, native, reference, directory, kernel, plan):
     vt = names['__ZTV14NativeHidInput'] + 16
     offset = native.backed_offset(image['segments'], vt, 207 * 8, len(kernel))
     compiled = struct.unpack_from('<207Q', kernel, offset)
+    qualified_event = qualify_hid_event_driver(reference)
+    at = native.backed_offset(image['segments'], 0xfffffff005d06a68, 220 * 8, len(kernel))
+    actual_event = struct.unpack_from('<220Q', kernel, at)
+    rebound = {value: names[name] for name, value in reference.names.items() if name in names}
+    require(actual_event == tuple(rebound.get(value, value) for value in qualified_event),
+            'Changed original event-driver dispatch after prelink')
     # Inline overrides may be local N_SECT definitions after linking. Reuse
     # the AES/display resolver, which checks unique executable definitions.
     wanted = {slot_names[i] for i in OWNED}

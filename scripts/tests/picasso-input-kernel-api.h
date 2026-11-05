@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stddef.h>
 using kern_return_t=int;
+using IOReturn=int;
+enum {kIOReturnNotFound=4,kIOReturnUnsupported=3,kIOReturnNotReady=1,kIOReturnIOError=2,kIOReturnSuccess=0};
 class OSSymbol;
 class OSMetaClass {
 public:
@@ -56,6 +58,7 @@ class IOMemoryMap:public OSObject {public: uintptr_t getVirtualAddress();};
 class IODeviceMemory:public OSObject {public:static IODeviceMemory *withRange(uint64_t,uint64_t); IOMemoryMap *map(unsigned);};
 struct IOLock;
 IOLock *IOLockAlloc(); void IOLockLock(IOLock *); void IOLockUnlock(IOLock *);
+void IOLockFree(IOLock *);
 using wait_result_t=int; using thread_t=void *;
 enum {kIOMapAnywhere=1,kIOMapInhibitCache=2,KERN_SUCCESS=0};
 void IODelay(unsigned); void IOSleep(unsigned);

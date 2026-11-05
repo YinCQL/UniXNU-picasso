@@ -45,7 +45,7 @@ def main():
         if execute:
             run(name + '-run', [cmd[cmd.index('-o') + 1]])
 
-    for source in ('picasso-buttons-host.cpp', 'picasso-buttons-dispatch-host.cpp'):
+    for source in ('picasso-buttons-host.cpp', 'picasso-buttons-dispatch-host.cpp', 'picasso-backlight-host.cpp'):
         for sanitized in (False, True):
             name = Path(source).stem + ('-sanitized' if sanitized else '')
             exe = out / (name + ('.exe' if os.name == 'nt' else ''))
@@ -58,7 +58,7 @@ def main():
 
     # Compile entire production worker/bridge bodies, including inline ARM64 MMIO
     # barriers. These explicit API declarations are not a substitute for XNU headers.
-    for name in ('PicassoHidInput', 'PicassoButtons'):
+    for name in ('PicassoHidInput', 'PicassoButtons', 'PicassoBacklight'):
         body = (ROOT / 'package' / (name + '.cpp')).read_text()
         body = re.sub(r'^#include <[^>]+>[^\n]*\n', '', body, flags=re.M)
         source = out / (name + '.cpp')
@@ -68,7 +68,7 @@ def main():
             '-mgeneral-regs-only', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function',
             '-I', str(ROOT / 'scripts/tests'), '-I', str(ROOT / 'package'),
             '-I', str(ROOT / 'drivers/NativeNovatekTouch'), '-c', str(source), '-o', str(out / (name + '.o'))])
-    inputs = [ROOT / 'package' / n for n in ('PicassoButtonsCore.h', 'PicassoButtons.cpp', 'PicassoHidInput.cpp')]
+    inputs = [ROOT / 'package' / n for n in ('PicassoButtonsCore.h', 'PicassoButtons.cpp', 'PicassoHidInput.cpp', 'PicassoBacklightCore.h', 'PicassoBacklight.cpp')]
     inputs += [ROOT / 'drivers/NativeHidInput/NativeHidInput.cpp', Path(__file__)]
     (out / 'results.json').write_text(json.dumps(dict(passed=True, scope=__doc__, runs=runs,
         hardware_tested=False, kernel_sdk_compiled=False,

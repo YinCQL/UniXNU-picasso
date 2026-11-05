@@ -1,0 +1,240 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9207,6 +9207,103 @@
+ 	native_picasso_persist_one("minstall", "/private/var/mobile/Library/MobileInstallation/MobileInstallation.plist");
+ }
+ #endif
++#if DEVELOPMENT || DEBUG
++/* Validate the entire upper directory before giving it a system view. This
++ * boot-only seed is not a general library overlay or a writable plugin path. */
++static int
++picasso_ui_library_directory(vnode_t vp, vfs_context_t ctx)
++{
++    char *buffer = kalloc_data(4096, Z_WAITOK);
++    uio_t uio = buffer ? uio_create(1, 0, UIO_SYSSPACE, UIO_READ) : NULL;
++    int error = uio ? 0 : ENOMEM, eof = 0;
++    unsigned found = 0;
++    for (unsigned batch = 0; !error && !eof && batch < 4; ++batch) {
++        uio_reset(uio, uio_offset(uio), UIO_SYSSPACE, UIO_READ);
++        error = uio_addiov(uio, CAST_USER_ADDR_T(buffer), 4096);
++        int entries = 0;
++        if (!error) error = VNOP_READDIR(vp, uio, 0, &eof, &entries, ctx);
++        if (error) break;
++        size_t used = 4096 - uio_resid(uio), at = 0;
++        const size_t header = offsetof(struct dirent, d_name);
++        while (at < used) {
++            if (used - at <= header) { error = EIO; break; }
++            const struct dirent *entry = (const struct dirent *)(buffer + at);
++            if (entry->d_reclen <= header || entry->d_reclen > used - at ||
++                entry->d_namlen >= entry->d_reclen - header || entry->d_name[entry->d_namlen]) {
++                error = EIO; break;
++            }
++            int dot = entry->d_namlen == 1 && entry->d_name[0] == '.';
++            int dotdot = entry->d_namlen == 2 && !memcmp(entry->d_name, "..", 2);
++            if (!dot && !dotdot) {
++                if (entry->d_namlen != sizeof("libpicasso-sb.dylib") - 1 ||
++                    memcmp(entry->d_name, "libpicasso-sb.dylib", sizeof("libpicasso-sb.dylib") - 1) || ++found != 1) {
++                    error = EINVAL; break;
++                }
++            }
++            at += entry->d_reclen;
++        }
++        if (!used && !eof) error = EIO;
++    }
++    if (!error && (!eof || found != 1)) error = EINVAL;
++    if (uio) uio_free(uio);
++    if (buffer) kfree_data(buffer, 4096);
++    return error;
++}
++
++static int
++picasso_ui_library_prepare(void)
++{
++    const char *paths[] = {"/private/var/picasso", "/private/var/picasso/usr-lib",
++        "/private/var/picasso/usr-lib/libpicasso-sb.dylib"};
++    vfs_context_t ctx = vfs_context_current();
++    for (unsigned i = 0; i < 3; ++i) {
++        vnode_t vp = NULLVP;
++        int error = vnode_lookup(paths[i], VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++        if (error) return error;
++        if (vnode_vtype(vp) != (i == 2 ? VREG : VDIR)) error = EINVAL;
++        if (!error && i == 1) error = picasso_ui_library_directory(vp, ctx);
++        if (!error) {
++            struct vnode_attr va;
++            VATTR_INIT(&va);
++            VATTR_SET(&va, va_mode, i == 2 ? 0644 : 0755);
++            VATTR_SET(&va, va_uid, 0);
++            VATTR_SET(&va, va_gid, 0);
++            error = vnode_setattr(vp, &va, ctx);
++            if (!error) {
++                VATTR_INIT(&va);
++                VATTR_WANTED(&va, va_mode); VATTR_WANTED(&va, va_uid); VATTR_WANTED(&va, va_gid);
++                error = vnode_getattr(vp, &va, ctx);
++                if (!error && (!VATTR_IS_SUPPORTED(&va, va_mode) || !VATTR_IS_SUPPORTED(&va, va_uid) ||
++                    !VATTR_IS_SUPPORTED(&va, va_gid) || va.va_uid || va.va_gid ||
++                    (va.va_mode & 07777) != (i == 2 ? 0644 : 0755))) error = EPERM;
++            }
++        }
++        vnode_put(vp);
++        if (error) return error;
++    }
++    return 0;
++}
++
++/* One read-only library union; signature/MAC/VM checks run normally on load. */
++static void
++picasso_ui_library_mount(proc_t p, user_addr_t scratch)
++{
++    static const char source[] = "/private/var/picasso/usr-lib";
++    static const char point[] = "/usr/lib";
++    static const char library[] = "/usr/lib/libpicasso-sb.dylib";
++    char requested[128] = {};
++    if (!PE_parse_boot_argn("picasso_inject_sb", requested, sizeof(requested)) ||
++        strcmp(requested, library)) return;
++    int error = picasso_ui_library_prepare();
++    if (error) { printf("PICASSO_INJECT view prepare error=%d\n", error); return; }
++    volatile int stage = 0, status = -1;
++    native_gpu_addon_mount(p, scratch, 0xc00, source, sizeof(source), point, sizeof(point),
++        "/usr/lib/dyld", library, &stage, &status);
++    printf("PICASSO_INJECT view stage=%d error=%d path=%s\n", stage, status, library);
++}
++#endif
++
++
+ static int
+ native_owner_data_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -9282,6 +9379,7 @@
+ 	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
+ #if DEVELOPMENT || DEBUG
+ 	if (!error) native_picasso_apps_mount(p, scratch);
++	if (!error) picasso_ui_library_mount(p, scratch);
+ #endif
+ done:
+ 	if (data_root) vnode_put(data_root);
+--- a/bsd/kern/kern_mman.c
++++ b/bsd/kern/kern_mman.c
+@@ -235,6 +235,7 @@
+ /* PICASSO_PREFLIGHT_BEGIN */
+ #if DEVELOPMENT || DEBUG
+ 	unsigned inject_ticket = 0;
++	const char *inject_stage = "arguments";
+ 	static unsigned pid1_mmap_count;
+ 	unsigned pid1_ticket = (proc_getpid(p) == 1 && fd >= 0 && !(uap->flags & MAP_ANON)) ? picasso_pid1_trace_ticket(&pid1_mmap_count, 64) : 0;
+ 	uint64_t pid1_thread = pid1_ticket ? thread_tid(current_thread()) : 0;
+@@ -242,9 +243,9 @@
+ 	    pid1_ticket, (unsigned long long)pid1_thread, fd, (unsigned long long)uap->pos, (unsigned long long)uap->len, (unsigned)uap->prot, (unsigned)uap->flags);
+ #define PICASSO_PID1_MMAP_RETURN(value) do { \
+ 	int pid1_error = (value); \
+-	if (inject_ticket) printf("PICASSO_INJECT mmap s=%u pid=%d off=%llx len=%llu prot=%x error=%d addr=%llx\n", \
++	if (inject_ticket) printf("PICASSO_INJECT mmap s=%u pid=%d off=%llx len=%llu prot=%x error=%d addr=%llx flags=%x stage=%s\n", \
+ 	    inject_ticket, proc_getpid(p), (unsigned long long)uap->pos, (unsigned long long)uap->len, \
+-	    (unsigned)uap->prot, pid1_error, pid1_error ? 0ULL : (unsigned long long)*retval); \
++	    (unsigned)uap->prot, pid1_error, pid1_error ? 0ULL : (unsigned long long)*retval, (unsigned)uap->flags, inject_stage); \
+ 	if (pid1_ticket) printf("PICASSO_PID1 mmap end s=%u t=%llu fd=%d errno=%d addr=%llx\n", \
+ 	    pid1_ticket, (unsigned long long)pid1_thread, fd, pid1_error, pid1_error ? 0ULL : (unsigned long long)*retval); \
+ 	return pid1_error; \
+@@ -671,6 +672,9 @@
+ 
+ 			handle = (void *)vp;
+ #if CONFIG_MACF
++#if DEVELOPMENT || DEBUG
++			inject_stage = "mac";
++#endif
+ 			error = mac_file_check_mmap(vfs_context_ucred(ctx),
+ 			    fp->fp_glob, prot, flags, file_pos + pageoff,
+ 			    &maxprot);
+@@ -687,6 +691,9 @@
+ 			 * then we don't check for writeability on the file
+ 			 * object, because it will only ever see reads.
+ 			 */
++#if DEVELOPMENT || DEBUG
++			inject_stage = "filesystem";
++#endif
+ 			error = VNOP_MMAP_CHECK(vp, (flags & MAP_PRIVATE) ?
+ 			    (prot & ~PROT_WRITE) : prot, ctx);
+ 			if (error) {
+@@ -969,6 +976,9 @@
+ 			goto bad;
+ 		}
+ 
++#if DEVELOPMENT || DEBUG
++			inject_stage = "vm";
++#endif
+ 		result = vm_map_enter_mem_object_control(user_map,
+ 		    &user_addr, user_size,
+ 		    0, vmk_flags,
+--- a/security/mac_file.c
++++ b/security/mac_file.c
+@@ -178,7 +178,30 @@
+ 	int maxp;
+ 
+ 	maxp = *maxprot;
++#if DEVELOPMENT || DEBUG
++    extern unsigned picasso_inject_load_ticket(proc_t, vnode_t);
++    unsigned ticket = (fg && FILEGLOB_DTYPE(fg) == DTYPE_VNODE) ?
++        picasso_inject_load_ticket(current_proc(), (vnode_t)fg_get_data(fg)) : 0;
++    /* Same ordered hooks, DTrace calls, error selection and maxprot checks as
++     * MAC_CHECK. Observe each verdict once; never re-run or replace a policy. */
++    if (!ticket) {
++        MAC_CHECK(file_check_mmap, cred, fg, NULL, prot, flags, offset, &maxp);
++    } else {
++    error = 0;
++    MAC_POLICY_ITERATE({
++        if (mpc->mpc_ops->mpo_file_check_mmap != NULL) {
++            DTRACE_MACF3(mac__call__file_check_mmap, void *, mpc, int, error, int, MAC_ITERATE_CHECK);
++            int step_error = mpc->mpc_ops->mpo_file_check_mmap(cred, fg, NULL, prot, flags, offset, &maxp);
++            DTRACE_MACF2(mac__rslt__file_check_mmap, void *, mpc, int, step_error);
++            if (ticket) printf("PICASSO_INJECT mmap_policy s=%u pid=%d policy=%.32s prot=%x error=%d maxprot=%x\n",
++                ticket, proc_selfpid(), mpc->mpc_name, prot, step_error, maxp);
++            error = mac_error_select(step_error, error);
++        }
++    });
++    }
++#else
+ 	MAC_CHECK(file_check_mmap, cred, fg, NULL, prot, flags, offset, &maxp);
++#endif
+ 	if ((maxp | *maxprot) != *maxprot) {
+ 		panic("file_check_mmap increased max protections");
+ 	}
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -6912,20 +6912,24 @@
+ 		args->structureInputSize = PICASSO_IOS16_SWAP_BYTES;
+ 		IOFreeData(picassoSwap, PICASSO_IPADOS17_SWAP_BYTES);
+ 	}
+-	/* Selector 12 = kern_RequestPowerChange (scalar: requested display power state). The
+-	 * GOP panel has no power switch; the retained family refuses it, after which backboardd
+-	 * stops presenting. Accept power-on. The lock screen renders but the display then drops;
+-	 * with picasso-fb-reject-off=1 the power-off transition is refused so backboardd keeps
+-	 * presenting the lock screen instead of believing the display went off. */
+-	if (selector == 12 && ret == kIOReturnUnsupported && args->scalarInputCount == 1 &&
+-	    !strncmp(getMetaClass()->getClassName(), "IOMobileFramebuffer", 19)) {
+-		unsigned rejectOff = 0;
+-		PE_parse_boot_argn("picasso-fb-reject-off", &rejectOff, sizeof(rejectOff));
+-		bool off = args->scalarInput[0] == 0;
+-		ret = (rejectOff && off) ? kIOReturnUnsupported : kIOReturnSuccess;
+-		printf("PICASSO_FBUC power change to %llu -> ret=%x\n",
+-		    (unsigned long long)args->scalarInput[0], ret);
+-	}
++    /* Selector 12 is the OS display-power request. The firmware scanout stays
++     * alive, but Picasso can now gate its WLED light and verify the write.
++     * No successful completion is invented if the backend is unavailable. */
++    if (selector == 12 && (ret == kIOReturnUnsupported || ret == kIOReturnSuccess) &&
++        args->scalarInputCount == 1 && args->scalarInput && args->scalarInput[0] <= 1 &&
++        !strncmp(getMetaClass()->getClassName(), "IOMobileFramebuffer", 19)) {
++        extern IOReturn picasso_backlight_power(IOService *, bool) __asm__("_picasso_backlight_power") __attribute__((weak_import));
++        IOReturn hardware = picasso_backlight_power ?
++            picasso_backlight_power(getProvider(), args->scalarInput[0] != 0) : kIOReturnNotReady;
++        if (hardware != kIOReturnNotReady && hardware != kIOReturnNotFound) ret = hardware;
++        else if (hardware == kIOReturnNotReady && ret == kIOReturnUnsupported && args->scalarInput[0] == 1) {
++            /* Preserve the existing firmware-on startup compatibility only.
++             * Off requires a functioning physical backend. */
++            ret = kIOReturnSuccess;
++        }
++        printf("PICASSO_FBUC power change to %llu -> ret=%x hardware=%x\n",
++            (unsigned long long)args->scalarInput[0], ret, hardware);
++    }
+ 	if (picassoFbTicket) {
+ 		printf("PICASSO_FBUC done=%u selector=%u ret=%x\n", picassoFbTicket, selector, ret);
+ 	}
