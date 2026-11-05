@@ -42,13 +42,14 @@ def prepare(tree, ipsw, output):
     packed_path, raw_path = output / 'kernelcache.lzfse', output / 'kernelcache.decoded'
     packed_path.write_bytes(payload)
     if sys.platform == 'darwin':
-        subprocess.run(['/usr/bin/compression_tool', '-decode', '-a', 'lzfse',
-                        '-i', str(packed_path), '-o', str(raw_path)], check=True)
-        raw = raw_path.read_bytes()
+        decoder = ['/usr/bin/compression_tool', '-decode', '-a', 'lzfse']
     else:
-        import lzfse
-        raw = lzfse.decompress(payload)
-        raw_path.write_bytes(raw)
+        # The fixed Linux toolchain ships Apple's reference decoder, not the
+        # separate Python extension. Use the same lookup as upstream IPSW reads.
+        from unixnu.util import lzfse
+        decoder = [lzfse(), '-decode']
+    subprocess.run([*decoder, '-i', str(packed_path), '-o', str(raw_path)], check=True)
+    raw = raw_path.read_bytes()
     if raw[:4] == b'\xca\xfe\xba\xbe':
         count = struct.unpack_from('>I', raw, 4)[0]
         if not 0 < count <= 16 or 8 + count * 20 > len(raw):
