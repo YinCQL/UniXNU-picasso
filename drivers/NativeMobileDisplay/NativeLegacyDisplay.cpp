@@ -7,6 +7,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <kern/clock.h>
@@ -92,6 +93,17 @@ static void picasso_frame_trace(uint64_t offer_ticks)
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
+    /* Zero-copy flip (sheng-sde-flip=1): the MDP/SDE register block, mapped once. The wf335 probe
+     * found the firmware's scanout on VIG0 (SSPP 0x5000, CTL0 0x2000) with SRC0_ADDR holding the
+     * GOP's physical address, i.e. the display reads physical memory directly. */
+    IOMemoryMap *sdeMap=nullptr;
+    volatile uint32_t *sdeRegs=nullptr;
+    /* sheng-sde-selftest=1: a scanout buffer this driver allocates itself, physically contiguous, so the SDE
+     * flip can be proven before the compositor's own (scattered) IOSurfaces are solved. Same panel geometry,
+     * same stride as the client's surface. */
+    IOBufferMemoryDescriptor *sdeShadow=nullptr;
+    uint64_t sdeShadowStride=0;
+    uint32_t sdeShadowPa=0;
     // The GOP panel's geometry. getDisplayDimensions() reports the mode (a
     // shorter 2340-row phone canvas when the ADT asks for it), so every panel
     // store and bounds check uses these instead.
@@ -233,7 +245,7 @@ public:
         IOFree(args,sizeof(Args));
         finishGpuSwap(status);
     }
-    void free() override {stopVsync();releaseCopyShadow();if(kickLock){IORecursiveLockFree(kickLock);kickLock=nullptr;}if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+    void free() override {stopVsync();releaseCopyShadow();OSSafeReleaseNULL(sdeShadow);sdeShadowStride=0;OSSafeReleaseNULL(sdeMap);sdeRegs=nullptr;if(kickLock){IORecursiveLockFree(kickLock);kickLock=nullptr;}if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
         // The GPU client may still own a frame; take it back before the display goes away, or its later completion
         // would reach a stopped (and freed) display.
@@ -254,9 +266,67 @@ public:
         Setter setter=reinterpret_cast<Setter *>(*reinterpret_cast<void **>(this))[354];
         setter(this,&request,false);
     }
+    static uint32_t sdeRead(volatile uint32_t *base,uint32_t offset) { return base[offset/4]; }
+    // sheng-sde-probe=1: read the SDE (display controller) register blocks that describe the firmware's
+    // scanout, so a direct flip (zero copy) can be built from the registers the boot loader actually
+    // programmed instead of the vendor driver's layout. Read-only; the MDP is powered while the panel scans.
+    void sdeProbe() {
+        static int enabled=-1;
+        if(enabled<0) { uint32_t value=0; enabled=(PE_parse_boot_argn("sheng-sde-probe",&value,sizeof value) && value)?1:0; }
+        if(enabled!=1 || !bootMapping)return;
+        const uint64_t gop=bootMapping->getPhysicalAddress();
+        const uint32_t gopLo=(uint32_t)gop,gopHi=(uint32_t)(gop>>32);
+        printf("PICASSO_SDE gop_pa=%llx len=%llu panel=%ux%u\n",(unsigned long long)gop,
+            (unsigned long long)bootMapping->getLength(),panelWidth,panelHeight);
+        IOMemoryDescriptor *mdp=IOMemoryDescriptor::withPhysicalAddress(0xae00000,0x90000,kIODirectionInOut);
+        IOMemoryMap *map=mdp?mdp->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
+        if(mdp)mdp->release();
+        if(!map) { printf("PICASSO_SDE mdp map failed\n"); return; }
+        volatile uint32_t *m=(volatile uint32_t *)map->getVirtualAddress();
+        printf("PICASSO_SDE version=%08x top",sdeRead(m,0));
+        for(uint32_t o=0;o<0x40;o+=4)printf(" %x",sdeRead(m,0x1000+o));
+        printf("\n");
+        const uint32_t sspp[5]={0x5000,0x7000,0x25000,0x27000,0x29000};
+        static const uint32_t ssppOffs[12]={0x0,0x4,0x8,0xc,0x10,0x14,0x18,0x1c,0x30,0x34,0x38,0x3c};
+        for(unsigned i=0;i<5;i++) {
+            printf("PICASSO_SDE sspp%u",i);
+            for(unsigned k=0;k<12;k++) {
+                const uint32_t value=sdeRead(m,sspp[i]+ssppOffs[k]);
+                printf(" %x",value);
+                if(value==gopLo || value==gopHi)printf("(gop)");
+            }
+            printf("\n");
+        }
+        const uint32_t ctl[4]={0x2000,0x2200,0x2400,0x2600};
+        for(unsigned i=0;i<4;i++) {
+            printf("PICASSO_SDE ctl%u",i);
+            for(uint32_t o=0;o<=0x30;o+=4)printf(" %x",sdeRead(m,ctl[i]+o));
+            printf("\n");
+        }
+        printf("PICASSO_SDE mixer0");
+        for(uint32_t o=0;o<=0x40;o+=4)printf(" %x",sdeRead(m,0x45000+o));
+        printf("\n");
+        printf("PICASSO_SDE pp0");
+        for(uint32_t o=0;o<=0x30;o+=4)printf(" %x",sdeRead(m,0x71000+o));
+        printf("\n");
+        printf("PICASSO_SDE intf1");
+        for(uint32_t o=0;o<=0x40;o+=4)printf(" %x",sdeRead(m,0x6b800+o));
+        printf("\n");
+        map->release();
+        IOMemoryDescriptor *vbif=IOMemoryDescriptor::withPhysicalAddress(0xaeb0000,0x1040,kIODirectionInOut);
+        IOMemoryMap *vmap=vbif?vbif->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
+        if(vbif)vbif->release();
+        if(vmap) {
+            volatile uint32_t *v=(volatile uint32_t *)vmap->getVirtualAddress();
+            printf("PICASSO_SDE vbif");
+            for(uint32_t o=0;o<=0x40;o+=4)printf(" %x",sdeRead(v,o));
+            printf("\n");
+            vmap->release();
+        }
+    }
     bool start(IOService *provider) override {
         if(!startDisplay(provider))return false;
-        startVsync();return true;
+        startVsync();sdeProbe();sdeDiag();return true;
     }
     bool startDisplay(IOService *provider) {
         if(!IOMobileFramebufferLegacy::start(provider))return false;
@@ -421,6 +491,34 @@ public:
         // GPU-copied or not (int-093). A failed prepare is retried next kick.
         if(!gpuBypass) {
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+        }
+        /* sheng-sde-flip=1: zero-copy scanout. The display controller reads the compositor's own
+         * surface (the same physical-address model the boot loader uses), so the GPU present/copy,
+         * its commit and its fence wait all leave the frame. Falls through to the copy paths when the
+         * surface is not an exact, contiguous panel-sized buffer. */
+        unsigned flip=0;PE_parse_boot_argn("sheng-sde-flip",&flip,sizeof flip);
+        if(flip==1 && sdeFlip(memory,sourceWidth,sourceHeight,sourceStride)) {
+            if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+            copyShadowValid=false;
+            native_legacy_swap_stage(3);
+            native_legacy_frame_observed(3,0,0,0,0,0);
+            native_legacy_transfer_observed(kIOReturnSuccess,request,0);
+            unsigned early=1;PE_parse_boot_argn("sheng-early-retire",&early,sizeof early);
+            if(early==1 && retireSwap(request,true)) native_legacy_early_retires=native_legacy_early_retires+1;
+            return;
+        }
+        /* sheng-sde-selftest=1: the same flip against a contiguous buffer this driver allocated itself
+         * (see sdeSelfTest), to prove the SDE path while the compositor's surfaces are still scattered. */
+        unsigned selftest=0;PE_parse_boot_argn("sheng-sde-selftest",&selftest,sizeof selftest);
+        if(selftest==1 && sdeSelfTest(memory,sourceWidth,sourceHeight,sourceStride)) {
+            if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+            copyShadowValid=false;
+            native_legacy_swap_stage(3);
+            native_legacy_frame_observed(3,0,0,0,0,0);
+            native_legacy_transfer_observed(kIOReturnSuccess,request,0);
+            unsigned early=1;PE_parse_boot_argn("sheng-early-retire",&early,sizeof early);
+            if(early==1 && retireSwap(request,true)) native_legacy_early_retires=native_legacy_early_retires+1;
+            return;
         }
         /* The phone canvas is shorter than the panel: hand the GPU the source height and the top-bar row
          * offset and let the presenter fill both bars, instead of copying 10 MB per frame on the CPU. */
@@ -684,6 +782,167 @@ public:
         native_legacy_client_enter(task,type);
         IOReturn status=IOMobileFramebufferLegacy::newUserClient(task,security,type,client);
         native_legacy_client_observed(status,status==kIOReturnSuccess && client?*client:nullptr);return status;
+    }
+    bool sdeEnsureMapped() {
+        if(sdeRegs)return true;
+        IOMemoryDescriptor *mdp=IOMemoryDescriptor::withPhysicalAddress(0xae00000,0x90000,kIODirectionInOut);
+        if(!mdp)return false;
+        IOMemoryMap *map=mdp->map(kIOMapAnywhere|kIOMapInhibitCache);
+        mdp->release();
+        if(!map)return false;
+        if(!map->getVirtualAddress()){map->release();return false;}
+        sdeMap=map;sdeRegs=(volatile uint32_t *)map->getVirtualAddress();
+        return true;
+    }
+    /* Program the active pipe (VIG0 = SSPP 0x5000, CTL0 = 0x2000; the boot loader's own scanout, found
+     * by the wf335 probe): same geometry, new base and stride, one CTL flush. The hardware latches the
+     * update at the next frame boundary. */
+    void sdeProgram(uint32_t pa,uint32_t width,uint32_t height,uint64_t stride) {
+        const uint32_t base=0x5000;
+        sdeRegs[base/4+0x00/4]=((uint32_t)height<<16)|width;   /* SSPP_SRC_SIZE */
+        sdeRegs[base/4+0x0c/4]=((uint32_t)height<<16)|width;   /* SSPP_OUT_SIZE */
+        sdeRegs[base/4+0x14/4]=pa;                             /* SSPP_SRC0_ADDR */
+        sdeRegs[base/4+0x24/4]=(uint32_t)stride;               /* SSPP_SRC_YSTRIDE0 */
+        __asm__ volatile("dsb st":::"memory");
+        sdeRegs[0x2000/4+0x18/4]=1u;                           /* CTL_FLUSH, VIG0 */
+    }
+    /* How the client's surface is laid out, once: descriptor class/length and the physical run structure of
+     * the first frames. The SDE reads one linear range, so a fully scattered 4 KB surface cannot be scanned;
+     * the longest run says whether anything larger is available. */
+    void sdeDescribeSurface(IOMemoryDescriptor *memory,uint64_t needed) {
+        static unsigned prints;
+        if(prints>=2)return;
+        ++prints;
+        const OSMetaClass *meta=memory->getMetaClass();
+        printf("PICASSO_SDE surface class=%s len=%llu needed=%llu\n",
+            meta?meta->getClassName():"?",(unsigned long long)memory->getLength(),(unsigned long long)needed);
+        uint64_t offset=0,longest=0,longestAt=0;unsigned runs=0,pages=0;
+        while(offset<needed && pages<2700) {
+            IOByteCount segment=0;
+            const addr64_t pa=memory->getPhysicalSegment(offset,&segment,0);
+            if(!pa || !segment)break;
+            if(segment>longest){longest=segment;longestAt=offset;}
+            offset+=segment;++runs;++pages;
+        }
+        printf("PICASSO_SDE surface runs=%u bytes=%llu longest=%llu at=%llu\n",
+            runs,(unsigned long long)offset,(unsigned long long)longest,(unsigned long long)longestAt);
+    }
+    bool sdeFlip(IOMemoryDescriptor *memory,uint32_t width,uint32_t height,uint64_t stride) {
+        if(!sdeEnsureMapped() || !primary || !bootMapping)return false;
+        if(width!=panelWidth || height!=panelHeight) {
+            static unsigned sizePrints;
+            if(sizePrints<4){++sizePrints;printf("PICASSO_SDE flip size %ux%u panel %ux%u\n",width,height,panelWidth,panelHeight);}
+            return false;
+        }
+        if((stride&3) || stride<(uint64_t)width*4)return false;
+        const uint64_t needed=(uint64_t)(height-1)*stride+(uint64_t)width*4;
+        IOByteCount segment=0;
+        const addr64_t pa=memory->getPhysicalSegment(0,&segment,0);
+        if(!pa || segment<needed || pa>(addr64_t)0xffffffffu || pa+needed<(addr64_t)pa) {
+            static unsigned skipPrints;
+            if(skipPrints<8){++skipPrints;printf("PICASSO_SDE flip skip pa=%llx seg=%llu needed=%llu\n",(unsigned long long)pa,(unsigned long long)segment,(unsigned long long)needed);}
+            sdeDescribeSurface(memory,needed);
+            return false;
+        }
+        {
+            static unsigned flipPrints;
+            if(flipPrints<8){++flipPrints;printf("PICASSO_SDE flip pa=%llx stride=%llu %ux%u\n",(unsigned long long)pa,(unsigned long long)stride,width,height);}
+        }
+        sdeProgram((uint32_t)pa,width,height,stride);
+        return true;
+    }
+    /* sheng-sde-selftest=1: copy the client's frame into a scanout buffer this driver allocated itself,
+     * physically contiguous, and point the SDE at that buffer. The copy is the same 10.4 MB copy the GOP
+     * path does; the point is that the SDE now scans memory this driver owns, which proves the flip's
+     * address translation, format and stride without needing the compositor's surface to be contiguous. */
+    bool sdeSelfTest(IOMemoryDescriptor *memory,uint32_t width,uint32_t height,uint64_t stride) {
+        if(!sdeEnsureMapped() || !primary || !bootMapping)return false;
+        if(width!=panelWidth || height!=panelHeight)return false;
+        if((stride&3) || stride<(uint64_t)width*4)return false;
+        const uint64_t needed=(uint64_t)(height-1)*stride+(uint64_t)width*4;
+        if(!sdeShadow) {
+            /* cpm_allocate finds the run in the free lists; keep the first one that fits the SDE's 32-bit
+             * address register (retry a few times, releasing buffers that land above 4 GB). */
+            for(unsigned attempt=0;attempt<6 && !sdeShadow;++attempt) {
+                IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withOptions(
+                    kIOMemoryPhysicallyContiguous|kIODirectionInOut,needed,4096);
+                if(!buffer) {printf("PICASSO_SDE selftest alloc failed attempt=%u\n",attempt);continue;}
+                IOByteCount segment=0;
+                const addr64_t pa=buffer->getPhysicalSegment(0,&segment,0);
+                if(pa && segment>=needed && pa+needed<=(addr64_t)0xffffffffu) {
+                    sdeShadow=buffer;sdeShadowStride=stride;sdeShadowPa=(uint32_t)pa;
+                    printf("PICASSO_SDE selftest buffer pa=%llx len=%llu stride=%llu\n",
+                        (unsigned long long)pa,(unsigned long long)buffer->getLength(),(unsigned long long)stride);
+                } else {
+                    printf("PICASSO_SDE selftest reject pa=%llx seg=%llu\n",(unsigned long long)pa,(unsigned long long)segment);
+                    buffer->release();
+                }
+            }
+            if(!sdeShadow) {printf("PICASSO_SDE selftest no contiguous buffer\n");return false;}
+        }
+        IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
+        if(!source || !source->getVirtualAddress() || source->getLength()<needed) {OSSafeReleaseNULL(source);return false;}
+        memcpy(sdeShadow->getBytesNoCopy(),reinterpret_cast<const void *>(source->getVirtualAddress()),(size_t)needed);
+        source->release();
+        __asm__ volatile("dsb sy":::"memory");
+        sdeProgram(sdeShadowPa,width,height,stride);
+        return true;
+    }
+    /* sheng-sde-probe=1 also runs these two capability checks, once, at display start:
+     *  - can the kernel hand out a physically contiguous scanout-sized buffer (the flip's fallback)?
+     *  - what is the apps SMMU (0x15000000) doing with the display's stream 0xb40: does the SDE read
+     *    physical addresses, or IOVAs translated by this SMMU? */
+    void sdeDiag() {
+        static int enabled=-1;
+        if(enabled<0) { uint32_t value=0; enabled=(PE_parse_boot_argn("sheng-sde-probe",&value,sizeof value) && value)?1:0; }
+        if(enabled!=1)return;
+        const vm_size_t sizes[3]={1u<<20,12u<<20,64u<<20};
+        for(unsigned i=0;i<3;i++) {
+            IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withOptions(
+                kIOMemoryPhysicallyContiguous|kIODirectionInOut,sizes[i],4096);
+            if(!buffer) {printf("PICASSO_SDE contig %llu failed\n",(unsigned long long)sizes[i]);continue;}
+            IOByteCount segment=0;
+            const addr64_t pa=buffer->getPhysicalSegment(0,&segment,0);
+            printf("PICASSO_SDE contig %llu ok pa=%llx seg=%llu len=%llu\n",
+                (unsigned long long)sizes[i],(unsigned long long)pa,
+                (unsigned long long)segment,(unsigned long long)buffer->getLength());
+            buffer->release();
+        }
+        /* The apps SMMU, read-only: which stream-match entry covers the display's stream (DT: SID 0xb40,
+         * mask 0x402), which context bank it uses, and whether that bank translates. Modeled on the sheng
+         * DPU port (NativeUfs.cpp): sMR at 0x800+4i, s2CR at 0xc00+4i, CBAR at 0x1000+4b, CBA2R 0x1800+4b,
+         * CBn at (pages+b)*4096 with pages from IDR1. */
+        IOMemoryDescriptor *smmu=IOMemoryDescriptor::withPhysicalAddress(0x15000000,0xd0000,kIODirectionIn);
+        IOMemoryMap *map=smmu?smmu->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
+        if(smmu)smmu->release();
+        if(!map) {printf("PICASSO_SMMU map failed\n");return;}
+        volatile uint32_t *s=(volatile uint32_t *)map->getVirtualAddress();
+        const uint32_t scr0=s[0],idr0=s[0x20/4],idr1=s[0x24/4];
+        const unsigned groups=(idr0&255)>128?128:(idr0&255),banks=idr1&255;
+        const unsigned pages=1u<<(((idr1>>28)&7)+1);
+        printf("PICASSO_SMMU scr0=%x idr0=%x idr1=%x groups=%u banks=%u pages=%u gfsr=%x\n",
+            scr0,idr0,idr1,groups,banks,pages,s[0x58/4]);
+        unsigned valid=0;
+        for(unsigned i=0;i<groups;i++) {
+            const uint32_t smr=s[(0x800+4*i)/4];
+            if(!(smr&0x80000000u))continue;
+            ++valid;
+            const uint32_t idLow=smr&0x7fff,maskHigh=(smr>>16)&0x7fff,maskLow=smr&0xffff;
+            /* sheng's layout: ID in 15:0, MASK in 30:16. ARM SMMU-500 TRM: ID in 30:16, MASK in 15:0. */
+            const bool hitLow=((0xb40u^idLow)&0x7fff&~maskHigh)==0;
+            const bool hitHigh=((0xb40u^maskHigh)&0xffff&~maskLow)==0;
+            if(!hitLow && !hitHigh)continue;
+            const uint32_t s2cr=s[(0xc00+4*i)/4],bank=s2cr&255;
+            printf("PICASSO_SMMU match smr[%u]=%x layout=%s s2cr=%x bank=%u type=%u\n",
+                i,smr,hitLow?"id-low":"id-high",s2cr,bank,(s2cr>>16)&3);
+            if(bank>=banks)continue;
+            volatile uint32_t *cb=s+(pages+bank)*(4096/4);
+            printf("PICASSO_SMMU cbar=%x cba2r=%x sctlr=%x ttbr0=%x%08x tcr2=%x tcr=%x mair=%x fsr=%x\n",
+                s[(0x1000+4*bank)/4],s[(0x1800+4*bank)/4],cb[0x00/4],
+                cb[0x24/4],cb[0x20/4],cb[0x10/4],cb[0x30/4],cb[0x38/4],cb[0x58/4]);
+        }
+        printf("PICASSO_SMMU valid-smrs=%u\n",valid);
+        map->release();
     }
     bool startHardware() override {
         unsigned enabled=1;

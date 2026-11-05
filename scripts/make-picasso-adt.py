@@ -214,10 +214,10 @@ def main():
                         ('osenvironment', b'main\0'),
                         # The scale MobileGestalt/UIKit read for the phone layout. It must be present from boot:
                         # a property the display driver adds later is not what the userland's identity read picks
-                        # up. 1080x2340 at scale 3 is a 360x780 pt canvas; the panel still scans 2400 rows and the driver
-                        # centres the 2340-row canvas with 30-row bars. The mode height comes from /chosen so the
-                        # driver does not need another command-line byte.
-                        *([('display-scale', struct.pack('<I', 3)), ('display-height', struct.pack('<I', 2340))]
+                        # up. 1080x2400 at scale 3 is a 360x800 pt canvas, exactly the panel's 2400 rows, so the
+                        # compositor's drawable matches the scanout and the driver has no bars to fill. The mode
+                        # height comes from /chosen so the driver does not need another command-line byte.
+                        *([('display-scale', struct.pack('<I', 3)), ('display-height', struct.pack('<I', 2400))]
                           if args.iphone_identity else []),
                         # Security status of a dev-fused, undemoted board (tuple 0,0,1,1),
                         # as MobileGestalt reads it. AMFI picks its code-signing trust
@@ -281,7 +281,7 @@ def main():
                          *([('product-description', b'iPhone 12 mini\0' if args.iphone_identity else
                                b'iPad Pro (12.9-inch) (2nd generation)\0'),
                             ('artwork-device-idiom', b'phone\0' if args.iphone_identity else b'pad\0'),
-                            ('artwork-device-subtype', struct.pack('<I', 2340 if args.iphone_identity else 2732)),
+                            ('artwork-device-subtype', struct.pack('<I', 2400 if args.iphone_identity else 2732)),
                             ('artwork-scale-factor', struct.pack('<I', 3 if args.iphone_identity else 2)),
                             ('artwork-display-gamut', b'P3\0'),
                             ('compatible-device-fallback', b'iPhone13,1\0' if args.iphone_identity else b'iPad6,7\0')]
