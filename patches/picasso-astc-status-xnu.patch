@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -5971,4 +5971,38 @@
+@@ -5971,3 +5971,37 @@
  SYSCTL_PROC(_kern, OID_AUTO, picasso_metrics_unavailable, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
      0, 3, picasso_inject_ack_sysctl, "I", "picasso: reports status bar metrics unavailable");
 +/* Read-only, bounded acknowledgements from the existing UI injection scope.
@@ -38,4 +38,3 @@
 +PICASSO_ASTC_STATUS(picasso_astc_restore_failed, 5);
 +#undef PICASSO_ASTC_STATUS
  #endif
- 

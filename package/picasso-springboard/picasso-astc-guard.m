@@ -3,7 +3,6 @@
 #import <Metal/Metal.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <stdio.h>
@@ -162,19 +161,20 @@ static void picasso_astc_image_added(const struct mach_header *header, intptr_t 
     uintptr_t *slots[2] = {(uintptr_t *)astc_slot, (uintptr_t *)atx_slot};
     uintptr_t originals[2] = {base + 0x1e7598, base + 0x15e59c};
     uintptr_t replacements[2] = {(uintptr_t)picasso_astc_guard, (uintptr_t)picasso_atx_guard};
-    mach_vm_address_t pages[2];
+    _Static_assert(sizeof(vm_address_t) == sizeof(uintptr_t), "VM address width must match arm64 pointers");
+    vm_address_t pages[2];
     vm_prot_t protections[2];
     if (!vm_page_size || (vm_page_size & (vm_page_size - 1))) return;
     for (unsigned i = 0; i < 2; ++i) {
         if (__atomic_load_n(slots[i], __ATOMIC_ACQUIRE) != originals[i]) {
             picasso_astc_note("unavailable", NULL, 0); return;
         }
-        mach_vm_address_t address = (mach_vm_address_t)slots[i];
-        mach_vm_size_t size = 0;
+        vm_address_t address = (vm_address_t)slots[i];
+        vm_size_t size = 0;
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t object = MACH_PORT_NULL;
-        kern_return_t kr = mach_vm_region(mach_task_self(), &address, &size,
+        kern_return_t kr = vm_region_64(mach_task_self(), &address, &size,
             VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object);
         if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
         pages[i] = (uintptr_t)slots[i] & ~((uintptr_t)vm_page_size - 1);
@@ -190,7 +190,7 @@ static void picasso_astc_image_added(const struct mach_header *header, intptr_t 
     picasso_astc_texture_vtable = texture_vtable;
     unsigned writable = 0;
     for (; writable < 2; ++writable) {
-        if (mach_vm_protect(mach_task_self(), pages[writable], vm_page_size, FALSE,
+        if (vm_protect(mach_task_self(), pages[writable], vm_page_size, FALSE,
                             VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) break;
     }
     if (writable == 2) {
@@ -199,7 +199,7 @@ static void picasso_astc_image_added(const struct mach_header *header, intptr_t 
     }
     int restored = 1;
     for (unsigned i = 0; i < writable; ++i) {
-        if (mach_vm_protect(mach_task_self(), pages[i], vm_page_size, FALSE,
+        if (vm_protect(mach_task_self(), pages[i], vm_page_size, FALSE,
                             protections[i]) != KERN_SUCCESS) restored = 0;
     }
     picasso_astc_note(!restored ? "restore_failed" : writable == 2 ? "installed" : "unavailable", NULL, 0);
