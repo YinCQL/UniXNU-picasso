@@ -1841,10 +1841,11 @@ bool publishGpu()
     return published == kIOReturnSuccess;
 }
 
-/* Register the staged AGXAccelerator for the original Metal discovery: load
+/* Register the staged AGXAccelerator provider: load
  * the original IOGPUFamily, find its IOAcceleratorES, run the staged class's
  * initializer under preModLoad/postModLoad (the sequence in the reference
- * board probe), then publish an accelerator carrying the Metal plugin keys.
+ * board probe), then publish the provider. This image has no Metal plugin;
+ * provider publication does not qualify an MTLDevice or a texture layout.
  * Stages: 1 class present and kext load attempted, 2 parent metatype found,
  * 3 class registered, 4 object created and initialised, 5 published. */
 bool publishMetal()
@@ -1904,15 +1905,15 @@ bool publishMetal()
             unsigned(kIOReturnError));
         return false;
     }
-    /* The two keys the original _MTLRegisterDevices helper reads, plus the
-     * process names this kernel's grant honours in place of the sandbox
+    /* Do not publish MetalPluginName/MetalPluginClassName for a library that
+     * is absent from this image. _MTLRegisterDevices uses those keys to load
+     * a plugin; a registered IOGPU provider alone cannot supply texture layouts.
+     * Keep the process names this kernel's grant honours in place of the sandbox
      * verdict (this upstream's native_sandbox_grant matches names literally;
      * names are the first 16 characters proc_selfname reports). */
-    accelerator->setProperty("MetalPluginName", "NativeAdrenoMetal");
     accelerator->setProperty("NativeSandboxGrantProcess",
         "backboardd,SpringBoard,mediaserverd,WidgetRenderer_D,"
         "iconservicesagent,posterboardd,Wallpaper");
-    accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
     stage = 4;
     if (!accelerator->attach(IOService::getPlatform())) {
         accelerator->release();
@@ -1922,7 +1923,7 @@ bool publishMetal()
     }
     accelerator->registerService();
     stage = 5;
-    printf("PICASSO_GPU cp: metal stage=%u status=%08x registered=1\n",
+    printf("PICASSO_GPU cp: metal stage=%u status=%08x registered=1 plugin=absent device_qualified=0\n",
         stage, unsigned(kIOReturnSuccess));
     return true;
 }
