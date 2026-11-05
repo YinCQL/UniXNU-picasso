@@ -668,6 +668,16 @@ void boot_progress_process_stage(int pid,const char *name,const char *text) {
 }
 void boot_progress_exit(int pid,const char *name,int status,unsigned ns,uint64_t code) {
   if(!enabled)return;
+  /* A nonzero exit is what a crash loop leaves behind; name it on the console as it happens (bounded), so the cause
+   * of sustained CPU in the supervisor (launchd) and the crash reporter can be read from the boot log. */
+  if(status) {
+    static unsigned exit_prints;
+    if(exit_prints<64) {
+      ++exit_prints;
+      printf("PICASSO_EXIT pid=%d status=%d signal=%u ns=%u code=%llx name=%.31s\n", pid, status,
+          (unsigned)status & 127, ns, (unsigned long long)code, name ? name : "?");
+    }
+  }
   census_note(name,1);
   if(name && !strcmp(name,"xpcproxy") && pid==proc_selfpid())xpc_fail_note(status,ns,code);
   if(__atomic_exchange_n(&exit_lock,1,__ATOMIC_ACQUIRE)) {
@@ -1433,6 +1443,17 @@ size_t boot_progress_profile_rows(char *out,size_t cap) {
         uint32_t r3=0;for(size_t i=first;i<first+count;i++){const uint32_t *x=bp_kern[bp_prof_snap[i]&0xffffffff];if(x[1]==(uint32_t)(pair>>32) && x[2]==(uint32_t)pair){r3=x[3];break;}}
         BP_ROW(" %x/%x/%x:%llu",(unsigned)(pair>>32),(unsigned)pair,r3,ge>>40);}
       BP_ROW("\n");
+    }
+  }
+  // Messages to and from pid 1 since the previous profile block (picasso-ipc-census=1): launchd's
+  // continuous Mach IPC keeps about a core of system time busy, and this row names the peer that
+  // sends to it and the peers it sends to. Absent when the census patch is not in the kernel.
+  {
+    extern size_t picasso_ipc_census_rows(char *,size_t) __attribute__((weak_import));
+    if(&picasso_ipc_census_rows) {
+      char row[320]={0};
+      const size_t got=picasso_ipc_census_rows(row,sizeof row);
+      if(got)BP_ROW("%s",row);
     }
   }
 #undef BP_ROW

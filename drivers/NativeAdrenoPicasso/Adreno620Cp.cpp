@@ -60,6 +60,7 @@ extern "C" int (*native_adreno_dram_read_words)(uint64_t physical, uint32_t *out
 extern "C" volatile uint64_t native_adreno_reassert_ticks;
 extern "C" volatile uint64_t native_adreno_cache_stats[5];
 extern "C" volatile uint32_t native_adreno_wc_audit[6];
+extern "C" size_t boot_progress_profile_rows(char *out, size_t cap) __attribute__((weak_import));
 /* One fresh mapping per page, kIOMapInhibitCache: a default-cache mapping of a physical page is cacheable, so it would both read a
  * stale cache line and leave one behind for the next reader (the earlier form omitted the flag and could report a zero the CPU had
  * cached, which is exactly the diagnostic this reader exists to answer). */
@@ -2002,6 +2003,12 @@ void addonReport(void *, wait_result_t)
             (unsigned long long)(&native_adreno_reassert_ticks ? native_adreno_reassert_ticks * 1000000 / freq : 0),
             &native_adreno_wc_audit ? native_adreno_wc_audit[5] : 0,
             (unsigned long long)(&native_adreno_cache_stats ? native_adreno_cache_stats[0] * 1000000 / freq : 0));
+        /* The interrupt-driven sampling profile (every interrupt records the interrupted process and PC). Its rows rank the
+         * busiest processes and their hottest user/kernel PCs, which names what keeps the CPU out of idle — on the console
+         * instead of only in the UFS log. Kernel PCs resolve against out/picasso/kernel/kernel.macho. */
+        static char profile[4096];
+        const size_t profile_bytes = &boot_progress_profile_rows ? boot_progress_profile_rows(profile, sizeof profile) : 0;
+        if (profile_bytes) printf("PICASSO_PROFILE begin\n%.*s\nPICASSO_PROFILE end\n", (int)profile_bytes, profile);
     }
 }
 
