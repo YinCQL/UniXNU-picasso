@@ -105,8 +105,8 @@ typedef struct {
 /* The vendor a630_sqe.fw/a650_sqe.fw have header 0 and a payload that is a
  * whole number of dwords. minimum_version is the mainline security floor for
  * the chosen file (0x190 for a630, 0x095 for a650); pass 0 to skip the flag.
- * The vendor files measured here are 0x188 and 0x087, below both floors, so
- * security_ok is reported instead of failing the structural parse. */
+ * The pinned stock versions are 0x197 and 0x093. security_ok reports the
+ * caller's version floor instead of failing the structural parse. */
 Adreno620FwStatus Adreno620SqeParse(const uint8_t *image, size_t bytes,
     uint32_t minimum_version, Adreno620SqeImage *out);
 

@@ -94,6 +94,12 @@ jobs:
           python3 scripts/fetch-picasso-touch-firmware.py --output out/picasso/novatek/firmware.bin
           echo "NOVATEK_TOUCH_FW=$PWD/out/picasso/novatek/firmware.bin" >> "$GITHUB_ENV"
 
+      - name: Prepare exact stock Adreno 620 firmware
+        run: |
+          python3 scripts/fetch-picasso-gpu-firmware.py --output out/picasso/gpu-firmware
+          echo "ADRENO620_FW_DIR=$PWD/out/picasso/gpu-firmware" >> "$GITHUB_ENV"
+          cp out/picasso/gpu-firmware/firmware.json out/picasso/logs/gpu-firmware.json
+
       - name: Fetch the original iPhone trust caches
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -160,7 +166,7 @@ jobs:
           plan = json.loads(kernel.with_suffix('.json').read_text())
           if hashlib.sha256(kernel.read_bytes()).hexdigest() != plan['candidate_sha256']:
               raise SystemExit('Prelink report does not match kernel.macho')
-          for component in ('com.apple.security.sandbox', 'com.apple.kext.AppleMatch', 'com.apple.iokit.IOSurface'):
+          for component in ('com.apple.security.sandbox', 'com.apple.kext.AppleMatch', 'com.apple.iokit.IOSurface', 'com.apple.iokit.IOGPUFamily'):
               if component not in plan['components']:
                   raise SystemExit(f'Missing required original component: {component}')
               start = plan['module_entrypoints'][component]['start_va']

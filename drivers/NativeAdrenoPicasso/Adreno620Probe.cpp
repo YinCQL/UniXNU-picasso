@@ -340,10 +340,10 @@ int opGmuFirmware(void *, uint32_t *crc32, uint32_t *bytes)
             adreno620::sqeAlternate()->bytes,
             adreno620::sqeAlternate()->crc32)) {
         expectedSqe = adreno620::sqeAlternate();
-        /* wf101: the device's own a650_sqe build is 0x087; mainline's 0x095 floor
-         * is a security-fix floor for a650 phones, not a CP-compatibility one.
-         * The image is pinned by size/CRC/SHA-256 above, and the boot args already
-         * carry sheng-gpu-allow-old-sqe=1 for this bring-up measurement. */
+        /* Keep the existing A620 bring-up compatibility floor for the exact
+         * stock input (now V13.0.5.0 version 0x093). This is below mainline's
+         * A650 security-fix floor 0x095; input identity and compatibility are
+         * separate from runtime/security qualification. */
         minimumVersion = 0x080u;
     }
     if (!expectedSqe) {

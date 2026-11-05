@@ -298,13 +298,14 @@ def build_adreno_picasso(record: dict):
     them, and a missing hook stops its stage with a diagnostic."""
     out = ROOT / 'build/adreno-picasso'
     out.mkdir(parents=True, exist_ok=True)
-    # Embedded firmware comes from ADRENO620_FW_DIR (default /tmp/picasso-gpu-fw); no blob is committed. Missing files
-    # produce empty arrays and probe stage 3 reports "blobs were not staged".
+    # Exact stock files are staged by both workflows; do not link empty arrays
+    # and discover missing firmware only after flashing (build153).
     generator = ROOT / 'scripts/build-adreno-picasso-firmware.py'
-    if generator.is_file():
-        env = os.environ.copy()
-        env.setdefault('ADRENO620_FW_OUT', str(out))
-        subprocess.run([sys.executable, str(generator)], check=True, env=env)
+    if not generator.is_file():
+        raise SystemExit('Missing owned Adreno 620 firmware generator')
+    env = os.environ.copy()
+    env['ADRENO620_FW_OUT'] = str(out)
+    subprocess.run([sys.executable, str(generator)], check=True, env=env)
     extra_flags = ['-I', str(ROOT / 'drivers/NativeAdrenoPicasso'),
                    '-I', str(ROOT / 'drivers/NativeAdreno'),
                    '-I', str(ROOT / 'kits/ArmSmmu4K'),
@@ -315,8 +316,9 @@ def build_adreno_picasso(record: dict):
                     'Adreno620Integration.cpp', 'Adreno620Gmu.cpp', 'Adreno620Cp.cpp')]
     c_sources = [ROOT / 'drivers/NativeAdrenoPicasso' / 'Adreno620Firmware.c']
     embedded = out / 'adreno620_embedded_firmware.c'
-    if embedded.is_file():
-        c_sources.append(embedded)
+    if not embedded.is_file():
+        raise SystemExit('GPU firmware generator produced no C source')
+    c_sources.append(embedded)
     objects = []
     for src in cpp_sources:
         dst = out / f'{src.stem}.o'

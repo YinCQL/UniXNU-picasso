@@ -191,10 +191,10 @@ static void testBoard()
 
     CHECK(zapSegmentCount() == 3);
     CHECK(std::strcmp(zapSegment(0).name, "a620_zap.b00") == 0);
-    CHECK(zapMdt().bytes == 6860u && zapMdt().crc32 == 0xae7b941cu);
-    CHECK(sqe().bytes == 32008u && sqe().crc32 == 0x8b648790u);
-    CHECK(sqeAlternate() && sqeAlternate()->bytes == 31460u);
-    CHECK(gmu().bytes == 41308u && gmu().crc32 == 0xc190814du);
+    CHECK(zapMdt().bytes == 6860u && zapMdt().crc32 == 0x7de1dd05u);
+    CHECK(sqe().bytes == 32264u && sqe().crc32 == 0xf9a2972eu);
+    CHECK(sqeAlternate() && sqeAlternate()->bytes == 31632u);
+    CHECK(gmu().bytes == 41548u && gmu().crc32 == 0x5c66275cu);
     CHECK(ZapEntry == 0x5000u && ZapCodeVaddr == 0x5000u &&
         ZapHashVaddr == 0x6000u);
     CHECK(SqeIovaAlignment == 0x1000u && GmuEntry == 0u);
@@ -842,14 +842,14 @@ static void testVendor(const char *directory)
     Adreno620SqeImage sqeImage;
     CHECK(Adreno620SqeParse(a630.data(), a630.size(), 0x190, &sqeImage)
         == Adreno620FwOk);
-    CHECK(sqeImage.version == 0x188u && sqeImage.security_ok == 0);
+    CHECK(sqeImage.version == 0x197u && sqeImage.security_ok == 1);
     std::printf("vendor a630_sqe.fw: %lu bytes payload=%lu version=0x%x "
                 "security=%u crc=%08x\n", static_cast<unsigned long>(a630.size()),
         static_cast<unsigned long>(sqeImage.payload_bytes), sqeImage.version,
         sqeImage.security_ok, sqeImage.crc32);
     CHECK(Adreno620SqeParse(a650.data(), a650.size(), 0x095, &sqeImage)
         == Adreno620FwOk);
-    CHECK(sqeImage.version == 0x087u && sqeImage.security_ok == 0);
+    CHECK(sqeImage.version == 0x093u && sqeImage.security_ok == 0);
     std::printf("vendor a650_sqe.fw: %lu bytes payload=%lu version=0x%x "
                 "security=%u crc=%08x\n", static_cast<unsigned long>(a650.size()),
         static_cast<unsigned long>(sqeImage.payload_bytes), sqeImage.version,
@@ -859,8 +859,7 @@ static void testVendor(const char *directory)
     Adreno620GmuImage gmu;
     CHECK(Adreno620GmuParse(gmuImage.data(), gmuImage.size(), &regions, &gmu)
         == Adreno620FwOk);
-    CHECK(gmu.blocks == 16 && gmu.data_bytes == 0xc0 + 0x140 + 0x36f8 +
-        0x54f4 + 0x398 + 0xec0 + 0x18);
+    CHECK(gmu.blocks == 16 && gmu.data_bytes == 41292);
     std::printf("vendor a650_gmu.bin: %lu bytes blocks=%lu data=%llu "
                 "image_crc=%08x entry=%u\n",
         static_cast<unsigned long>(gmuImage.size()),

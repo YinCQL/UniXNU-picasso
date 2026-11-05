@@ -1,0 +1,17 @@
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1758,6 +1758,14 @@
+ 	if (seeder != PROC_NULL) proc_rele(seeder);
+ 	proc_t compositor = picasso_dump_named_proc("backboardd");
+ 	if (compositor != PROC_NULL) proc_rele(compositor);
++	/* build153: lsd waits in IconServices; backboardd waits on media/PM.
++	 * Sample these server processes with the existing remote-task walker. */
++	proc_t icons = picasso_dump_named_proc("iconservicesagent");
++	if (icons != PROC_NULL) proc_rele(icons);
++	proc_t media = picasso_dump_named_proc("mediaserverd");
++	if (media != PROC_NULL) proc_rele(media);
++	proc_t power = picasso_dump_named_proc("powerd");
++	if (power != PROC_NULL) proc_rele(power);
+ 	proc_t widgets = picasso_dump_named_proc("chronod");
+ 	if (widgets != PROC_NULL) proc_rele(widgets);
+ 	picasso_dump_runnable();

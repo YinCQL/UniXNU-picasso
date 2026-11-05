@@ -83,6 +83,8 @@ roots = [
   # Original IOBSD-matched IOSurfaceRoot, required by graphics/media clients.
   "com.apple.iokit.IOSurface",
   "com.apple.iokit.IOMobileGraphicsFamily",
+  # Original IOAcceleratorES parent used by both display fallback and A620.
+  "com.apple.iokit.IOGPUFamily",
   "com.apple.iokit.IOStorageFamily",
   "com.apple.kec.Libm",
   "com.apple.kec.corecrypto",

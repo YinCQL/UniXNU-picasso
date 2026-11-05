@@ -250,15 +250,9 @@ const FirmwareFile &zapMdt();
 size_t zapSegmentCount();
 const FirmwareFile &zapSegment(unsigned index);
 const FirmwareFile &zapElf();
-/* The vendor image ships a630_sqe.fw together with a650_sqe.fw. The stock
- * kernel's firmware-name strings introduce only "a620_zap" for A620 and reuse
- * the already-listed a630/a650 names, which is the downstream pattern for
- * A620 = a630_sqe.fw + a650_gmu.bin. The a650_sqe.fw alternative is exposed
- * because the pinned mainline catalog uses it for the A650 family; see
- * README.md and choose at integration time, never silently.
- * The pinned alternative is linux-firmware's a650_sqe.fw (version 0x112,
- * 31964 bytes), whose version clears mainline's 0x095 floor; the vendor image's
- * 0x087 file (31460 bytes) is kept out of tree as a650_sqe_vendor_0x87.fw. */
+/* Exact V13.0.5.0 inputs: a630 SQE 0x197 and a650 SQE 0x093.
+ * The embedded A620 path uses stock a650 SQE with a650 GMU; a630 is retained
+ * as the explicitly checked alternative. Firmware files remain outside Git. */
 const FirmwareFile &sqe();
 const FirmwareFile *sqeAlternate();
 const FirmwareFile &gmu();

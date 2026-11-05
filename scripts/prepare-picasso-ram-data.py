@@ -23,9 +23,12 @@ import uuid
 from picasso_target import OS_SHA256, LAUNCHD_SHA256, BUILD
 
 
-# build81 exhausted APFS transaction headroom in the 256 MiB logical volume.
+# build153 copied about 499 MiB of staged apps before launchd into a 512 MiB
+# volume. Leave space for swap, LaunchServices and APFS deletion transactions.
 # Sparse pages still allocate only on writes; this is not a RAM reservation.
-DATA_BYTES = 512 * 1024**2
+DATA_BYTES = 1024 * 1024**2
+STAGED_RUNTIME_RESERVE = 256 * 1024**2
+STAGED_METADATA_BYTES = 8192
 PAGE = 4096
 MAX_PACKED = 4 * 1024**2
 MAX_LOGICAL = 2 * 1024**3  # Larger disks select the persistent-store driver path.
@@ -137,6 +140,44 @@ def inventory(root):
     if result['.']['type'] != 'directory':
         raise ValueError('The original private/var must be a real directory')
     return result
+
+
+def staged_apps_budget(root, source_bytes):
+    """Budget decompressed file sizes without copying apps into the seed.
+
+    The guest restores these writable bundles before launchd. A small packed
+    seed says nothing about their eventual space use. Inspect the unchanged OS
+    while mounted read-only, and reject unsupported objects or insufficient
+    runtime headroom before creating the Data image.
+    """
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError('Original staged apps must be a real directory')
+    pending = [root]
+    directories = files = logical = rounded = 0
+    while pending:
+        current = pending.pop()
+        directories += 1
+        if directories > 16384:
+            raise ValueError('Staged apps exceed the guest directory budget')
+        for path in current.iterdir():
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                pending.append(path)
+            elif stat.S_ISREG(info.st_mode):
+                files += 1
+                logical += info.st_size
+                rounded += (info.st_size + PAGE - 1) // PAGE * PAGE
+            else:
+                raise ValueError(f'Unsupported staged app object: {path.relative_to(root)}')
+    metadata_bytes = (directories + files) * STAGED_METADATA_BYTES + 16 * 1024**2
+    required = source_bytes + rounded + metadata_bytes + STAGED_RUNTIME_RESERVE
+    if required > DATA_BYTES:
+        raise ValueError(f'Staged apps need {required} bytes with runtime reserve; Data has {DATA_BYTES}')
+    return dict(directories=directories, files=files, logical_bytes=logical,
+                rounded_bytes=rounded, metadata_allowance_bytes=metadata_bytes,
+                runtime_reserve_bytes=STAGED_RUNTIME_RESERVE, required_bytes=required,
+                data_bytes=DATA_BYTES, fits=True)
 
 
 def copy_var(source, target, manifest):
@@ -412,6 +453,9 @@ def prepare(tree, source, output, config):
         if audit_path(original, 'private/var').get('type') != 'directory':
             raise ValueError('Original private/var must not traverse a symlink')
         manifest = inventory(source_var)
+        staged_budget = staged_apps_budget(source_var / 'staged_system_apps',
+                                          sum(e['bytes'] for e in manifest.values() if e['type'] == 'file'))
+        print('PICASSO_STAGED_BUDGET ' + json.dumps(staged_budget, sort_keys=True), flush=True)
         source_paths = {'/' + relative: audit_path(original, relative) for relative in ORIGINAL_PATHS}
         subprocess.run([
             'hdiutil', 'create', '-size', f'{DATA_BYTES // 1024**2}m', '-layout', 'NONE',
@@ -436,7 +480,7 @@ def prepare(tree, source, output, config):
     pack(image, packed)
     packed_info = inspect_packed(packed, raw=image)
     if packed_info['logical_bytes'] != DATA_BYTES:
-        raise ValueError('Expected exactly 512 MiB of logical volatile Data')
+        raise ValueError('Expected exactly 1 GiB of logical volatile Data')
     manifest_path = output / 'source-var-manifest.json'
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8')
     files = [entry for entry in manifest.values() if entry['type'] == 'file']
@@ -450,6 +494,7 @@ def prepare(tree, source, output, config):
         guest_mutable=True, persistent=False, ownership_preserved=True,
         os_inputs_modified=False, hardware_tested=False,
         excluded=['private/var/staged_system_apps'],
+        staged_apps_budget=staged_budget,
     )
     (output / 'seed.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     # Both mounted images have detached and raw/packed bytes have been verified.

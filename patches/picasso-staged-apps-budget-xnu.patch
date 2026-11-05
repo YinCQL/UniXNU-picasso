@@ -1,0 +1,210 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7760,9 +7760,49 @@
+ char native_staged_apps_path[96];   /* the file being copied, for the boot log */
+ static const char native_staged_apps_marker[] = "/private/var/db/.sheng-staged-apps";
+ #define NATIVE_STAGED_APPS_OWNER 501
++/* Preserve swap/LaunchServices and APFS transaction space while restoring apps.
++ * This is a volatile sparse Data disk; the limit is not a RAM reservation. */
++#define PICASSO_STAGED_RESERVE (256ULL * 1024 * 1024)
++#define PICASSO_STAGED_TX_ALLOWANCE (64ULL * 1024)
++static int
++picasso_staged_free_bytes(mount_t mp, uint64_t *bytes)
++{
++	struct vfs_attr va;
++	VFSATTR_INIT(&va);
++	VFSATTR_WANTED(&va, f_bavail);
++	VFSATTR_WANTED(&va, f_bsize);
++	int error = vfs_getattr(mp, &va, vfs_context_current());
++	if (error) return error;
++	if (!VFSATTR_IS_SUPPORTED(&va, f_bavail) || !VFSATTR_IS_SUPPORTED(&va, f_bsize) ||
++	    !va.f_bsize || va.f_bavail > UINT64_MAX / va.f_bsize) return EINVAL;
++	*bytes = va.f_bavail * va.f_bsize;
++	return 0;
++}
++static int
++picasso_staged_headroom(mount_t mp, uint64_t length)
++{
++	uint64_t free_bytes = 0;
++	int error = picasso_staged_free_bytes(mp, &free_bytes);
++	if (error) return error;
++	if (length > free_bytes || free_bytes - length < PICASSO_STAGED_RESERVE + PICASSO_STAGED_TX_ALLOWANCE)
++		return ENOSPC;
++	return 0;
++}
++static void
++picasso_staged_report(mount_t mp)
++{
++	uint64_t free_bytes = 0;
++	int error = picasso_staged_free_bytes(mp, &free_bytes);
++	printf("PICASSO_STAGED stage=%d dirs=%d files=%d bytes=%llu failed=%d error=%d\n",
++	    native_staged_apps_stage, native_staged_apps_dirs, native_staged_apps_files,
++	    (unsigned long long)native_staged_apps_bytes, native_staged_apps_failed, native_staged_apps_error);
++	printf("PICASSO_STAGED free_bytes=%llu reserve_bytes=%llu stat_error=%d path=%s\n",
++	    (unsigned long long)free_bytes, (unsigned long long)PICASSO_STAGED_RESERVE, error, native_staged_apps_path);
++}
+ static void
+ native_staged_apps_fail(int error)
+ {
++	native_staged_apps_stage = -3;
+ 	native_staged_apps_failed++;
+ 	native_staged_apps_error = error;
+ }
+@@ -7795,28 +7835,41 @@
+ static int
+ native_staged_apps_file(vnode_t source, const char *path, int mode, uint8_t *buffer, uint32_t chunk, vfs_context_t ctx)
+ {
+-	int error = VNOP_OPEN(source, FREAD, ctx);
++	int error = 0;
++	/* SOURCE is read-only OS: use the writable destination's mount for space. */
++	vnode_t parent = NULLVP;
++	error = vnode_lookup("/private/var", 0, &parent, ctx);
++	if (error) return error;
++	mount_t data_mount = vnode_mount(parent);
++	error = picasso_staged_headroom(data_mount, 0);
++	vnode_put(parent);
++	if (error) return error;
++	error = VNOP_OPEN(source, FREAD, ctx);
+ 	if (error) {
+ 		return error;
+ 	}
+ 	vnode_t vp = NULLVP;
+-	size_t length = strlen(path);
+-	strlcpy(native_staged_apps_path, path + (length > sizeof(native_staged_apps_path) - 1 ? length - (sizeof(native_staged_apps_path) - 1) : 0),
++	size_t path_length = strlen(path);
++	strlcpy(native_staged_apps_path, path + (path_length > sizeof(native_staged_apps_path) - 1 ? path_length - (sizeof(native_staged_apps_path) - 1) : 0),
+ 	    sizeof(native_staged_apps_path));
+ 	error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, mode, 0, &vp, ctx);
+ 	for (off_t at = 0; !error;) {
+ 		int resid = 0;
+ 		error = vn_rdwr(UIO_READ, source, (caddr_t)buffer, (int)chunk, at, UIO_SYSSPACE, IO_NOAUTH, vfs_context_ucred(ctx), &resid,
+ 		    vfs_context_proc(ctx));
++		if (resid < 0 || resid > (int)chunk) { error = EIO; break; }
+ 		int length = (int)chunk - resid;
+ 		if (error || !length) {
+ 			break;
+ 		}
++		error = picasso_staged_headroom(data_mount, (uint64_t)length);
++		if (error) break;
+ 		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)buffer, length, at, UIO_SYSSPACE, IO_NOAUTH | IO_UNIT, vfs_context_ucred(ctx), &resid,
+ 		    vfs_context_proc(ctx));
+ 		if (!error && resid) {
+ 			error = EIO;
+ 		}
++		if (error) break;
+ 		at += length;
+ 		native_staged_apps_bytes += (uint64_t)length;
+ 	}
+@@ -7838,7 +7891,8 @@
+ 			error = close_error;
+ 		}
+ 	}
+-	VNOP_CLOSE(source, FREAD, ctx);
++	int source_close_error = VNOP_CLOSE(source, FREAD, ctx);
++	if (!error) error = source_close_error;
+ 	return error;
+ }
+ /* Directories still to copy, as paths relative to the staged directory: the walk is iterative, because APFS operations need much of the
+@@ -7863,7 +7917,7 @@
+ 		return;
+ 	}
+ 	off_t offset = 0;
+-	for (int eof = 0; !error && !eof;) {
++	for (int eof = 0; !error && !eof && !native_staged_apps_failed;) {
+ 		uio_t uio = uio_create(1, offset, UIO_SYSSPACE, UIO_READ);
+ 		if (!uio) {
+ 			error = ENOMEM;
+@@ -7878,9 +7932,10 @@
+ 		if (error || !filled) {
+ 			break;
+ 		}
+-		for (uint32_t at = 0; at + offsetof(struct direntry, d_name) < filled;) {
++		for (uint32_t at = 0; !native_staged_apps_failed && at + offsetof(struct direntry, d_name) < filled;) {
+ 			struct direntry *entry = (struct direntry *)(entries + at);
+-			if (!entry->d_reclen || at + entry->d_reclen > filled) {
++			if (entry->d_reclen <= offsetof(struct direntry, d_name) || entry->d_reclen > filled - at ||
++			    !memchr(entry->d_name, 0, entry->d_reclen - offsetof(struct direntry, d_name))) {
+ 				error = EINVAL;
+ 				break;
+ 			}
+@@ -7936,7 +7991,8 @@
+ 	if (error) {
+ 		native_staged_apps_fail(error);
+ 	}
+-	VNOP_CLOSE(dir, FREAD, ctx);
++	int close_error = VNOP_CLOSE(dir, FREAD, ctx);
++	if (close_error && !native_staged_apps_failed) native_staged_apps_fail(close_error);
+ }
+ /* Copies the tree below SOURCE into the Data directory PATH, which exists. */
+ static void
+@@ -7952,7 +8008,7 @@
+ 	size_t root = strlen(path);
+ 	if (pending.pool && pending.at && entries) {
+ 		native_staged_apps_dir(p, scratch, source, path, path_size, root + 1, &pending, entries, entries_size, buffer, chunk, ctx);
+-		while (pending.count) {
++		while (pending.count && !native_staged_apps_failed) {
+ 			const char *rel = pending.pool + pending.at[--pending.count];
+ 			if (root + 1 + strlen(rel) >= path_size) {
+ 				native_staged_apps_fail(ENAMETOOLONG);
+@@ -7995,6 +8051,7 @@
+ 	if (!vnode_lookup(native_staged_apps_marker, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) {
+ 		vnode_put(vp);
+ 		native_staged_apps_stage = 3;
++		picasso_staged_report(data_mount);
+ 		return;
+ 	}
+ 	int error = covered ? vnode_getwithref(covered) : ENOENT;
+@@ -8009,6 +8066,7 @@
+ 	if (error) {
+ 		native_staged_apps_error = error;
+ 		native_staged_apps_stage = -1;
++		picasso_staged_report(data_mount);
+ 		return;
+ 	}
+ 	const uint32_t chunk = 1024 * 1024;
+@@ -8027,9 +8085,17 @@
+ 			vnode_t marker = NULLVP;
+ 			error = vnode_open(native_staged_apps_marker, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, 0644, 0, &marker, ctx);
+ 			if (!error) {
+-				error = vnode_close(marker, FWRITE, ctx);
++				error = VNOP_FSYNC(marker, MNT_WAIT, ctx);
++				int close_error = vnode_close(marker, FWRITE, ctx);
++				if (!error) error = close_error;
+ 			}
+ 			if (error) {
++				/* A failed sync/close must not leave a completion marker for a retry. */
++				struct unlink_args remove = {.path = scratch + 0xa00};
++				int32_t result = 0;
++				int cleanup = copyout(native_staged_apps_marker, remove.path, sizeof(native_staged_apps_marker));
++				if (!cleanup) cleanup = unlink(p, &remove, &result);
++				if (cleanup && cleanup != ENOENT) printf("PICASSO_STAGED marker_cleanup=%d\n", cleanup);
+ 				native_staged_apps_fail(error);
+ 			} else {
+ 				native_staged_apps_stage = 2;
+@@ -8037,6 +8103,7 @@
+ 		}
+ 	} else {
+ 		native_staged_apps_stage = -2;
++		native_staged_apps_error = ENOMEM;
+ 	}
+ 	if (buffer) {
+ 		kfree_data(buffer, chunk);
+@@ -8045,6 +8112,7 @@
+ 		kfree_data(path, MAXPATHLEN);
+ 	}
+ 	vnode_put(vp);
++	picasso_staged_report(data_mount);
+ }
+ 
+ #if DEVELOPMENT || DEBUG
+@@ -8889,6 +8957,10 @@
+ static void
+ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+ {
++	if (native_staged_apps_stage != 2 && native_staged_apps_stage != 3) {
++		printf("PICASSO_APPS_MOUNT skipped staged=%d error=%d\n", native_staged_apps_stage, native_staged_apps_error);
++		return;
++	}
+ 	static const char source[] = "/private/var/staged_system_apps";
+ 	static const char point[] = "/Applications";
+ 	uint32_t picassoExtras = 7;

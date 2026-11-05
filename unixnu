@@ -20,6 +20,7 @@ LATE_OVERLAYS = [
     'cdc-snapshot', 'addon-marker-sync', 'bindfs-fileid', 'ls-rebuild',
     'ca-prefs', 'persist-probe', 'cdc-poller-sleep', 'cdc-cpu-usage',
     'quiet-boot', 'quiet-boot2', 'defer-ps', 'ls-persist',
+    'staged-apps-budget', 'startup-waits',
 ]
 
 
