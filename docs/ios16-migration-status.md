@@ -35,6 +35,15 @@ Boot images:
    — iPadOS `94e1c8c` retry and `cd3c8e9` vtable/class guard; kernel rebuilt.
 3. `6f4f58d gpu: advertise the owner Metal plugin only when its addon is present`
    — restores `MetalPluginName`/`MetalPluginClassName` behind `sheng-gpu-addon=1`.
+4. `2686825 usb: drop the DWC3 pull-up before a warm reset`
+   — ports the iPadOS `2906fa3` fix so CDC `reboot-fastboot` gives the host a
+   clean disconnect and the boot loader's fastboot gadget re-enumerates.
+
+Final kernel with all four changes:
+sha256 `adb58af78249af9b802bcd77c8918f80c05696012ba0a8593b314a15366297d3`.
+Final boot images: `out/picasso/boot/boot-latest.img` (60 MiB) and
+`out/ios16-gpu2/picasso/boot/ios16-gpu2.img` (80 MiB, addon
+`32cde9b0...`).
 
 ## iOS16 GPU addon (experiment)
 
@@ -55,25 +64,29 @@ This is a build artifact only; it has not been device-qualified. The kernel
 advertises the plugin only when the payload carries `sheng-gpu-addon=1`, so
 the normal 60 MiB image keeps the old CPU-only behavior.
 
-## Device state
+## Device state (2026-11-06 06:30 CST)
 
-The phone is enumerated as fastboot (`52cc791d`, Google 18d1:d00d, 480 Mbps)
-but its fastboot protocol stopped answering after an earlier `fastboot boot`
-transfer into the 65 MiB image. USB re-enumeration, endpoint clear, and hub
-port power cycles do not recover it; the phone needs a physical power cycle
-(power button long press) before the next `fastboot` command.
+The phone got a responsive fastboot back at 02:03 CST: a hub-port VBUS cycle
+followed by ~75 s of settling returns the boot loader's protocol, and small
+`fastboot flash`/`getvar` commands then work. The raw 8.4 GiB userdata image
+cannot be flashed with fastboot 34/37: the size check reaches
+`copy_avb_footer()`, which reads the whole image into memory and dies with
+`Failed reading from userdata`. `out/picasso/userdata/userdata-root.sparse.img`
+is the Android-sparse conversion of the same image (6.5 GiB, includes FILL
+chunks) so that fastboot takes the sparse path and skips the AVB footer copy.
 
-`temp/overnight-control.py` is running as a detached watcher. When the phone
-appears in a responsive fastboot it will:
+A `fastboot boot temp/tiny-boot.img` (2.1 MiB, no payload) then booted the UEFI
+firmware successfully, but that image has no payload in its ramdisk, so the
+firmware sat in its boot menu without exposing USB. A VBUS cycle does not reset
+a running UEFI session; the phone now needs a physical power-button press
+(long press) before fastboot is reachable again. Do not use the payload-less
+image as a diagnostic again.
 
-1. flash `out/picasso/userdata/userdata-root.img` once;
-2. alternately boot `boot-latest.img` and `ios16-gpu1.img`;
-3. capture the CDC console, run `status` and `snapshot`, and leave the image
-   running for inspection.
-
-The CDC console control path (`picasso_usb=2`, `reboot-fastboot`, `status`,
-`snapshot`) is retained in both images. `scripts/picasso-cdc-command.py`
-remains the intended way to return a running XNU to fastboot without a button.
+`temp/overnight-control.py` is the detached watcher. When a responsive
+fastboot appears it will flash the sparse userdata once, then alternately boot
+`out/picasso/boot/boot-latest.img` and `out/ios16-gpu2/picasso/boot/ios16-gpu2.img`
+(the USB-reset-fix kernel, HID retry, 2400 ADT and GPU addon), capture CDC,
+send `status`/`snapshot` and leave the working image running.
 
 ## Next steps on a responsive device
 
