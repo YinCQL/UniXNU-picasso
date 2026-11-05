@@ -23,6 +23,10 @@ def main():
     extractor=importlib.util.module_from_spec(extract_spec);extract_spec.loader.exec_module(extractor)
     ram=(out/'NativeRamBlock.cpp').read_text()
     (out/'sync.inc').write_text(extractor.extract(ram,'  IOReturn doSynchronizeCache()').replace(' override',''))
+    for name,signature in [('fallback-qualify','  static bool acceptsVolatileFallback('),
+                           ('fallback-allocate','  uint8_t *allocateSparsePage('),
+                           ('fallback-prepare','  bool prepareVolatileFallback(')]:
+        (out/(name+'.inc')).write_text(extractor.extract(ram,signature))
     (out/'aux-claim.inc').write_text(extractor.extract((ROOT/'drivers/NativeUfs/PicassoPersistence.h').read_text(),'static bool picassoAuxClaim('))
     runs=[]
     for sanitized in (False,True):

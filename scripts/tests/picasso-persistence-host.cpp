@@ -105,8 +105,87 @@ static unsigned run() {
     return 9;
 }
 }
+namespace FallbackTest {
+static uint32_t native_data_persist_state;
+static uint64_t native_ram_block_resident_bytes;
+static bool allocationFail=false;
+static unsigned outstanding=0;
+static void *IOMallocZero(uint64_t n) { if(allocationFail)return nullptr;void *p=calloc(1,size_t(n));if(p)++outstanding;return p; }
+static void IOFree(void *p,uint64_t) { if(p){assert(outstanding);--outstanding;free(p);} }
+static void IOLog(const char *,...) {}
+struct NativeRamBlock {
+    bool isBig=true,direct=false,directFailed=false,online=false,stopping=false,volatileFallback=false;
+    static constexpr uint64_t kVolatileResidentLimit=2ULL<<30;
+    SeedDisk big={};RamSparseDisk sparse={};persist::Overlay overlay;
+    #include "fallback-qualify.inc"
+    #include "fallback-allocate.inc"
+    #include "fallback-prepare.inc"
+    NativeRamBlock() {
+        big.bytes=4ULL<<30;big.count=big.capacity=2;big.resident=8192;
+        big.index=(uint64_t *)IOMallocZero(16);big.page=(uint8_t **)IOMallocZero(2*sizeof(uint8_t *));
+        big.index[0]=3;big.index[1]=big.bytes/4096-1;
+        for(unsigned i=0;i<2;++i){big.page[i]=(uint8_t *)IOMallocZero(4096);memset(big.page[i],0x30+i,4096);}
+    }
+    ~NativeRamBlock() {
+        for(uint64_t i=0;i<big.count;++i)IOFree(big.page[i],4096);
+        IOFree(big.index,16);IOFree(big.page,2*sizeof(uint8_t *));
+        if(sparse.pages){for(uint64_t i=0;i<sparse.bytes/4096;++i)IOFree(sparse.pages[i],4096);IOFree(sparse.pages,sparse.bytes/4096*sizeof(uint8_t *));}
+    }
+};
+struct Ops {
+    NativeRamBlock &ram;Buffer &buffer;
+    uint8_t *allocate(){return ram.allocateSparsePage();}
+    uint64_t read(uint64_t at,void *p,uint64_t n){return buffer.read(at,p,n);}
+    uint64_t copy(uint64_t at,const void *p,uint64_t n){return buffer.copy(at,p,n);}
+};
+static unsigned run() {
+    unsigned cases=0;
+    persist::Overlay candidate;candidate.header=1;candidate.scan=persist::BlankScan::Nonzero;
+    assert(NativeRamBlock::acceptsVolatileFallback(2,persist::Open::Kept,candidate,0));++cases;
+    for(unsigned mode=0;mode<2;++mode){assert(!NativeRamBlock::acceptsVolatileFallback(mode,persist::Open::Kept,candidate,0));++cases;}
+    assert(!NativeRamBlock::acceptsVolatileFallback(2,persist::Open::Kept,candidate,1));++cases;
+    for(auto status:{persist::Open::Failed,persist::Open::Resumed,persist::Open::Fresh,persist::Open::Blank}) {
+        assert(!NativeRamBlock::acceptsVolatileFallback(2,status,candidate,0));++cases;
+    }
+    for(int header:{0,2,3,-1}){candidate.header=header;assert(!NativeRamBlock::acceptsVolatileFallback(2,persist::Open::Kept,candidate,0));++cases;}
+    candidate.header=1;
+    for(auto scan:{persist::BlankScan::ReadFailed,persist::BlankScan::NoBuffer,persist::BlankScan::Zero,persist::BlankScan::NotRun}) {
+        candidate.scan=scan;assert(!NativeRamBlock::acceptsVolatileFallback(2,persist::Open::Kept,candidate,0));++cases;
+    }
+    {
+        NativeRamBlock ram;auto *original=ram.big.page[1];allocationFail=true;
+        assert(!ram.prepareVolatileFallback() && ram.isBig && ram.big.page[1]==original && !ram.sparse.pages);++cases;
+        allocationFail=false;ram.online=true;assert(!ram.prepareVolatileFallback());ram.online=false;++cases;
+        ram.directFailed=true;assert(!ram.prepareVolatileFallback());ram.directFailed=false;++cases;
+        assert(ram.prepareVolatileFallback() && !ram.isBig && ram.volatileFallback && !ram.big.page && ram.sparse.find((4ULL<<30)/4096-1)==original);
+        assert(native_data_persist_state==8 && native_ram_block_resident_bytes==8192 && !ram.overlay.active);++cases;
+        assert(!ram.prepareVolatileFallback());++cases;
+        Buffer buffer;buffer.data.resize(4096);Ops ops={ram,buffer};bool oom=false;
+        assert(ramSparseIO(ram.sparse,false,(4ULL<<30)-4096,4096,ops,oom)==4096 && !oom);
+        for(auto c:buffer.data)assert(c==0x31);++cases;
+        buffer.data.assign(512,0x79);
+        assert(ramSparseIO(ram.sparse,true,(4ULL<<30)-4096+512,512,ops,oom)==512 && !oom);
+        buffer.data.assign(4096,0);assert(ramSparseIO(ram.sparse,false,(4ULL<<30)-4096,4096,ops,oom)==4096);
+        for(unsigned i=0;i<4096;++i)assert(buffer.data[i]==(i>=512 && i<1024?0x79:0x31));++cases;
+        assert(ramSparseIO(ram.sparse,false,0,4096,ops,oom)==4096);for(auto c:buffer.data)assert(!c);++cases;
+        auto resident=ram.sparse.resident;ram.sparse.resident=ram.kVolatileResidentLimit;
+        assert(!ramSparseIO(ram.sparse,true,0,4096,ops,oom) && oom && !ram.sparse.find(0));++cases;
+        assert(ramSparseIO(ram.sparse,true,3*4096,4096,ops,oom)==4096 && !oom);++cases;
+        ram.sparse.resident=resident;allocationFail=true;
+        assert(!ramSparseIO(ram.sparse,true,0,4096,ops,oom) && oom);allocationFail=false;++cases;
+        assert(ramSparseIO(ram.sparse,true,0,4096,ops,oom)==4096 && !oom && ram.sparse.resident==resident+4096);++cases;
+        assert(!ramSparseIO(ram.sparse,true,4ULL<<30,1,ops,oom));++cases;
+    }
+    assert(!outstanding);
+    {
+        NativeRamBlock ram;ram.big.index[1]=ram.big.index[0];
+        assert(!ram.prepareVolatileFallback() && ram.isBig && !ram.sparse.pages && ram.big.page[0]);++cases;
+    }
+    assert(!outstanding);return cases;
+}
+}
 int main() {
-    unsigned cases=AuxTest::run();
+    unsigned cases=AuxTest::run()+FallbackTest::run();
     SyncHarness sync;
     assert(!sync.doSynchronizeCache() && syncCalls==1 && native_data_persist_syncs==1 && !locks);++cases;
     syncOK=false;assert(sync.doSynchronizeCache()==kIOReturnIOError && sync.directFailed && sync.failures==1 && !locks);++cases;
@@ -140,6 +219,15 @@ int main() {
     // A blank header with even one foreign byte in the LAST page is not empty.
     Medium foreign;foreign.limit=medium.limit;foreign.disk[foreign.limit-1][4095]=1;persist::Overlay f;
     assert(f.open(foreign,pages,seed,false,bits.data(),false,true,stage.data(),32)==persist::Open::Kept && !foreign.writes);++cases;
+    assert(f.scan==persist::BlankScan::Nonzero && f.scanBlock==foreign.limit-1 && f.scanOffset==4095 && f.scannedBlocks==foreign.limit-1);
+    assert(f.scanCrc==persist::crc32(foreign.disk[foreign.limit-1].data(),4096));++cases;
+    Medium head;head.limit=medium.limit;head.disk[0][127]=5;persist::Overlay h;
+    assert(h.open(head,pages,seed,false,bits.data(),false,true,stage.data(),32)==persist::Open::Kept);
+    assert(h.scanBlock==0 && h.scanOffset==127 && !head.writes);++cases;
+    Medium unreadable;unreadable.limit=medium.limit;unreadable.fail=3;persist::Overlay failedScan;
+    assert(failedScan.open(unreadable,pages,seed,false,bits.data(),false,true,stage.data(),32)==persist::Open::Failed);
+    assert(failedScan.scan==persist::BlankScan::ReadFailed && failedScan.scanBlock==32 && failedScan.scannedBlocks==32 && !unreadable.writes);++cases;
+    assert(ov.scan==persist::BlankScan::Zero && ov.scannedBlocks==medium.limit);++cases;
     // Reset fault at each mutation: old header is invalidated before bitmap edits.
     Medium small;small.limit=persist::windowBlocks(16);uint8_t sb[4096],page[4096];memset(page,0x55,sizeof page);
     persist::Overlay initial;assert(initial.open(small,16,seed,false,sb,true)==persist::Open::Fresh);

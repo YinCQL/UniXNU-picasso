@@ -53,7 +53,12 @@ static void picassoLogThread(void *,wait_result_t) {
     thread_terminate(current_thread());
 }
 }
+extern "C" volatile uint32_t native_data_persist_state;
 extern "C" int picasso_persistence_start(void) {
+    // A volatile seed fallback does not establish ownership of persistent windows.
+    if(native_data_persist_state!=2 && native_data_persist_state!=3) {
+        IOLog("PICASSO_RECORDS disabled Data state=%u\n",native_data_persist_state);return 0;
+    }
     static bool attempted=false;
     if(attempted)return gPicassoRecordLock && gPicassoNvram.ready;
     attempted=true;
