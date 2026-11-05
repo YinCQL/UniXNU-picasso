@@ -186,21 +186,32 @@ jobs:
           test -s out/picasso/boot/boot.img
           sha256sum out/picasso/boot/boot.img out/picasso/payload/payload.img > out/picasso/boot/SHA256SUMS
 
-      - name: Upload boot image, kernel, payload and reports
+      - name: Upload boot image, diagnostic kernel, reports and reusable inputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: picasso-linux-bootimg-${{ github.run_number }}
           include-hidden-files: true
+          # Keep the diagnostic kernel and exact reusable seeds. Raw audit Data
+          # copies (.cdr), extracted payload trees and object files stay on runner.
           path: |
-            device/out/picasso/boot/
-            device/out/picasso/kernel/
-            device/out/picasso/payload/
-            device/out/picasso/logs/
+            device/out/picasso/boot/**
+            device/out/picasso/kernel/kernel.macho
+            device/out/picasso/kernel/*.json
+            device/out/picasso/kernel/SHA256SUMS
+            device/out/picasso/payload/*.json
+            device/out/picasso/logs/**/*.log
+            device/out/picasso/logs/**/*.json
+            device/out/picasso/logs/**/*.txt
             device/out/picasso/host-checks/**/*.json
-            device/out/picasso/linux-inputs/
+            device/out/picasso/host-checks/**/*.log
+            device/out/picasso/tree/build/**/*.json
+            device/out/picasso/tree/build/**/*.log
+            device/out/picasso/novatek/*.json
             device/out/picasso/ram-data/*.json
-            device/out/picasso/ram-data/data.dbrdisk
+            device/out/picasso/linux-inputs/**
             device/out/picasso/.config
+            !device/out/picasso/logs/**/*.files/**
+            !device/out/picasso/logs/**/*.cdr
           if-no-files-found: warn
           retention-days: 7

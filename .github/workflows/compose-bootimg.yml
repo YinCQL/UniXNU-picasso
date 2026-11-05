@@ -293,39 +293,32 @@ jobs:
             2>&1 | tee out/picasso/logs/bootimg.log
           ls -lh out/picasso/boot/boot.img
 
-      - name: Upload boot image + kernel + payload + logs
+      - name: Upload boot image, diagnostic kernel, reports and reusable inputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: picasso-bootimg-${{ github.run_number }}
           include-hidden-files: true
+          # Keep the diagnostic kernel and exact reusable seeds. Raw audit Data
+          # copies (.cdr), extracted payload trees and object files stay on runner.
           path: |
             device/out/picasso/boot/**
-            device/out/picasso/kernel/**
-            device/out/picasso/payload/**
-            device/out/picasso/logs/**
-            device/out/picasso/tree/build/sheng-platform-power/*.json
-            device/out/picasso/tree/build/sheng-platform-power/*.log
-            device/out/picasso/tree/build/sheng-platform-power/*.o
-            device/out/picasso/tree/build/sheng-platform-power/*.a
-            device/out/picasso/tree/build/native-aes/*.json
-            device/out/picasso/tree/build/native-aes/*.log
-            device/out/picasso/tree/build/native-aes/*.o
-            device/out/picasso/tree/build/native-aes/*.a
-            device/out/picasso/tree/build/native-legacy-display/*.json
-            device/out/picasso/tree/build/native-legacy-display/*.log
-            device/out/picasso/tree/build/native-legacy-display/*.o
-            device/out/picasso/tree/build/native-legacy-display/*.a
-            device/out/picasso/tree/build/native-legacy-display/*.h
-            device/out/picasso/tree/build/novatek-touch/*.json
-            device/out/picasso/tree/build/novatek-touch/*.o
-            device/out/picasso/tree/build/novatek-touch/*.a
+            device/out/picasso/kernel/kernel.macho
+            device/out/picasso/kernel/*.json
+            device/out/picasso/kernel/SHA256SUMS
+            device/out/picasso/payload/*.json
+            device/out/picasso/logs/**/*.log
+            device/out/picasso/logs/**/*.json
+            device/out/picasso/logs/**/*.txt
+            device/out/picasso/host-checks/**/*.json
+            device/out/picasso/host-checks/**/*.log
+            device/out/picasso/tree/build/**/*.json
+            device/out/picasso/tree/build/**/*.log
             device/out/picasso/novatek/*.json
-            device/out/picasso/tree/build/xnu/**/kern_exec.cpo.json
-            device/out/picasso/tree/build/xnu/**/vfs_syscalls.cpo.json
             device/out/picasso/ram-data/*.json
-            device/out/picasso/ram-data/data.dbrdisk
-            device/out/picasso/linux-inputs/
+            device/out/picasso/linux-inputs/**
             device/out/picasso/.config
+            !device/out/picasso/logs/**/*.files/**
+            !device/out/picasso/logs/**/*.cdr
           if-no-files-found: warn
           retention-days: 7
