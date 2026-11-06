@@ -21,7 +21,7 @@ LATE_OVERLAYS = [
     'ca-prefs', 'persist-probe', 'cdc-poller-sleep', 'cdc-cpu-usage',
     'quiet-boot', 'quiet-boot2', 'defer-ps', 'ls-persist',
     'staged-apps-budget', 'startup-waits', 'normal-dram-io', 'runtime-swap',
-    'image-mapping', 'astc-status', 'inject-load-result', 'ui-runtime', 'settings-waits', 'persistent-records', 'brightness-properties', 'startup-cache', 'network-timeout', 'network-progress', 'runtime-jobs',
+    'image-mapping', 'astc-status', 'inject-load-result', 'ui-runtime', 'settings-waits', 'persistent-records', 'brightness-properties', 'startup-cache', 'network-timeout', 'network-progress', 'runtime-jobs', 'gpu-table',
 ]
 
 

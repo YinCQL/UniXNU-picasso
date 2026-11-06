@@ -230,3 +230,44 @@ measurement.
 the old path), so the CDC `snapshot` command copies the surface actually on
 screen into the GOP memory before it samples it. Without that call the GOP
 mapping is stale exactly while direct scanout is active.
+
+## Rebased onto the merged base and re-validated (2026-11-06 14:19 CST)
+
+`stage12/picasso-ios16` was rebased onto the reviewed merge `ea2b5a0`; the
+diagnostics the merge dropped (frame timeline, touch row, IPC census, ASTC
+destination) are re-applied as `cc92dbd`. Kernel `4536c977` (Darwin banner
+"Fri Nov 6 14:09:36 CST 2026") booted as `out/picasso/boot/boot-rebased.img`
+at 14:17:54; the kernel banner arrived at 14:19:09. The validation command
+line carried the merged board defaults plus `sheng-dpu-scanout=2` and
+`picasso-ipc-census=1` (995 bytes; one default, `picasso-wled=1`, was
+temporarily dropped to fit the 1000-byte budget — the shipped board stays at
+969 bytes).
+
+| Probe | Output |
+|---|---|
+| display SMMU | `PICASSO_DPU smmu scr0=2d0406 idr0=4c017e51 … groups=81 banks=62 pages=128`, stream `smr=84020b40` bank 2 |
+| direct scanout | `PICASSO_DPU direct scanout on bank=2 window=10000000 boot=a0000000 stride=4320`; 510+ flips, `maps=2 mapfails=0 fallbacks=0 latch_timeouts=0`, latch 1.7–4.0 ms, fence 0–1 µs |
+| frame path | 3,500+ `PICASSO_DISPLAY frame … kind=3` rows (direct), 0 aborts |
+| touch row | `TOUCH d_frames=0 d_hid=0 d_begin=0 d_edge=0 d_skip=0 phys=0 count=0`, one per 10 s |
+| IPC census | `IP to1 d=2285 23:UserEventAgent=334 26:SpringBoard=230 …` / `IP ids 202=20 203=10 db6=2 201=1` |
+| userland | `PICASSO_STAGED … dirs=5575 files=3840 bytes=510877688 failed=0`; launchd pid 1; SpringBoard pid 26 |
+
+### The merged board's persistent Data needs a blank userdata tail
+
+The merged board adds `sheng-data-persist=2 picasso-data-init-blank=1
+picasso-data-replace-20g=1 picasso-persist-records=1`. On this phone the
+20 GiB overlay window still held foreign data from earlier layouts
+(`blank-scan status=2 zero_blocks=0 crc32=ba6ecf9e`), so the driver refused to
+reset it:
+
+    PICASSO_DATASTORE overlay first=30157802 windowBlocks=524305 open=3 header=1 present=0
+    PICASSO_DATASTORE kept header=1; unknown/foreign contents preserved; automatic reset disabled
+    PICASSO_DATASTORE ready=0 direct=0 volatile=0 failed=0 bytes=2147483648
+    PICASSO_RECORDS disabled Data state=7
+
+That is the documented safety behaviour (`docs/persistent-data-20g.md`), not a
+regression: the boot continues on the volatile seed with staging intact. The
+first 20 GiB initialization needs the userdata tail blank — erase the
+partition, re-flash `userdata-root.img` and boot; the journal window and Data
+header are then empty and the replacement journal runs on that boot.
+
