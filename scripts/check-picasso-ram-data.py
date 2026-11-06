@@ -96,7 +96,7 @@ def main():
     mutate('wrong page size', 12, '<I', 16384)
     mutate('zero logical size', 16, '<Q', 0)
     mutate('unaligned logical size', 16, '<Q', len(raw_bytes) + 1)
-    mutate('oversized logical size', 16, '<Q', 4 * 1024**3 + page)
+    mutate('oversized logical size', 16, '<Q', data.MAX_LOGICAL + page)
     mutate('extent count overflow', 24, '<Q', 65537)
     mutate('extent table truncated', 24, '<Q', 4096)
     mutate('zero extent length', 40, '<Q', 0)
@@ -120,7 +120,7 @@ def main():
     short_raw = out / 'short.cdr'
     short_raw.write_bytes(raw_bytes[:-1])
     rejected('raw size mismatch', lambda: data.inspect_packed(packed, short_raw))
-    empty_data = out / 'empty2g.dbrdisk'
+    empty_data = out / 'empty20g.dbrdisk'
     empty_data.write_bytes(struct.pack('<8sIIQQ', b'DBRDISK1', 1, page, data.DATA_BYTES, 0))
 
     def verify_sparse():
@@ -131,7 +131,7 @@ def main():
         assert result['logical_bytes'] == data.DATA_BYTES
         assert result['raw_sha256'] == digest.hexdigest()
 
-    passes('4 GiB logical empty disk hashes without dense allocation', verify_sparse)
+    passes('20 GiB logical empty disk hashes without dense allocation', verify_sparse)
 
     staged = out / 'staged-budget'
     staged.mkdir()
@@ -149,7 +149,7 @@ def main():
         rejected('build153 sized staged tree exceeds old 512 MiB Data',
                  lambda: data.staged_apps_budget(staged, 1024**2))
     with app.open('wb') as stream:
-        stream.truncate(3700 * 1024**2)
+        stream.truncate(data.DATA_BYTES)
     rejected('oversized staged apps fail before Data image creation',
              lambda: data.staged_apps_budget(staged, 1024**2))
     rejected('missing staged source', lambda: data.staged_apps_budget(out / 'missing-apps', 0))

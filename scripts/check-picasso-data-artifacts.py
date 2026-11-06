@@ -158,7 +158,7 @@ def check(work, tree, output):
     for key in ('logical_bytes', 'packed_bytes', 'packed_sha256', 'raw_sha256',
                 'page_size', 'extent_count', 'seed_identity_sha256'):
         require(seed[key] == packed[key], f'Data report mismatch: {key}')
-    require(packed['logical_bytes'] == preparation['DATA_BYTES'], 'Expected 4 GiB sparse logical disk')
+    require(packed['logical_bytes'] == preparation['DATA_BYTES'], 'Expected 20 GiB sparse logical disk')
     require(packed['packed_bytes'] <= 4 * 1024**2, 'Packed seed exceeds its memory/payload budget')
     require(seed['persistent'] is False and seed['ownership_preserved'] is True
             and seed['os_inputs_modified'] is False, 'Unsafe seed provenance')
@@ -208,6 +208,8 @@ def check(work, tree, output):
             symbols[fields[2]] = int(fields[0], 16)
     require('_native_ram_block_volume_seed' in symbols, 'Kernel lacks the RAM volume provider')
     require('_native_ufs_store_open' in symbols, 'Kernel lacks its UFS provider')
+    require('_picasso_data_init_begin' in symbols and '_picasso_data_init_finish' in symbols,
+            'Kernel lacks the one-time 20 GiB initialization journal')
     ram = tree / 'build/native-ram-block'
     ufs = tree / 'build/native-ufs'
     imports = json.loads((ram / 'storage-imports.json').read_text())

@@ -8,11 +8,11 @@ using thread_t=void *;
 struct IOLock;
 constexpr int kIOReturnSuccess=0,KERN_SUCCESS=0;
 #define THREAD_NULL nullptr
-struct Geometry {bool valid;uint64_t first,last,imageBytes;};
+struct Geometry {bool valid;uint64_t first,last,imageBytes;uint32_t headerCrc,entriesCrc;};
 extern Geometry gStoreGeometry;
 struct Host {IOLock *lock;};
 extern Host gHost;
-extern uint64_t gAuxRegionFirst,gAuxRegionBlocks;
+extern uint64_t gAuxRegionFirst,gAuxRegionBlocks,gStoreRegionFirst,gStoreRegionBlocks;
 constexpr uint64_t kLogReserveBlocks=8192,kExportBlocks=65536;
 IOReturn hostRead4k(unsigned,uint64_t,uint32_t,void *);
 IOReturn hostWrite4k(unsigned,uint64_t,uint32_t,const void *,bool);

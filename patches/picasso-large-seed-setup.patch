@@ -1,0 +1,12 @@
+--- a/scripts/seed-data-skip-setup.py
++++ b/scripts/seed-data-skip-setup.py
+@@ -93,5 +93,8 @@
+         finally:
+             subprocess.run(['hdiutil', 'detach', device], check=True)
+-        if raw.read_bytes()[32:36] != b'NXSB':
++        # Only the APFS magic is needed here; Data may be tens of GiB.
++        with raw.open('rb') as stream:
++            apfs_magic = stream.read(36)[32:36]
++        if apfs_magic != b'NXSB':
+             sys.exit('The edited image is no APFS container any more')
+         metadata = packed_ramdisk.pack(raw, output)

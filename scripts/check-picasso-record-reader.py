@@ -16,7 +16,7 @@ def main():
     path=ROOT/'scripts/read-picasso-records.py';spec=importlib.util.spec_from_file_location('reader',path)
     reader=importlib.util.module_from_spec(spec);spec.loader.exec_module(reader)
     cases=[]
-    for name,kind,capacity in [('nvram',1,8192),('log',2,262144),('aux-owner',3,4096)]:
+    for name,kind,capacity in [('nvram',1,8192),('log',2,262144),('aux-owner',3,4096),('data-init',4,4096)]:
         first=slot(kind,capacity,7,b'old');second=slot(kind,capacity,8,b'new')
         dump=out/(name+'.bin');dump.write_bytes(bytes(19)+first+second)
         records=reader.records(dump,19,kind,capacity)

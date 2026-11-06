@@ -36,6 +36,10 @@ def main():
                            ('fallback-seed-info','  bool seedInfo(')]:
         (out/(name+'.inc')).write_text(extractor.extract(ram,signature))
     (out/'aux-claim.inc').write_text(extractor.extract((ROOT/'drivers/NativeUfs/PicassoPersistence.h').read_text(),'static bool picassoAuxClaim('))
+    persistence=(ROOT/'drivers/NativeUfs/PicassoPersistence.h').read_text()
+    for name,signature in [('init-begin','extern "C" int picasso_data_init_begin('),
+                           ('init-finish','extern "C" int picasso_data_init_finish(')]:
+        (out/(name+'.inc')).write_text(extractor.extract(persistence,signature).replace('extern "C" ',''))
     runs=[]
     for sanitized in (False,True):
         name='storage'+('-asan' if sanitized else '')
@@ -69,6 +73,6 @@ def main():
     result=subprocess.run(ram_cmd,capture_output=True,text=True)
     (out/'ram-kernel.log').write_text(result.stdout+result.stderr)
     if result.returncode:raise RuntimeError(f'Failed ARM64 RamBlock integration; see {out}')
-    (out/'results.json').write_text(json.dumps(dict(scope=__doc__,passed=True,runs=runs,hardware_tested=False,source_sha256={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in [ROOT/'drivers/NativeUfs/PicassoRecord.h',ROOT/'drivers/NativeUfs/PicassoPersistence.h',ROOT/'patches/picasso-native-ram-block-mode1-guard.patch',ROOT/'scripts/tests/picasso-persistence-host.cpp']}),indent=2)+'\n')
-    print('PASS: 4 GiB direct Data and double-buffered persistent records')
+    (out/'results.json').write_text(json.dumps(dict(scope=__doc__,passed=True,runs=runs,hardware_tested=False,source_sha256={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in [ROOT/'drivers/NativeUfs/PicassoRecord.h',ROOT/'drivers/NativeUfs/PicassoDataInit.h',ROOT/'drivers/NativeUfs/PicassoPersistence.h',ROOT/'patches/picasso-native-ram-block-mode1-guard.patch',ROOT/'scripts/tests/picasso-persistence-host.cpp']}),indent=2)+'\n')
+    print('PASS: 4/20 GiB direct Data and double-buffered persistent records')
 if __name__=='__main__':main()

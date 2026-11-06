@@ -62,7 +62,7 @@ def main():
         return base, packed, transform, path
 
     fixture = None
-    for size in (2 * 1024**3, 2 * 1024**3 + 4096, 4 * 1024**3):
+    for size in (2 * 1024**3, 2 * 1024**3 + 4096, 4 * 1024**3, 20 * 1024**3):
         work = out / str(size)
         (work / 'ram-data').mkdir(parents=True)
         (work / 'payload').mkdir()
@@ -86,7 +86,7 @@ def main():
         base, packed, transform, setup_path = check_handoff(work)
         assert (base['raw_sha256'] == base['seed_identity_sha256']) == (size <= 2 * 1024**3)
         cases.append('upstream Setup identity at ' + str(size))
-        if size == 4 * 1024**3:
+        if size == prepare.DATA_BYTES:
             fixture = work, base, packed, transform, setup_path, payload
 
     work, base, packed, transform, setup_path, payload = fixture
@@ -144,7 +144,7 @@ def main():
             files={n: dict(bytes=(directory / n).stat().st_size, sha256=inputs.digest(directory / n)) for n in inputs.FILES}))
     manifest()
     assert inputs.validate(directory, tree)['volume_uuid'] == identity
-    cases.append('4 GiB Compose reuse validates all hashes and handoff fields')
+    cases.append('20 GiB Compose reuse validates all hashes and handoff fields')
     for name, bad, message in (
         ('reuse rejects wrong base hash domain', {**transform, 'base_sha256': base['raw_sha256']}, 'another base'),
         ('reuse rejects wrong output hash domain', {**transform, 'output': {**transform['output'], 'sha256': packed['raw_sha256']}}, 'hash/geometry mismatch'),

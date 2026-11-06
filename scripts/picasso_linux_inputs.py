@@ -159,7 +159,9 @@ def extract(archive, output):
     with zipfile.ZipFile(archive) as bundle:
         for entry in bundle.infolist():
             parts = PurePosixPath(entry.filename).parts
-            if len(parts) < 2 or parts[-2] != 'linux-inputs' or parts[-1] not in (*FILES, 'manifest.json'):
+            # Dedicated seed artifacts contain bare files; combined boot
+            # artifacts put the identical files in linux-inputs/.
+            if not parts or (len(parts) != 1 and parts[-2] != 'linux-inputs') or parts[-1] not in (*FILES, 'manifest.json'):
                 continue
             name = parts[-1]
             limit = 4 * 1024**2 if name.endswith(('.dbr', '.dbrdisk', '.dylib')) else 16 * 1024**2
@@ -203,7 +205,7 @@ def acquire(repository, branch, tree, output):
                 continue
             artifacts = api(repository, f'actions/runs/{run["id"]}/artifacts?per_page=100')['artifacts']
             for artifact in artifacts:
-                if artifact['expired'] or not artifact['name'].startswith('picasso-bootimg-'):
+                if artifact['expired'] or not artifact['name'].startswith(('picasso-data-seed-', 'picasso-bootimg-')):
                     continue
                 checksum = artifact.get('digest', '')
                 require(checksum.startswith('sha256:') and len(checksum) == 71 and
@@ -230,7 +232,7 @@ def acquire(repository, branch, tree, output):
                     producer_workflow=run['path'], artifact_id=artifact['id'], artifact_sha256=checksum[7:])
                 (output / 'reuse.json').write_text(json.dumps(provenance, indent=2) + '\n', encoding='utf-8')
                 return
-    raise ValueError('No compatible iOS16 Compose input bundle is retained. Run macOS Compose once on feat/ios16-gpu, then run Linux.')
+    raise ValueError('No compatible iOS16 Compose input bundle is retained. Restore the saved linux-inputs or explicitly create a new seed; existing persistent Data requires its exact seed.')
 
 
 def reuse(tree, output, work, repository, branch):
@@ -277,6 +279,8 @@ def main():
     parser.add_argument('--output', type=Path, default=ROOT / 'out/picasso/linux-inputs')
     parser.add_argument('--repository', default=os.environ.get('GITHUB_REPOSITORY', 'YinCQL/UniXNU-picasso'))
     parser.add_argument('--branch', default=os.environ.get('GITHUB_REF_NAME', 'feat/ios16-gpu'))
+    parser.add_argument('--allow-new-seed', action='store_true',
+                        help='Explicit first-seed creation only; never silently replace an unavailable seed')
     args = parser.parse_args()
     if args.command == 'key':
         print(recipe(args.tree.resolve()))
@@ -288,8 +292,8 @@ def main():
         except ValueError as error:
             # Only an absent compatible seed permits new formatting; IO/provenance
             # failures remain fatal and never silently replace an existing seed.
-            if str(error).startswith('No compatible iOS16 Compose input bundle'):
-                print('No reusable seed for this recipe; first Compose will create one.')
+            if args.allow_new_seed and str(error).startswith('No compatible iOS16 Compose input bundle'):
+                print('Explicit new-seed creation requested. Existing Data cannot resume with a different seed.')
             else: raise
     else:
         reuse(args.tree.resolve(), args.output.resolve(), args.work.resolve(), args.repository, args.branch)

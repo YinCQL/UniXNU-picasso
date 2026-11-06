@@ -18,6 +18,10 @@ on:
         description: Skip optional artifact checks for device iteration
         type: boolean
         default: false
+      create_data_seed:
+        description: Create the first 20 GiB seed if none is reusable (changes Data identity)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -150,13 +154,16 @@ jobs:
           cp "out/ipsw/$PICASSO_BACKEND_BUILD/report.json" out/picasso/logs/kernel-donor.json
           echo "UNIXNU_KERNELCACHE=$PWD/out/ipsw/$PICASSO_BACKEND_BUILD/kernelcache.decompressed" >> "$GITHUB_ENV"
 
-      - name: Reuse exact persistent Data seed or create the first one
+      - name: Reuse persistent Data seed (new seed requires explicit input)
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          CREATE_DATA_SEED: ${{ inputs.create_data_seed }}
         run: |
           python3 ./unixnu defconfig picasso_defconfig
+          SEED_ARGS=()
+          if [ "$CREATE_DATA_SEED" = true ]; then SEED_ARGS+=(--allow-new-seed); fi
           python3 scripts/picasso_linux_inputs.py reuse-optional --tree "$UNIXNU_TREE" \
-            --output out/picasso/persistent-inputs
+            --output out/picasso/persistent-inputs "${SEED_ARGS[@]}"
           if [ -s out/picasso/persistent-inputs/reuse.json ]; then
             echo "PICASSO_LINUX_INPUTS=$PWD/out/picasso/persistent-inputs" >> "$GITHUB_ENV"
             # Use the signed library bound to the reused Setup seed, then rebuild
@@ -292,6 +299,16 @@ jobs:
             -o "$GITHUB_WORKSPACE/device/out/picasso/boot/boot.img" \
             2>&1 | tee out/picasso/logs/bootimg.log
           ls -lh out/picasso/boot/boot.img
+
+      # A few MiB of packed seeds must outlive the disposable kernel artifacts.
+      # If all copies become unavailable, reuse fails instead of formatting APFS.
+      - name: Retain the exact Data seed independently
+        uses: actions/upload-artifact@v4
+        with:
+          name: picasso-data-seed-${{ github.run_number }}
+          path: device/out/picasso/linux-inputs/**
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Upload boot image, diagnostic kernel, reports and reusable inputs
         if: always()

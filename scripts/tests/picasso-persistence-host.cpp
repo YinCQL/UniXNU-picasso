@@ -9,6 +9,7 @@
 #include "PersistOverlay.h"
 #include "DirectDisk.h"
 #include "PicassoRecord.h"
+#include "PicassoDataInit.h"
 struct Medium {
     std::map<uint64_t,std::array<uint8_t,4096>> disk;
     uint64_t limit=0,reads=0,readBlocks=0,writes=0,syncs=0,operations=0,fail=0;
@@ -105,6 +106,86 @@ static unsigned run() {
     return 9;
 }
 }
+namespace InitTest {
+static Medium medium;
+static struct {uint64_t first,last,imageBytes;uint32_t headerCrc,entriesCrc;} gStoreGeometry={2883584,15330298,8380219392ULL,0x3c17a352,0xd82988c2};
+static uint64_t gStoreRegionFirst=9825114,gStoreRegionBlocks=5243041;
+static constexpr uint64_t kLogReserveBlocks=8192,kExportBlocks=65536;
+static picasso_data_init::Journal gPicassoDataInit;
+static uint8_t gPicassoInitScratch[4096],gPicassoInitSaved[4096];
+static bool authorized=true,gptBad=false,windowBad=false;
+static uint64_t reserveBlocks(){return 262144;}
+static bool PE_parse_boot_argn(const char *,void *p,unsigned){*(uint32_t *)p=authorized;return true;}
+static int native_ufs_store_gpt_check(){return gptBad;}
+static bool picassoRecordWindowOpen(){return !windowBad;}
+static void IOLog(const char *,...){}
+struct PicassoRecordOps {
+    bool read(uint64_t b,uint32_t n,void *p){return medium.read(b,n,p);}
+    bool write(uint64_t b,uint32_t n,const void *p){return medium.write(b,n,p);}
+    bool sync(){return medium.sync();}
+};
+#include "init-begin.inc"
+#include "init-finish.inc"
+static unsigned run(){
+    unsigned cases=0;uint8_t seed[32]={0x19};medium.limit=15330299;
+    authorized=false;assert(!picasso_data_init_begin(5242880,seed) && !medium.writes);++cases;
+    authorized=true;gptBad=true;assert(!picasso_data_init_begin(5242880,seed) && !medium.writes);++cases;gptBad=false;
+    ++gStoreRegionFirst;assert(!picasso_data_init_begin(5242880,seed) && !medium.writes);++cases;--gStoreRegionFirst;
+    assert(!picasso_data_init_begin(1048576,seed) && !medium.writes);++cases;
+    assert(picasso_data_init_begin(5242880,seed)==1);++cases;
+    Medium pending=medium;
+    assert(picasso_data_init_begin(5242880,seed)==1 && picasso_data_init_finish());++cases;
+    Medium completed=medium;auto writes=medium.writes;
+    // A remaining replacement bootarg cannot reset an already published disk.
+    assert(picasso_data_init_begin(5242880,seed)==2 && picasso_data_init_finish());writes=medium.writes;++cases;
+    seed[0]^=1;assert(!picasso_data_init_begin(5242880,seed) && medium.writes==writes);seed[0]^=1;++cases;
+    authorized=false;assert(picasso_data_init_begin(5242880,seed)==2);authorized=true;++cases;
+    for(unsigned step=1;step<=6;++step)for(bool tear:{false,true}) {
+        medium=pending;assert(picasso_data_init_begin(5242880,seed)==1);
+        medium.fail=medium.operations+step;medium.tear=tear;
+        assert(!picasso_data_init_finish());medium.fail=0;
+        int state=picasso_data_init_begin(5242880,seed);
+        assert(state==1 || state==2);assert(picasso_data_init_finish());++cases;
+    }
+    // No pending header: a torn initial journal must refuse, not infer consent.
+    for(unsigned step=1;step<=3;++step)for(bool tear:{false,true}) {
+        medium=Medium{};medium.limit=15330299;medium.fail=4+step;medium.tear=tear;
+        assert(!picasso_data_init_begin(5242880,seed));medium.fail=0;
+        int state=picasso_data_init_begin(5242880,seed);assert(state==0 || state==1);++cases;
+    }
+    for(unsigned slot=0;slot<2;++slot) {
+        medium=completed;medium.disk[15256581+slot*2][0]^=1;
+        assert(picasso_data_init_begin(5242880,seed)==2 && picasso_data_init_finish());++cases;
+    }
+    medium=completed;
+    // Crash during Data reset: journal stays pending until overlay is durable.
+    Medium data;data.limit=persist::windowBlocks(5242880);
+    data.disk[14806002-9825114][0]=0xa5;const auto old=data.disk;
+    std::vector<uint8_t> bits(160*4096),scratch(32*4096);persist::Overlay overlay;
+    // Every reset I/O boundary, including a torn final header. No guest sees
+    // this disk until BOTH complete journal slots are durable.
+    for(unsigned step=1;step<=165;++step) {
+        Medium interrupted=data;interrupted.fail=1+step;interrupted.tear=true;
+        persist::Overlay attempt;
+        assert(attempt.open(interrupted,5242880,seed,false,bits.data(),true)==persist::Open::Failed);
+        interrupted.fail=0;persist::Overlay retry;
+        assert(retry.open(interrupted,5242880,seed,false,bits.data(),true)==persist::Open::Fresh);
+        assert(retry.present==0);++cases;
+    }
+    assert(overlay.open(data,5242880,seed,false,bits.data(),true)==persist::Open::Fresh);++cases;
+    for(const auto &item:old)assert(data.disk[item.first]==item.second); // bitmap hides retired contents
+    SeedDisk disk={};disk.bytes=20ULL<<30;Buffer buf;buf.data.assign(4096,0x62);bool error=false;
+    assert(directDiskIO(disk,overlay,data,scratch.data(),32,true,(20ULL<<30)-4096,4096,buf,&error)==4096 && !error);++cases;
+    persist::Overlay resumed;assert(resumed.open(data,5242880,seed,false,bits.data())==persist::Open::Resumed);
+    buf.data.assign(4096,0);assert(directDiskIO(disk,resumed,data,scratch.data(),32,false,(20ULL<<30)-4096,4096,buf,&error)==4096 && !error);
+    for(auto b:buf.data)assert(b==0x62);++cases;
+    // Completed journal selects reset=false: damaged and changed-seed overlays
+    // cannot be made fresh just because the boot argument remains set.
+    data.disk[0][60]^=1;auto before=data.writes;persist::Overlay broken;
+    assert(broken.open(data,5242880,seed,false,bits.data())==persist::Open::Kept && data.writes==before);++cases;
+    return cases;
+}
+}
 namespace FallbackTest {
 static uint32_t native_data_persist_state;
 static uint64_t native_ram_block_resident_bytes;
@@ -112,6 +193,8 @@ static uint32_t native_ram_block_ready=0,native_ram_block_attach_requested=1;
 static uint32_t native_data_persist_header=9,native_data_persist_gpt=0,native_data_persist_gpt_after=0;
 static uint64_t native_data_persist_pages=0,native_data_persist_loaded=0,native_data_persist_first_lba=0,native_data_persist_present=0;
 static Medium store;
+static int picasso_data_init_begin(uint64_t pages,const uint8_t *seed){return InitTest::picasso_data_init_begin(pages,seed);}
+static int picasso_data_init_finish(){return InitTest::picasso_data_init_finish();}
 static unsigned gptCalls=0,terminated=0,publications=0;
 using wait_result_t=int;
 static void *current_thread(){return nullptr;}
@@ -120,7 +203,7 @@ static void IOSleep(unsigned){assert(false && "unexpected worker wait");}
 static unsigned native_ufs_store_ready(){return 1;}
 static unsigned native_ufs_store_mode(){return 2;}
 static unsigned native_ufs_store_gpt_check(){++gptCalls;return 0;}
-static int native_ufs_store_open(uint64_t blocks,uint64_t *first,const char **why){assert(blocks==store.limit);*first=14019546;*why="";return 1;}
+static int native_ufs_store_open(uint64_t blocks,uint64_t *first,const char **why){assert(blocks==store.limit);*first=blocks==5243041?9825114:14019546;*why="";return 1;}
 static int native_ufs_store_read(uint64_t b,uint32_t n,void *p){return store.read(b,n,p);}
 static int native_ufs_store_write(uint64_t b,uint32_t n,const void *p){return store.write(b,n,p);}
 static int native_ufs_store_sync(){return store.sync();}
@@ -176,16 +259,16 @@ struct NativeRamBlock {
     #include "fallback-qualify.inc"
     #include "fallback-allocate.inc"
     #include "fallback-prepare.inc"
-    NativeRamBlock() {
+    NativeRamBlock(uint64_t size=4ULL<<30) {
         // Two nonzero extents, exercising the production packed-import branch.
         std::vector<uint8_t> packed(64+8192);
         memcpy(packed.data(),"DBRDISK1",8);persist::put32(packed.data()+8,1);persist::put32(packed.data()+12,4096);
-        persist::put64(packed.data()+16,4ULL<<30);persist::put64(packed.data()+24,2);
+        persist::put64(packed.data()+16,size);persist::put64(packed.data()+24,2);
         persist::put64(packed.data()+32,3*4096);persist::put64(packed.data()+40,4096);
-        persist::put64(packed.data()+48,(4ULL<<30)-4096);persist::put64(packed.data()+56,4096);
+        persist::put64(packed.data()+48,size-4096);persist::put64(packed.data()+56,4096);
         memset(packed.data()+64,0x30,4096);memset(packed.data()+64+4096,0x31,4096);
         assert(importSeed(packed.data(),packed.size()));
-        assert(isBig && sparse.bytes==(4ULL<<30) && !sparse.pages && !sparse.resident);
+        assert(isBig && sparse.bytes==size && !sparse.pages && !sparse.resident);
     }
     ~NativeRamBlock() {
         IOFree(overlayBits,persist::bitmapBlocks(capacity*512/4096)*4096);IOFree(stage,kStagePages*4096);
@@ -270,10 +353,35 @@ static unsigned run() {
         assert(ram.seedInfo(&base,&bytes,hash) && !base && bytes==(4ULL<<30) && !memcmp(hash,digest,32));++cases;
         auto reads=store.reads;ram.attachStore();assert(store.reads==reads && !store.writes && ram.online);++cases;
     }
+    // Entire production import -> journal -> overlay -> worker -> seedInfo.
+    InitTest::medium=Medium{};InitTest::medium.limit=15330299;
+    store=Medium{};store.limit=5243041;store.disk[14806002-9825114][0]=0xa5;
+    for(unsigned boot=0;boot<4;++boot) {
+        NativeRamBlock ram(20ULL<<30);native_ram_block_ready=0;publications=terminated=0;
+        if(boot==2)ram.seedHash[0]^=1;
+        if(boot==3)store.disk[0][60]^=1;
+        auto before=store.writes;
+        NativeRamBlock::startPersistent(&ram,0);
+        if(boot<2) {
+            assert(ram.online && ram.direct && !ram.volatileFallback && publications==1 && native_ram_block_ready==1);
+            assert(native_data_persist_state==(boot?2U:3U));
+            uint64_t base=9,size=0;uint8_t identity[32];
+            assert(ram.seedInfo(&base,&size,identity) && base==0 && size==(20ULL<<30));
+            Buffer b;b.data.assign(4096,boot?0:0x71);bool error=false;NativeRamBlock::StoreOps ops;
+            assert(directDiskIO(ram.big,ram.overlay,ops,ram.stage,32,boot==0,(20ULL<<30)-4096,4096,b,&error)==4096 && !error);
+            for(auto v:b.data)assert(v==0x71);
+            if(boot)assert(store.writes==before);
+        } else {
+            assert(!ram.online && !ram.direct && !ram.volatileFallback && !publications && native_ram_block_ready==2);
+            assert(store.writes==before);
+        }
+        assert(terminated==1 && ram.releases==1 && !locks);++cases;
+    }
     assert(!outstanding);return cases;
 }
 }
 int main() {
+    const unsigned initCases=InitTest::run();
     unsigned cases=AuxTest::run()+FallbackTest::run();
     SyncHarness sync;
     assert(!sync.doSynchronizeCache() && syncCalls==1 && native_data_persist_syncs==1 && !locks);++cases;
@@ -347,5 +455,5 @@ int main() {
     assert(no.open(hidden,2,1,8192,recordScratch,out)==0 && !hidden.writes);++cases;
     Medium corrupt=baseline;corrupt.disk[3][0]^=1;picasso_record::Record bad;
     assert(bad.open(corrupt,2,1,8192,recordScratch,out)==0 && corrupt.writes==baseline.writes);++cases;
-    printf("PASS persistence: %u large-disk, recovery, foreign-data and torn-write cases\n",cases);
+    printf("PASS persistence: %u large-disk, recovery, foreign-data and torn-write cases\n",cases+initCases);
 }

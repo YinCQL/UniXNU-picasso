@@ -84,15 +84,15 @@ static void checkBoardApis()
   uint64_t first = 0, count = 0;
   geometry(partition, image);
   assert(!native_ufs_store_open(0, &first, &why));
-  assert(!native_ufs_store_open(partition / 4 + 1, &first, &why));
+  assert(!native_ufs_store_open(kDataMaxWindowBlocks + 1, &first, &why));
   assert(gStoreRegionBlocks == 0 && !gStoreOpen);
   assert(!native_ufs_aux_open(1, &first, &why));
   if (!testMode) {
     assert(!native_ufs_store_open(131072, &first, &why));
     assert(!native_ufs_store_sync());
   } else {
-    assert(native_ufs_store_open(partition / 4, &first, &why));
-    assert(first == gStoreGeometry.last + 1 - reserve - partition / 4);
+    assert(native_ufs_store_open(kDataMaxWindowBlocks, &first, &why));
+    assert(first == gStoreGeometry.last + 1 - reserve - kDataMaxWindowBlocks);
     assert(!native_ufs_store_open(1, &first, &why));
     std::array<uint8_t,4096> bytes{};
     if (testMode == 1) {
@@ -117,7 +117,7 @@ static void checkBoardApis()
       assert(device[kUcdOffset + 17] == 0x08);
       assert(!native_ufs_aux_write(65536, 1, bytes.data()));
       assert(!native_ufs_aux_read(65535, 2, bytes.data()));
-      assert(!native_ufs_store_write(partition / 4, 1, bytes.data()));
+      assert(!native_ufs_store_write(kDataMaxWindowBlocks, 1, bytes.data()));
       assert(native_ufs_store_sync() && native_ufs_aux_sync());
     }
   }
@@ -131,6 +131,17 @@ static void checkBoardApis()
     assert(!native_ufs_store_open(131072, &first, &why) && gStoreRegionBlocks == 0);
     geometry(reserve ? reserve : 1024, 0);
     assert(!native_ufs_store_open(1, &first, &why));
+    geometry(15330298ULL-2883584+1,2045952);
+    gStoreGeometry.first=2883584;gStoreGeometry.last=15330298;
+    assert(native_ufs_store_open(5243041,&first,&why));
+    assert(first==15330299ULL-reserve-5243041);
+    if(testReserveMiB==1024)assert(first==9825114);
+    assert(first>gStoreGeometry.first+2045952+1024+65536);
+    if(testMode==2) {
+      assert(!hostInWindow(first-1,1) && !hostInWindow(first+5243041,1));
+      assert(!hostInWindow(2883584,1));
+      if(reserve)assert(!hostInWindow(15330298,1));
+    }
   }
   // Oversized tail reserves used to underflow partition-reserve in log_open.
   // In particular a 512 MiB partition must reject the default 1 GiB reserve.
@@ -146,7 +157,7 @@ static void checkBoardApis()
     assert(native_ufs_export_blocks() == kExportBlocks);
     assert(!native_ufs_log_open(&first, &count, &why));
   }
-  puts("PASS: production persistence modes, quarter/guard/reserve policy, aux capacity and all window opening orders; transport is a host fixture");
+  puts("PASS: production persistence modes, 20 GiB/guard/reserve policy, aux capacity and all window opening orders; transport is a host fixture");
 }
 
 int main(int argc, char **argv)

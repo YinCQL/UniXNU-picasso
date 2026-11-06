@@ -1172,7 +1172,7 @@ static uint32_t be32w (const uint8_t *at)
 // The only part of this driver that ever writes. The consumer (NativeRamBlock's overlay) asks for a window of the given
 // size at the END of the userdata partition. Mode 1 (boot argument sheng-data-persist=1) only reads: it proves the window and
 // lets the consumer inspect its header. Mode 2 additionally opens the write window. A window is refused unless it lies inside
-// the partition, clear of the flashed root image plus a 4 MiB guard, and is at most a quarter of the partition.
+// the partition, clear of the flashed root image plus a 4 MiB guard, and fits the fixed 20 GiB developer Data limit.
 namespace {
 struct StoreGeometry {
   bool valid;
@@ -1183,6 +1183,8 @@ StoreGeometry gStoreGeometry;
 static unsigned gStoreReady;
 extern "C" unsigned native_ufs_store_ready(void) {return __atomic_load_n(&gStoreReady,__ATOMIC_ACQUIRE);}
 uint64_t gStoreRegionFirst, gStoreRegionBlocks;
+constexpr uint64_t kDataPages20GiB = (20ULL << 30) / 4096;
+constexpr uint64_t kDataMaxWindowBlocks = kDataPages20GiB + (kDataPages20GiB + 32767) / 32768 + 1;
 // The diagnostic log (sheng-log=1): always the last 32 MiB of userdata, so the Data store's place does not depend on logging.
 constexpr uint64_t kLogReserveBlocks = 8192;
 // The log's export region: the 256 MiB just below the log window (the render server's pipeline caches, kits/sheng BootLog.c). It is
@@ -1237,7 +1239,7 @@ extern "C" int native_ufs_store_open (uint64_t blocks, uint64_t *firstLba, const
     uint64_t partition = gStoreGeometry.last - gStoreGeometry.first + 1;
     uint64_t imageBlocks = (gStoreGeometry.imageBytes + 4095) / 4096;
     const uint64_t reserve = reserveBlocks ();
-    if (!blocks || blocks > partition / 4 || reserve >= partition || blocks > partition - reserve) reason = "size";
+    if (!blocks || blocks > kDataMaxWindowBlocks || reserve >= partition || blocks > partition - reserve) reason = "size";
     else if (partition - blocks - reserve < imageBlocks + 1024) reason = "overlaps the root image";
     else {
       // The reserve at the end of the partition belongs to the diagnostic log (its last 32 MiB, with the export region below them);
@@ -1255,9 +1257,8 @@ extern "C" int native_ufs_store_open (uint64_t blocks, uint64_t *firstLba, const
     }
   }
   if (ok) {
-    const uint64_t partition = gStoreGeometry.last - gStoreGeometry.first + 1;
-    IOLog ("PICASSO_STORE open first=%llu blocks=%llu quarter=%llu lowGuard=%llu\n",
-           gStoreRegionFirst, gStoreRegionBlocks, partition / 4, gStoreRegionFirst - gStoreGeometry.first);
+    IOLog ("PICASSO_STORE open first=%llu blocks=%llu maxBlocks=%llu lowGuard=%llu\n",
+           gStoreRegionFirst, gStoreRegionBlocks, kDataMaxWindowBlocks, gStoreRegionFirst - gStoreGeometry.first);
   } else {
     IOLog ("PICASSO_STORE refused blocks=%llu why=%s\n", blocks, reason);
   }

@@ -283,6 +283,8 @@ kernel_args = [
   "picasso-aks-state=1",
   "sheng-data-persist=2",
   "picasso-data-init-blank=1",
+  # One-time 20 GiB replacement; persistent journal prevents subsequent resets.
+  "picasso-data-replace-20g=1",
   "picasso-persist-records=1",
   # Software refresh notifications only; panel timing remains firmware-owned.
   "sheng-vsync=60",

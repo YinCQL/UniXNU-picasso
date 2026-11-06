@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 #pragma once
 #include "PicassoRecord.h"
+#include "PicassoDataInit.h"
 // Board-private records in the existing 1 GiB reserve, disjoint from Data/aux.
 // NVRAM: first six 4K blocks of the otherwise-unused export region.
 // Console: two 260 KiB slots at the beginning of the final 32 MiB log region.
@@ -21,6 +22,22 @@ IOLock *gPicassoRecordLock;
 picasso_record::Record gPicassoNvram, gPicassoLog;
 uint8_t gPicassoNvramImage[8192],gPicassoNvramScratch[8192];
 bool gPicassoNvramLoaded;
+// Called serially by the pre-publication Data worker, then records startup.
+bool gPicassoRecordWindowOpened;
+static bool picassoRecordWindowOpen() {
+    if(gPicassoRecordWindowOpened)return true;
+    uint64_t partition=gStoreGeometry.last-gStoreGeometry.first+1;
+    if(storeMode()!=2 || logMode()!=0 || !gStoreGeometry.valid ||
+       reserveBlocks()<kLogReserveBlocks+kExportBlocks || reserveBlocks()>=partition ||
+       partition-reserveBlocks()<(gStoreGeometry.imageBytes+4095)/4096+1024)return false;
+    uint64_t first=gStoreGeometry.last+1-kLogReserveBlocks-kExportBlocks;
+    IOLockLock(gHost.lock);
+    gPicassoRecordWindowOpened=hostLogOpen(first,kLogReserveBlocks+kExportBlocks);
+    IOLockUnlock(gHost.lock);
+    return gPicassoRecordWindowOpened;
+}
+picasso_data_init::Journal gPicassoDataInit;
+uint8_t gPicassoInitScratch[4096],gPicassoInitSaved[4096];
 extern "C" void picasso_nvram_periodic_sync(void) __attribute__((weak_import));
 extern "C" uint32_t picasso_console_snapshot(void *,uint32_t,uint64_t *,uint64_t *) __attribute__((weak_import));
 static void picassoLogThread(void *,wait_result_t) {
@@ -53,6 +70,36 @@ static void picassoLogThread(void *,wait_result_t) {
     thread_terminate(current_thread());
 }
 }
+// Exact Picasso layout measured in build164. Root authentication and both GPT
+// CRC checks still precede initialization. No writes to the root or GPT.
+extern "C" int picasso_data_init_begin(uint64_t pages,const uint8_t seed[32]) {
+    uint32_t request=0;PE_parse_boot_argn("picasso-data-replace-20g",&request,sizeof(request));
+    if(!seed || pages!=5242880 || gStoreRegionBlocks!=5243041 || gStoreRegionFirst!=9825114 ||
+       gStoreGeometry.first!=2883584 || gStoreGeometry.last!=15330298 ||
+       gStoreGeometry.imageBytes!=8380219392ULL || reserveBlocks()!=262144 ||
+       gStoreGeometry.headerCrc!=0x3c17a352 || gStoreGeometry.entriesCrc!=0xd82988c2 ||
+       native_ufs_store_gpt_check() || !picassoRecordWindowOpen())return 0;
+    uint8_t identity[picasso_data_init::identityBytes]={};
+    picasso_record::put64(identity,gStoreGeometry.first);
+    picasso_record::put64(identity+8,gStoreGeometry.last);
+    picasso_record::put64(identity+16,gStoreGeometry.imageBytes);
+    picasso_record::put64(identity+24,gStoreRegionFirst);
+    picasso_record::put64(identity+32,gStoreRegionBlocks);
+    picasso_record::put32(identity+40,gStoreGeometry.headerCrc);
+    picasso_record::put32(identity+44,gStoreGeometry.entriesCrc);
+    picasso_record::put64(identity+48,pages);
+    memcpy(identity+56,seed,32);
+    PicassoRecordOps ops;
+    uint64_t marker=gStoreGeometry.last+1-kLogReserveBlocks-kExportBlocks+10;
+    int phase=gPicassoDataInit.begin(ops,marker,identity,request==1,gPicassoInitScratch,gPicassoInitSaved);
+    IOLog("PICASSO_DATA_INIT phase=%d first=%llu blocks=%llu marker=%llu\n",phase,gStoreRegionFirst,gStoreRegionBlocks,marker);
+    return phase;
+}
+extern "C" int picasso_data_init_finish() {
+    PicassoRecordOps ops;
+    bool ok=!native_ufs_store_gpt_check() && gPicassoDataInit.finish(ops,gPicassoInitScratch);
+    IOLog("PICASSO_DATA_INIT complete=%u\n",ok);return ok;
+}
 extern "C" volatile uint32_t native_data_persist_state;
 extern "C" int picasso_persistence_start(void) {
     // A volatile seed fallback does not establish ownership of persistent windows.
@@ -68,10 +115,7 @@ extern "C" int picasso_persistence_start(void) {
     if(reserveBlocks()<kLogReserveBlocks+kExportBlocks || reserveBlocks()>=partition ||
         partition-reserveBlocks()<(gStoreGeometry.imageBytes+4095)/4096+1024)return 0;
     uint64_t first=gStoreGeometry.last+1-kLogReserveBlocks-kExportBlocks;
-    // host window registration and all transport commands share the controller lock.
-    IOLockLock(gHost.lock);
-    bool opened=hostLogOpen(first,kLogReserveBlocks+kExportBlocks);
-    IOLockUnlock(gHost.lock);
+    bool opened=picassoRecordWindowOpen();
     if(!opened || !(gPicassoRecordLock=IOLockAlloc()))return 0;
     PicassoRecordOps ops;
     int state=gPicassoNvram.open(ops,first,1,8192,gPicassoNvramScratch,gPicassoNvramImage);
