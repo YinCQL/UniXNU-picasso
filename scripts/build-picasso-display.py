@@ -247,12 +247,13 @@ def main():
                ROOT / 'kits/picasso/PicassoAccelerator.cpp',
                source_dir / 'NativeGOPPresenter.cpp', source_dir / 'NativeGOPGlue.cpp',
                ROOT / 'kits/picasso/PicassoPr13.cpp', ROOT / 'kits/picasso/PicassoBacklight.cpp',
-               ROOT / 'kits/picasso/PicassoBrightness.cpp', ROOT / 'kits/picasso/PicassoSpmi.cpp']
+               ROOT / 'kits/picasso/PicassoBrightness.cpp', ROOT / 'kits/picasso/PicassoSpmi.cpp',
+               ROOT / 'kits/picasso/PicassoAdsp.cpp']
     audit = None
     for source in sources:
         obj = out / (source.stem + '.o')
         command = platform.compile_command(record, source, obj, ROOT) + ['-I', str(out), '-I', str(source_dir),
-            '-I', str(ROOT / 'drivers/NativeAdreno'), '-mgeneral-regs-only']
+            '-I', str(ROOT / 'drivers/NativeAdreno'), '-I', str(ROOT / 'drivers/NativeWlan'), '-mgeneral-regs-only']
         platform.run(command, obj.with_suffix('.compile.log'), record['directory'])
         if source.stem == 'NativeLegacyDisplay':
             audit = audit_object(platform, native, obj, slots, aliases, names)
@@ -279,7 +280,8 @@ def main():
     sources += hid_sources
     sources += [ROOT / 'drivers/NativeNovatekTouch/TouchPublish.h']
     sources += [ROOT / 'kits/picasso/PicassoBacklightCore.h', ROOT / 'kits/picasso/PicassoButtonsCore.h',
-                ROOT / 'kits/picasso/PicassoSpmi.h', ROOT / 'kits/picasso/PicassoSpmiCore.h']
+                ROOT / 'kits/picasso/PicassoSpmi.h', ROOT / 'kits/picasso/PicassoSpmiCore.h',
+                ROOT / 'kits/picasso/PicassoAdsp.h', ROOT / 'drivers/NativeWlan/WlanSmem.h']
     sources += [ROOT / 'drivers/NativeAdreno/OriginalAcceleratorABI.h']
     pending = Path(tempfile.mkdtemp(prefix='qualified-display-', dir=out)) / 'libNativeLegacyDisplay.late.a'
     platform.run(['xcrun', 'ar', 'rcs', pending, *objects], out / 'archive.log')
