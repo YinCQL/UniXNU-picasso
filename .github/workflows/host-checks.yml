@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checks:
+  host-regressions:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     defaults:
@@ -182,20 +182,6 @@ jobs:
           python3 scripts/check-picasso-novatek.py --output out/picasso/host-checks/novatek
           cp out/picasso/host-checks/novatek/results.json out/picasso/logs/novatek-host.json
 
-      - name: Check packed Data format and seed validation
-        run: |
-          # Fixtures contain intentional symlinks. Upload only the result JSON.
-          python3 scripts/check-picasso-ram-data.py --output out/picasso/host-checks/data \
-            --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py"
-          python3 scripts/check-picasso-data-artifacts-host.py --output out/picasso/host-checks/payload-seed
-          python3 scripts/check-picasso-setup-identity.py \
-            --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py" \
-            --output out/picasso/host-checks/setup-identity
-          mkdir -p out/picasso/logs
-          cp out/picasso/host-checks/data/results.json out/picasso/logs/data-host-check.json
-          cp out/picasso/host-checks/payload-seed/results.json out/picasso/logs/payload-seed-host.json
-          cp out/picasso/host-checks/setup-identity/results.json out/picasso/logs/setup-identity-host.json
-
       - name: Check persistent Data and dual record recovery
         run: |
           python3 scripts/check-picasso-persistence.py --tree "$UNIXNU_TREE" --output out/picasso/host-checks/persistent-data
@@ -224,7 +210,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: picasso-host-${{ github.run_id }}
+          name: picasso-host-core-${{ github.run_id }}
           # Anchor log searches outside Data fixtures containing directory symlinks.
           path: |
             device/out/picasso/logs/**
@@ -240,6 +226,93 @@ jobs:
             device/out/picasso/host-checks/linux-host/*.json
           if-no-files-found: warn
           retention-days: 7
+
+  # These two suites hash large logical disks. Give each its own CPU budget
+  # while driver regressions run, without shrinking fixtures or caching results.
+  seed-checks:
+    name: seed-${{ matrix.suite }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [format, identity]
+    defaults:
+      run:
+        shell: bash
+        working-directory: device
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare the pinned upstream packer
+        run: |
+          TREE=$(python3 ./unixnu --prepare)
+          echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
+          mkdir -p out/picasso/seed-reports/logs
+      - name: Check packed Data format and payload seed
+        if: matrix.suite == 'format'
+        run: |
+          # bash pipefail preserves the test's failure through tee. Only logs
+          # and reports are uploaded, never sparse fixtures or their symlinks.
+          python3 scripts/check-picasso-ram-data.py --output out/picasso/host-checks/data \
+            --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py" \
+            2>&1 | tee out/picasso/seed-reports/logs/data-format.log
+          cp out/picasso/host-checks/data/results.json out/picasso/seed-reports/logs/data-host-check.json
+          python3 scripts/check-picasso-data-artifacts-host.py --output out/picasso/host-checks/payload-seed \
+            2>&1 | tee out/picasso/seed-reports/logs/payload-seed.log
+          cp out/picasso/host-checks/payload-seed/results.json out/picasso/seed-reports/logs/payload-seed-host.json
+      - name: Check upstream Setup identity and Compose reuse
+        if: matrix.suite == 'identity'
+        run: |
+          python3 scripts/check-picasso-setup-identity.py \
+            --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py" \
+            --output out/picasso/host-checks/setup-identity \
+            2>&1 | tee out/picasso/seed-reports/logs/setup-identity.log
+          cp out/picasso/host-checks/setup-identity/results.json out/picasso/seed-reports/logs/setup-identity-host.json
+      - name: Upload seed regression reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: picasso-host-seed-${{ matrix.suite }}-${{ github.run_id }}
+          path: device/out/picasso/seed-reports/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # Preserve the existing required check name. It must fail if any shard fails
+  # or is skipped; a successful driver job alone is not a complete host check.
+  checks:
+    if: always()
+    needs: [host-regressions, seed-checks]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Collect host regression reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: picasso-host-*-${{ github.run_id }}
+          merge-multiple: true
+          path: reports
+      - name: Publish combined host reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: picasso-host-${{ github.run_id }}
+          path: reports/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Require every regression shard
+        if: always()
+        env:
+          CORE_RESULT: ${{ needs.host-regressions.result }}
+          SEED_RESULT: ${{ needs.seed-checks.result }}
+        run: |
+          test "$CORE_RESULT" = success
+          test "$SEED_RESULT" = success
 
   ui-library:
     runs-on: macos-latest
