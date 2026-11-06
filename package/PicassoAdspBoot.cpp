@@ -135,6 +135,7 @@ int start(Boot &b) {
     b.phase="service";unsigned snapshots=0;uint64_t next=bootDeadline(5);bool handoverLogged=false;
     for(;;) {
         e={};if((error=sample(b,e)))return error;
+        if(e.hasValue && (e.value&2) && b.events->service)b.events->service(b.events->context);
         if(b.handed && b.voted && !handoverLogged) {
             reportRetainedPower(b);
             handoverLogged=true;

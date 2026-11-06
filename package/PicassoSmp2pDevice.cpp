@@ -11,6 +11,7 @@
 #include "PicassoRpmh.h"
 #include "PicassoAdspBoot.h"
 #include "PicassoAdsp.h"
+#include "PicassoGlink.h"
 
 // Display also builds without the optional Adreno archive. A missing shared
 // owner means no power plan; never create an independent RSC writer.
@@ -56,7 +57,7 @@ IOMemoryMap *smemMap(uint64_t base, uint64_t bytes) {
     IOMemoryMap *map = m->map(kIOMapAnywhere | kIOMapInhibitCache);
     m->release(); return map;
 }
-int prepare(SmemDevice *d, const PicassoSmemIo *io, PicassoSmp2p *s) {
+int prepare(SmemDevice *d, const PicassoSmemIo *io, PicassoSmp2p *s, PicassoGlink *glink) {
     s->audit.phase = "lock";
     if (__atomic_exchange_n(&allocatorGate, 1U, __ATOMIC_ACQ_REL)) return -16;
     PicassoSmemLockIo lock = {d, lockRead, lockWrite, smemBarrier};
@@ -68,6 +69,7 @@ int prepare(SmemDevice *d, const PicassoSmemIo *io, PicassoSmp2p *s) {
         if (!acquired) {
             d->held = true;
             error = picasso_smp2p_prepare(io, s);
+            if (!error) error = picasso_glink_prepare(io, glink, &s->audit);
             int released = picasso_smem_unlock(&lock);
             d->held = false;
             enable_preemption();
@@ -81,17 +83,52 @@ int prepare(SmemDevice *d, const PicassoSmemIo *io, PicassoSmp2p *s) {
     __atomic_store_n(&allocatorGate, 0U, __ATOMIC_RELEASE);
     return error;
 }
-struct BootEvents { SmemDevice *device; const PicassoSmemIo *io; PicassoSmp2p *state; };
+struct BootEvents {
+    SmemDevice *device; const PicassoSmemIo *io; PicassoSmp2p *state; PicassoGlink *glink;
+    bool sentLogged, readyLogged, blockedLogged, failedLogged;
+};
 int bootPoll(void *context, PicassoSmp2pEvent *event) {
     auto *b=static_cast<BootEvents *>(context);
     int error=picasso_smp2p_service(b->io,b->state,event);
     if(!error && event->kick)smpKick(b->device);
     return error;
 }
+void bootService(void *context) {
+    auto *b=static_cast<BootEvents *>(context);
+    // The coordinator calls here only after its own PAS AUTH and fresh ready;
+    // neither a preflight sample nor the stopped observer can transmit GLINK.
+    {
+        bool kick=false;auto *g=b->glink;
+        int transport=picasso_glink_service(b->io,g,&kick);
+        if(kick) {
+            smemBarrier(b->device);
+            *reinterpret_cast<volatile uint32_t *>(b->device->ipcc+0x0c)=3U<<16;
+            smemBarrier(b->device);
+        }
+        if(g->sent && !b->sentLogged) {
+            b->sentLogged=true;
+            IOLog("PICASSO_ADSP glink stage=version-sent version=1 features=0 signal=3/0\n");
+        }
+        if(g->ready && !b->readyLogged) {
+            b->readyLogged=true;
+            IOLog("PICASSO_ADSP glink stage=negotiated version=1 features=0 rx_bytes=%u channel_open=0 pcm=0\n",g->rx.size);
+        }
+        if(g->blocked && !b->blockedLogged) {
+            b->blockedLogged=true;
+            IOLog("PICASSO_ADSP glink stage=pending command=%u channel=%u data=%x rx_tail=%u negotiated=%u channel_open=0 pcm=0\n",
+                g->pendingCommand,g->pendingChannel,g->pendingData,g->rxTail,g->ready);
+        }
+        if(transport && transport!=-11 && !b->failedLogged) {
+            b->failedLogged=true;
+            IOLog("PICASSO_ADSP glink stage=stopped error=%d tx=%u rx=%u commands=%u channel_open=0 pcm=0\n",
+                transport,g->txHead,g->rxTail,g->commands);
+        }
+    }
+}
 int bootSnapshot(void *context) {
     auto *b=static_cast<BootEvents *>(context);
     picasso_adsp_snapshot s={};picasso_adsp_survey(&b->io->reader,&s);
-    IOLog("PICASSO_ADSP boot snapshot crash_error=%d reason=%.79s glink_error=%d fifo=%x/%x/%x/%x\n",
+    IOLog("PICASSO_ADSP boot snapshot crash_error=%d reason=%.255s glink_error=%d fifo=%x/%x/%x/%x\n",
         s.crash_error,s.crash,s.glink_error,s.fifo[0],s.fifo[1],s.fifo[2],s.fifo[3]);
     return s.glink_error;
 }
@@ -122,14 +159,17 @@ extern "C" void picasso_smp2p_start(void) {
     }
     PicassoSmemIo io = {{&d, smemRead}, smemWrite, smemBarrier, lockHeld};
     PicassoSmp2p s = {};
-    int error = prepare(&d, &io, &s);
+    PicassoGlink glink={};
+    int error = prepare(&d, &io, &s, &glink);
     IOLog("PICASSO_ADSP smp2p stage=prepare error=%d created=%u partition=%x/%x out=%x/%x owner=%x irq=0 authenticated=0\n",
         error, s.created, s.partition.offset, s.partition.size, s.out.offset, s.out.size, lockRead(&d));
     logAudit(s);
     if (error) return;
     smpKick(&d);
-    BootEvents boot={&d,&io,&s};
-    PicassoAdspEvents events={&boot,bootPoll,bootSnapshot};
+    IOLog("PICASSO_ADSP glink stage=prepared descriptor=%x/%x tx=%x/%x remote_pid=2\n",
+        glink.desc.offset,glink.desc.size,glink.tx.offset,glink.tx.size);
+    BootEvents boot={&d,&io,&s,&glink,false,false,false,false};
+    PicassoAdspEvents events={&boot,bootPoll,bootSnapshot,bootService};
     picasso_adsp_boot(&events);
     unsigned missing = 0, logs = 0;
     bool wasOpen = false, hadValue = false;

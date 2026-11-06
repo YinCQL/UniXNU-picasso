@@ -66,7 +66,7 @@ def check(tree, work, kernelcache, output):
         'hid-original-bindings.o', 'NativeGOPPresenter.late.o', 'NativeGOPGlue.o',
         'PicassoPr13.o', 'PicassoButtons.o', 'PicassoBacklight.o', 'PicassoBrightness.late.o',
         'PicassoSpmi.o', 'PicassoAdsp.o', 'PicassoAdspFirmware.o', 'PicassoFat.o',
-        'PicassoQmp.o', 'PicassoAop.o', 'PicassoSmp2p.o', 'PicassoSmp2pDevice.o', 'PicassoAdspBoot.o'}, 'Wrong display/state/input archive members')
+        'PicassoQmp.o', 'PicassoAop.o', 'PicassoSmp2p.o', 'PicassoSmp2pDevice.o', 'PicassoAdspBoot.o', 'PicassoGlink.o'}, 'Wrong display/state/input archive members')
     kernel = work / 'kernel/kernel.macho'
     plan = json.loads(kernel.with_suffix('.json').read_text())
     report = builder.verify_kernel(aes, native, original, kernel.read_bytes(), plan, audit)
@@ -79,6 +79,10 @@ def check(tree, work, kernelcache, output):
                      '_picasso_pas_acquire', '_picasso_pas_release', '_picasso_pas_adsp',
                      '_picasso_rpmh_adsp_resources', '_picasso_rpmh_crypto_ready'} <= linked_names,
                     'Missing ADSP boot transaction or shared GPU power/PAS owner')
+    builder.require(any('picasso_glink_prepare' in n for n in linked_names) and
+                    any('picasso_glink_service' in n for n in linked_names) and
+                    any('picasso_smem_prepare_glink' in n for n in linked_names),
+                    'Missing GLINK allocation or control transport')
     builder.require({'_picasso_backlight_start', '_picasso_backlight_power', '_picasso_backlight_level',
                      '_picasso_backlight_current', '_picasso_brightness_allocate', '_picasso_brightness_is_service', '__GLOBAL__sub_I_PicassoBrightness.cpp'} <= linked_names, 'Missing physical display power backend')
     report['hid'] = hid.verify(platform, aes, native, OriginalReference(kernelcache, board),

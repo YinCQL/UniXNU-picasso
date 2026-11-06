@@ -12,7 +12,7 @@ struct picasso_adsp_snapshot {
     int partition_error, inbound_error, outbound_error, glink_error;
     uint32_t inbound, outbound, fifo[4];
     int crash_error;
-    char crash[80];
+    char crash[256]; // stock MAX_SSR_REASON_LEN, including the terminator
 };
 static inline int picasso_adsp_item(const struct wlan_smem_io *io,
     const struct wlan_smem_partition *p,uint16_t id,uint16_t local,uint16_t remote,
@@ -27,7 +27,8 @@ static inline int picasso_adsp_glink(const struct wlan_smem_io *io,
     for (unsigned i=0;i<3;++i) {
         int error=wlan_smem_find(io,p,(uint16_t)(478+i),&items[i]);
         if (error) return error;
-        if (items[i].size!=(i ? 16384U : 32U)) return -22;
+        if (i<2 ? items[i].size!=(i ? 16384U : 32U) :
+            (items[i].size<16 || items[i].size>65536 || (items[i].size&7))) return -22;
     }
     uint8_t first[16],after[16];
     if (wlan_smread(io,items[0].offset,first,16) ||
@@ -35,20 +36,22 @@ static inline int picasso_adsp_glink(const struct wlan_smem_io *io,
     for (unsigned i=0;i<16;++i) if (first[i]!=after[i]) return -11;
     for (unsigned i=0;i<4;++i) {
         uint32_t v=wlan_sm32(first+4*i);
-        if (v>=16384 || (v&7)) return -22;
+        if (v>=items[i<2 ? 1 : 2].size || (v&7)) return -22;
     }
     for (unsigned i=0;i<4;++i) fifo[i]=wlan_sm32(first+4*i);
     return 0;
 }
-static inline int picasso_adsp_crash(const struct wlan_smem_io *io,char text[80]) {
+static inline int picasso_adsp_crash(const struct wlan_smem_io *io,char text[256]) {
+    if (!text) return -22;
+    text[0]=0;
     struct wlan_smem_partition p={0,0,0,0,0};
     struct wlan_smem_item item={0,0};
     int error=wlan_smem_partition(io,0xfffe,0xfffe,&p);
     if (!error) error=wlan_smem_find(io,&p,423,&item);
     if (error) return error;
     if (!item.size) return -22;
-    uint8_t first[79],after[79];
-    uint32_t size=item.size<79 ? item.size : 79;
+    uint8_t first[255],after[255];
+    uint32_t size=item.size<255 ? item.size : 255;
     if (wlan_smread(io,item.offset,first,size) || wlan_smread(io,item.offset,after,size)) return -22;
     for (uint32_t i=0;i<size;++i) if (first[i]!=after[i]) return -11;
     uint32_t n=0;

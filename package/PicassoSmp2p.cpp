@@ -135,6 +135,48 @@ int picasso_smp2p_prepare(const PicassoSmemIo *io, PicassoSmp2p *s) {
     return error;
 }
 
+int picasso_smem_prepare_glink(const PicassoSmemIo *io, wlan_smem_item *desc, wlan_smem_item *tx, PicassoSmemAudit *audit) {
+    if (!io || !io->reader.read || !io->write32 || !io->barrier || !io->locked || !desc || !tx || !audit) return -22;
+    *desc = {}; *tx = {};
+    if (!locked(io)) return -16;
+    struct wlan_smem_partition p = {}, check = {};
+    int error = partition(io, &p, audit);
+    if (error) return error;
+    if (audit->infoMagic == 0x49494953 && audit->items <= 480) return -22;
+    wlan_smem_item old = {};
+    error = wlan_smem_find(&io->reader, &p, 443, &old);
+    if (!error) return -16; // Never initialize a transport beside an inherited peer.
+    if (error != -2) return error;
+    for (unsigned id = 478; id <= 480; ++id) {
+        error = wlan_smem_find(&io->reader, &p, uint16_t(id), &old);
+        if (!error) return -17;
+        if (error != -2) return error;
+    }
+    constexpr uint32_t total = 16 + 32 + 16 + 16384;
+    if (total > p.cached - p.uncached) return -28;
+    if ((error = partition(io, &check, audit))) return error;
+    if (!same(p, check) || !locked(io)) return -11;
+    const uint32_t at = p.offset + p.uncached;
+    // Both headers and all APPS-owned bytes precede the single free-pointer
+    // publication. No stack-sized FIFO, no decrement/rollback after publication.
+    for (unsigned offset = 0; offset < total; offset += 4) {
+        uint32_t value = offset == 0 ? 0xa5a5 | (478U << 16) : offset == 4 ? 32 :
+                         offset == 48 ? 0xa5a5 | (479U << 16) : offset == 52 ? 16384 : 0;
+        if ((error = wr(io, at + offset, value))) return error;
+    }
+    fence(io);
+    if (!locked(io)) return -16;
+    if ((error = wr(io, p.offset + 12, p.uncached + total))) return error;
+    fence(io);
+    if ((error = partition(io, &check, audit))) return error;
+    if ((error = wlan_smem_find(&io->reader, &check, 478, &old))) return error;
+    if (old.offset != at + 16 || old.size != 32) return -22;
+    if ((error = wlan_smem_find(&io->reader, &check, 479, &old))) return error;
+    if (old.offset != at + 64 || old.size != 16384) return -22;
+    *desc = {at + 16, 32}; *tx = old;
+    return 0;
+}
+
 int picasso_smp2p_service(const PicassoSmemIo *io, PicassoSmp2p *s, PicassoSmp2pEvent *event) {
     if (!io || !io->reader.read || !io->write32 || !io->barrier || !s || !event || !s->created || s->failed) return -22;
     *event = {};

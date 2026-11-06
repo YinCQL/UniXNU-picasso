@@ -36,11 +36,11 @@ def main():
     for sanitized in (False, True):
         suffix = '-asan' if sanitized else ''
         flags = (['-fsanitize=address' if os.name=='nt' else '-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if sanitized else [])
-        for name in ('smp2p','smp2p-device'):
+        for name in ('smp2p','smp2p-device','glink'):
             exe = out/(name+suffix+('.exe' if os.name=='nt' else ''))
             run(name+'-compile'+suffix, [a.cxx,'-std=c++17','-O1','-Wall','-Wextra','-Werror',*flags,*includes,
-                str(ROOT/f'scripts/tests/picasso-{name}-host.cpp'),str(core),'-o',str(exe)])
-            cases = ('normal',) if name=='smp2p' else ('normal','peer','owner','remote','gate','bad',
+                str(ROOT/f'scripts/tests/picasso-{name}-host.cpp'),str(core),str(ROOT/'package/PicassoGlink.cpp'),'-o',str(exe)])
+            cases = ('normal',) if name!='smp2p-device' else ('normal','peer','glink','owner','remote','gate','bad',
                 'alloc1','alloc2','alloc3','map1','map2','map3','zero1','zero2','zero3')
             for case in cases:
                 run(name+'-'+case+suffix,[str(exe),case])
@@ -49,11 +49,12 @@ def main():
         'void IOLog(const char *,...) __attribute__((format(printf,1,2)));\n'
         'void IOSleep(unsigned); void _disable_preemption(); void _enable_preemption(); }\n'
         '#define disable_preemption() _disable_preemption()\n#define enable_preemption() _enable_preemption()\n'+body,encoding='utf8',newline='\n')
-    for name,source in [('smp2p',core),('smp2p-device',arm)]:
+    for name,source in [('smp2p',core),('smp2p-device',arm),('glink',ROOT/'package/PicassoGlink.cpp')]:
         run(name+'-arm64',[a.cxx,'-target','arm64-apple-ios17.0','-std=c++17','-ffreestanding',
             '-fno-exceptions','-fno-rtti','-fno-threadsafe-statics','-mgeneral-regs-only','-Wall','-Wextra','-Werror',
             *includes,'-c',str(source),'-o',str(out/(name+'.o'))])
     inputs = ['package/PicassoSmp2p.h','package/PicassoSmp2p.cpp','package/PicassoSmp2pDevice.cpp',
+        'package/PicassoGlink.h','package/PicassoGlink.cpp','scripts/tests/picasso-glink-host.cpp',
         'package/PicassoSmemLock.h','package/PicassoAdspBoot.h','package/PicassoAdsp.h','drivers/NativeWlan/WlanSmem.h','drivers/NativeAdrenoPicasso/PicassoRpmh.h',
         'scripts/check-picasso-smp2p.py','scripts/tests/picasso-smp2p-host.cpp','scripts/tests/picasso-smp2p-device-host.cpp',
         'scripts/tests/picasso-wlan-kernel-api.h','scripts/build-picasso-display.py',

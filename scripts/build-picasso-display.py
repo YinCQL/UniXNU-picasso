@@ -251,7 +251,8 @@ def main():
                ROOT / 'kits/picasso/PicassoAdsp.cpp', ROOT / 'kits/picasso/PicassoAdspFirmware.cpp',
                ROOT / 'kits/picasso/PicassoFat.cpp', ROOT / 'kits/picasso/PicassoQmp.cpp',
                ROOT / 'kits/picasso/PicassoAop.cpp', ROOT / 'kits/picasso/PicassoSmp2p.cpp',
-               ROOT / 'kits/picasso/PicassoSmp2pDevice.cpp', ROOT / 'kits/picasso/PicassoAdspBoot.cpp']
+               ROOT / 'kits/picasso/PicassoSmp2pDevice.cpp', ROOT / 'kits/picasso/PicassoAdspBoot.cpp',
+               ROOT / 'kits/picasso/PicassoGlink.cpp']
     audit = None
     for source in sources:
         obj = out / (source.stem + '.o')
@@ -288,7 +289,7 @@ def main():
                 ROOT / 'kits/picasso/PicassoAdsp.h', ROOT / 'drivers/NativeWlan/WlanSmem.h',
                 ROOT / 'kits/picasso/PicassoFat.h', ROOT / 'kits/picasso/PicassoAdspFirmwareProfile.h',
                 ROOT / 'kits/picasso/PicassoAdspLoadPlan.h', ROOT / 'kits/picasso/PicassoAdspBoot.h',
-                ROOT / 'kits/picasso/PicassoQmp.h', ROOT / 'kits/picasso/PicassoSmp2p.h',
+                ROOT / 'kits/picasso/PicassoQmp.h', ROOT / 'kits/picasso/PicassoSmp2p.h', ROOT / 'kits/picasso/PicassoGlink.h',
                 ROOT / 'kits/picasso/PicassoSmemLock.h']
     sources += [ROOT / 'drivers/NativeAdreno/OriginalAcceleratorABI.h', ROOT / 'drivers/NativeUfs/FirmwareWindow.h',
                 ROOT / 'drivers/NativeAdrenoPicasso/PicassoRpmh.h', ROOT / 'drivers/NativeAdrenoPicasso/PicassoPas.h']

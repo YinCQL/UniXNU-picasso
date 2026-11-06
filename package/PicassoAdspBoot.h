@@ -8,6 +8,7 @@ struct PicassoAdspEvents {
     void *context;
     int (*poll)(void *, PicassoSmp2pEvent *);
     int (*snapshot)(void *); // Bounded crash/GLINK observations after startup/failure.
+    void (*service)(void *); // Only after PAS AUTH + fresh ready, never preflight/fatal.
 };
 struct PicassoAdspImage;
 extern "C" PicassoAdspImage *picasso_adsp_image_open(int *error);

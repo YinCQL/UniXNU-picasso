@@ -6,11 +6,11 @@
 #include <string.h>
 #include "PicassoSmp2p.h"
 #include "PicassoAdspBoot.h"
-extern "C" void picasso_adsp_boot(const PicassoAdspEvents *e) { assert(e && e->poll && e->snapshot); }
+extern "C" void picasso_adsp_boot(const PicassoAdspEvents *e);
 static uint32_t ram[WLAN_SMEM_SIZE/4], mutexRam[1024], ipccRam[1024];
 static unsigned allocations,mappings,releases,unmaps,lines,sleeps,preempt,plans,kicks;
 static unsigned failAlloc,failMap,zeroMap;
-static bool peer;
+static bool peer,transport;
 static constexpr unsigned part=0x1cf000, toc=WLAN_SMEM_SIZE-4096;
 enum {kIOMapAnywhere=1,kIOMapInhibitCache=2,OSNoRetain=0};
 class IOMemoryMap {
@@ -70,6 +70,31 @@ static void IOSleep(unsigned ms) {
     if(sleeps==1602)ram[(part+48+36)/4]=1; // External mutation stops service.
 }
 #include "PicassoSmp2pDevice-body.inc"
+// Exercise the real SMEM/MMIO adapter separately from the coordinator tests,
+// which prove that this callback is gated by PAS authentication and fresh ready.
+extern "C" void picasso_adsp_boot(const PicassoAdspEvents *e) {
+    assert(e && e->poll && e->snapshot && e->service);
+    if(!transport)return;
+    auto *b=static_cast<BootEvents *>(e->context);auto *g=b->glink;
+    assert(!preempt && !mutexRam[0] && g->prepared && !g->sent);
+    assert(ipccRam[3]==0x30002);++kicks;ipccRam[3]=0;
+    PicassoSmp2pEvent event={};assert(e->poll(e->context,&event)==-2);
+    assert(!g->sent && !ram[(g->desc.offset+4)/4] && !ipccRam[3]);
+    e->service(e->context);
+    assert(g->sent && !g->ready && g->txHead==8);
+    assert(ram[g->tx.offset/4]==0x10000 && !ram[g->tx.offset/4+1]);
+    assert(ipccRam[3]==0x30000);ipccRam[3]=0;
+    unsigned at=part+ram[(part+12)/4],rx=at+16;
+    ram[at/4]=0xa5a5|(480U<<16);ram[at/4+1]=16384;
+    ram[rx/4]=0x10000;ram[rx/4+1]=1; // peer offers intent reuse
+    ram[rx/4+2]=0x10001;ram[rx/4+3]=0; // agrees to features 0
+    ram[(part+12)/4]+=16400;ram[(g->desc.offset+12)/4]=16;
+    e->service(e->context);
+    assert(g->ready && g->rxTail==16 && g->txHead==16);
+    assert(ram[g->tx.offset/4+2]==0x10001 && !ram[g->tx.offset/4+3]);
+    assert(ipccRam[3]==0x30000);ipccRam[3]=0;
+    e->service(e->context);assert(!ipccRam[3]);
+}
 extern "C" int picasso_rpmh_adsp_plan(){assert(!preempt && !allocations);++plans;return 0;}
 int main(int argc,char **argv) {
     assert(argc==2);const char *mode=argv[1];
@@ -89,6 +114,7 @@ int main(int argc,char **argv) {
     if(!strcmp(mode,"gate"))allocatorGate=1;
     if(!strcmp(mode,"bad"))ram[part/4]=0;
     peer=!strcmp(mode,"peer");
+    transport=!strcmp(mode,"glink");
     // Exercise aligned word reads, arbitrary output alignment and boundaries.
     SmemDevice d={reinterpret_cast<uintptr_t>(ram),reinterpret_cast<uintptr_t>(mutexRam),0,false};
     uint8_t data[11]={};assert(!smemRead(&d,0x5d,data+1,7));
@@ -96,9 +122,11 @@ int main(int argc,char **argv) {
     assert(smemRead(&d,WLAN_SMEM_SIZE-1,data,2)==-22);
     picasso_smp2p_start();picasso_smp2p_start();
     assert(allocations==3 && releases==3-!!failAlloc && mappings==releases && unmaps==mappings-!!failMap && !preempt);
-    if(!strcmp(mode,"normal") || peer) {
+    if(!strcmp(mode,"normal") || peer || transport) {
         assert(plans==1 && sleeps==1602 && kicks==(peer?2U:1U));
-        assert(lines==(peer?69U:7U));assert(ram[(part+12)/4]==(peer?752U:392U));
+        assert(lines==(peer?70U:transport?10U:8U));
+        assert(ram[(part+12)/4]==(peer?17200U:transport?33240U:16840U));
+        if(transport)assert(!ipccRam[3]); // stopped observer never transmits GLINK
         assert(!allocatorGate && !mutexRam[0]);
     } else {
         assert(plans==1 && !kicks && ram[(part+12)/4]==32);

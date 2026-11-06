@@ -43,7 +43,7 @@ static void setup(){
     smp(item(part,429,340),0,2,"master-kernel",1);
     desc=item(part,478,32);item(part,479,16384);item(part,480,16384);
     p32(desc,8);p32(desc+4,16);p32(desc+8,24);p32(desc+12,32);
-    crash=item(global,423,80);memcpy(memory+crash,"previous\ncrash",15);
+    crash=item(global,423,256);memcpy(memory+crash,"previous\ncrash",15);
 }
 static void parser_tests(){
     wlan_smem_io io={nullptr,read};picasso_adsp_snapshot s;
@@ -59,6 +59,13 @@ static void parser_tests(){
     setup();p32(desc+4,3);picasso_adsp_survey(&io,&s);assert(s.glink_error==-22);
     setup();change=desc;picasso_adsp_survey(&io,&s);assert(s.glink_error==-11);
     setup();change=crash;picasso_adsp_survey(&io,&s);assert(s.crash_error==-11 && !s.crash[0]);
+    setup();memset(memory+crash,'x',256);memcpy(memory+crash+80,"sensor watchdog suffix",22);
+    picasso_adsp_survey(&io,&s);assert(!s.crash_error && strlen(s.crash)==255 && !memcmp(s.crash+80,"sensor watchdog suffix",22));
+    // Non-NUL input is truncated safely; control characters are still sanitized.
+    setup();memset(memory+crash,'y',256);memory[crash+200]='\n';picasso_adsp_survey(&io,&s);
+    assert(strlen(s.crash)==255 && s.crash[200]=='.' && !s.crash[255]);
+    setup();p32(crash-12,8);p16(crash-8,7);p32(global+12,56);memory[crash]='z';
+    picasso_adsp_survey(&io,&s);assert(!s.crash_error && !strcmp(s.crash,"z"));
     setup();change=inbound+36;picasso_adsp_survey(&io,&s);assert(s.inbound_error==-11 && !s.inbound);
     setup();change=part+12;picasso_adsp_survey(&io,&s);assert(s.inbound_error || s.partition_error);
     setup();p32(part+12,32);picasso_adsp_survey(&io,&s);assert(s.inbound_error==-2 && s.glink_error==-2);

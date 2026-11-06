@@ -12,6 +12,8 @@
 static const char *mode;
 static unsigned maps,unmaps,mdrefs,leases,releases,opens,closes,loads,polls,auths,shutdowns,on,off,finishes,writes,snapshots;
 static bool owned,poison;
+static unsigned services;
+static PicassoSmp2pEvent latest;
 static uint64_t ticks;
 static uint8_t meta[0x3000], image[64], expected[picassoAdspMetadataBytes];
 static unsigned commands[8],commandCount,addresses[32],values[32];
@@ -81,7 +83,7 @@ extern "C" int picasso_pas_adsp(unsigned cmd,uint64_t a,uint64_t n){
     if(is("interrupted")&&cmd==1)return -115;
     return 0;
 }
-static int poll(void *,PicassoSmp2pEvent *e){
+static int pollState(void *,PicassoSmp2pEvent *e){
     ++polls;*e={};
     if(polls==1){if(is("stale")){e->hasValue=true;e->value=2;return 0;}return -2;}
     if(!auths)return is("pre-auth-peer")?0:-2;
@@ -98,12 +100,18 @@ static int poll(void *,PicassoSmp2pEvent *e){
     else if(polls>=6){if(is("restart"))e->restart=true;else e->value|=1;}
     return 0;
 }
+static int poll(void *ctx,PicassoSmp2pEvent *e){int error=pollState(ctx,e);latest=error?PicassoSmp2pEvent{}:*e;return error;}
+static void service(void *) {
+    assert(auths==1 && !shutdowns && !owned && polls>=4);
+    assert(latest.hasValue && (latest.value&2) && !(latest.value&1) && !latest.restart);
+    ++services;
+}
 static int snapshot(void *){++snapshots;return -2;}
 int main(int argc,char **argv){
     assert(argc==2);mode=argv[1];memset(expected,0x5a,sizeof expected);
     if(is("memory-overlap"))args.physBase=0x89200000;
     if(is("memory-missing"))PE_state.bootArgs=nullptr;
-    PicassoAdspEvents events={nullptr,poll,snapshot};picasso_adsp_boot(&events);picasso_adsp_boot(&events);
+    PicassoAdspEvents events={nullptr,poll,snapshot,service};picasso_adsp_boot(&events);picasso_adsp_boot(&events);
     assert(!owned && opens<=1 && closes==(opens && !is("firmware")));
     assert(releases==(is("lease")?0U:is("reacquire")?1U:leases));
     bool quarantine=is("interrupted")||is("shutdown")||is("aop-uncertain")||is("off")||is("close")||is("shutdown-vote")||is("reacquire")||is("vote1")||is("vote2")||is("vote3");
@@ -111,6 +119,8 @@ int main(int argc,char **argv){
     if(quarantine){assert(!unmaps);if(is("interrupted")||is("aop-uncertain"))assert(!shutdowns&&!off);}
     else assert(unmaps==maps-unsigned(is("map1")||is("map2")));
     if(is("stale"))assert(!opens&&!on&&!commandCount);
+    if(is("normal") || is("restart") || is("no-handover"))assert(services==2);
+    if(!auths || is("fatal") || is("initial-restart") || is("timeout") || is("missing") || is("missing-entry") || is("lost-ready") || is("restart-no-entry"))assert(!services);
     if(is("pre-auth-peer")||is("load"))assert(loads==1&&!auths&&shutdowns==1);
     if(is("timeout"))assert(ticks==10000 && shutdowns==1);
     if(is("normal")||is("restart")||is("missing")||is("missing-entry")||is("no-handover"))assert(auths==1&&shutdowns==1&&on==1&&off==1&&!poison);
