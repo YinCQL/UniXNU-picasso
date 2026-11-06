@@ -3,6 +3,7 @@
 """Execute device firmware/FAT/UFS bodies; optional read-only stock ROM validation."""
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -17,11 +18,18 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--stock', type=Path)
+    p.add_argument('--stock-gpt', type=Path, help='Picasso V13.0.5.0 gpt_main4.bin (read only)')
     p.add_argument('--cxx', default=shutil.which('clang++'))
     a = p.parse_args()
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     runs = []
+    vcvars = None
+    if os.name == 'nt':
+        spec = importlib.util.spec_from_file_location('fault', ROOT / 'scripts/check-picasso-user-fault.py')
+        fault = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fault)
+        vcvars = fault.find_vcvars()
 
     def run(name, command):
         r = subprocess.run(command, capture_output=True, text=True, timeout=120)
@@ -36,6 +44,27 @@ def main():
     for sanitizer in (False, True):
         suffix = '-asan' if sanitizer else ''
         flags = ['-fsanitize=address' if os.name == 'nt' else '-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if sanitizer else []
+        command_exe = out/('commands'+suffix+('.exe' if os.name == 'nt' else ''))
+        if vcvars:
+            # Installed MSVC STL requires newer clang than the host's clang18.
+            command = f'cl /nologo /std:c++17 /EHsc /W4 /WX /Od /Zi /Fd:commands{suffix}.pdb'
+            if sanitizer:
+                command += ' /fsanitize=address'
+            command += f' /Fo:commands{suffix}.obj /Fe:{command_exe.name} "{ROOT / "scripts/tests/picasso-firmware-commands.cpp"}"'
+            if sanitizer:
+                command += ' /link /INCREMENTAL:NO'
+            label = 'commands'+suffix
+            result = fault.batch_run(out, label+'-compile', command+f' > {label}-compile.log 2>&1\nexit /b %errorlevel%\n', vcvars)
+            if result.returncode:
+                raise RuntimeError((out/(label+'-compile.log')).read_text())
+            result = fault.batch_run(out, label, f'{command_exe.name} > {label}.log 2>&1\nexit /b %errorlevel%\n', vcvars)
+            if result.returncode:
+                raise RuntimeError((out/(label+'.log')).read_text())
+            runs.append(dict(name=label, passed=True, compiler='MSVC', output=(out/(label+'.log')).read_text()))
+        else:
+            run('commands-compile'+suffix, [a.cxx, '-std=c++17', '-O1', '-Wall', '-Wextra', '-Werror', *flags,
+                str(ROOT/'scripts/tests/picasso-firmware-commands.cpp'), '-o', str(command_exe)])
+            run('commands'+suffix, [str(command_exe)])
         for name, sources in [('firmware', [ROOT/'scripts/tests/picasso-firmware-host.cpp', ROOT/'package/PicassoFat.cpp']),
                               ('modem', [ROOT/'scripts/tests/picasso-firmware-ufs.cpp']),
                               ('gpt', [ROOT/'scripts/tests/picasso-firmware-gpt.cpp'])]:
@@ -45,6 +74,8 @@ def main():
                 *includes, *map(str,sources), *libs, '-o', str(exe)])
             if name != 'firmware':
                 run(name+suffix, [str(exe)])
+                if name == 'modem' and a.stock_gpt:
+                    run('stock-gpt'+suffix, [str(exe), str(a.stock_gpt)])
             else:
                 for case in ('partition','alloc','thread','bad-volume','not-ready','late-ready'):
                     run(case+suffix, [str(exe), case])
@@ -52,7 +83,10 @@ def main():
                     run('stock'+suffix, [str(exe), 'stock', str(a.stock)])
     arm = out/'firmware-arm.cpp'
     arm.write_text('#include "picasso-firmware-kernel-api.h"\n'+body, encoding='utf8', newline='\n')
-    for name, source in [('firmware',arm), ('fat',ROOT/'package/PicassoFat.cpp')]:
+    transport = out/'firmware-transport-arm.cpp'
+    transport.write_text('#include "picasso-firmware-transport-api.h"\n#include "FirmwareCommands.h"\n#include "FirmwareRead.h"\n',
+                         encoding='utf8', newline='\n')
+    for name, source in [('firmware',arm), ('fat',ROOT/'package/PicassoFat.cpp'), ('transport',transport)]:
         run(name+'-arm64', [a.cxx, '-target', 'arm64-apple-ios17.0', '-std=c++17', '-ffreestanding', '-fno-exceptions',
             '-fno-rtti', '-fno-threadsafe-statics', '-mgeneral-regs-only', '-Wall', '-Wextra', '-Werror', *includes,
             '-I', str(ROOT/'scripts/tests'), '-c', str(source), '-o', str(out/(name+'.o'))])
@@ -62,6 +96,10 @@ def main():
               'scripts/build-picasso-display.py', 'scripts/check-picasso-firmware.py',
               'scripts/tests/picasso-firmware-host.cpp', 'scripts/tests/picasso-firmware-ufs.cpp',
               'scripts/tests/picasso-firmware-kernel-api.h', 'scripts/tests/picasso-firmware-gpt.cpp']
+    inputs += ['drivers/NativeUfs/FirmwareWindow.h', 'drivers/NativeUfs/FirmwareCommands.h',
+               'drivers/NativeUfs/RootCommands.h', 'drivers/NativeUfs/tests/RootCommandsBridge.cpp',
+               'drivers/NativeUfs/tests/RootCommands.cpp', 'scripts/tests/picasso-firmware-commands.cpp',
+               'scripts/tests/picasso-firmware-transport-api.h']
     (out/'results.json').write_text(json.dumps(dict(passed=True, hardware_tested=False, kernel_sdk_compiled=False,
         dsp_started=False, runs=runs, inputs={n:hashlib.sha256((ROOT/n).read_bytes()).hexdigest() for n in inputs}),indent=2)+'\n', encoding='utf8', newline='\n')
     print('PASS firmware worker, FAT failures, modem bounds and ARM64 API model')

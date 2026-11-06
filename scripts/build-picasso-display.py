@@ -254,7 +254,8 @@ def main():
     for source in sources:
         obj = out / (source.stem + '.o')
         command = platform.compile_command(record, source, obj, ROOT) + ['-I', str(out), '-I', str(source_dir),
-            '-I', str(ROOT / 'drivers/NativeAdreno'), '-I', str(ROOT / 'drivers/NativeWlan'), '-mgeneral-regs-only']
+            '-I', str(ROOT / 'drivers/NativeAdreno'), '-I', str(ROOT / 'drivers/NativeWlan'),
+            '-I', str(ROOT / 'drivers/NativeUfs'), '-mgeneral-regs-only']
         platform.run(command, obj.with_suffix('.compile.log'), record['directory'])
         if source.stem == 'NativeLegacyDisplay':
             audit = audit_object(platform, native, obj, slots, aliases, names)
@@ -284,7 +285,7 @@ def main():
                 ROOT / 'kits/picasso/PicassoSpmi.h', ROOT / 'kits/picasso/PicassoSpmiCore.h',
                 ROOT / 'kits/picasso/PicassoAdsp.h', ROOT / 'drivers/NativeWlan/WlanSmem.h',
                 ROOT / 'kits/picasso/PicassoFat.h', ROOT / 'kits/picasso/PicassoAdspFirmwareProfile.h']
-    sources += [ROOT / 'drivers/NativeAdreno/OriginalAcceleratorABI.h']
+    sources += [ROOT / 'drivers/NativeAdreno/OriginalAcceleratorABI.h', ROOT / 'drivers/NativeUfs/FirmwareWindow.h']
     pending = Path(tempfile.mkdtemp(prefix='qualified-display-', dir=out)) / 'libNativeLegacyDisplay.late.a'
     platform.run(['xcrun', 'ar', 'rcs', pending, *objects], out / 'archive.log')
     members = platform.check_archive_members(platform.run(['xcrun', 'ar', 't', pending], out / 'members.log').splitlines(), objects)

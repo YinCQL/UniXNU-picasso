@@ -7,14 +7,15 @@
 #include <libkern/crypto/sha2.h>
 #include "PicassoFat.h"
 #include "PicassoAdspFirmwareProfile.h"
+#include "FirmwareWindow.h"
 
-extern "C" int native_ufs_modem_size(uint64_t *);
-extern "C" int native_ufs_modem_read(uint64_t, void *, uint32_t, void *);
+extern "C" unsigned native_ufs_store_ready(void);
 extern "C" void picasso_adsp_firmware_start(void);
 
 namespace {
 constexpr unsigned fileCount = sizeof(picassoAdspFiles) / sizeof(picassoAdspFiles[0]);
 struct Firmware {
+    UfsFirmwareWindow window;
     FatVolume volume;
     FatFile files[fileCount];
     uint8_t seen[8192], bounce[4096], chunk[65536];
@@ -30,7 +31,7 @@ int readFirmware(void *context, uint64_t at, void *to, size_t length) {
     while (length) {
         if (mach_absolute_time() >= f->deadline) return -1;
         uint32_t take = length > 65536 ? 65536 : static_cast<uint32_t>(length);
-        if (native_ufs_modem_read(at, out, take, f->bounce)) return -1;
+        if (native_ufs_modem_read(&f->window, at, out, take, f->bounce)) return -1;
         at += take; out += take; length -= take;
     }
     return 0;
@@ -67,24 +68,31 @@ int validateFirmware(Firmware *f, uint64_t bytes, unsigned *failed, uint64_t *ch
 }
 void worker(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "picasso-adsp-fw");
-    uint64_t bytes = 0;
-    int error = -11;
-    for (unsigned i = 0; i < 120 && error == -11; ++i) {
-        error = native_ufs_modem_size(&bytes);
-        if (error == -11) IOSleep(1000);
+    unsigned ready = 0;
+    for (unsigned i = 0; i < 120 && !ready; ++i) {
+        ready = native_ufs_store_ready();
+        if (!ready) IOSleep(1000);
     }
-    if (error) {
-        IOLog("PICASSO_ADSP firmware source=modem lun=0 error=%d stage=partition checked=0 authenticated=0\n", error);
+    if (!ready) {
+        IOLog("PICASSO_ADSP firmware source=modem error=-11 stage=root-ready checked=0 authenticated=0\n");
         return;
     }
     auto *f = static_cast<Firmware *>(IOMalloc(sizeof(Firmware)));
     if (!f) { IOLog("PICASSO_ADSP firmware error=-12 stage=allocation\n"); return; }
     bzero(f, sizeof(*f));
+    int error = native_ufs_modem_open(&f->window, f->chunk, sizeof f->chunk);
+    if (error) {
+        IOLog("PICASSO_ADSP firmware source=modem error=%d stage=partition checked=0 authenticated=0\n", error);
+        IOFree(f, sizeof(Firmware));
+        return;
+    }
+    uint64_t bytes = (f->window.last - f->window.first + 1) * 4096ULL;
     clock_interval_to_deadline(60, kSecondScale, &f->deadline);
     unsigned failed = fileCount;
     uint64_t checked = 0;
     error = validateFirmware(f, bytes, &failed, &checked);
-    IOLog("PICASSO_ADSP firmware source=modem lun=0 partition_bytes=%llu error=%d file=%s checked=%llu files=%u authenticated=0\n",
+    IOLog("PICASSO_ADSP firmware source=modem lun=%u first=%llx last=%llx partition_bytes=%llu error=%d file=%s checked=%llu files=%u authenticated=0\n",
+        f->window.lun, static_cast<unsigned long long>(f->window.first), static_cast<unsigned long long>(f->window.last),
         static_cast<unsigned long long>(bytes), error, failed < fileCount ? picassoAdspFiles[failed].path : "volume",
         static_cast<unsigned long long>(checked), error ? (failed < fileCount ? failed : 0) : fileCount);
     if (!error) IOLog("PICASSO_ADSP firmware validated=1 pas=1 carveout=89200000+2800000 pending=power-mailbox-pas pcm=0\n");

@@ -912,6 +912,7 @@ static bool gRootBringupTrace = false;
 #include "RootQueue.h"
 #define NATIVE_UFS_READ_TRACE(...) IOLog(__VA_ARGS__)
 #include "RootCommands.h"
+#include "FirmwareCommands.h"
 #undef NATIVE_UFS_READ_TRACE
 #undef NATIVE_UFS_TRACE
 
@@ -1167,9 +1168,6 @@ static uint32_t be32w (const uint8_t *at)
 #include "RootPublication.h"
 
 }
-
-// Immutable after gStoreReady release; never registered as a write window.
-static uint64_t gModemFirst, gModemLast;
 
 // ---- Persistent Data store window (sheng-data-persist) ----------------------------------------------------------
 // The only part of this driver that ever writes. The consumer (NativeRamBlock's overlay) asks for a window of the given
@@ -2684,8 +2682,6 @@ bool NativeUfs::startRoot (IOService *provider)
   }
   gStoreGeometry = { true, layout->userdataFirst, layout->userdataLast, layout->imageBytes, layout->gptEntriesLba,
                      layout->gptHeaderCrc, layout->gptEntriesCrc, layout->gptEntryCount };
-  gModemFirst = layout->modemFirst;
-  gModemLast = layout->modemLast;
   __atomic_store_n(&gStoreReady,1U,__ATOMIC_RELEASE);
   const char *names[4] = {};
   for (unsigned i = 0; i < layout->windows; ++i) names[i] = layout->window[i].name;

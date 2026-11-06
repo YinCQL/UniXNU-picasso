@@ -28,6 +28,7 @@ static void SHA256_Final(void *p, SHA256_CTX *c) {
 #include <openssl/sha.h>
 #endif
 #include "PicassoFat.h"
+#include "FirmwareWindow.h"
 static uint8_t *disk;
 static size_t diskBytes;
 static unsigned calls, failRead, sleepCount, allocated, freed, starts, released, lines;
@@ -38,8 +39,9 @@ static int readDisk(void *, uint64_t at, void *to, size_t n) {
     if (++calls == failRead || at > diskBytes || n > diskBytes - at) return -1;
     memcpy(to, disk + at, n); return 0;
 }
-extern "C" int native_ufs_modem_size(uint64_t *n) { *n = 335544320; if (neverReady || pending) {if(pending)--pending;return -11;} return noPartition ? -2 : 0; }
-extern "C" int native_ufs_modem_read(uint64_t at, void *to, uint32_t n, void *) {return readDisk(nullptr, at, to, n);}
+extern "C" unsigned native_ufs_store_ready() { if (neverReady || pending) {if(pending)--pending;return 0;} return 1; }
+extern "C" int native_ufs_modem_open(UfsFirmwareWindow *w, void *, uint32_t) { *w={100,100+335544320/4096-1,4}; return noPartition ? -2 : 0; }
+extern "C" int native_ufs_modem_read(const UfsFirmwareWindow *,uint64_t at, void *to, uint32_t n, void *) {return readDisk(nullptr, at, to, n);}
 static void IOSleep(unsigned) { ++sleepCount; }
 static uint64_t mach_absolute_time() { return ++ticks; }
 static void clock_interval_to_deadline(unsigned, unsigned, uint64_t *out) { *out = ticks + 1000000; }
@@ -115,8 +117,8 @@ int main(int argc,char **argv) {
         neverReady=!strcmp(mode,"not-ready");pending=!strcmp(mode,"late-ready")?3:0;
         noPartition=!strcmp(mode,"partition");noMemory=!strcmp(mode,"alloc");noThread=!strcmp(mode,"thread");
         calls=sleepCount=0;picasso_adsp_firmware_start();picasso_adsp_firmware_start();assert(starts==1);
-        assert(released==!noThread);assert(allocated==(!noThread&&!noPartition&&!neverReady));
-        assert(freed==(!noThread&&!noPartition&&!noMemory&&!neverReady));assert(lines==1);
+        assert(released==!noThread);assert(allocated==(!noThread&&!neverReady));
+        assert(freed==(!noThread&&!noMemory&&!neverReady));assert(lines==1);
         if(neverReady)assert(sleepCount==120);if(!strcmp(mode,"late-ready"))assert(sleepCount>=3);
     }
     free(disk);
