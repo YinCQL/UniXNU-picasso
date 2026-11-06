@@ -205,8 +205,12 @@ def main():
                            ('certificate-security-mode', struct.pack('<I', 1)),
                            ('effective-security-mode-sep', struct.pack('<I', 1))] if apple_identity else []),
                         # Firmware has a placeholder 0; the selected phone artwork
-                        # uses 3. Match the 1080x2400 panel exactly: 360x800 pt at
-                        # scale 3, so the compositor drawable is the scanout size.
+                        # uses 3. The published mode height is the panel's 2400 rows
+                        # so a 3x canvas is 360x800 pt and the drawable matches the
+                        # scanout. The artwork subtype stays the iPhone X 2436:
+                        # check-picasso-iphone-migration.py pins the identity that
+                        # selects the artwork, and iOS 16 reads the mode height from
+                        # /chosen rather than from the asset subtype.
                         *([('display-scale', struct.pack('<I', 3)),
                            ('display-height', struct.pack('<I', 2400))] if args.iphone_identity else []),
                         # This property describes the actual volatile Data RAM disk.
@@ -251,7 +255,7 @@ def main():
                          ('model', b'xiaomi,picasso\0'),
                          *([('product-description', b'iPhone X\0' if args.iphone_identity else b'iPad Pro (12.9-inch) (2nd generation)\0'),
                             ('artwork-device-idiom', b'phone\0' if args.iphone_identity else b'pad\0'),
-                            ('artwork-device-subtype', struct.pack('<I', 2400 if args.iphone_identity else 2732)),
+                            ('artwork-device-subtype', struct.pack('<I', 2436 if args.iphone_identity else 2732)),
                             ('artwork-scale-factor', struct.pack('<I', 3 if args.iphone_identity else 2)),
                             ('artwork-display-gamut', b'P3\0'),
                             ('compatible-device-fallback', b'iPhone9,2\0' if args.iphone_identity else b'iPad6,7\0')] if apple_identity else []),
