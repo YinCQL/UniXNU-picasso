@@ -236,6 +236,8 @@ jobs:
             device/out/picasso/host-checks/ufs-cache/*.log
             device/out/picasso/host-checks/ufs-persistence/*.log
             device/out/picasso/host-checks/novatek/*.log
+            device/out/picasso/host-checks/linux-host/*.log
+            device/out/picasso/host-checks/linux-host/*.json
           if-no-files-found: warn
           retention-days: 7
 

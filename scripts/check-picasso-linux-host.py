@@ -105,13 +105,16 @@ def main():
             live = out/f'live-{attempt}.json'
             log = out/f'live-{attempt}.log'
             with log.open('w') as stream:
-                subprocess.run(['sudo', sys.executable, '-B', str(script), '--tree', str(a.tree.resolve()),
-                                '--cache-dir', str(cache), '--report', str(live)], stdout=stream,
-                               stderr=subprocess.STDOUT, check=True, timeout=900)
+                process = subprocess.run(['sudo', sys.executable, '-B', str(script), '--tree', str(a.tree.resolve()),
+                                          '--cache-dir', str(cache), '--report', str(live)], stdout=stream,
+                                         stderr=subprocess.STDOUT, timeout=900)
+            if process.returncode:
+                raise RuntimeError(log.read_text(errors='replace')[-16000:])
             data = json.loads(live.read_bytes())
             assert data['passed'] and (attempt == 1 or not data['apt_used'])
+            print('Live host verification: ' + json.dumps(data), flush=True)
             runs.append({'name': f'live-ubuntu-{attempt}', 'passed': True,
-                         'apt_used': data['apt_used'], 'seconds': data['elapsed_seconds']})
+                         'apt_used': data['apt_used'], 'seconds': data['elapsed_seconds'], 'details': data})
     names = ['scripts/install-picasso-linux-host.py', 'scripts/check-picasso-linux-host.py',
              '.github/workflows/build-kernel-linux.yml', '.github/workflows/host-checks.yml']
     (out/'results.json').write_text(json.dumps({'passed':True, 'live_ubuntu_tested':a.live, 'runs':runs,
