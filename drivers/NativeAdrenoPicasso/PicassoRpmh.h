@@ -84,7 +84,7 @@ static inline uint16_t picasso_db16(const uint8_t *p) { return p[0] | (uint16_t(
 static inline uint32_t picasso_db32(const uint8_t *p) { return picasso_db16(p) | (uint32_t(picasso_db16(p + 2)) << 16); }
 static inline int picasso_arc_lookup(const uint8_t *db, uint32_t size, const char *name,
                                     uint32_t minimum, PicassoArcResource *out) {
-    if (!db || !name || !out || size < 144 || picasso_db32(db) != 1 || picasso_db32(db + 4) != 0x0c0330db) return -22;
+    if (!db || !name || !out || size < 144 || picasso_db32(db + 4) != 0x0c0330db) return -22;
     uint8_t query[8] = {}; unsigned length = 0;
     while (length < 8 && name[length]) {query[length] = uint8_t(name[length]); ++length;}
     if (!length || (length == 8 && name[length])) return -22;

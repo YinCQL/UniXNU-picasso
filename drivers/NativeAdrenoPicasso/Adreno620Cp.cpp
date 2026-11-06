@@ -2136,6 +2136,7 @@ extern "C" int picasso_rpmh_adsp_plan(void)
         error = 0;
         for (unsigned i = 0; i < kRpmhCmdDbBytes; i += 4)
             if (picasso_db32(copy + i) != read32(db, i)) { error = -11; break; }
+        printf("PICASSO_ADSP rpmh cmd_db_version=%x stable=%u vote_sent=0\n", picasso_db32(copy), !error);
         PicassoArcResource rails[3] = {};
         const char *names[] = {"lcx.lvl", "lmx.lvl", "xo.lvl"};
         for (unsigned i = 0; !error && i < 3; ++i) {
