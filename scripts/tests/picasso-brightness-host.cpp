@@ -67,7 +67,7 @@ struct TestBus {
     uint8_t regs[2][256]={};unsigned operations=0,writes=0,fail=0;
     TestBus() {
         regs[0][0x46]=0x80;regs[1][0x46]=0x70;regs[1][0x50]=0x80;
-        regs[1][0x53]=0xff;regs[1][0x54]=3;
+        regs[1][0x53]=0xff;regs[1][0x54]=3;regs[1][0x65]=3;
     }
     int read(bool s,uint8_t r,uint8_t &v) {if(++operations==fail)return -1;v=regs[s][r];return 0;}
     int write(bool s,uint8_t r,uint8_t v) {if(++operations==fail)return -1;++writes;regs[s][r]=v;return 0;}

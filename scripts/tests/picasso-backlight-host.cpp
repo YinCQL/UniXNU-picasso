@@ -11,7 +11,7 @@ struct Bus {
     Bus() {
         regs[0][0x46]=0x85;
         regs[1][0x46]=0x70; regs[1][0x50]=0x80; regs[1][0x51]=1;
-        regs[1][0x53]=0x34; regs[1][0x54]=2;
+        regs[1][0x53]=0x34; regs[1][0x54]=2; regs[1][0x65]=3;
     }
     int read(bool sink,uint8_t reg,uint8_t &v) {
         if(++operations==fail)return -1;
@@ -111,19 +111,27 @@ int main() {
         bus.regs[1][0x51]^=1;assert(state.brightness(bus,4095) && !state.failed);++cases;
     }
     {
-        Bus bus;State state;assert(!state.adopt(bus));bus.regs[1][0x65]=2;
-        assert(state.brightness(bus,42) && !state.failed && !bus.writes);++cases;
+        Bus bus;State state;assert(!state.adopt(bus));bus.regs[1][0x65]=3;
+        assert(!state.brightness(bus,42) && !state.failed && state.level==42);
+        assert(bus.trace[2]==0x16500 && bus.trace[3]==0x16501);
+        assert(!state.set(bus,false) && !state.on && !state.set(bus,true) && state.on);++cases;
+    }
+    // Every latched strobe combination is legal, including boot171's 0x03.
+    for(unsigned sync=0;sync<256;++sync) {
+        Bus bus;State state;assert(!state.adopt(bus));bus.regs[1][0x65]=uint8_t(sync);
+        assert(!state.brightness(bus,4095) && state.level==4095);
+        assert(bus.regs[1][0x65]==((sync&0xf0)|1));++cases;
     }
     // Real build170's -3 is a preflight rejection, with no failed SPMI op.
     // Preserve exact operands; no diagnostic re-reads and no automatic retry.
-    for(unsigned which=0;which<6;++which) {
+    for(unsigned which=0;which<5;++which) {
         Bus bus;State state;assert(!state.adopt(bus));
-        const unsigned regs[]={0x46,8,0xb0,0x51,0x53,0x65};
-        const unsigned masks[]={1,1,0x40,1,1,2};
+        const unsigned regs[]={0x46,8,0xb0,0x51,0x53};
+        const unsigned masks[]={1,1,0x40,1,1};
         bool sink=which>=2;unsigned reg=regs[which];uint8_t before=bus.regs[sink][reg];
         bus.regs[sink][reg]^=masks[which];
         assert(state.brightness(bus,4095)==picasso_backlight::configuration && !state.failed && !bus.writes);
-        assert(state.stage==(which<4?1:which==4?2:3));
+        assert(state.stage==(which<4?1:2));
         if(which==0)assert(state.gate==bus.regs[0][0x46]);
         if(which==1)assert(state.faults==bus.regs[0][8]);
         if(which==2)assert(state.flash==bus.regs[1][0xb0]);

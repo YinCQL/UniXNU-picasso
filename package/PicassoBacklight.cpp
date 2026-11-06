@@ -12,6 +12,7 @@
 #include <mach/kmod.h>
 #include "PicassoButtonsCore.h"
 #include "PicassoBacklightCore.h"
+#include "PicassoSpmi.h"
 extern "C" {
 extern kmod_info_t g_kernel_kmod_info;
 void picasso_brightness_static_init() __asm__("__GLOBAL__sub_I_PicassoBrightness.cpp");
@@ -30,12 +31,6 @@ struct Window {
     }
     ~Window() { OSSafeReleaseNULL(map); }
 };
-struct Channel {
-    volatile uint32_t *va;
-    void write(unsigned offset, uint32_t value) { va[offset/4]=value; __asm__ volatile("dsb sy" ::: "memory"); }
-    uint32_t read(unsigned offset) { uint32_t value=va[offset/4]; __asm__ volatile("dsb sy" ::: "memory"); return value; }
-    void delay() { IODelay(1); }
-};
 // Mapped only once at display startup, published with release/acquire. The
 // mutex serializes all requests and survives until shutdown with these maps.
 struct Backend {
@@ -44,12 +39,15 @@ struct Backend {
     IOLock *lock = nullptr;
     picasso_backlight::State state;
     unsigned reports = 0, errorReports = 0;
+    bool fatalReported = false;
     bool lastSink = false, lastWrite = false;
     uint8_t lastReg = 0, lastValue = 0;
     int lastError = 0;
     void report_error(int error) {
-        if (errorReports >= 16) return;
-        ++errorReports;
+        // Busy diagnostics must not consume the first fatal transport report.
+        if (state.failed && !fatalReported) fatalReported=true;
+        else if (errorReports >= 16) return;
+        else ++errorReports;
         IOLog("PICASSO_WLED rejected error=%d fatal=%u stage=%u gate=%02x expected=%02x fault=%02x flash=%02x source=%02x expected_source=%02x level=%u expected_level=%u sync=%02x last_write=%u last_sink=%u last_reg=%02x last_value=%02x transport=%d\n",
             error,state.failed,state.stage,state.gate,uint8_t((state.module&0x7f)|(state.on?0x80:0)),
             state.faults,state.flash,state.currentSource,state.source,state.observedLevel,state.level,state.sync,
@@ -59,23 +57,15 @@ struct Backend {
     bool displayOn = true;
     uint32_t requested = 0;
     int read(bool sink, uint8_t reg, uint8_t &value) {
-        Channel channel{observer[sink].va};
-        int error = picasso_buttons::read8(channel, reg, value);
+        int error = picasso_spmi_read8(observer[sink].va, reg, value);
         lastWrite=false;lastSink=sink;lastReg=reg;lastValue=value;lastError=error;
         if (error || adopting) IOLog("PICASSO_WLED read sink=%u reg=%02x value=%02x error=%d\n",sink,reg,value,error);
         return error;
     }
     int write(bool sink, uint8_t reg, uint8_t value) {
         lastWrite=true;lastSink=sink;lastReg=reg;lastValue=value;lastError=-1;
-        Channel channel{writer[sink].va};
-        channel.write(0x10,value);
-        channel.write(0,uint32_t(reg)<<4); // v5 EXT_WRITEL, 1 byte
-        for (unsigned n=0;n<1000;++n) {
-            uint32_t status=channel.read(8);
-            if (status & 1) {lastError=int(status & 0xe);return lastError;}
-            channel.delay();
-        }
-        return -1;
+        lastError=picasso_spmi_write8(writer[sink].va,reg,value);
+        return lastError;
     }
     void soft_start() { IOSleep(10); }
 };
@@ -85,6 +75,7 @@ extern "C" void picasso_backlight_start(IOService *display) {
     unsigned enabled=0;
     PE_parse_boot_argn("picasso-wled",&enabled,sizeof(enabled));
     if (enabled!=1 || !display || backend) return;
+    if (!picasso_spmi_init()) { IOLog("PICASSO_WLED refused spmi-lock\n"); return; }
     Window core, owners;
     if (!core.open(0xc440000,0x2000) || !owners.open(0xc40a000,0x1000)) {
         IOLog("PICASSO_WLED refused MMIO mapping\n"); return;

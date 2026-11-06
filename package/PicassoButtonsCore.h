@@ -8,7 +8,6 @@ constexpr uint32_t pon_ppid = 0x008, up_ppid = 0x4c4;
 constexpr uint32_t report_bits = 0x0e;
 inline bool version_supported(uint32_t version) { return version >= 0x50000000 && version < 0x60000000; }
 inline uint32_t observer_offset(unsigned apid) { return apid * 0x80; } // EE 0
-inline uint32_t command(uint8_t reg) { return (1u << 27) | (uint32_t(reg) << 4); }
 
 // Use only a mapping assigned to APPS EE 0; never assume APID == PPID.
 template<class Read> int find_apid(Read read, uint32_t ppid) {
@@ -21,21 +20,6 @@ template<class Read> int find_apid(Read read, uint32_t ppid) {
     return found;
 }
 
-// read/write operate on one observer channel. Status is checked after issuing
-// the command, as in the vendor driver; a timeout poisons the session upstream.
-template<class Bus> int read8(Bus &bus, uint8_t reg, uint8_t &value) {
-    bus.write(0, command(reg));
-    for (unsigned n = 0; n < 1000; ++n) {
-        uint32_t status = bus.read(8);
-        if (status & 1) {
-            if (status & 0xe) return int(status & 0xe);
-            value = uint8_t(bus.read(0x18));
-            return 0;
-        }
-        bus.delay();
-    }
-    return -1;
-}
 inline bool gpio_input(uint8_t type, uint8_t subtype, uint8_t mode, uint8_t enable) {
     if (type != 0x10 || !(enable & 0x80)) return false;
     switch (subtype) {

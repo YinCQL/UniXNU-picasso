@@ -11,6 +11,7 @@
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include "PicassoButtonsCore.h"
+#include "PicassoSpmi.h"
 
 extern "C" bool picasso_buttons_deliver(uint32_t);
 extern "C" bool picasso_buttons_available(void);
@@ -28,15 +29,10 @@ struct Window {
     }
     ~Window() { OSSafeReleaseNULL(map); }
 };
-struct Bus {
-    volatile uint32_t *va;
-    void write(unsigned offset, uint32_t value) { va[offset / 4] = value; __asm__ volatile("dsb sy" ::: "memory"); }
-    uint32_t read(unsigned offset) { uint32_t v = va[offset / 4]; __asm__ volatile("dsb sy" ::: "memory"); return v; }
-    void delay() { IODelay(1); }
-};
 uint64_t milliseconds() { uint64_t n = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &n); return n / 1000000; }
 void worker(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "picasso-buttons");
+    if (!picasso_spmi_init()) { IOLog("PICASSO_BUTTONS refused reason=spmi-lock\n"); return; }
     Window core, owners, observer;
     if (!core.open(0xc440000, 0x2000) || !owners.open(0xc40a000, 0x1000)) {
         IOLog("PICASSO_BUTTONS refused reason=map\n"); return;
@@ -51,13 +47,13 @@ void worker(void *, wait_result_t) {
     if (pon < 0 || up < 0 || !observer.open(0xe600000, 0x10000)) {
         IOLog("PICASSO_BUTTONS refused reason=owner-or-map pon=%d up=%d\n", pon, up); return;
     }
-    Bus p{observer.va + picasso_buttons::observer_offset(unsigned(pon)) / 4};
-    Bus g{observer.va + picasso_buttons::observer_offset(unsigned(up)) / 4};
+    auto *p=observer.va + picasso_buttons::observer_offset(unsigned(pon)) / 4;
+    auto *g=observer.va + picasso_buttons::observer_offset(unsigned(up)) / 4;
     uint8_t type = 0, mode = 0, enable = 0, subtype = 0;
-    int error = picasso_buttons::read8(g, 4, type);
-    if (!error) error = picasso_buttons::read8(g, 5, subtype);
-    if (!error) error = picasso_buttons::read8(g, 0x40, mode);
-    if (!error) error = picasso_buttons::read8(g, 0x46, enable);
+    int error = picasso_spmi_read8(g, 4, type);
+    if (!error) error = picasso_spmi_read8(g, 5, subtype);
+    if (!error) error = picasso_spmi_read8(g, 0x40, mode);
+    if (!error) error = picasso_spmi_read8(g, 0x46, enable);
     // Adopt only an enabled GPIO input; expose incompatible firmware instead
     // of driving a button pin or reporting all keys permanently released.
     if (error || !picasso_buttons::gpio_input(type, subtype, mode, enable)) {
@@ -69,14 +65,15 @@ void worker(void *, wait_result_t) {
     for (;;) {
         if (!picasso_buttons_available()) break;
         uint8_t pv = 0, gv = 0;
-        error = picasso_buttons::read8(p, 0x10, pv);
-        if (!error) error = picasso_buttons::read8(g, 0x10, gv);
+        int failedApid=pon;
+        error = picasso_spmi_read8(p, 0x10, pv);
+        if (!error) { failedApid=up; error = picasso_spmi_read8(g, 0x10, gv); }
         if (error) {
             // Stop after a failed/unfinished command. Do not reuse a timed-out
             // channel or guess its state. Cancel our logical HID hold explicitly:
             // this is transport teardown, not an observed physical release.
             bool cancelled = picasso_buttons_deliver(0x80000000u);
-            IOLog("PICASSO_BUTTONS stopped error=%d last_mask=%x cancel_ok=%u\n", error, state.delivered, cancelled); break;
+            IOLog("PICASSO_BUTTONS stopped error=%d apid=%d last_mask=%x cancel_ok=%u\n", error, failedApid, state.delivered, cancelled); break;
         }
         bool changed = state.sample(picasso_buttons::mask(pv, gv), milliseconds(), [](uint32_t mask) {
             if (mask) picasso_hid_physical_button();

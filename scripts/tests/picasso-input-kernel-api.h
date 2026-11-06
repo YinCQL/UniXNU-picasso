@@ -65,3 +65,11 @@ void IODelay(unsigned); void IOSleep(unsigned);
 thread_t current_thread(); void thread_set_thread_name(thread_t,const char *);
 int kernel_thread_start(void (*)(void *,wait_result_t),void *,thread_t *);
 void thread_deallocate(thread_t);
+
+// IOLocks API shapes for compiling the shared controller implementation.
+struct IOSimpleLock;
+using IOInterruptState=int;
+IOSimpleLock *IOSimpleLockAlloc();
+void IOSimpleLockFree(IOSimpleLock *);
+IOInterruptState IOSimpleLockLockDisableInterrupt(IOSimpleLock *);
+void IOSimpleLockUnlockEnableInterrupt(IOSimpleLock *,IOInterruptState);

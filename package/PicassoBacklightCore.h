@@ -130,8 +130,11 @@ struct State {
         if(!error && observedLevel!=level)return configuration;
         if(!error && level==requested)return 0;
         if(!error) {stage=3;error=bus.read(true,0x65,sync);}
-        // MOD_B must not be active; retain unrelated upper register bits.
-        if(!error && (sync&0x0e))return configuration;
+        // 0x65 contains update strobes, not modulator enable state. Firmware
+        // leaves 0x03 (both strobes set) on build171. Stock clears the low
+        // nibble then sets MOD_A bit0; 0x60 is the distinct MOD_B enable.
+        // Adoption already checks every active string routes to MOD_A.
+        // Preserve upper bits exactly as stock's masked writes do.
         if(!error)stage=5;
         if(!error)error=checked_write(bus,true,0x53,uint8_t(requested));
         if(!error)error=checked_write(bus,true,0x54,uint8_t(requested>>8));
