@@ -5,7 +5,7 @@
 #include <stddef.h>
 using kern_return_t=int;
 using IOReturn=int;
-enum {kIOReturnNotFound=4,kIOReturnUnsupported=3,kIOReturnNotReady=1,kIOReturnIOError=2,kIOReturnSuccess=0};
+enum {kIOReturnBadArgument=5,kIOReturnNotFound=4,kIOReturnUnsupported=3,kIOReturnNotReady=1,kIOReturnIOError=2,kIOReturnSuccess=0};
 class OSSymbol;
 class OSMetaClass {
 public:
@@ -33,7 +33,7 @@ class IOService:public IORegistryEntry {
 public:
  static OSDictionary *serviceMatching(const char *);
  static IOService *waitForMatchingService(OSDictionary *,uint64_t);
- bool init();bool attach(IOService *);bool start(IOService *);void detach(IOService *);
+ bool init();bool attach(IOService *);bool start(IOService *);void detach(IOService *);void stop(IOService *);
 };
 #define OSSafeReleaseNULL(p) do {if(p)(p)->release();(p)=nullptr;}while(0)
 #define OSDynamicCast(t,p) static_cast<t *>(p)

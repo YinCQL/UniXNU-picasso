@@ -246,7 +246,8 @@ def main():
                ROOT / 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp', ROOT / 'kits/picasso/PicassoKeyStore.cpp',
                ROOT / 'kits/picasso/PicassoAccelerator.cpp',
                source_dir / 'NativeGOPPresenter.cpp', source_dir / 'NativeGOPGlue.cpp',
-               ROOT / 'kits/picasso/PicassoPr13.cpp', ROOT / 'kits/picasso/PicassoBacklight.cpp']
+               ROOT / 'kits/picasso/PicassoPr13.cpp', ROOT / 'kits/picasso/PicassoBacklight.cpp',
+               ROOT / 'kits/picasso/PicassoBrightness.cpp']
     audit = None
     for source in sources:
         obj = out / (source.stem + '.o')
@@ -256,7 +257,7 @@ def main():
         if source.stem == 'NativeLegacyDisplay':
             audit = audit_object(platform, native, obj, slots, aliases, names)
             platform.write_json(out / 'object-audit.json', audit)
-        if source.stem in ('NativeLegacyDisplay', 'NativeKeyStoreEvents', 'PicassoAccelerator', 'NativeGOPPresenter'):
+        if source.stem in ('NativeLegacyDisplay', 'NativeKeyStoreEvents', 'PicassoAccelerator', 'NativeGOPPresenter', 'PicassoBrightness'):
             late = out / (source.stem + '.late.o')
             objcopy = shutil.which('llvm-objcopy')
             require(objcopy, 'llvm-objcopy required')

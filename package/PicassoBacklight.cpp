@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Picasso g7a panel: PM8150L SID5 WLED5, not Sheng's I2C backlight.
-// Only adopt a running, fault-free stock configuration; gate the light on an
-// OS display power request. Panel scanout, rails, brightness and CABC remain
-// owned by firmware. This does not implement deep sleep or brightness fades.
+// Only adopt a running, fault-free stock configuration; gate the light on
+// OS display power/brightness requests. Panel scanout, rails and CABC remain
+// owned by firmware. This does not implement deep sleep.
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <pexpert/pexpert.h>
+#include <libkern/c++/OSMetaClass.h>
+#include <mach/kmod.h>
 #include "PicassoButtonsCore.h"
 #include "PicassoBacklightCore.h"
+extern "C" {
+extern kmod_info_t g_kernel_kmod_info;
+void picasso_brightness_static_init() __asm__("__GLOBAL__sub_I_PicassoBrightness.cpp");
+IOService *picasso_brightness_allocate();
+}
 namespace {
 struct Window {
     IOMemoryMap *map = nullptr;
@@ -38,6 +45,8 @@ struct Backend {
     picasso_backlight::State state;
     unsigned reports = 0;
     bool adopting = true;
+    bool displayOn = true;
+    uint32_t requested = 0;
     int read(bool sink, uint8_t reg, uint8_t &value) {
         Channel channel{observer[sink].va};
         int error = picasso_buttons::read8(channel, reg, value);
@@ -88,17 +97,58 @@ extern "C" void picasso_backlight_start(IOService *display) {
     IOLog("PICASSO_WLED adopt version=%08x control_apid=%d sink_apid=%d source=%u error=%d\n",version,apid[0],apid[1],next->state.source,error);
     if(error) {if(next->lock)IOLockFree(next->lock);delete next;return;}
     next->adopting=false;
+    next->requested=next->state.level;
     display->retain();
     next->display=display;
     __atomic_store_n(&backend,next,__ATOMIC_RELEASE);
+    void *handle=OSMetaClass::preModLoad(g_kernel_kmod_info.name);
+    if(!handle) {IOLog("PICASSO_BRIGHTNESS preModLoad failed\n");return;}
+    picasso_brightness_static_init();
+    int status=OSMetaClass::postModLoad(handle);
+    if(status) {IOLog("PICASSO_BRIGHTNESS metaclass error=%x\n",status);return;}
+    IOService *service=picasso_brightness_allocate();
+    bool initialized=service && service->init();
+    bool attached=initialized && service->attach(display);
+    bool started=attached && service->start(display);
+    if(!started && attached) {service->stop(display);service->detach(display);}
+    OSSafeReleaseNULL(service);
+    IOLog("PICASSO_BRIGHTNESS started=%u\n",started);
 }
 extern "C" IOReturn picasso_backlight_power(IOService *provider, bool on) {
     Backend *b=__atomic_load_n(&backend,__ATOMIC_ACQUIRE);
     if(!b)return kIOReturnNotReady;
     if(provider!=b->display)return kIOReturnNotFound;
     IOLockLock(b->lock);
-    int error=b->state.set(*b,on);
+    int error=0;
+    if(on && b->requested)error=b->state.brightness(*b,picasso_backlight::clamp(b->requested));
+    if(!error)error=b->state.set(*b,on && b->requested!=0);
+    if(!error)b->displayOn=on;
     if(b->reports<64) {++b->reports;IOLog("PICASSO_WLED power=%u error=%d verified=%u\n",on,error,!error); }
     IOLockUnlock(b->lock);
     return error?kIOReturnIOError:kIOReturnSuccess;
+}
+extern "C" IOReturn picasso_backlight_level(uint32_t level) {
+    Backend *b=__atomic_load_n(&backend,__ATOMIC_ACQUIRE);
+    if(!b)return kIOReturnNotReady;
+    if(level>picasso_backlight::max_level)return kIOReturnBadArgument;
+    IOLockLock(b->lock);
+    level=picasso_backlight::clamp(level);
+    int error=b->state.failed?picasso_backlight::configuration:0;
+    if(!error && b->displayOn) {
+        if(level)error=b->state.brightness(*b,level);
+        if(!error)error=b->state.set(*b,level!=0);
+    }
+    if(!error)b->requested=level;
+    if(error || b->reports<128 || (b->reports&63)==0) {IOLog("PICASSO_WLED brightness=%u applied=%u deferred=%u error=%d\n",
+        level,b->state.on?b->state.level:0,!b->displayOn,error);}
+    ++b->reports;
+    IOLockUnlock(b->lock);
+    return error?kIOReturnIOError:kIOReturnSuccess;
+}
+extern "C" bool picasso_backlight_current(uint32_t *level) {
+    Backend *b=__atomic_load_n(&backend,__ATOMIC_ACQUIRE);
+    if(!b || !level)return false;
+    IOLockLock(b->lock);bool ok=!b->state.failed;
+    if(ok)*level=b->requested;
+    IOLockUnlock(b->lock);return ok;
 }

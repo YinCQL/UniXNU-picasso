@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check production PMIC/button logic and ARM64 bodies; no SDK/device qualification."""
+"""Check production buttons, brightness and ARM64 bodies; no SDK/device qualification."""
 import argparse
 import hashlib
 import json
@@ -34,6 +34,13 @@ def main():
     (out / 'button-sink.inc').write_text(sink)
     (out / 'button-consumer.inc').write_text('\n'.join(extract(consumer, n) for n in
         ('static bool buttonsNotify(', 'static IOReturn buttonsAction(', 'static IOReturn stopButtons(')))
+    backlight = (ROOT / 'package/PicassoBacklight.cpp').read_text()
+    (out / 'brightness-backend.inc').write_text('\n'.join(extract(backlight, n) for n in
+        ('extern "C" IOReturn picasso_backlight_power(', 'extern "C" IOReturn picasso_backlight_level(',
+         'extern "C" bool picasso_backlight_current(')))
+    brightness = (ROOT / 'package/PicassoBrightness.cpp').read_text()
+    brightness = re.sub(r'^#include <[^>]+>[^\n]*\n', '', brightness, flags=re.M)
+    (out / 'brightness-service.inc').write_text(brightness)
     runs = []
 
     def run(name, cmd, execute=False):
@@ -45,7 +52,7 @@ def main():
         if execute:
             run(name + '-run', [cmd[cmd.index('-o') + 1]])
 
-    for source in ('picasso-buttons-host.cpp', 'picasso-buttons-dispatch-host.cpp', 'picasso-backlight-host.cpp'):
+    for source in ('picasso-buttons-host.cpp', 'picasso-buttons-dispatch-host.cpp', 'picasso-backlight-host.cpp', 'picasso-brightness-host.cpp'):
         for sanitized in (False, True):
             name = Path(source).stem + ('-sanitized' if sanitized else '')
             exe = out / (name + ('.exe' if os.name == 'nt' else ''))
@@ -68,8 +75,17 @@ def main():
             '-mgeneral-regs-only', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function',
             '-I', str(ROOT / 'scripts/tests'), '-I', str(ROOT / 'package'),
             '-I', str(ROOT / 'drivers/NativeNovatekTouch'), '-c', str(source), '-o', str(out / (name + '.o'))])
-    inputs = [ROOT / 'package' / n for n in ('PicassoButtonsCore.h', 'PicassoButtons.cpp', 'PicassoHidInput.cpp', 'PicassoBacklightCore.h', 'PicassoBacklight.cpp')]
+    source = out / 'PicassoBrightness.cpp'
+    source.write_text('#define PICASSO_BRIGHTNESS_ARM_API\n#include "picasso-brightness-api.h"\n' + brightness)
+    run('PicassoBrightness-arm64', [args.cc, '-target', 'arm64-apple-ios17.0', '-std=c++17',
+        '-fapple-kext', '-fno-c++-static-destructors',
+        '-ffreestanding', '-fno-exceptions', '-fno-rtti', '-fno-threadsafe-statics', '-mgeneral-regs-only',
+        '-Wall', '-Wextra', '-Werror', '-I', str(ROOT / 'scripts/tests'), '-I', str(ROOT / 'package'),
+        '-c', str(source), '-o', str(out / 'PicassoBrightness.o')])
+    inputs = [ROOT / 'package' / n for n in ('PicassoButtonsCore.h', 'PicassoButtons.cpp', 'PicassoHidInput.cpp', 'PicassoBacklightCore.h', 'PicassoBacklight.cpp', 'PicassoBrightness.cpp')]
     inputs += [ROOT / 'drivers/NativeHidInput/NativeHidInput.cpp', Path(__file__)]
+    inputs += [ROOT / 'scripts/tests' / n for n in ('picasso-backlight-host.cpp',
+        'picasso-brightness-host.cpp', 'picasso-brightness-api.h', 'picasso-input-kernel-api.h')]
     (out / 'results.json').write_text(json.dumps(dict(passed=True, scope=__doc__, runs=runs,
         hardware_tested=False, kernel_sdk_compiled=False,
         inputs={str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}), indent=2) + '\n')

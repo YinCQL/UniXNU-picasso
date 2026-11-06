@@ -6,7 +6,7 @@
 using picasso_backlight::State;
 struct Bus {
     unsigned operations=0, fail=0, mismatch=0, writes=0, sleeps=0;
-    unsigned trace[16]={};
+    unsigned trace[128]={};
     uint8_t regs[2][256]={};
     Bus() {
         regs[0][0x46]=0x85;
@@ -41,7 +41,7 @@ int main() {
         Bus bus;State state;bus.fail=n;assert(state.adopt(bus) && !state.ready && !bus.writes);++cases;
     }
     const unsigned bad[][3]={{0,8,1},{0,0x46,0},{1,0x46,0x80},{1,0x50,0},
-        {1,0x51,2},{1,0x51,3},{1,0x52,1},{1,0x73,1},{1,0x83,1},{1,0x93,1},{1,0xb0,0x40},{1,0x54,0xf0}};
+        {1,0x51,2},{1,0x51,3},{1,0x52,1},{1,0x73,1},{1,0x83,1},{1,0x93,1},{1,0x73,2},{1,0x83,2},{1,0x93,2},{1,0xb0,0x40},{1,0x54,0xf0}};
     for(auto &entry:bad) {
         Bus bus;State state;bus.regs[entry[0]][entry[1]]=uint8_t(entry[2]);
         assert(state.adopt(bus) && !state.ready && !bus.writes);++cases;
@@ -77,6 +77,49 @@ int main() {
         bus.regs[reg==0xb0][reg]^=reg==0xb0?0x40:1;
         assert(state.set(bus,false) && state.failed && !bus.writes);++cases;
     }
+    // The WLED5 sequence is two brightness bytes, then MOD_A sync 0 -> 1.
+    const unsigned goals[]={42,1023,2048,4095};
+    for(unsigned goal : goals) {
+        Bus bus; State state; bus.regs[1][0x65]=0xa1;
+        assert(!state.adopt(bus)); assert(!state.brightness(bus,goal));
+        assert(state.level==goal && bus.writes==4);
+        assert(bus.trace[0]==(0x15300|(goal&255)) && bus.trace[1]==(0x15400|(goal>>8)));
+        assert(bus.trace[2]==0x165a0 && bus.trace[3]==0x165a1);
+        unsigned writes=bus.writes;assert(!state.brightness(bus,goal) && bus.writes==writes);++cases;
+    }
+    Bus sample; State sampleState; assert(!sampleState.adopt(sample));
+    unsigned begin=sample.operations;assert(!sampleState.brightness(sample,4095));
+    unsigned operations=sample.operations-begin;
+    for(unsigned n=1;n<=operations;++n) {
+        Bus bus; State state;assert(!state.adopt(bus));bus.fail=bus.operations+n;
+        assert(state.brightness(bus,4095) && state.failed);
+        unsigned count=bus.operations;assert(state.brightness(bus,1023) && bus.operations==count);++cases;
+    }
+    const unsigned mismatches[]={6,9,11,13,15,16,17};
+    for(unsigned n : mismatches) {
+        Bus bus; State state;assert(!state.adopt(bus));bus.mismatch=bus.operations+n;
+        assert(state.brightness(bus,4095) && state.failed);++cases;
+    }
+    const unsigned badGoals[]={0,1,41,4096,0xffffffff};
+    for(unsigned badGoal : badGoals) {
+        Bus bus; State state;assert(!state.adopt(bus));unsigned before=bus.operations;
+        assert(state.brightness(bus,badGoal) && bus.operations==before && !bus.writes);++cases;
+    }
+    {
+        Bus bus;State state;assert(!state.adopt(bus));assert(!state.set(bus,false));
+        assert(!state.brightness(bus,42) && !state.on);assert(!state.set(bus,true));++cases;
+        bus.regs[1][0x51]^=1;assert(state.brightness(bus,4095) && state.failed);++cases;
+    }
+    {
+        Bus bus;State state;assert(!state.adopt(bus));bus.regs[1][0x65]=2;
+        assert(state.brightness(bus,42) && state.failed && !bus.writes);++cases;
+    }
+    picasso_backlight::Fade fade;
+    fade.begin(1023,4095,1000,100);assert(fade.value(100)==1023 && fade.value(600)==2559);
+    assert(fade.value(1100)==4095 && !fade.active(1100));++cases;
+    fade.begin(4095,0,1000,0);assert(fade.value(500)==2048 && fade.value(999)==42 && fade.value(1000)==0);++cases;
+    fade.begin(42,4095,10000,0);assert(fade.duration==5000 && fade.value(5000)==4095);++cases;
+    fade.begin(1023,1,0,0);assert(fade.value(0)==42 && !fade.active(0));++cases;
     uint32_t maps[512]={},owners[512]={};
     auto read=[&](bool owner,uint32_t offset) {return owner?owners[(offset-0x700)/4]:maps[(offset-0x900)/4];};
     assert(picasso_backlight::find_apid(read,0x5d8)==-1);
