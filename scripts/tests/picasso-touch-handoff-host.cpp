@@ -6,6 +6,7 @@ extern "C" {
 #include "TouchBoard.h"
 #include "TouchPublish.h"
 volatile uint32_t native_touch_seq, native_touch_count, native_touch_writer_lock;
+volatile uint32_t native_touch_physical_active;   /* diagnostics counter in publish() */
 volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
 }
 static unsigned autoStop, notifications;
