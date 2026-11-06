@@ -115,3 +115,38 @@ send `status`/`snapshot` and leave the working image running.
    reboot-fastboot`, then repeat with `ios16-gpu1.img` and look for
    `PICASSO_GPU cp: metal ... plugin=declared`, `PICASSO_GPU open: plugin`,
    `submissions` growth and `PICASSO_DISPLAY_STATE ... copies=0`/`flips` growth.
+
+## GPU pipeline creation fixed: the uchar3 function constant (2026-11-06 18:40 CST)
+
+CoreAnimation's Metal backend aborted backboardd on every pipeline because
+`CA::OGL::MetalContext::create_fragment_shader` could not make its fragment
+function. The exit reason does not keep the abort payload, so the abort-text
+probe in `patches/picasso-abort-text-xnu.patch` reads it in
+`abort_with_payload_internal` and prints it from the kernel. On gpu9 (old
+plugin) every backboardd instance reported:
+
+    PICASSO_ABORTTEXT pid=50 name=backboardd code=7 size=73 \
+      text=function=fixed_frag_lph_cph spec=A2Xhf constant type 51 is not qualified
+
+`MTLDataTypeUChar3` is 51. CA specializes `fixed_frag_lph_cph` with a 3-byte
+`uchar3` function constant; the plugin's `constantBytes()` table declined every
+3-wide vector ("3-wide vectors are not qualified"), so
+`newFunctionWithName:constantValues:error:` returned nil, CA retried once and
+aborted with `OS_REASON_COREANIMATION`.
+
+The fix is in `temp/gpu-ios16/src/NativeMetal/NativeBridgeMetalFrontend.mm`
+(standalone diff: `temp/gpu-ios16/patches/ios16-uchar3-function-constant.patch`):
+`constantBytes()` now sizes all 3-wide vector types (`Float3` 12, `Half3` 6,
+`Int3`/`UInt3` 12, `Short3`/`UShort3` 6, `Char3`/`UChar3`/`Bool3` 3, `Long3`/
+`ULong3` 24) instead of returning 0. The plugin, addon and owner-trust bundle
+were rebuilt as one set (`ngpu-addon-ios16.bin` 12,136,128 bytes;
+`gpu-trust.bundle` sha256 `83716f41f291bf5031c138b2ccc6d26b8c99486f36f678ae2992716164a97e9f`)
+and packed as `out/gpu10/picasso/boot/gpu10.img` with the abort-text kernel
+`7cff78a5b3cca1cf9a05b84da1929069de0f771dfaac58a5a0ce8ff3e809159a`.
+
+Hardware result (gpu10, `picasso-wled=0`): no `PICASSO_ABORTTEXT` and no
+`PICASSO_SERVICE exit` at all; the GPU scanout presenter reaches `P4 e0`
+(serving) and reports `PF <frames>/0` rows at vsync, e.g. 6,631 frames served
+with 0 failures in 62 s (~60 fps) on the 1080x2400 panel. This is the first run
+where backboardd survives CA fragment pipeline creation and the display keeps
+receiving presented frames; touch injection is still a separate open item.
