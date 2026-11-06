@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Device-side firmware stage of unixnu.com/porting/power. Read only; no PAS,
-// power vote or DSP execution until the mailbox and resource owners exist.
+// Device-side firmware stage of unixnu.com/porting/power. Input is read only;
+// then exercise the AOP transport. No power vote or DSP execution yet.
 #include <IOKit/IOLib.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
@@ -8,6 +8,7 @@
 #include "PicassoFat.h"
 #include "PicassoAdspFirmwareProfile.h"
 #include "FirmwareWindow.h"
+#include "PicassoQmp.h"
 
 extern "C" unsigned native_ufs_store_ready(void);
 extern "C" void picasso_adsp_firmware_start(void);
@@ -99,6 +100,7 @@ void worker(void *, wait_result_t) {
     // Do not retain tens of MiB or stale handles before the PAS lifecycle exists.
     // A future loader must re-open/revalidate input as part of its own transaction.
     IOFree(f, sizeof(Firmware));
+    if (!error) picasso_aop_probe();
 }
 }
 

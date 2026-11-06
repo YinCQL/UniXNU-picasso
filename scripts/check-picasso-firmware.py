@@ -91,7 +91,7 @@ def main():
             '-fno-rtti', '-fno-threadsafe-statics', '-mgeneral-regs-only', '-Wall', '-Wextra', '-Werror', *includes,
             '-I', str(ROOT/'scripts/tests'), '-c', str(source), '-o', str(out/(name+'.o'))])
     inputs = ['package/PicassoFat.cpp', 'package/PicassoFat.h', 'package/PicassoAdspFirmware.cpp',
-              'package/PicassoAdspFirmwareProfile.h', 'drivers/NativeUfs/FirmwareRead.h',
+              'package/PicassoAdspFirmwareProfile.h', 'package/PicassoQmp.h', 'drivers/NativeUfs/FirmwareRead.h',
               'drivers/NativeUfs/NativeUfs.cpp', 'drivers/NativeUfs/RootLayout.h', 'package/PicassoPr13.cpp',
               'scripts/build-picasso-display.py', 'scripts/check-picasso-firmware.py',
               'scripts/tests/picasso-firmware-host.cpp', 'scripts/tests/picasso-firmware-ufs.cpp',
