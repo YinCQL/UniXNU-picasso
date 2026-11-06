@@ -64,6 +64,9 @@ CONFIG_XNU_BOOT_PROGRESS=y
 CONFIG_XNU_SHENG_HIDINPUT=y
 # Novatek NT36672C touch: the GENI SPI probe and its embedded firmware.
 CONFIG_XNU_NOVATEK_TOUCH=y
+# SM7250 WCN3998 WLAN bring-up probe (sheng-wlan=<1..5>, sheng-wlan-smem=1,
+# sheng-wlan-start=<seconds>); read-only and inert without those arguments.
+CONFIG_XNU_NATIVE_WLAN=y
 # SM7250 cpufreq-hw probe and governor (sheng-cpufreq=<1..4>, inert without it).
 CONFIG_XNU_PICASSO_CPUFREQ=y
 # A620 GPU platform/firmware/stage probe (sheng-gpu=<1..5>, inert without it).

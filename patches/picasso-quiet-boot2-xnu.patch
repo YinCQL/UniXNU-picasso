@@ -1,0 +1,144 @@
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -4591,7 +4591,14 @@
+ /* Saturating tickets bound output even when PID 1 has concurrent threads. */
+ static unsigned
+ picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+ {
++	static int picasso_probes = -1;
++	if (picasso_probes < 0) {
++		unsigned value = 0;
++		extern int PE_parse_boot_argn(const char *, void *, int);
++		picasso_probes = (PE_parse_boot_argn("picasso-probes", &value, sizeof value) && value != 0);
++	}
++	if (!picasso_probes) return 0;
+ 	unsigned value = os_atomic_load(counter, relaxed);
+ 	while (value < limit) {
+ 		if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -100,7 +100,14 @@
+ /* Saturating tickets bound output even when PID 1 has concurrent threads. */
+ static unsigned
+ picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+ {
++	static int picasso_probes = -1;
++	if (picasso_probes < 0) {
++		unsigned value = 0;
++		extern int PE_parse_boot_argn(const char *, void *, int);
++		picasso_probes = (PE_parse_boot_argn("picasso-probes", &value, sizeof value) && value != 0);
++	}
++	if (!picasso_probes) return 0;
+ 	unsigned value = os_atomic_load(counter, relaxed);
+ 	while (value < limit) {
+ 		if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1602,7 +1602,14 @@
+ /* Saturating tickets bound output even when PID 1 has concurrent threads. */
+ static unsigned
+ picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+ {
++	static int picasso_probes = -1;
++	if (picasso_probes < 0) {
++		unsigned value = 0;
++		extern int PE_parse_boot_argn(const char *, void *, int);
++		picasso_probes = (PE_parse_boot_argn("picasso-probes", &value, sizeof value) && value != 0);
++	}
++	if (!picasso_probes) return 0;
+ 	unsigned value = os_atomic_load(counter, relaxed);
+ 	while (value < limit) {
+ 		if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
+--- a/bsd/kern/sys_generic.c
++++ b/bsd/kern/sys_generic.c
+@@ -399,7 +399,14 @@
+ /* Saturating tickets also bound concurrent PID 1 callers. */
+ static unsigned
+ picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+ {
++    static int picasso_probes = -1;
++    if (picasso_probes < 0) {
++        unsigned value = 0;
++        extern int PE_parse_boot_argn(const char *, void *, int);
++        picasso_probes = (PE_parse_boot_argn("picasso-probes", &value, sizeof value) && value != 0);
++    }
++    if (!picasso_probes) return 0;
+     unsigned value = os_atomic_load(counter, relaxed);
+     while (value < limit) {
+         if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -5778,7 +5778,14 @@
+ /* Saturating tickets also bound concurrent PID 1 callers. */
+ static unsigned
+ picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+ {
++    static int picasso_probes = -1;
++    if (picasso_probes < 0) {
++        unsigned value = 0;
++        extern int PE_parse_boot_argn(const char *, void *, int);
++        picasso_probes = (PE_parse_boot_argn("picasso-probes", &value, sizeof value) && value != 0);
++    }
++    if (!picasso_probes) return 0;
+     unsigned value = os_atomic_load(counter, relaxed);
+     while (value < limit) {
+         if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+diff --git a/bsd/kern/kern_mman.c b/bsd/kern/kern_mman.c
+--- a/bsd/kern/kern_mman.c
++++ b/bsd/kern/kern_mman.c
+@@ -182,7 +182,14 @@
+ /* Saturating tickets also bound concurrent PID 1 callers. */
+ static unsigned
+ picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+ {
++    static int picasso_probes = -1;
++    if (picasso_probes < 0) {
++        unsigned value = 0;
++        extern int PE_parse_boot_argn(const char *, void *, int);
++        picasso_probes = (PE_parse_boot_argn("picasso-probes", &value, sizeof value) && value != 0);
++    }
++    if (!picasso_probes) return 0;
+     unsigned value = os_atomic_load(counter, relaxed);
+     while (value < limit) {
+         if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+diff --git a/bsd/kern/kern_descrip.c b/bsd/kern/kern_descrip.c
+--- a/bsd/kern/kern_descrip.c
++++ b/bsd/kern/kern_descrip.c
+@@ -2747,7 +2747,14 @@
+ /* Saturating tickets also bound concurrent PID 1 callers. */
+ static unsigned
+ picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+ {
++    static int picasso_probes = -1;
++    if (picasso_probes < 0) {
++        unsigned value = 0;
++        extern int PE_parse_boot_argn(const char *, void *, int);
++        picasso_probes = (PE_parse_boot_argn("picasso-probes", &value, sizeof value) && value != 0);
++    }
++    if (!picasso_probes) return 0;
+     unsigned value = os_atomic_load(counter, relaxed);
+     while (value < limit) {
+         if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;
+diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -2094,7 +2094,14 @@
+ /* Saturating tickets bound output even when PID 1 has concurrent threads. */
+ static unsigned
+ picasso_pid1_trace_ticket(unsigned *counter, unsigned limit)
+ {
++	static int picasso_probes = -1;
++	if (picasso_probes < 0) {
++		unsigned value = 0;
++		extern int PE_parse_boot_argn(const char *, void *, int);
++		picasso_probes = (PE_parse_boot_argn("picasso-probes", &value, sizeof value) && value != 0);
++	}
++	if (!picasso_probes) return 0;
+ 	unsigned value = os_atomic_load(counter, relaxed);
+ 	while (value < limit) {
+ 		if (os_atomic_cmpxchg(counter, value, value + 1, relaxed)) return value + 1;

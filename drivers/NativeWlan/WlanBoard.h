@@ -83,6 +83,17 @@ enum wlan_transport {
 #define WLAN_MODEM_WLAN_BASE 0x8c000000ULL
 #define WLAN_MODEM_WLAN_SIZE 0xf800000ULL
 
+// SMEM: smem_region@80900000, no-map, reg = <0x00 0x80900000 0x00 0x200000> (picasso.dts:397-401), wired into
+// qcom,smem by memory-region (picasso.dts:6230-6236). Modern SoCs describe the layout with a table of contents
+// at the base: identifier "$TOC" (0x434F5424), version, num_entries, then 48-byte entries {offset, size, flags,
+// host0, host1, cacheline, reserved[3], exclusions[4]} (QcomPkg SmemLib inc/smem_toc.h in the ABL reference).
+// The probe reads the header only; no SMEM allocation or lock is taken.
+#define WLAN_SMEM_BASE 0x80900000ULL
+#define WLAN_SMEM_SIZE 0x200000ULL
+#define WLAN_SMEM_TOC_IDENTIFIER 0x434F5424u   /* "$TOC" */
+#define WLAN_SMEM_TOC_ENTRY_BYTES 48u
+#define WLAN_SMEM_TOC_ENTRIES_MAX 32u
+
 // IRQs. interrupts = <0 0x84 4, 0 0x51 4, 0 0x19f 4, 0 0x1a0 4, 0 0x1a1 4, 0 0x56 4, 0 0x5e 4, 0 0x60 4,
 // 0 0x52 4, 0 0x77 4, 0 0x78 4, 0 0x57 4> (picasso.dts:7305). All are GIC_SPI, level high; these are the raw
 // SPI numbers (INTID = 32 + SPI). The DT gives no interrupt-names for icnss.

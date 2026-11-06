@@ -110,6 +110,19 @@ if [ "$NOVATEK_TOUCH" = 1 ]; then
   # carved from the stock kernel; the probe skips that trailer itself).
   if [ "$BOOTSTRAP" = 0 ]; then python3 scripts/build-native-novatek-touch.py ${NOVATEK_TOUCH_FW:+--firmware "$NOVATEK_TOUCH_FW"}; fi
 fi
+NATIVE_WLAN=${XNU_NATIVE_WLAN:-0}
+if [ "$NATIVE_WLAN" != 0 ] && [ "$NATIVE_WLAN" != 1 ]; then
+  echo 'XNU_NATIVE_WLAN must be 0 or 1' >&2
+  exit 1
+fi
+if [ "$NATIVE_WLAN" = 1 ]; then
+  if [ "$BOOT_PROGRESS" != 1 ] && [ "$BOOTSTRAP" != 1 ]; then
+    echo 'NativeWlan needs the boot-progress build: its probe call site lives in BootProgress.c' >&2
+    exit 1
+  fi
+  # Inert unless sheng-wlan / sheng-wlan-smem is on the command line.
+  if [ "$BOOTSTRAP" = 0 ]; then python3 scripts/build-native-wlan.py; fi
+fi
 PICASSO_CPUFREQ=${XNU_PICASSO_CPUFREQ:-0}
 if [ "$PICASSO_CPUFREQ" != 0 ] && [ "$PICASSO_CPUFREQ" != 1 ]; then
   echo 'XNU_PICASSO_CPUFREQ must be 0 or 1' >&2
@@ -822,6 +835,10 @@ PY_BINDINGS
   if [ "$NOVATEK_TOUCH" = 1 ]; then
     KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$ROOT/build/novatek-touch/libNativeNovatekTouch.a"
     KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $ROOT/build/novatek-touch/libNativeNovatekTouch.a"
+  fi
+  if [ "$NATIVE_WLAN" = 1 ]; then
+    KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$ROOT/build/native-wlan/libNativeWlan.a"
+    KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $ROOT/build/native-wlan/libNativeWlan.a"
   fi
   if [ "$PICASSO_CPUFREQ" = 1 ]; then
     KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$ROOT/build/picasso-cpufreq/libPicassoCpuFreq.a"

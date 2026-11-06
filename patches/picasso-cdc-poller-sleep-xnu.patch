@@ -1,0 +1,41 @@
+--- a/bsd/dev/picasso_usb.c
++++ b/bsd/dev/picasso_usb.c
+@@ -2791,12 +2791,15 @@
+ 	const volatile uint64_t *timer_irqs = &armcpu_timer_interrupts;
+ 
+ 	/*
+-	 * Keep the bounded spin, then allow other runnable work to proceed.
+-	 * In this XNU, zero depresses to priority 0 without a restore timeout;
+-	 * 1 ms arms the priority-restoration timer. It is not a return deadline
+-	 * and still requires working timer IRQ delivery and scheduling.
++	 * Sleep, do not spin. The poller used to busy-wait 100 us and then yield; with
++	 * nothing else runnable the yield returns immediately, so this thread and the
++	 * bsd_init console loop below kept both A76 cores at 100% from early boot. The
++	 * governor read that as load and pinned the performance cluster at 2208/2400 MHz,
++	 * which is most of the phone's idle heat. Timer IRQ delivery works on this kernel
++	 * (the display's vsync timer runs), so a 1 ms timed sleep keeps the console
++	 * responsive at 1/1000 s granularity without a runnable poller.
+ 	 */
+-	printf("PICASSO USB: busy poller started\n");
++	printf("PICASSO USB: poller started (1 ms sleep)\n");
+ 	for (;;) {
+ 		ud_background_poll(&progress);
+ 		polls++;
+@@ -2804,7 +2807,7 @@
+ 			printf("PICASSO USB: poller heartbeat polls=%llu events=%llu rx_busy=%u\n",
+ 			    polls, ud.events, ud.rx_busy ? 1u : 0u);
+ 		}
+-		picasso_usb_busy_wait(100);
++		ud_sleep_ms(1);
+ 		bool report_yield = first_yield && !ud.panic_mode;
+ 		first_yield = false;
+ 		if (report_yield) {
+@@ -2842,7 +2845,7 @@
+ 				printf("PICASSO CDC: automatic panic-test after host attach\n");
+ 				panic("PICASSO CDC PANIC TEST: automatic capture is active");
+ 			}
+-			picasso_usb_busy_wait(1000);
++			ud_sleep_ms(1);
+ 		} else {
+ 			ud_sleep_ms(1000);
+ 			picasso_usb_watchdog_pet();

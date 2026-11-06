@@ -1727,3 +1727,41 @@ Client side (read-only reference copies):
   just before `PICASSO_GPU text: P4 e0`); after that the copy counters stay frozen while submissions
   climb, which is the expected first-frame fallback. Image `out/wf145/picasso/boot/wf145.img`, log
   `out/wf145-runs/run1.log`.
+
+- **wf146: swap is created as soon as the writable Data volume is mounted.** The first create attempt still
+  fails on the read-only root (`Failed to open swap file 30`, `vm_swap_create_file failed @ 378 secs`)
+  because it runs before `load_init_program` mounts the RAM Data seed at `/private/var`. New kernel patch
+  `patches/picasso-swap-retry-xnu.patch`: `vm_swap_retry_create()` clears
+  `vm_swapfile_last_failed_to_create_ts` and wakes the VM swapfile thread, called from the boot path
+  immediately after `native_owner_data_prepare()` succeeds; the create thread also logs success now.
+  Evidence: `NATIVE_OWNER_DATA done stage=4 error=0 readonly=0` followed by
+  `vm_swap_create_file created @ 379 secs on /private/var/vm/swapfile0`. Kernel
+  `sha256 7e9e22b1eeb76cd5…`, image `out/wf146/picasso/boot/wf146.img`, log `out/wf146-runs/run1.log`.
+  Stability soak: see the 30-minute section of this record.
+
+- **wf148–wf150: the GPU scanout hand-off freezes under real touch; the perf index is not the trigger.**
+  wf148 (perf index 3, early retire on) unlocked with a real finger and then froze: `PICASSO_GPU stall:
+  fence=610 pending=50003 us`, PF stopped at 266, display counters stopped at `submit=339 accept=339
+  transfer=338 retire=337` with `PICASSO_DISPLAY event=7 a=ffffffffe00002d8 failure=1`
+  (kIOReturnNotReady) and SMMU far `0x1138f508`. wf149 repeated the same test at perf index 1 and also
+  froze (PF stuck at 211 while display kept accepting to submit=469, retire two behind). wf150 disabled
+  early retirement (`sheng-early-retire=0`, perf index 3) and still froze: PF 271 while display reached
+  submit=1088 with recurring 50 ms stalls (fence 308, 423, 1274, 1368, 1651). So the common factor is the
+  GPU hand-off copy path under sustained real input, not the GMU perf level or early retirement. The
+  workaround used for interaction testing is `sheng-fb-gpu` absent (GPU renders UI, display copies on the
+  CPU), image wf151; the real fix still needs the hand-off copy's fence/SMMU fault root-caused.
+  Logs `out/wf148-runs/run1.log`, `out/wf149-runs/run1.log`, `out/wf150-runs/run1.log`.
+
+- **wf153: the UI freeze under load is an unmapped GPU address, not the hand-off or the perf index.**
+  Built a kernel diagnostic (`PICASSO_GPU stall far=<FAR> handle=<BO handle>`, NativeAdrenoSubmit.cpp)
+  and booted it with the hand-off disabled (`NO_FBGPU=1`, perf index 3, swap, grid): wf153. A real-finger
+  swipe reproduced the stall: `PICASSO_GPU stall: fence=58 pending=50017 us cpFence=57`, and every
+  snapshot prints `PICASSO_GPU stall far=1338f108 handle=0`. `handle=0` means the faulting IOVA has no
+  BO mapped in the client's GPU address space; the same `0x1338f1xx` page appeared in wf70's early
+  stalls (`1338f508`), so it is a stable, reusable GPU address (most likely a shader/IB BO) that is
+  unmapped while the CP still references it. The GPU then stops advancing its fence, CA blocks and the
+  UI freezes; app-store launch reproducibly triggers it. This is a BO lifetime / page-table race in the
+  GPU driver, independent of `sheng-fb-gpu` and `sheng-gpu-perf-index`. Image
+  `out/wf153/picasso/boot/wf153.img`, logs `out/wf153-runs/run1.log` (fault at line 956) and
+  `run2.log`. The diagnostic print is currently unbounded (prints on every snapshot); keep that in mind
+  when grepping large logs.

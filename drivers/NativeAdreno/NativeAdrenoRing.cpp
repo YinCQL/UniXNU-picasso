@@ -424,6 +424,18 @@ IOReturn NativeAdrenoRing::restart(uint32_t completed)
     context_=0;reset_pending_=true;table_=0;table_pending_=false;
     return kIOReturnSuccess;
 }
+IOReturn NativeAdrenoRing::resync(uint32_t completed)
+{
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    /* The CP consumed the board's me_init/probe words at the start of this ring; program()'s rptr is where the
+     * next submission may start. The fence page still holds `completed` (written by restart before the CP init). */
+    uint32_t rptr=0;
+    IOReturn status=readRptr(&rptr);
+    if(status)return status;
+    next_=rptr;rptr_shadow_=rptr;seqno_=completed;completed_=completed;
+    restore_wptr_=false;reset_pending_=false;table_pending_=false;
+    return kIOReturnSuccess;
+}
 IOReturn NativeAdrenoRing::restartSecondary(uint32_t completed)
 {
     if(!attached_ || !secondary_)return kIOReturnNotReady;

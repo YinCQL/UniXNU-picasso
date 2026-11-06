@@ -55,7 +55,10 @@ static int selected(proc_t p,void *arg) {
 static int capture(proc_t p,void *arg) {
  (void)arg;
  const char *name=proc_best_name(p);unsigned index=10;
- for(unsigned i=0;i<10;++i)if(!strcmp(name,targets[i])){index=i;break;}
+ /* A traced slot wins over an untraced one: "launchd" is targets[0] (never traced) and, with boot-ui-focus=launchd,
+  * targets[1]; matching slot 0 first left the focused process unattached (PICASSO_UI_TRACE B=p0). */
+ for(unsigned i=0;i<10;++i)if(trace_slot[i] && !strcmp(name,targets[i])){index=i;break;}
+ if(index==10)for(unsigned i=0;i<10;++i)if(!strcmp(name,targets[i])){index=i;break;}
  if(proc_pid(p)==0)index=9;
  if(followed_slot(p)<10)index=followed_slot(p);
  // A slot the chain uses belongs to the followed process only (runningboardd/PreBoard would mix their threads into its trace).

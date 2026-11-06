@@ -41,9 +41,12 @@ volatile int native_wlan_handshake_error;
 void native_wlan_set_firmware(const uint8_t *data, size_t size);
 void native_wlan_probe(void);
 
-// Firmware is supplied by the integrator (weak symbols or the setter); no vendor blob is stored in this tree.
-extern const uint8_t native_wlan_firmware[] __attribute__((weak_import));
-extern const uint32_t native_wlan_firmware_size __attribute__((weak_import));
+// Firmware is supplied by the integrator (strong definitions of these, or the setter); no vendor blob is stored in
+// this tree. The weak definitions keep the force-loaded archive linkable with no image staged: size 0 means none.
+extern "C" {
+extern __attribute__((weak)) const uint8_t native_wlan_firmware[] = {0};
+extern __attribute__((weak)) const uint32_t native_wlan_firmware_size = 0;
+}
 }
 
 namespace {
@@ -240,6 +243,35 @@ int stage5(void *) {
     return WLAN_ERR_NOTSUP;
 }
 
+// SMEM table-of-contents probe (`sheng-wlan-smem=1`), the foundation the GLINK/SMP2P/QMI stack above it needs.
+// Read-only and bounded: one mapping, the ToC header, at most 16 entries. A missing or foreign ToC means the
+// boot chain did not initialise SMEM, and nothing higher (WLFW included) can work.
+int smemProbe() {
+    native_wlan_step = 61;
+    Region smem = {};
+    if (!mapRegion(WLAN_SMEM_BASE, 0x1000, smem)) {
+        printf("PICASSO_WLAN_SMEM map-failed base=%08llx\n", static_cast<unsigned long long>(WLAN_SMEM_BASE));
+        return WLAN_ERR_NOMEM;
+    }
+    const volatile uint32_t *toc = reinterpret_cast<const volatile uint32_t *>(smem.va);
+    const uint32_t identifier = toc[0], version = toc[1], entries = toc[2];
+    printf("PICASSO_WLAN_SMEM toc id=%08x version=%u entries=%u base=%08llx\n", identifier, version, entries,
+           static_cast<unsigned long long>(WLAN_SMEM_BASE));
+    if (identifier != WLAN_SMEM_TOC_IDENTIFIER) {
+        printf("PICASSO_WLAN_SMEM error=no-toc (SMEM not initialised by the boot chain)\n");
+        return WLAN_ERR_INVAL;
+    }
+    // smem_toc_entry_type: offset, size, flags, host0/host1 (u16 each), cacheline, reserved[3], exclusions[4].
+    const unsigned per_entry = WLAN_SMEM_TOC_ENTRY_BYTES / 4u;
+    const unsigned shown = entries < 16u ? entries : 16u;
+    for (unsigned i = 0; i < shown; ++i) {
+        const volatile uint32_t *entry = toc + 8u + i * per_entry;
+        printf("PICASSO_WLAN_SMEM entry %u offset=%08x size=%08x flags=%08x host=%u/%u\n", i, entry[0], entry[1],
+               entry[2], entry[3] & 0xffffu, entry[3] >> 16);
+    }
+    return 0;
+}
+
 void copyState(const struct wlan_probe_state &state) {
     native_wlan_stage = state.stage;
     native_wlan_step = state.step;
@@ -256,6 +288,18 @@ extern "C" void native_wlan_set_firmware(const uint8_t *data, size_t size) {
 // nothing. The entry point depends only on IOKit and its own pure helpers, so a boot monitor can declare it
 // weak_import and link whether or not this driver is included.
 extern "C" void native_wlan_probe(void) {
+    // The SMEM ToC probe is independent of the staged sequence: it answers whether the boot chain published
+    // SMEM at all, the prerequisite for GLINK/SMP2P/QMI and therefore for WLFW.
+    uint32_t smem = 0;
+    if (PE_parse_boot_argn("sheng-wlan-smem", &smem, sizeof smem) && smem) {
+        if (native_wlan_stage_req) return;
+        native_wlan_stage_req = 1;
+        const int rc = smemProbe();
+        native_wlan_stage = 6;
+        native_wlan_error = rc;
+        printf("PICASSO_WLAN_SMEM end error=%d\n", rc);
+        return;
+    }
     unsigned stage = 0;
     if (!PE_parse_boot_argn("sheng-wlan", &stage, sizeof stage) || stage < 1) return;
     if (native_wlan_stage_req) return;

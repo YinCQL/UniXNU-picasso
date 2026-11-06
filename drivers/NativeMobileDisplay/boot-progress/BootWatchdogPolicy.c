@@ -22,7 +22,11 @@ static const char policy_tail[]="</dict></plist>\n";
 // all of which start at the first boot of a fresh Data and compete with SpringBoard for the CPU and for memory. The first four are the
 // cycle of synchronous XPC waits the isolation work found. Labels are the ones in the target's own LaunchDaemons.
 static const char lite_jobs[]=
- "com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd,"
+ // bluetoothd stays enabled: audiomxd's CoreAudio Bluetooth-audio HAL client looks up
+ // com.apple.BTAudioHALPlugin.xpc, a MachService of this job. With the job disabled the lookup
+ // fails and CoreAudio retries it thousands of times per second against launchd, which is the
+ // idle heat source the IPC census found (docs/experiment-20261105-idle-cpu-ipc-storm.md).
+ "com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,"
  "com.apple.photoanalysisd,com.apple.mediaanalysisd,com.apple.mediastream.mstreamd,com.apple.icloud.searchpartyd,"
  "com.apple.findmy.findmybeaconingd,com.apple.familycircled,com.apple.financed,com.apple.softwareupdateservicesd,"
  "com.apple.ndoagent,com.apple.biomesyncd,com.apple.email.maild,com.apple.amsengagementd,com.apple.adid,com.apple.eyereliefd,"
@@ -78,7 +82,7 @@ int sheng_boot_watchdog_policy(void *process, uint64_t scratch) {
  proc_t p=process;
  int enabled=0,error=0,fd=-1;int32_t result=0;
  PE_parse_boot_argn("sheng-disable-watchdogd",&enabled,sizeof(enabled));
- if(!PE_parse_boot_argn("sheng-disable-jobs",jobs,sizeof(jobs)))jobs[0]=0;jobs[sizeof(jobs)-1]=0;
+ if(!PE_parse_boot_argn("sheng-disable-jobs",jobs,sizeof(jobs)))strlcpy(jobs,"com.apple.driverkitd,com.apple.cameracaptured",sizeof(jobs));jobs[sizeof(jobs)-1]=0;
  int lite=0;PE_parse_boot_argn("sheng-lite",&lite,sizeof(lite));if(lite!=1)lite=0;
  if(enabled!=1)enabled=0;
  for(const char *c=jobs;*c;++c)if(!((*c>='a'&&*c<='z')||(*c>='A'&&*c<='Z')||(*c>='0'&&*c<='9')||*c=='.'||*c=='-'||*c==','))return EINVAL;

@@ -169,6 +169,9 @@ extern void native_hid_swipe_tick(unsigned) __attribute__((weak_import));
 // sheng-touch-start=<seconds> delays the start on the monitor clock, so a faulting
 // probe cannot take the display and the CDC console down with it.
 extern void native_novatek_touch_probe(void) __attribute__((weak_import));
+// WLAN bring-up probe (sheng-wlan=<1..5>, sheng-wlan-smem=1); inert without an argument.
+// sheng-wlan-start=<seconds> delays it on the monitor clock like the touch probe.
+extern void native_wlan_probe(void) __attribute__((weak_import));
 // Prints (once, early) the IMEM step marker the probe left when it died on the previous boot.
 extern void native_novatek_touch_boot_report(unsigned) __attribute__((weak_import));
 extern volatile uint32_t native_hid_stage,native_hid_resource_found __attribute__((weak_import));
@@ -546,6 +549,13 @@ static void refresh(unsigned now) {
     memset(display.previous,0xff,sizeof(display.previous));
     for(unsigned i=0;i<48;++i) display.previous[i][BP_COLS-1]=0;
     bp_clear(&display);
+  } else if (boot_progress_display_owned && !display.bound) {
+    // A validated scanout yielded the panel (prepare_scanout), and the resume window (if any) has not
+    // elapsed: the OS owns the screen now. Without this gate the page kept repainting over the live UI
+    // every time its counters changed (and wholesale every 15 s), which the user sees as the diagnostic
+    // window flickering on the desktop and which costs about a million uncached stores per pass.
+    __atomic_store_n(&render_busy,0,__ATOMIC_RELEASE);
+    return;
   }
   if (take()) {
     render_snapshot=state;
@@ -658,6 +668,16 @@ void boot_progress_process_stage(int pid,const char *name,const char *text) {
 }
 void boot_progress_exit(int pid,const char *name,int status,unsigned ns,uint64_t code) {
   if(!enabled)return;
+  /* A nonzero exit is what a crash loop leaves behind; name it on the console as it happens (bounded), so the cause
+   * of sustained CPU in the supervisor (launchd) and the crash reporter can be read from the boot log. */
+  if(status) {
+    static unsigned exit_prints;
+    if(exit_prints<64) {
+      ++exit_prints;
+      printf("PICASSO_EXIT pid=%d status=%d signal=%u ns=%u code=%llx name=%.31s\n", pid, status,
+          (unsigned)status & 127, ns, (unsigned long long)code, name ? name : "?");
+    }
+  }
   census_note(name,1);
   if(name && !strcmp(name,"xpcproxy") && pid==proc_selfpid())xpc_fail_note(status,ns,code);
   if(__atomic_exchange_n(&exit_lock,1,__ATOMIC_ACQUIRE)) {
@@ -1268,10 +1288,20 @@ static void monitor(void *arg, wait_result_t result) {
         // Default 0 runs it at the first pass, which is also the earliest boot state.
         static unsigned touch_start_at,touch_start_set;
         if(!touch_start_set) {
-          touch_start_set=1;touch_start_at=0;
+          touch_start_set=1;touch_start_at=60;
           PE_parse_boot_argn("sheng-touch-start",&touch_start_at,sizeof(touch_start_at));
         }
         if(native_novatek_touch_probe && now>=touch_start_at)native_novatek_touch_probe();
+      }
+      {
+        // sheng-wlan-start=<seconds>: the WLAN probe maps MMIO, so give clocks and the
+        // monitor a settled boot first. Default 90 s; inert without sheng-wlan* arguments.
+        static unsigned wlan_start_at,wlan_start_set;
+        if(!wlan_start_set) {
+          wlan_start_set=1;wlan_start_at=90;
+          PE_parse_boot_argn("sheng-wlan-start",&wlan_start_at,sizeof(wlan_start_at));
+        }
+        if(native_wlan_probe && now>=wlan_start_at)native_wlan_probe();
       }
     }
     // Secondary-CPU progress over CDC: the panel row only exists on the screen, and
@@ -1413,6 +1443,39 @@ size_t boot_progress_profile_rows(char *out,size_t cap) {
         uint32_t r3=0;for(size_t i=first;i<first+count;i++){const uint32_t *x=bp_kern[bp_prof_snap[i]&0xffffffff];if(x[1]==(uint32_t)(pair>>32) && x[2]==(uint32_t)pair){r3=x[3];break;}}
         BP_ROW(" %x/%x/%x:%llu",(unsigned)(pair>>32),(unsigned)pair,r3,ge>>40);}
       BP_ROW("\n");
+    }
+  }
+  // Messages to and from pid 1 since the previous profile block (picasso-ipc-census=1): launchd's
+  // continuous Mach IPC keeps about a core of system time busy, and this row names the peer that
+  // sends to it and the peers it sends to. Absent when the census patch is not in the kernel.
+  {
+    extern size_t picasso_ipc_census_rows(char *,size_t) __attribute__((weak_import));
+    if(&picasso_ipc_census_rows) {
+      char row[320]={0};
+      const size_t got=picasso_ipc_census_rows(row,sizeof row);
+      if(got)BP_ROW("%s",row);
+    }
+  }
+  // Touch pipeline per profile block: frames the panel probe sampled and published, HID reports the
+  // virtual digitizer sent, and the event-driver edge counters. A contact that appears in d_frames
+  // but not d_hid stops at publication; one that appears in d_hid but not on screen stops downstream.
+  {
+    extern volatile uint32_t native_novatek_touch_frames __attribute__((weak_import));
+    extern volatile uint32_t native_touch_hid_reports __attribute__((weak_import));
+    extern volatile uint32_t native_touch_edge_stats[4] __attribute__((weak_import));
+    extern volatile uint32_t native_touch_physical_active __attribute__((weak_import));
+    if(&native_novatek_touch_frames && &native_touch_hid_reports && &native_touch_edge_stats[0]) {
+      static uint32_t lf, lh, le1, le2, le3;
+      const uint32_t f = __atomic_load_n(&native_novatek_touch_frames, __ATOMIC_RELAXED);
+      const uint32_t h = __atomic_load_n(&native_touch_hid_reports, __ATOMIC_RELAXED);
+      const uint32_t e1 = __atomic_load_n(&native_touch_edge_stats[1], __ATOMIC_RELAXED);
+      const uint32_t e2 = __atomic_load_n(&native_touch_edge_stats[2], __ATOMIC_RELAXED);
+      const uint32_t e3 = __atomic_load_n(&native_touch_edge_stats[3], __ATOMIC_RELAXED);
+      BP_ROW("TOUCH d_frames=%u d_hid=%u d_begin=%u d_edge=%u d_skip=%u phys=%u count=%u\n",
+          f - lf, h - lh, e1 - le1, e2 - le2, e3 - le3,
+          &native_touch_physical_active ? (unsigned)native_touch_physical_active : 0u,
+          (unsigned)native_touch_count);
+      lf = f; lh = h; le1 = e1; le2 = e2; le3 = e3;
     }
   }
 #undef BP_ROW

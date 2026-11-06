@@ -1,0 +1,98 @@
+diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
+index fbd8ad2..3bad4e5 100644
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -149,6 +149,83 @@ picasso_pid1_cache_path(struct nameidata *ndp, proc_t p, const char *path)
+ 		    (unsigned long long)thread_tid(vfs_context_thread(ndp->ni_cnd.cn_context)), path);
+ 	}
+ }
++/* Does dyld actually open the injected library, and in which process? AMFI's
++ * accepted signature says nothing about the load; a path copy for OP_OPEN is
++ * the first proof the insertion reached the filesystem. Bounded to 64 lines. */
++static void
++picasso_inject_open_probe(struct nameidata *ndp, proc_t p, const char *path)
++{
++	static unsigned probe_count;
++	if (!p || ndp->ni_op != OP_OPEN) return;
++	const char *base = strrchr(path, '/');
++	base = base ? base + 1 : path;
++	if (strcmp(base, "libpicasso-sb.dylib") && strncmp(base, "picasso-marker-", 15)) return;
++	unsigned ticket = picasso_pid1_trace_ticket(&probe_count, 64);
++	if (!ticket) return;
++	char name[MAXCOMLEN + 1] = "?";
++	proc_name(proc_getpid(p), name, sizeof name);
++	printf("PICASSO_INJECT open=%u pid=%d name=%s path=%.160s\n",
++	    ticket, proc_getpid(p), name, path);
++}
++/* LaunchServices validation probe: on a boot that keeps an exported store in place, lsd prunes
++ * the application records within a couple of seconds and the home screen loses its icons. The
++ * paths it looks up while deciding show what it validates (bundle paths, store companions,
++ * volumes). Filtered by process name for cost; the type/localization noise is skipped so the
++ * bounded budget reaches the application and store paths; bounded to 400 lines. */
++static int
++picasso_lsd_contains(const char *text, const char *needle)
++{
++	const size_t n = strlen(needle);
++	for (; *text; ++text) {
++		if (!strncmp(text, needle, n)) return 1;
++	}
++	return 0;
++}
++static void
++picasso_lsd_probe(struct nameidata *ndp, proc_t p, const char *path)
++{
++	static unsigned probe_count;
++	if (!p || (ndp->ni_op != OP_OPEN && ndp->ni_op != OP_LOOKUP)) return;
++	if (strcmp(p->p_name, "lsd")) return;
++	/* White list: the application-bundle and LaunchServices paths are what the prune decision can
++	 * depend on; the loader, type and localization noise is skipped so the bounded budget reaches
++	 * them. */
++	if (!picasso_lsd_contains(path, "/Applications") && !picasso_lsd_contains(path, ".app") &&
++	    !picasso_lsd_contains(path, "LaunchServices") && !picasso_lsd_contains(path, "containers/Bundle") &&
++	    !picasso_lsd_contains(path, "containers/Data"))
++		return;
++	if (probe_count >= 400) return;
++	++probe_count;
++	printf("PICASSO_LSD op=%u pid=%d path=%.180s\n", ndp->ni_op, proc_getpid(p), path);
++}
++/* Does SpringBoard reach the staged home-screen applications? The first probe counted every
++ * /Applications open and its budget filled with system view services before the user apps; this
++ * one watches only the twelve staged bundles, which are exactly the icons the home screen shows.
++ * SpringBoard only, OP_OPEN, bounded to 200 lines. */
++static void
++picasso_sb_apps_probe(struct nameidata *ndp, proc_t p, const char *path)
++{
++	static const char *const staged[] = {
++		"Camera.app", "MobileSafari.app", "MobileMail.app", "Weather.app", "MobileNotes.app",
++		"MobileCal.app", "Reminders.app", "Maps.app", "MobileSlideShow.app", "Contacts.app",
++		"MobileTimer.app", "AppleTV.app"
++	};
++	static unsigned probe_count;
++	if (!p || ndp->ni_op != OP_OPEN) return;
++	if (strcmp(p->p_name, "SpringBoard")) return;
++	if (strncmp(path, "/Applications/", 14)) return;
++	unsigned match = 0;
++	for (unsigned i = 0; i < sizeof(staged) / sizeof(staged[0]); ++i) {
++		if (picasso_lsd_contains(path, staged[i])) {
++			match = 1;
++			break;
++		}
++	}
++	if (!match) return;
++	if (probe_count >= 200) return;
++	++probe_count;
++	printf("PICASSO_SBAPP pid=%d path=%.180s\n", proc_getpid(p), path);
++}
+ #endif
+ 
+ #include <sys/paths.h>
+@@ -347,6 +424,9 @@ retry_copy:
+ 	/* Independent path samples correlate with open begin/end by thread. A
+ 	 * copied path is not a successful lookup or a successful open. */
+ 	picasso_pid1_cache_path(ndp, p, cnp->cn_pnbuf);
++	picasso_inject_open_probe(ndp, p, cnp->cn_pnbuf);
++	picasso_lsd_probe(ndp, p, cnp->cn_pnbuf);
++	picasso_sb_apps_probe(ndp, p, cnp->cn_pnbuf);
+ #endif
+ 	ndp->ni_pathlen = (u_int)bytes_copied;
+ 	bytes_copied = 0;

@@ -5,6 +5,8 @@
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <kern/task.h>
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
@@ -16,8 +18,12 @@ volatile uint64_t native_gop_gpu_offers,native_gop_gpu_completions,native_gop_gp
 /* waitSwap: [0] calls, [1] timeouts, [2] the requested timeout of the last call (ms), [3] time the last timed-out call really waited (ns), [4] the shortest
  * and [5] the longest such wait (ns), [6] total ns waited in timed-out calls. A timed wait that returns long before its deadline shows here. */
 volatile uint64_t native_gop_wait_stats[7];
+/* Round-trip timestamps of the last swap, for the display driver's PICASSO_FRAME trace: when the waiting client took
+ * the frame (after its pages were mapped into the client) and when its completion arrived. With the display driver's
+ * offer tick this splits offer-to-done into scheduling, userspace present and completion handling. */
+volatile uint64_t native_gop_last_take_tick,native_gop_last_complete_tick;
 IOService *native_gop_presenter_create(void);
-bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height,uint32_t destY);
 void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
 // Provided by the display driver: finishes (status 0) or fails the swap that was offered.
 void native_legacy_gpu_complete(void *display,int status);
@@ -37,8 +43,36 @@ class NativeGOPPresenter : public IOService {
     // GPU hand-off (sheng-fb-gpu=1): one offered frame at a time, from the display driver to the privileged client.
     bool gpuMode=false,gpuClient=false;
     struct {bool offered,delivered;uint64_t sequence;void *display;IOMemoryDescriptor *memory;IOMemoryMap *map;
-            uint64_t stride;uint32_t width,height;} swap={};
+            uint64_t stride;uint32_t width,height,destY;} swap={};
     uint64_t swapSequence=0;
+    /* A flip timeout, as in the display drivers this hand-off replaces: a frame the client neither picks up nor
+     * completes within SwapTimeoutMs is taken back, the display driver is told it failed (it falls back to its own
+     * copy), and offers are refused until a client waits again. Without it one stalled present froze the whole
+     * swap queue: the display's single-outstanding latch never cleared, so no later frame was ever offered. */
+    static constexpr uint32_t SwapTimeoutMs=500;
+    IOTimerEventSource *watchdog=nullptr;
+    /* A service without a provider work loop had no timer at all: wf242 ran 894 offerings, then the display's own
+     * 1.5 s fallback (not this 500 ms timeout) took stalled frames back three times (abandoned stayed 0), and the
+     * completion after such a fallback found no outstanding swap. Give the timer a loop of its own if the registry
+     * offered none. */
+    IOWorkLoop *ownLoop=nullptr;
+    uint64_t swapSince=0;
+    unsigned watchdogPrints=0;
+    /* The scanout has one serving client: the first task that waits owns it (the render server starts serving long
+     * before anything else). Two processes serving the same scanout would run two presenters over one framebuffer
+     * and compete for the single outstanding swap. Ownership lapses after 2 s without a wait, so a wedged or dead
+     * serving thread can be replaced. */
+    task_t gpuTask=TASK_NULL;
+    uint64_t gpuTaskSince=0;
+    static constexpr uint64_t GpuTaskLapseNs=2000000000ull;
+    static void watchdogFired(OSObject *,IOTimerEventSource *);
+    void armWatchdogLocked() {
+        if(!watchdog)return;
+        uint64_t deadline=0;
+        clock_interval_to_deadline(SwapTimeoutMs,kMillisecondScale,&deadline);
+        watchdog->wakeAtTime(deadline);
+    }
+    void cancelWatchdog() {if(watchdog)watchdog->cancelTimeout();}
     IOReturn waitSwap(task_t,uint64_t timeoutMs,NGPSwap *);
     IOReturn completeSwap(uint64_t sequence,int status);
     void abandonSwap();
@@ -46,7 +80,9 @@ public:
     void setMemorySource(IOService *source) {memorySource=source;}
     static IOReturn handoffCall(uint32_t op,task_t task,const void *in,size_t inSize,void *out,size_t outSize);
     static IOMemoryDescriptor *handoffMemory();
-    bool offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+    bool offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height,uint32_t destY);
+    // Take back the swap this display owns (the display is stopping; its completion must not reach it).
+    void abandonDisplay(void *display);
 private:
     IOReturn transfer(task_t,const NGPPresent &,NGPTransfer *);
 public:
@@ -92,18 +128,34 @@ bool NativeGOPPresenter::start(IOService *provider) {
        mapping->getLength()!=video.v_rowBytes*video.v_height)return false;
     gate=IOLockAlloc();if(!gate)return false;
     {unsigned v=0;PE_parse_boot_argn("sheng-fb-gpu",&v,sizeof v);gpuMode=(v==1);}
+    // The flip timeout runs on this service's work loop; a device without one keeps serving without it.
+    IOWorkLoop *loop=getWorkLoop();
+    if(!loop && (ownLoop=IOWorkLoop::workLoop()))loop=ownLoop;
+    if(loop) {
+        watchdog=IOTimerEventSource::timerEventSource(this,&NativeGOPPresenter::watchdogFired);
+        if(!watchdog || loop->addEventSource(watchdog)!=kIOReturnSuccess)OSSafeReleaseNULL(watchdog);
+    }
+    printf("PICASSO_DISPLAY gpu watchdog loop=%p own=%d timer=%p\n",loop,int(ownLoop!=nullptr),watchdog);
     mode={NGP_VERSION,NGP_BGRX8888,video.v_width,video.v_height,video.v_rowBytes,mapping->getLength()};
     native_gop_physical=mapping->getPhysicalAddress();native_gop_virtual=mapping->getVirtualAddress();
     online=true;native_gop_ready=1;if(gpuMode)gHandoff=this;registerService();return true;
 }
 void NativeGOPPresenter::stop(IOService *provider) {
     if(gHandoff==this)gHandoff=nullptr;
+    if(watchdog) {
+        watchdog->cancelTimeout();
+        IOWorkLoop *loop=getWorkLoop();
+        if(!loop)loop=ownLoop;
+        if(loop)loop->removeEventSource(watchdog);
+        OSSafeReleaseNULL(watchdog);
+    }
+    OSSafeReleaseNULL(ownLoop);
     if(gate)IOLockLock(gate);online=false;native_gop_ready=0;if(gate){IOLockWakeup(gate,&swap,false);IOLockUnlock(gate);}
     abandonSwap();
     IOService::stop(provider);
 }
 void NativeGOPPresenter::free() {
-    OSSafeReleaseNULL(mapping);if(gate){IOLockFree(gate);gate=nullptr;}IOService::free();
+    OSSafeReleaseNULL(mapping);if(gate){IOLockFree(gate);gate=nullptr;}OSSafeReleaseNULL(ownLoop);IOService::free();
 }
 IOReturn NativeGOPPresenter::transfer(task_t task,const NGPPresent &q,NGPTransfer *result) {
     if(gpuMode)return kIOReturnUnsupported;   // in GPU mode no CPU copy exists, not even on request
@@ -128,14 +180,16 @@ IOReturn NativeGOPPresenter::transfer(task_t task,const NGPPresent &q,NGPTransfe
 }
 // The display driver offers a finished frame. Accepted only while the privileged GPU client is alive and waiting for work; otherwise the
 // display driver keeps its own path (counted by it as a fallback).
-bool NativeGOPPresenter::offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height) {
+bool NativeGOPPresenter::offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height,uint32_t destY) {
     if(!gpuMode || !memory || !display || !gate)return false;
     IOLockLock(gate);
     bool accepted=online && gpuClient && !swap.offered;
     if(accepted) {
         memory->retain();
-        swap={true,false,++swapSequence,display,memory,nullptr,stride,width,height};
+        swap={true,false,++swapSequence,display,memory,nullptr,stride,width,height,destY};
+        swapSince=mach_absolute_time();
         native_gop_gpu_offers=native_gop_gpu_offers+1;
+        armWatchdogLocked();
         IOLockWakeup(gate,&swap,false);
     }
     IOLockUnlock(gate);return accepted;
@@ -147,9 +201,20 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     const uint64_t began=mach_absolute_time();
     native_gop_wait_stats[0]=native_gop_wait_stats[0]+1;native_gop_wait_stats[2]=timeoutMs;
     IOLockLock(gate);
+    {
+        const uint64_t now=mach_absolute_time();
+        if(gpuTask!=task && gpuTask) {
+            uint64_t idle=0;absolutetime_to_nanoseconds(now-gpuTaskSince,&idle);
+            if(idle<GpuTaskLapseNs) {IOLockUnlock(gate);return kIOReturnNotReady;}
+        }
+        gpuTask=task;gpuTaskSince=now;
+    }
     gpuClient=true;
     while(online && (!swap.offered || swap.delivered)) {
         if(IOLockSleepDeadline(gate,&swap,deadline,THREAD_ABORTSAFE)!=THREAD_AWAKENED) {
+            // Nobody is waiting for a frame after this return: refuse offers until the client waits again, so a
+            // frame is not accepted for a client that has gone away.
+            gpuClient=false;
             IOLockUnlock(gate);
             uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-began,&ns);
             native_gop_wait_stats[1]=native_gop_wait_stats[1]+1;native_gop_wait_stats[3]=ns;
@@ -162,7 +227,7 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     if(!online) {IOLockUnlock(gate);return kIOReturnNotReady;}
     swap.delivered=true;
     IOMemoryDescriptor *memory=swap.memory;memory->retain();
-    const uint64_t sequence=swap.sequence,stride=swap.stride;const uint32_t width=swap.width,height=swap.height;
+    const uint64_t sequence=swap.sequence,stride=swap.stride;const uint32_t width=swap.width,height=swap.height,destY=swap.destY;
     IOLockUnlock(gate);
     // The frame's pages go into the client's task here, writable like any import (the GPU maps them for reading; the kernel pins and maintains them).
     IOMemoryMap *map=memory->createMappingInTask(task,0,kIOMapAnywhere);
@@ -173,24 +238,65 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     }
     swap.map=map;
     out->sequence=sequence;out->address=map->getVirtualAddress();out->bytes=map->getLength();out->stride=stride;
-    out->width=width;out->height=height;out->format=NGP_BGRX8888;out->reserved=0;
+    out->width=width;out->height=height;out->format=NGP_BGRX8888;out->reserved=destY;
+    native_gop_last_take_tick=mach_absolute_time();
     IOLockUnlock(gate);return kIOReturnSuccess;
 }
 IOReturn NativeGOPPresenter::completeSwap(uint64_t sequence,int status) {
     IOLockLock(gate);
-    if(!swap.offered || !swap.delivered || swap.sequence!=sequence) {IOLockUnlock(gate);return kIOReturnBadArgument;}
+    // A completion for a swap the flip timeout already took back is a no-op, not an error: the serve loop must survive
+    // a frame it finished too late, or the hand-off never resumes after one timeout.
+    if(!swap.offered) {IOLockUnlock(gate);return kIOReturnSuccess;}
+    if(!swap.delivered || swap.sequence!=sequence) {IOLockUnlock(gate);return kIOReturnBadArgument;}
+    native_gop_last_complete_tick=mach_absolute_time();
     auto done=swap;swap={};
+    cancelWatchdog();
     IOLockUnlock(gate);
     OSSafeReleaseNULL(done.map);done.memory->release();
     if(status)__atomic_fetch_add(&native_gop_gpu_failures,1,__ATOMIC_RELAXED);
     else native_gop_gpu_completions=native_gop_gpu_completions+1;
     native_legacy_gpu_complete(done.display,status);return kIOReturnSuccess;
 }
+// The flip timeout: the frame was offered (and maybe taken) but not completed in time. Take it back and tell the display
+// driver it failed, so it uses its own path and its single-outstanding latch clears. Offers are refused afterwards until a
+// client waits again, so a serve thread stuck in a GPU wait cannot freeze the display a second time.
+void NativeGOPPresenter::watchdogFired(OSObject *owner,IOTimerEventSource *) {
+    NativeGOPPresenter *self=static_cast<NativeGOPPresenter *>(owner);
+    if(!self || !self->gate)return;
+    struct {bool any;void *display;IOMemoryDescriptor *memory;IOMemoryMap *map;uint64_t sequence;uint64_t ms;bool delivered;} done={};
+    IOLockLock(self->gate);
+    if(self->swap.offered) {
+        uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-self->swapSince,&ns);
+        const uint64_t ms=ns/1000000;
+        if(ms>=SwapTimeoutMs) {
+            done={true,self->swap.display,self->swap.memory,self->swap.map,self->swap.sequence,ms,self->swap.delivered};
+            self->swap={};
+            self->gpuClient=false;
+            __atomic_fetch_add(&native_gop_gpu_abandoned,1,__ATOMIC_RELAXED);
+            if(self->watchdogPrints<8) {
+                ++self->watchdogPrints;
+                printf("PICASSO_DISPLAY gpu flip timeout: seq=%llu delivered=%d waited_ms=%llu abandoned=%llu\n",
+                    (unsigned long long)done.sequence,int(done.delivered),(unsigned long long)ms,
+                    (unsigned long long)native_gop_gpu_abandoned);
+            }
+        } else {
+            uint64_t deadline=0;
+            clock_interval_to_deadline((uint32_t)(SwapTimeoutMs-ms),kMillisecondScale,&deadline);
+            if(self->watchdog)self->watchdog->wakeAtTime(deadline);
+        }
+    }
+    IOLockUnlock(self->gate);
+    if(done.any) {
+        OSSafeReleaseNULL(done.map);if(done.memory)done.memory->release();
+        native_legacy_gpu_complete(done.display,kIOReturnTimeout);
+    }
+}
 // The client went away with a frame outstanding: the display driver is told it failed, so it can use its own path instead of waiting forever.
 void NativeGOPPresenter::abandonSwap() {
     if(!gate)return;
     IOLockLock(gate);
     gpuClient=false;
+    cancelWatchdog();
     auto done=swap;swap={};
     IOLockUnlock(gate);
     if(!done.offered)return;
@@ -198,12 +304,32 @@ void NativeGOPPresenter::abandonSwap() {
     __atomic_fetch_add(&native_gop_gpu_abandoned,1,__ATOMIC_RELAXED);
     native_legacy_gpu_complete(done.display,kIOReturnAborted);
 }
+// The display named in the outstanding swap is going away. Take the frame back without calling it: its
+// completion would reach a stopped (and freed) display.
+void NativeGOPPresenter::abandonDisplay(void *display) {
+    if(!gate)return;
+    bool mine=false;
+    IOLockLock(gate);
+    if(swap.offered && swap.display==display) {
+        mine=true;gpuClient=false;cancelWatchdog();
+        auto done=swap;swap={};
+        IOLockUnlock(gate);
+        OSSafeReleaseNULL(done.map);if(done.memory)done.memory->release();
+        __atomic_fetch_add(&native_gop_gpu_abandoned,1,__ATOMIC_RELAXED);
+        return;
+    }
+    IOLockUnlock(gate);
+    (void)mine;
+}
+extern "C" void native_gop_gpu_abandon_display(void *display) {
+    if(NativeGOPPresenter *p=gHandoff)p->abandonDisplay(display);
+}
 extern "C" void native_gop_presenter_set_source(IOService *presenter,IOService *nub) {
     if(NativeGOPPresenter *p=OSDynamicCast(NativeGOPPresenter,presenter))p->setMemorySource(nub);
 }
-extern "C" bool native_gop_gpu_offer(IOService *presenter,void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height) {
+extern "C" bool native_gop_gpu_offer(IOService *presenter,void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height,uint32_t destY) {
     NativeGOPPresenter *p=OSDynamicCast(NativeGOPPresenter,presenter);
-    return p && p->offer(display,memory,stride,width,height);
+    return p && p->offer(display,memory,stride,width,height,destY);
 }
 // Entry points for the GPU client that reaches the hand-off through an already admitted connection (the Adreno accelerator's user client, which
 // the original sandbox profiles allow where they do not allow this service): op 0 mode, 2 wait for a frame, 3 complete it (the NGP_METHOD_*

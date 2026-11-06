@@ -56,6 +56,10 @@ static struct {
 
 extern "C" bool native_legacy_display_probe_ready(void);
 extern "C" bool native_legacy_surface_ready(void);
+// GPU scanout hand-off counters (NativeGOPPresenter.cpp): offers the presenter took, completions it got back, failed
+// copies, and swaps taken back by the flip timeout (the display then falls back to its own copy for that frame).
+extern "C" {extern volatile uint64_t native_gop_gpu_offers,native_gop_gpu_completions,native_gop_gpu_failures,native_gop_gpu_abandoned;
+extern volatile uint64_t native_gop_wait_stats[7];}
 extern "C" int boot_progress_prepare_scanout(void) __attribute__((weak_import));
 
 extern "C" kern_return_t native_start_kext_and_report(const char *identifier,
@@ -264,12 +268,18 @@ static void reportDisplayState(const char *trigger) {
     const uint64_t lastFrame = __atomic_load_n(&displayStats.lastFrameTick, __ATOMIC_RELAXED);
     const uint64_t lastTransfer = __atomic_load_n(&displayStats.lastTransferTick, __ATOMIC_RELAXED);
     const uint64_t lastRetire = __atomic_load_n(&displayStats.lastRetireTick, __ATOMIC_RELAXED);
+    // Short line first: the long one is long enough that another core's printf can split it and drop the hand-off
+    // counters. waits/timeouts come from the presenter's waitSwap stats ([0] calls, [1] timeouts).
+    printf("PICASSO_DISPLAY_GPU offers=%llu done=%llu fail=%llu abandoned=%llu waits=%llu wait_to=%llu\n",
+        (unsigned long long)native_gop_gpu_offers, (unsigned long long)native_gop_gpu_completions,
+        (unsigned long long)native_gop_gpu_failures, (unsigned long long)native_gop_gpu_abandoned,
+        (unsigned long long)native_gop_wait_stats[0], (unsigned long long)native_gop_wait_stats[1]);
     printf("PICASSO_DISPLAY_STATE trigger=%s now_ns=%llu submit=%llu accept=%llu reject=%llu "
         "reasons=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu scans=%llu blank=%llu nonblack=%llu "
         "transfer=%llu transfer_fail=%llu retire=%llu retire_fail=%llu copies=%llu copy_bytes=%llu "
         "last_submit_ns=%llu last_frame_ns=%llu last_transfer_ns=%llu last_retire_ns=%llu "
         "last_copy_ticks=%llu last_copy_bytes=%llu last_pixels=%llu bbox=%llu,%llu-%llu,%llu "
-        "last_status=%x vsync_ticks=%llu\n",
+        "last_status=%x vsync_ticks=%llu gpu_offers=%llu gpu_done=%llu gpu_fail=%llu gpu_abandoned=%llu\n",
         trigger, (unsigned long long)absoluteNanoseconds(now),
         (unsigned long long)__atomic_load_n(&displayStats.submissions, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&displayStats.accepted, __ATOMIC_RELAXED),
@@ -303,7 +313,9 @@ static void reportDisplayState(const char *trigger) {
         (unsigned long long)__atomic_load_n(&displayStats.lastMaxX, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&displayStats.lastMaxY, __ATOMIC_RELAXED),
         __atomic_load_n(&displayStats.lastTransferStatus, __ATOMIC_RELAXED),
-        (unsigned long long)__atomic_load_n(&displayStats.vsyncTicks, __ATOMIC_RELAXED));
+        (unsigned long long)__atomic_load_n(&displayStats.vsyncTicks, __ATOMIC_RELAXED),
+        (unsigned long long)native_gop_gpu_offers, (unsigned long long)native_gop_gpu_completions,
+        (unsigned long long)native_gop_gpu_failures, (unsigned long long)native_gop_gpu_abandoned);
 }
 
 extern "C" void native_legacy_display_state_report(void) {
@@ -484,6 +496,14 @@ extern "C" bool native_legacy_surface_ready(void) {
  * judged from the serial log alone. A 12x24 luminance grid, one hex digit per
  * cell, is sampled every sheng-display-grid seconds; read-only, and inactive
  * unless that boot argument is present. */
+/* Kernel virtual address of the display mapping and its geometry, read by the
+ * CDC "snapshot" command (bsd/dev/picasso_usb.c). The mapping is created for
+ * the display policy check regardless of sheng-display-grid, so the command
+ * works in every image; it only ever reads. */
+extern "C" volatile uint64_t picasso_snapshot_virtual = 0;
+extern "C" volatile uint32_t picasso_snapshot_width = 0, picasso_snapshot_height = 0,
+    picasso_snapshot_stride = 0;
+
 static uint64_t gridPhysical, gridBytes, gridPeriodMs;
 static uint32_t gridWidth, gridHeight, gridStride;
 
@@ -506,6 +526,7 @@ static void gridSampleThread(void *, wait_result_t)
         reportDisplayState("grid");
         for (uint32_t row = 0; row < 24; ++row) {
             char text[13];
+            uint32_t raw[12];
             for (uint32_t col = 0; col < 12; ++col) {
                 const uint32_t x = (col * gridWidth + gridWidth / 2) / 12;
                 const uint32_t y = (row * gridHeight + gridHeight / 2) / 24;
@@ -513,14 +534,45 @@ static void gridSampleThread(void *, wait_result_t)
                     reinterpret_cast<volatile const uint32_t *>(
                         fb + uint64_t(y) * gridStride + uint64_t(x) * 4);
                 const uint32_t value = *pixel;
+                raw[col] = value;
                 const uint32_t luma = ((value & 0xff) * 11 +
                     ((value >> 8) & 0xff) * 59 + ((value >> 16) & 0xff) * 30) / 100;
                 text[col] = "0123456789abcdef"[luma >> 4];
             }
             text[12] = 0;
             printf("PICASSO_GRID %02u %s\n", row, text);
+            /* The luma digit cannot tell a translucent red bar from gray; the top rows carry the
+             * status bar, so print their exact BGRX samples for the provider check. */
+            if (row < 7) {
+                char hex[12 * 9 + 1];
+                int at = 0;
+                for (uint32_t col = 0; col < 12; ++col) {
+                    at += snprintf(hex + at, sizeof(hex) - at, "%08x ", raw[col]);
+                }
+                printf("PICASSO_GRID_RGB %02u %s\n", row, hex);
+            }
         }
     }
+}
+
+/* The mode the display presents to userland, which is not always the panel's
+ * row count: the phone identity asks for a 1080x2340 canvas over this
+ * 1080x2400 panel, and the copy path centres it with 30-row black bars. The
+ * height comes from the board ADT (built by make-picasso-adt.py) so the
+ * command line stays within its 1000-byte budget. A missing, zero or
+ * out-of-range value keeps the panel geometry. */
+extern "C" uint32_t native_legacy_display_mode_height(uint32_t panelHeight) {
+    uint32_t height = 0;
+    IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+    if (chosen) {
+        OSObject *property = chosen->getProperty("display-height");
+        OSData *data = OSDynamicCast(OSData, property);
+        if (data && data->getLength() == sizeof(height))
+            memcpy(&height, data->getBytesNoCopy(), sizeof(height));
+        OSSafeReleaseNULL(chosen);
+    }
+    if (height < panelHeight / 2 || height > panelHeight) height = panelHeight;
+    return height;
 }
 
 extern "C" bool native_legacy_gop_mapping_observed(IOService *, IOMemoryMap *map, uint32_t width, uint32_t height) {
@@ -529,18 +581,34 @@ extern "C" bool native_legacy_gop_mapping_observed(IOService *, IOMemoryMap *map
         width != video.v_width || height != video.v_height) return false;
     if (displayChosen) return false;
     displayChosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
-    // Two scanout pixels per UI point. This is UI policy, not physical DPI.
-    bool ok = displayChosen && matchWord(displayChosen, "display-scale", 2, scaleAdded) &&
+    // Two scanout pixels per UI point. This is UI policy, not physical DPI; sheng-display-scale overrides it for a
+    // phone layout (1080x2400 at 3 -> 360x800 pt). When the command line does not repeat the scale, the identity's
+    // own /chosen value (the one UIKit reads) is the expectation instead of the 2 default: the phone identity puts
+    // 3 there, and a mismatch used to fail the start below (no main CADisplay, wf178-wf191).
+    uint32_t displayScale = 2;
+    bool scaleArg = PE_parse_boot_argn("sheng-display-scale", &displayScale, static_cast<int>(sizeof displayScale));
+    if (!scaleArg && displayChosen) {
+        OSObject *property = displayChosen->getProperty("display-scale");
+        OSData *data = OSDynamicCast(OSData, property);
+        if (data && data->getLength() == sizeof displayScale)
+            memcpy(&displayScale, data->getBytesNoCopy(), sizeof displayScale);
+    }
+    if (displayScale < 1 || displayScale > 4) displayScale = 2;
+    bool ok = displayChosen && matchWord(displayChosen, "display-scale", displayScale, scaleAdded) &&
         matchWord(displayChosen, "display-rotation", 0, rotationAdded);
     if (!ok) finishDisplayPolicy(false);
-    printf("PICASSO_DISPLAY mapped ok=%u base=%llx bytes=%llx width=%u height=%u stride=%lu depth=%lu console=%lu scale=2\n",
+    printf("PICASSO_DISPLAY mapped ok=%u base=%llx bytes=%llx width=%u height=%u stride=%lu depth=%lu console=%lu scale=%u\n",
         ok, map->getPhysicalAddress(), map->getLength(), width, height,
-        video.v_rowBytes, video.v_depth, video.v_display);
+        video.v_rowBytes, video.v_depth, video.v_display, displayScale);
     gridPhysical = map->getPhysicalAddress();
     gridBytes = map->getLength();
     gridWidth = width;
     gridHeight = height;
     gridStride = video.v_rowBytes;
+    picasso_snapshot_virtual = static_cast<uint64_t>(map->getVirtualAddress());
+    picasso_snapshot_width = width;
+    picasso_snapshot_height = height;
+    picasso_snapshot_stride = static_cast<uint32_t>(video.v_rowBytes);
     uint32_t gridSeconds = 0;
     if (PE_parse_boot_argn("sheng-display-grid", &gridSeconds,
             static_cast<int>(sizeof gridSeconds)) && gridSeconds) {

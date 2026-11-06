@@ -1,0 +1,86 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8290,3 +8290,79 @@
++#if DEVELOPMENT || DEBUG
++/* CoreAnimation allocates Apple's lossless-compressed '&BGA' scanout surface as soon as the render server owns a
++ * published Metal device, but this port's GPU (Turnip) writes plain BGRA rows and the display copies plain rows.
++ * The three preferences below are what a real device reads at process start (vphone-cli does the same for its
++ * iOS 17.7 guest): the current-application domain is backboardd, the global domain is cfprefsd's fallback. They
++ * must be on disk before backboardd starts; setting them from the plugin is too late. */
++static const uint8_t native_picasso_ca_prefs_plist[] = {
++	0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, 0xd3, 0x01, 0x02, 0x03,
++	0x04, 0x04, 0x04, 0x5f, 0x10, 0x17, 0x43, 0x41, 0x45, 0x6e, 0x61, 0x62,
++	0x6c, 0x65, 0x44, 0x65, 0x65, 0x70, 0x46, 0x72, 0x61, 0x6d, 0x65, 0x62,
++	0x75, 0x66, 0x66, 0x65, 0x72, 0x5f, 0x10, 0x1e, 0x43, 0x41, 0x45, 0x6e,
++	0x61, 0x62, 0x6c, 0x65, 0x46, 0x72, 0x61, 0x6d, 0x65, 0x62, 0x75, 0x66,
++	0x66, 0x65, 0x72, 0x43, 0x6f, 0x6d, 0x70, 0x72, 0x65, 0x73, 0x73, 0x69,
++	0x6f, 0x6e, 0x5f, 0x10, 0x1c, 0x43, 0x41, 0x45, 0x6e, 0x61, 0x62, 0x6c,
++	0x65, 0x49, 0x4f, 0x53, 0x75, 0x72, 0x66, 0x61, 0x63, 0x65, 0x43, 0x6f,
++	0x6d, 0x70, 0x72, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x08, 0x08, 0x0f,
++	0x29, 0x4a, 0x69, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6a,
++};
++static int
++native_picasso_ca_mkdir(proc_t p, user_addr_t scratch, const char *path)
++{
++	struct mkdir_args request = {.path = scratch + 0xb00, .mode = 0755};
++	int32_t result = 0;
++	int error = copyout(path, request.path, strlen(path) + 1);
++	if (!error) {
++		error = mkdir(p, &request, &result);
++	}
++	if (error && error != EEXIST) {
++		return error;
++	}
++	return 0;
++}
++static int
++native_picasso_ca_pref_write(const char *path)
++{
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	int error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, 0644, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	int resid = 0;
++	error = vn_rdwr(UIO_WRITE, vp, (caddr_t)native_picasso_ca_prefs_plist,
++	    (int)sizeof(native_picasso_ca_prefs_plist), 0, UIO_SYSSPACE, IO_NOAUTH | IO_UNIT,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	if (!error && resid) {
++		error = EIO;
++	}
++	if (!error) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_mode, 0644);
++		VATTR_SET(&va, va_uid, 501);
++		VATTR_SET(&va, va_gid, 501);
++		error = vnode_setattr(vp, &va, ctx);
++	}
++	if (!error) {
++		error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++	}
++	int close_error = vnode_close(vp, FWRITE, ctx);
++	return error ? error : close_error;
++}
++static void
++native_picasso_ca_prefs(proc_t p, user_addr_t scratch)
++{
++	int mobile_dir = native_picasso_ca_mkdir(p, scratch, "/private/var/mobile/Library/Preferences");
++	int system_dir = native_picasso_ca_mkdir(p, scratch, "/private/var/preferences");
++	int mobile = mobile_dir ? mobile_dir : native_picasso_ca_pref_write(
++	    "/private/var/mobile/Library/Preferences/backboardd.plist");
++	int system = system_dir ? system_dir : native_picasso_ca_pref_write(
++	    "/private/var/preferences/.GlobalPreferences.plist");
++	printf("PICASSO_CA_PREFS mobile=%d system=%d\n", mobile, system);
++}
++#endif
+ static int
+ native_owner_data_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -8296,2 +8296,3 @@
+ 	if (!error) native_owner_data_stage = 4;
++	if (!error) native_picasso_ca_prefs(p, scratch);
+ 	if (!error) native_gpu_addon_prepare(p, scratch);
