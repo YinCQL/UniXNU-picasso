@@ -1,15 +1,13 @@
-# Board description of the Redmi K30 5G (picasso, SM7250), read by the unixnu build driver.
-# Minimal skeleton to build the UniXNU UEFI firmware. Kernel/IPSW/UserData sections are
-# placeholders to be filled during kernel bring-up.
+# Redmi K30 5G (picasso, SM7250) configuration for the legacy UniXNU build driver.
 
 [board]
 name = "picasso"
 soc = "SM7250"
+os_profile = "ipados-17.7.11-21H461"
 description = "Redmi K30 5G"
 kit = "picasso"
 
-# Target OS image. PLACEHOLDER   select an IPSW whose ARM version is compatible with
-# SM7250 (ARMv8.2 / Cortex-A76). Only needed for the kernel step, not for firmware.
+# Target iPadOS image; independent of the firmware build inputs.
 [ipsw]
 # Same unchanged iPad7,1 iPadOS 17.7.11 image uke (SM7675) and sheng (SM8550) use.
 # SM7250 (ARMv8.2 / Cortex-A76) is instruction-compatible with this kernel source.
@@ -223,12 +221,8 @@ kernel_args = [
   # timebase+yield path has been exercised on hardware; scans also yield at
   # every 128 KiB batch so CDC keeps draining.
   "native-ufs-delay-yield=1",
-  # Command tracing stays off. It prints two lines per SCSI/query command
-  # (NATIVE_UFS_NOP clear=begin/end, named for the UCD clear they share), and a
-  # boot that is reading the root volume emits them continuously, which buries
-  # every other message. Set it back to 1 only when the UFS transport itself is
-  # the question.
-  "native-ufs-diagnostics=0",
+  # UFS command tracing defaults off; add native-ufs-diagnostics=1 only for a
+  # transport investigation. Omit the redundant =0 to preserve argument space.
   # Request the optional NativeUfs store window for changed Data pages.
   # The generated APFS seed has 1024 MiB sparse logical capacity.
   "sheng-data-persist=2",
@@ -273,10 +267,8 @@ kernel_args = [
   # this, the read-only guard sees zero matches and deliberately leaves the
   # controller untouched.
   "picasso_usb_smmu=6",
-  # Let bsd_init continue to root mounting after the CDC poller starts.
-  # hold=1 parks bsd_init indefinitely for USB-only qualification; that mode
-  # cannot exercise this branch's UFS/root/SystemOS path.
-  "picasso_usb_hold=0",
+  # The CDC hold defaults to 0, allowing root mounting. picasso_usb_hold=1 is
+  # reserved for USB-only qualification and parks bsd_init indefinitely.
   # Bound the attended synchronous window while still leaving time to issue
   # status/start-graphics/register-display/publish-display-start commands.
   "picasso_usb_control_ms=15000",
@@ -424,7 +416,7 @@ root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 # and 4 GiB device-tree banks, 5 GiB). Device DH-B (wf141) measured 4.95 GiB of
 # managed RAM this way, up from 768 MiB; DarwinBoot clamps the request to the
 # largest free run if the memory map is smaller. Keep the packed Data seed:
-# it is sparse, so its logical 8 GiB costs only the pages actually written.
+# it is sparse, so its logical capacity costs only the pages actually written.
 owned_memory_size = "0x140000000"
 cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
 unique_chip_id = "required"

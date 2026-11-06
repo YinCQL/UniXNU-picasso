@@ -1,0 +1,21 @@
+name: Build Picasso Kernel (Linux)
+
+# GitHub requires workflow_dispatch on the default branch to show Run workflow.
+# Selecting test/pr17 runs that branch's full workflow at this same file path.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  select_build_branch:
+    name: Select test/pr17 for a Linux kernel build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Explain how to select the kernel build branch
+        run: |
+          echo 'Select test/pr17 in Run workflow to compile the Picasso kernel.'
+          echo 'The main branch only provides this manual workflow entry point.'
+          echo 'To build the Linux kernel, select test/pr17 in the Run workflow branch menu.' >> "$GITHUB_STEP_SUMMARY"
