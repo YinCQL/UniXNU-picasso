@@ -83,6 +83,7 @@ def main():
             command += ['--kernel-arg', arg]
         subprocess.run(command, cwd=ROOT, check=True)
         subprocess.run([sys.executable, str(tree / 'unixnu'), 'bootimg', *common,
+                        '--uefi', str(ROOT / 'uefi/mu-silicium'),
                         '--fd', str(fd), '--dtb', str(ROOT / 'uefi/mu-silicium/Resources/DTBs/picasso-topology.dtb'),
                         '--ramdisk', str(output / 'picasso/payload/payload.img'),
                         '--output', str(output / f'picasso/boot/{tag}.img')], cwd=ROOT, check=True)
