@@ -25,7 +25,7 @@ concurrency:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     defaults:
       run:
@@ -58,6 +58,12 @@ jobs:
           TREE=$(python3 ./unixnu --prepare)
           echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
           mkdir -p out/picasso/logs
+
+      - name: Check Linux dependency reuse and live host verification
+        run: |
+          python3 scripts/check-picasso-linux-host.py --tree "$UNIXNU_TREE" --live \
+            --output out/picasso/host-checks/linux-host
+          cp out/picasso/host-checks/linux-host/results.json out/picasso/logs/linux-host-deps-host.json
 
       - name: Replay UI runtime XNU changes and check errors
         run: |
