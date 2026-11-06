@@ -69,13 +69,13 @@ int main() {
         assert(!state.adopt(bus) && !state.set(bus,false) && !state.set(bus,true));
         assert(bus.regs[1][0x51]==src);++cases;
         bus.regs[1][0x51]^=1;
-        assert(state.set(bus,false) && state.failed);++cases;
+        assert(state.set(bus,false) && !state.failed);++cases;
     }
     const unsigned changed[]={8,0x46,0xb0};
     for(unsigned reg:changed) {
         Bus bus;State state;assert(!state.adopt(bus));
         bus.regs[reg==0xb0][reg]^=reg==0xb0?0x40:1;
-        assert(state.set(bus,false) && state.failed && !bus.writes);++cases;
+        assert(state.set(bus,false) && !state.failed && !bus.writes);++cases;
     }
     // The WLED5 sequence is two brightness bytes, then MOD_A sync 0 -> 1.
     const unsigned goals[]={42,1023,2048,4095};
@@ -98,7 +98,7 @@ int main() {
     const unsigned mismatches[]={6,9,11,13,15,16,17};
     for(unsigned n : mismatches) {
         Bus bus; State state;assert(!state.adopt(bus));bus.mismatch=bus.operations+n;
-        assert(state.brightness(bus,4095) && state.failed);++cases;
+        assert(state.brightness(bus,4095) && state.failed==(n!=6));++cases;
     }
     const unsigned badGoals[]={0,1,41,4096,0xffffffff};
     for(unsigned badGoal : badGoals) {
@@ -108,11 +108,28 @@ int main() {
     {
         Bus bus;State state;assert(!state.adopt(bus));assert(!state.set(bus,false));
         assert(!state.brightness(bus,42) && !state.on);assert(!state.set(bus,true));++cases;
-        bus.regs[1][0x51]^=1;assert(state.brightness(bus,4095) && state.failed);++cases;
+        bus.regs[1][0x51]^=1;assert(state.brightness(bus,4095) && !state.failed);++cases;
     }
     {
         Bus bus;State state;assert(!state.adopt(bus));bus.regs[1][0x65]=2;
-        assert(state.brightness(bus,42) && state.failed && !bus.writes);++cases;
+        assert(state.brightness(bus,42) && !state.failed && !bus.writes);++cases;
+    }
+    // Real build170's -3 is a preflight rejection, with no failed SPMI op.
+    // Preserve exact operands; no diagnostic re-reads and no automatic retry.
+    for(unsigned which=0;which<6;++which) {
+        Bus bus;State state;assert(!state.adopt(bus));
+        const unsigned regs[]={0x46,8,0xb0,0x51,0x53,0x65};
+        const unsigned masks[]={1,1,0x40,1,1,2};
+        bool sink=which>=2;unsigned reg=regs[which];uint8_t before=bus.regs[sink][reg];
+        bus.regs[sink][reg]^=masks[which];
+        assert(state.brightness(bus,4095)==picasso_backlight::configuration && !state.failed && !bus.writes);
+        assert(state.stage==(which<4?1:which==4?2:3));
+        if(which==0)assert(state.gate==bus.regs[0][0x46]);
+        if(which==1)assert(state.faults==bus.regs[0][8]);
+        if(which==2)assert(state.flash==bus.regs[1][0xb0]);
+        if(which==3)assert(state.currentSource==bus.regs[1][0x51]);
+        bus.regs[sink][reg]=before;
+        assert(!state.brightness(bus,4095) && !state.failed && state.level==4095);++cases;
     }
     picasso_backlight::Fade fade;
     fade.begin(1023,4095,1000,100);assert(fade.value(100)==1023 && fade.value(600)==2559);

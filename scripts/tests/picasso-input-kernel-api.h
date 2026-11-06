@@ -5,7 +5,7 @@
 #include <stddef.h>
 using kern_return_t=int;
 using IOReturn=int;
-enum {kIOReturnBadArgument=5,kIOReturnNotFound=4,kIOReturnUnsupported=3,kIOReturnNotReady=1,kIOReturnIOError=2,kIOReturnSuccess=0};
+enum {kIOReturnBadArgument=5,kIOReturnNotFound=4,kIOReturnUnsupported=3,kIOReturnBusy=6,kIOReturnNotReady=1,kIOReturnIOError=2,kIOReturnSuccess=0};
 class OSSymbol;
 class OSMetaClass {
 public:

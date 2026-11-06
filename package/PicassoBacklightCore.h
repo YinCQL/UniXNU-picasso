@@ -11,20 +11,6 @@ constexpr int mismatch = -2, configuration = -3;
 // enable (stock wled5_sample_hold_control). Keep that unqualified path out.
 constexpr uint32_t min_level = 42, max_level = 4095;
 inline uint32_t clamp(uint32_t n) { return n ? n<min_level?min_level:n>max_level?max_level:n : 0; }
-// Decode a finite IEEE binary64 normalized value with integer arithmetic only.
-// Reject negative (except -0), NaN, infinity and >1; round to the nearest level.
-inline bool normalized(uint64_t ieee, uint32_t *level) {
-    uint64_t magnitude = ieee & 0x7fffffffffffffffULL;
-    if ((ieee >> 63) && magnitude) return false;
-    if (magnitude > 0x3ff0000000000000ULL) return false;
-    unsigned exponent = unsigned(magnitude >> 52);
-    if (exponent < 1010) { *level = 0; return true; }
-    unsigned shift = 1075 - exponent; // [52,65]; product needs 65 bits.
-    uint64_t significand = (magnitude & 0xfffffffffffffULL) | (1ULL << 52);
-    unsigned __int128 scaled = (unsigned __int128)significand * max_level;
-    *level = uint32_t((scaled + ((unsigned __int128)1 << (shift - 1))) >> shift);
-    return true;
-}
 struct Fade {
     uint32_t from=0,to=0,duration=0;uint64_t start=0;
     void begin(uint32_t current,uint32_t target,uint32_t ms,uint64_t now) {
@@ -58,6 +44,11 @@ struct State {
     bool ready = false, on = false, failed = false;
     uint8_t module = 0, source = 0;
     uint32_t level = 0;
+    // 1=gate/fault/flash/source, 2=old level, 3=sync, 4=power writes,
+    // 5=brightness writes/readback. These are snapshots, not extra bus reads.
+    uint8_t stage = 0, gate = 0, faults = 0, flash = 0, currentSource = 0;
+    uint8_t sync = 0;
+    uint32_t observedLevel = 0;
     // No brightness/current/voltage/IRQ changes during adoption. The shipped
     // g7a DT selects MOD_A, 12-bit brightness, strings 0..2. Boot160 uses HIGH, not DT CABC1.
     template<class Bus> int adopt(Bus &bus) {
@@ -91,14 +82,22 @@ struct State {
     }
     template<class Bus> int set(Bus &bus, bool requested) {
         if (!ready || failed) return configuration;
-        uint8_t actual = 0, faults = 0, flash = 0, currentSource = 0;
-        int error = bus.read(false, 0x46, actual);
+        stage = 1;
+        gate = faults = flash = currentSource = 0;
+        int error = bus.read(false, 0x46, gate);
         if (!error) error = bus.read(false, 0x08, faults);
         if (!error) error = bus.read(true, 0xb0, flash);
         if (!error) error = bus.read(true, 0x51, currentSource);
-        if (!error && (currentSource != source || actual != uint8_t((module & 0x7f) | (on ? 0x80 : 0)) ||
+        if (!error && (currentSource != source || gate != uint8_t((module & 0x7f) | (on ? 0x80 : 0)) ||
                        (faults & 7) || (flash & 0xc0))) error = configuration;
-        if (!error && requested == on) return 0;
+        if (error) {
+            // A fully completed read-only validation is safe to repeat on the
+            // next caller request. A bus error is not: it poisons the channel.
+            if (error != configuration) failed = true;
+            return error;
+        }
+        if (requested == on) return 0;
+        stage = 4;
         // HFRC off before module gate; clear flash shutdown on enable, then
         // allow the documented soft-start interval. No PMIC IRQ is claimed.
         if (!error) error = checked_write(bus, false, 0xef, requested ? 0 : 3);
@@ -121,21 +120,27 @@ struct State {
         // Read/validate the adopted gate, source, fault and flash state before
         // changing the MOD_A brightness. No CABC/current/voltage reprogramming.
         int error=set(bus,on);
-        uint8_t lo=0,hi=0,sync=0;
+        if(error)return error;
+        stage=2;
+        uint8_t lo=0,hi=0;
+        sync=0;
         if(!error)error=bus.read(true,0x53,lo);
         if(!error)error=bus.read(true,0x54,hi);
-        if(!error && (uint32_t(lo)|(uint32_t(hi)<<8))!=level)error=configuration;
+        observedLevel=uint32_t(lo)|(uint32_t(hi)<<8);
+        if(!error && observedLevel!=level)return configuration;
         if(!error && level==requested)return 0;
-        if(!error)error=bus.read(true,0x65,sync);
+        if(!error) {stage=3;error=bus.read(true,0x65,sync);}
         // MOD_B must not be active; retain unrelated upper register bits.
-        if(!error && (sync&0x0e))error=configuration;
+        if(!error && (sync&0x0e))return configuration;
+        if(!error)stage=5;
         if(!error)error=checked_write(bus,true,0x53,uint8_t(requested));
         if(!error)error=checked_write(bus,true,0x54,uint8_t(requested>>8));
         if(!error)error=checked_write(bus,true,0x65,uint8_t(sync&0xf0));
         if(!error)error=checked_write(bus,true,0x65,uint8_t((sync&0xf0)|1));
         if(!error)error=bus.read(true,0x53,lo);
         if(!error)error=bus.read(true,0x54,hi);
-        if(!error && (uint32_t(lo)|(uint32_t(hi)<<8))!=requested)error=mismatch;
+        observedLevel=uint32_t(lo)|(uint32_t(hi)<<8);
+        if(!error && observedLevel!=requested)error=mismatch;
         if(error)failed=true;else level=requested;
         return error;
     }

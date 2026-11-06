@@ -43,23 +43,36 @@ struct Backend {
     IOService *display = nullptr;
     IOLock *lock = nullptr;
     picasso_backlight::State state;
-    unsigned reports = 0;
+    unsigned reports = 0, errorReports = 0;
+    bool lastSink = false, lastWrite = false;
+    uint8_t lastReg = 0, lastValue = 0;
+    int lastError = 0;
+    void report_error(int error) {
+        if (errorReports >= 16) return;
+        ++errorReports;
+        IOLog("PICASSO_WLED rejected error=%d fatal=%u stage=%u gate=%02x expected=%02x fault=%02x flash=%02x source=%02x expected_source=%02x level=%u expected_level=%u sync=%02x last_write=%u last_sink=%u last_reg=%02x last_value=%02x transport=%d\n",
+            error,state.failed,state.stage,state.gate,uint8_t((state.module&0x7f)|(state.on?0x80:0)),
+            state.faults,state.flash,state.currentSource,state.source,state.observedLevel,state.level,state.sync,
+            lastWrite,lastSink,lastReg,lastValue,lastError);
+    }
     bool adopting = true;
     bool displayOn = true;
     uint32_t requested = 0;
     int read(bool sink, uint8_t reg, uint8_t &value) {
         Channel channel{observer[sink].va};
         int error = picasso_buttons::read8(channel, reg, value);
+        lastWrite=false;lastSink=sink;lastReg=reg;lastValue=value;lastError=error;
         if (error || adopting) IOLog("PICASSO_WLED read sink=%u reg=%02x value=%02x error=%d\n",sink,reg,value,error);
         return error;
     }
     int write(bool sink, uint8_t reg, uint8_t value) {
+        lastWrite=true;lastSink=sink;lastReg=reg;lastValue=value;lastError=-1;
         Channel channel{writer[sink].va};
         channel.write(0x10,value);
         channel.write(0,uint32_t(reg)<<4); // v5 EXT_WRITEL, 1 byte
         for (unsigned n=0;n<1000;++n) {
             uint32_t status=channel.read(8);
-            if (status & 1) return int(status & 0xe);
+            if (status & 1) {lastError=int(status & 0xe);return lastError;}
             channel.delay();
         }
         return -1;
@@ -124,8 +137,10 @@ extern "C" IOReturn picasso_backlight_power(IOService *provider, bool on) {
     if(!error)error=b->state.set(*b,on && b->requested!=0);
     if(!error)b->displayOn=on;
     if(b->reports<64) {++b->reports;IOLog("PICASSO_WLED power=%u error=%d verified=%u\n",on,error,!error); }
+    if(error)b->report_error(error);
+    IOReturn result=!error?kIOReturnSuccess:b->state.failed?kIOReturnIOError:kIOReturnBusy;
     IOLockUnlock(b->lock);
-    return error?kIOReturnIOError:kIOReturnSuccess;
+    return result;
 }
 extern "C" IOReturn picasso_backlight_level(uint32_t level) {
     Backend *b=__atomic_load_n(&backend,__ATOMIC_ACQUIRE);
@@ -139,11 +154,13 @@ extern "C" IOReturn picasso_backlight_level(uint32_t level) {
         if(!error)error=b->state.set(*b,level!=0);
     }
     if(!error)b->requested=level;
-    if(error || b->reports<128 || (b->reports&63)==0) {IOLog("PICASSO_WLED brightness=%u applied=%u deferred=%u error=%d\n",
+    if(b->reports<128 || (b->reports&63)==0) {IOLog("PICASSO_WLED brightness=%u applied=%u deferred=%u error=%d\n",
         level,b->state.on?b->state.level:0,!b->displayOn,error);}
     ++b->reports;
+    if(error)b->report_error(error);
+    IOReturn result=!error?kIOReturnSuccess:b->state.failed?kIOReturnIOError:kIOReturnBusy;
     IOLockUnlock(b->lock);
-    return error?kIOReturnIOError:kIOReturnSuccess;
+    return result;
 }
 extern "C" bool picasso_backlight_current(uint32_t *level) {
     Backend *b=__atomic_load_n(&backend,__ATOMIC_ACQUIRE);

@@ -31,7 +31,7 @@ def main():
     (out / 'startup-cache.inc').write_text(cache, newline='\n')
     iokit = (args.xnu / 'iokit/Kernel/IOUserClient.cpp').read_text()
     mac = '\n'.join(module.extract(iokit, name) for name in
-                    ('static int\npicasso_iokit_set_properties_check(',))
+                    ('static int\npicasso_brightness_caller(', 'static int\npicasso_iokit_set_properties_check(',))
     (out / 'brightness-mac.inc').write_text(mac, newline='\n')
     display = (ROOT / 'package/PicassoDisplay.cpp').read_text()
     network = module.extract(display, 'static void picasso_network_stack_start(')

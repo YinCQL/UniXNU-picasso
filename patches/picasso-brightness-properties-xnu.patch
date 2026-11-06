@@ -4,15 +4,42 @@
  #include <libkern/c++/OSKext.h>
 +#include <libkern/c++/OSCollectionIterator.h>
  #include <libkern/c++/OSSharedPtr.h>
-@@ -4237,6 +4238,73 @@
+@@ -47,6 +48,8 @@
+ #include <libkern/OSDebug.h>
+ #include <DriverKit/OSAction.h>
+ #include <sys/proc.h>
++#include <sys/vnode.h>
++#include <sys/codesign.h>
+ #if DEVELOPMENT || DEBUG
+ #include <kern/thread.h>
+ #endif
+@@ -4237,6 +4240,85 @@
  
  
  static bool native_sandbox_grant(IOService * service);
-+// Only the live board service can select the brightness-only property protocol.
-+// The fallback actually discards unsupported optional properties and reruns MAC;
-+// no rejected property is forwarded and no service/open permission is granted.
++// Board-scoped backlight compatibility follows the display tutorial. Only the
++// original platform backboardd may send this service's typed actuator request;
++// no generic user-client/open grant or telemetry-to-command conversion.
 +extern "C" bool picasso_brightness_is_service(IORegistryEntry *) __attribute__((weak_import));
 +#if CONFIG_MACF
++static int
++picasso_brightness_caller(void)
++{
++	proc_t p = (proc_t)get_bsdtask_info(current_task());
++	if (!p) return 1;
++	if (!csproc_get_platform_binary(p)) return 2;
++	char name[32] = {};
++	proc_name(proc_selfpid(), name, sizeof(name));
++	if (strcmp(name, "backboardd")) return 3;
++	vnode_t vp = proc_getexecutablevnode(p);
++	if (!vp) return 4;
++	char path[128] = {};
++	int length = sizeof(path);
++	int error = vn_getpath(vp, path, &length);
++	vnode_put(vp);
++	return error ? 5 : strcmp(path, "/usr/libexec/backboardd") ? 6 : 0;
++}
++
 +static int
 +picasso_iokit_set_properties_check(IORegistryEntry *entry, OSObject **object)
 +{
@@ -23,39 +50,33 @@
 +	int original = mac_iokit_check_set_properties(kauth_cred_get(), entry, *object);
 +	if (!board) return original;
 +	int verdict = original;
-+	bool projected = false, attempted = false;
++	bool allowed = false;
 +	OSDictionary *dict = OSDynamicCast(OSDictionary, *object);
 +	OSNumber *level = dict ? OSDynamicCast(OSNumber, dict->getObject("brightness")) : nullptr;
 +	OSNumber *fade = dict ? OSDynamicCast(OSNumber, dict->getObject("FadePeriod")) : nullptr;
 +	OSNumber *panel = dict ? OSDynamicCast(OSNumber, dict->getObject("backlight-level")) : nullptr;
-+	// 20H392 CoreBrightness emits brightness, FadePeriod and optionally backlight-level.
-+	// The old board has no independent panel-brightness actuator. On MAC rejection,
-+	// negotiate the brightness-only subset; FadePeriod is not silently authorized.
-+	// Do not gate a second policy check on a redundant process-name/platform/path
-+	// heuristic. MAC checks the actual credential and service for every caller.
-+	bool valid = dict && level && level->unsigned64BitValue() <= 4095 &&
-+	    (!dict->getObject("FadePeriod") || (fade && fade->unsigned64BitValue() <= UINT32_MAX)) &&
-+	    (!dict->getObject("backlight-level") || (panel && panel->unsigned64BitValue() <= 4095)) &&
++	auto integer = [](OSNumber *n, uint64_t maximum) {
++		return n && (n->numberOfBits() == 8 || n->numberOfBits() == 16 ||
++		    n->numberOfBits() == 32 || n->numberOfBits() == 64) &&
++		    n->unsigned64BitValue() <= maximum;
++	};
++	bool valid = dict && integer(level, 4095) &&
++	    (!dict->getObject("FadePeriod") || integer(fade, UINT32_MAX)) &&
++	    (!dict->getObject("backlight-level") || integer(panel, 4095)) &&
 +	    dict->getCount() == 1U + (fade ? 1U : 0U) + (panel ? 1U : 0U);
-+	if (original && valid && (fade || panel)) {
-+		OSDictionary *subset = OSDictionary::withCapacity(1);
-+		if (subset && subset->setObject("brightness", level)) {
-+			attempted = true;
-+			verdict = mac_iokit_check_set_properties(kauth_cred_get(), entry, subset);
-+			if (!verdict) {
-+				(*object)->release();
-+				*object = subset;
-+				subset = nullptr;
-+				projected = true;
-+			}
-+		}
-+		OSSafeReleaseNULL(subset);
++	int caller = original && valid ? picasso_brightness_caller() : -1;
++	if (original && valid && caller == 0) {
++		// Original profiles cannot name this board driver. The tutorial grants
++		// all service properties by process name; constrain that rule here to
++		// this exact live service, executable identity and three integer keys.
++		allowed = true;
++		verdict = 0;
 +	}
 +	static unsigned reports;
 +	unsigned ticket = __atomic_fetch_add(&reports, 1U, __ATOMIC_RELAXED);
 +	if (ticket < 128 || !(ticket & 63))
-+		IOLog("PICASSO_BRIGHTNESS mac original=%d final=%d brightness_only=%u valid=%u attempted=%u pid=%d\n",
-+		    original, verdict, projected, valid, attempted, proc_selfpid());
++		IOLog("PICASSO_BRIGHTNESS mac original=%d final=%d backlight_rule=%u valid=%u caller=%d pid=%d\n",
++		    original, verdict, allowed, valid, caller, proc_selfpid());
 +	dict = OSDynamicCast(OSDictionary, *object);
 +	if (dict && ticket < 16) {
 +		OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
