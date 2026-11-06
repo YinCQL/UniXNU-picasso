@@ -1905,12 +1905,20 @@ bool publishMetal()
             unsigned(kIOReturnError));
         return false;
     }
-    /* Do not publish MetalPluginName/MetalPluginClassName for a library that
-     * is absent from this image. _MTLRegisterDevices uses those keys to load
-     * a plugin; a registered IOGPU provider alone cannot supply texture layouts.
+    /* Advertise the Metal plugin only when the payload actually carries the
+     * owner addon (sheng-gpu-addon=1). _MTLRegisterDevices uses these keys to
+     * load a bundle; a registered IOGPU provider alone cannot supply texture
+     * layouts, and advertising an absent bundle makes every Metal client fail.
      * Keep the process names this kernel's grant honours in place of the sandbox
      * verdict (this upstream's native_sandbox_grant matches names literally;
      * names are the first 16 characters proc_selfname reports). */
+    uint32_t addonValue = 0;
+    const bool advertisePlugin = PE_parse_boot_argn("sheng-gpu-addon",
+        &addonValue, static_cast<int>(sizeof addonValue)) && addonValue;
+    if (advertisePlugin) {
+        accelerator->setProperty("MetalPluginName", "NativeAdrenoMetal");
+        accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
+    }
     accelerator->setProperty("NativeSandboxGrantProcess",
         "backboardd,SpringBoard,mediaserverd,WidgetRenderer_D,"
         "iconservicesagent,posterboardd,Wallpaper");
@@ -1923,8 +1931,8 @@ bool publishMetal()
     }
     accelerator->registerService();
     stage = 5;
-    printf("PICASSO_GPU cp: metal stage=%u status=%08x registered=1 plugin=absent device_qualified=0\n",
-        stage, unsigned(kIOReturnSuccess));
+    printf("PICASSO_GPU cp: metal stage=%u status=%08x registered=1 plugin=%s device_qualified=0\n",
+        stage, unsigned(kIOReturnSuccess), advertisePlugin ? "declared" : "absent");
     return true;
 }
 

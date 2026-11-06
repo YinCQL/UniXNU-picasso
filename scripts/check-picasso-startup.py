@@ -7,6 +7,8 @@ import json
 import os
 import ast
 import plistlib
+import tomllib
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -64,8 +66,23 @@ def main():
     entry = module.extract(iokit, 'is_io_registry_entry_set_properties\n(')
     assert entry.count('picasso_iokit_set_properties_check(entry, &obj)') == 1
     assert entry.index('picasso_iokit_set_properties_check') < entry.index('entry->setProperties( obj )')
+    # Keep seed identity unchanged while applying only the approved runtime job release.
+    board = tomllib.loads((ROOT / 'board.toml').read_text())['payload']
+    assert board['runtime_enabled_jobs'] == ['com.apple.bluetoothd']
+    before = plistlib.dumps({job: True for job in board['offline_disabled_jobs']})
+    after = plistlib.dumps({job: True for job in board['offline_disabled_jobs'] if job not in board['runtime_enabled_jobs']})
+    constants = source[source.index('static const uint8_t picasso_jobs_before_sha'):source.index('static int\npicasso_jobs_match(')]
+    for name, data in [('before', before), ('after', after)]:
+        literal = re.search('picasso_jobs_' + name + r'_sha\[32\] = \{(.*?)\}', constants)[1]
+        assert bytes(int(n, 16) for n in literal.split(',')) == hashlib.sha256(data).digest()
+    policy = constants + '\n'.join(module.extract(source, name) for name in
+        ('static int\npicasso_jobs_match(', 'static int\npicasso_jobs_metadata(', 'static int\npicasso_jobs_sync(', 'static int\npicasso_jobs_enable('))
+    (out / 'runtime-jobs.inc').write_text(policy, newline='\n')
+    (out / 'jobs-data.inc').write_text('\n'.join('static const unsigned char jobs_' + name + '[] = {' + ','.join(str(n) for n in data) + '};' for name, data in [('before', before), ('after', after)]), newline='\n')
+    assert data_prepare.count('picasso_jobs_enable(p, scratch)') == 1
+    assert data_prepare.index('native_staged_apps_prepare(') < data_prepare.index('picasso_jobs_enable(')
     runs = []
-    for fixture in ('picasso-startup-cache-host.c', 'picasso-brightness-mac-host.cpp', 'picasso-network-start-host.cpp', 'picasso-network-config-host.c', 'picasso-network-observe-host.cpp', 'picasso-network-reader-host.c'):
+    for fixture in ('picasso-startup-cache-host.c', 'picasso-brightness-mac-host.cpp', 'picasso-network-start-host.cpp', 'picasso-network-config-host.c', 'picasso-network-observe-host.cpp', 'picasso-network-reader-host.c', 'picasso-runtime-jobs-host.c'):
         cpp = fixture.endswith('.cpp')
         compiler = shutil.which('clang++' if cpp else 'clang')
         if not compiler and os.name == 'nt':
@@ -83,7 +100,7 @@ def main():
                 if result.returncode:
                     raise RuntimeError(result.stdout + result.stderr)
                 runs.append(dict(name=name, stage=stage, passed=True))
-    inputs = [Path(__file__), ROOT / 'scripts/tests/picasso-startup-cache-host.c',
+    inputs = [Path(__file__), ROOT / 'board.toml', ROOT / 'unixnu', ROOT / 'patches/picasso-runtime-jobs-xnu.patch', ROOT / 'scripts/tests/picasso-runtime-jobs-host.c', ROOT / 'scripts/tests/picasso-startup-cache-host.c',
               ROOT / 'scripts/tests/picasso-brightness-mac-host.cpp',
               ROOT / 'scripts/tests/picasso-network-start-host.cpp', ROOT / 'scripts/tests/picasso-network-config-host.c',
               ROOT / 'scripts/tests/picasso-network-observe-host.cpp', ROOT / 'scripts/tests/picasso-network-reader-host.c', ROOT / 'package/PicassoDisplay.cpp',

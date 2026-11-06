@@ -24,14 +24,22 @@ using task_t=void *;
 using IOReturn=int;
 enum {kIOReturnSuccess=0,kIOReturnBadArgument=-1,kIOReturnNotReady=-2,
     kIOReturnNotOpen=-3,kIOReturnUnsupported=-4,kIOReturnError=-5,
-    kIOReturnNoMemory=-6,kIOReturnNoSpace=-7,kIOReturnUnderrun=-8};
+    kIOReturnNoMemory=-6,kIOReturnNoSpace=-7,kIOReturnUnderrun=-8,
+    kIODirectionIn=1};
 struct OSDictionary {};
 struct IOExternalMethodDispatch {};
 struct IOMemoryDescriptor {
     uint8_t bytes[256]={}; size_t length=256, written=0; bool shortWrite=false;
+    int prepareResult=kIOReturnSuccess,completeResult=0; unsigned prepares=0, completes=0;bool prepared=false;
     size_t getLength()const{return length;}
+    IOReturn prepare(int direction) {
+        assert(direction==kIODirectionIn);++prepares;prepared=prepareResult==0;return prepareResult;
+    }
+    IOReturn complete(int direction) {
+        assert(direction==kIODirectionIn && prepared);++completes;prepared=false;return completeResult;
+    }
     size_t writeBytes(size_t offset,const void *data,size_t n) {
-        assert(offset+n<=length);written=shortWrite?n-1:n;memcpy(bytes+offset,data,written);return written;
+        assert(prepared && offset+n<=length);written=shortWrite?n-1:n;memcpy(bytes+offset,data,written);return written;
     }
 };
 struct IOExternalMethodArguments {
@@ -129,10 +137,11 @@ int main() {
     assert(call(client,0,a)==0);
     a.scalarInput=&context;a.scalarInputCount=1;a.scalarOutput=&scalar;a.scalarOutputCount=1;
     assert(call(client,7,a)==0 && scalar==4);
+    // Reference compatibility ignores the context; this does not authenticate a bag.
     context=1;scalar=0xdeadbeef;
-    assert(call(client,7,a)==kIOReturnUnsupported && scalar==0xdeadbeef);
-    context=UINT64_MAX;assert(call(client,17,a)==kIOReturnUnsupported);
-    context=0;a.scalarInput=nullptr;assert(call(client,7,a)==kIOReturnBadArgument);
+    assert(call(client,7,a)==0 && scalar==4);
+    context=0;a.scalarInput=nullptr;
+    assert(call(client,7,a)==kIOReturnBadArgument);
     a.scalarInput=&context;
     uint8_t out[160];memset(out,0xa5,sizeof(out));
     a.scalarOutputCount=0;a.structureOutput=out;a.structureOutputSize=sizeof(out);
@@ -141,6 +150,9 @@ int main() {
     assert(state.at("ss")==4 && state.at("sls")==3 && state.at("bh")==0);
     size_t length=a.structureOutputSize;
     assert(out[length]==0xa5);
+    // Selector 31 is the configuration query: an empty DER SET, not device state.
+    memset(out,0xa5,sizeof(out));a.structureOutputSize=sizeof(out);
+    assert(call(client,31,a)==0 && a.structureOutputSize==2 && out[0]==0x31 && out[1]==0x00 && out[2]==0xa5);
     for(size_t size=0;size<length;++size) {
         a.structureOutputSize=(uint32_t)size;memset(out,0xa5,sizeof(out));
         assert(call(client,35,a)==kIOReturnNoSpace && a.structureOutputSize==size);
@@ -149,19 +161,44 @@ int main() {
     a.structureOutput=nullptr;a.structureOutputSize=0;
     IOMemoryDescriptor memory;a.structureOutputDescriptor=&memory;a.structureOutputDescriptorSize=(uint32_t)memory.length;
     assert(call(client,35,a)==0 && memory.written==length && decode(memory.bytes,length)==state);
+    assert(memory.prepares==1 && memory.completes==1);
     memory.written=0;a.structureOutputDescriptorSize=(uint32_t)length-1;
     assert(call(client,17,a)==kIOReturnNoSpace && !memory.written);
     a.structureOutputDescriptorSize=256;memory.length=length-1;
     assert(call(client,17,a)==kIOReturnNoSpace && !memory.written);
+    assert(memory.prepares==1 && memory.completes==1);
     memory.length=256;memory.shortWrite=true;
     assert(call(client,17,a)==kIOReturnUnderrun && a.structureOutputDescriptorSize==256);
+    // A short write still completes the prepared descriptor.
+    assert(memory.prepares==2 && memory.completes==2);
+    memory.shortWrite=false;memory.written=0;memory.prepareResult=kIOReturnError;
+    assert(call(client,17,a)==kIOReturnError && !memory.written);
+    assert(memory.prepares==3 && memory.completes==2);
+    memory.prepareResult=kIOReturnSuccess;memory.completeResult=kIOReturnError;
+    assert(call(client,17,a)==kIOReturnError && memory.completes==3 && !memory.prepared);
+    assert(a.structureOutputDescriptorSize==256);
     a.structureOutputDescriptor=nullptr;
+    // Bookkeeping selectors succeed with no scalar output and report no write.
+    for(unsigned selector:{4u,5u,9u,12u,13u,26u,27u,55u,101u,102u}) {
+        scalar=0xdeadbeef;a.scalarOutput=&scalar;a.scalarOutputCount=1;
+        assert(call(client,selector,a)==0 && a.scalarOutputCount==0 && scalar==0xdeadbeef);
+    }
+    // Selector 14 returns the upstream-compatible synthetic keybag handle 0.
+    scalar=0xdeadbeef;a.scalarOutput=&scalar;a.scalarOutputCount=1;
+    assert(call(client,14,a)==0 && scalar==0);
+    a.scalarOutputCount=0;assert(call(client,14,a)==kIOReturnBadArgument);
+    a.scalarOutputCount=1;
     processName="keybagd";
-    for(unsigned i=0;i<10;++i)picasso_aks_observed(14,kIOReturnUnsupported,true,0xdeadbeef);
+    for(unsigned i=0;i<10;++i)picasso_aks_observed(14,kIOReturnUnsupported,0,0,0,0,0xdeadbeef);
     processName="SpringBoard";
-    // All bag, unlock, crypto, assertion, notification and unknown operations fail.
+    // Selectors outside the explicit compatibility surface still fail.
+    static const unsigned bookkeeping[]={4,5,9,12,13,26,27,55,101,102};
     for(unsigned selector=1;selector<300;++selector) {
-        if(selector==7 || selector==17 || selector==35)continue;
+        if(selector==7 || selector==14 || selector==17 || selector==31 ||
+            selector==35)continue;
+        bool known=false;
+        for(unsigned candidate:bookkeeping)if(candidate==selector)known=true;
+        if(known)continue;
         scalar=0xdeadbeef;
         assert(call(client,selector,a)==kIOReturnUnsupported && scalar==0xdeadbeef);
     }
@@ -173,13 +210,13 @@ int main() {
     enabled=false;assert(call(client,7,a)==kIOReturnNotReady);enabled=true;
     assert(client->clientClose()==0 && call(client,7,a)==kIOReturnNotReady);
     client->release();
-    assert(diagnosticOutput.find("name=SpringBoard selector=7 sample=1 result=0 state_context=0x0")!=std::string::npos);
-    assert(diagnosticOutput.find("state_context=0x1")!=std::string::npos);
+    assert(diagnosticOutput.find("name=SpringBoard selector=7 sample=1 result=0 in=1 out=1 sin=0 sout=0 state_context=0x0")!=std::string::npos);
+    assert(diagnosticOutput.find("name=SpringBoard selector=7 sample=2 result=0 in=1 out=1 sin=0 sout=0 state_context=0x1")!=std::string::npos);
     assert(diagnosticOutput.find("name=keybagd selector=14 sample=2")!=std::string::npos);
     assert(diagnosticOutput.find("name=keybagd selector=14 sample=3")==std::string::npos);
     assert(diagnosticOutput.find("deadbeef")==std::string::npos);
     assert(diagnosticOutput.find("sample=3")==std::string::npos);
-    processName="securityd";picasso_aks_observed(0,kIOReturnSuccess,false,0);
+    processName="securityd";picasso_aks_observed(0,kIOReturnSuccess,0,0,0,0,0);
     assert(diagnosticOutput.find("name=securityd selector=0 sample=1 result=0")!=std::string::npos);
-    puts("PASS state ABI, no key operations, lifecycle failures, input/output bounds and short writes");
+    puts("PASS development compatibility ABI, no cryptography, lifecycle failures, input/output bounds and short writes");
 }

@@ -129,6 +129,11 @@ jobs:
           python3 scripts/check-picasso-buttons.py --output out/picasso/host-checks/buttons
           cp out/picasso/host-checks/buttons/results.json out/picasso/logs/buttons-host.json
 
+      - name: Check reviewed PR18 touch USB and sparse fixes
+        run: |
+          python3 scripts/check-picasso-pr18.py --output out/picasso/host-checks/pr18
+          cp out/picasso/host-checks/pr18/results.json out/picasso/logs/pr18-host.json
+
       - name: Check native HID event dispatch
         run: |
           python3 scripts/check-picasso-hid-events.py --output out/picasso/host-checks/hid-events
@@ -182,7 +187,7 @@ jobs:
           python3 scripts/check-picasso-runtime-memory.py --output out/picasso/host-checks/runtime-memory
           cp out/picasso/host-checks/runtime-memory/results.json out/picasso/logs/runtime-memory-host.json
 
-      - name: Check ephemeral keystore state boundaries
+      - name: Check unprotected KeyStore compatibility boundaries
         run: |
           python3 scripts/check-picasso-keystore.py --output out/picasso/host-checks/keystore
           cp out/picasso/host-checks/keystore/results.json out/picasso/logs/keystore-host-check.json
@@ -198,6 +203,8 @@ jobs:
             device/out/picasso/host-checks/display-policy/*.log
             device/out/picasso/host-checks/hid-plan/*.log
             device/out/picasso/host-checks/keystore/*.log
+            device/out/picasso/host-checks/pr18/*.log
+            device/out/picasso/host-checks/ui-runtime/startup/*.log
             device/out/picasso/host-checks/ufs-cache/*.log
             device/out/picasso/host-checks/ufs-persistence/*.log
             device/out/picasso/host-checks/novatek/*.log

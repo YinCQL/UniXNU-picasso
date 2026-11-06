@@ -1,0 +1,129 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9535,6 +9535,118 @@
+     printf("PICASSO_NETWORK config stage=%d error=%d stack_s=5 quiet_s=5\n", stage, error);
+ }
+ 
++/* Update the one approved launchd job before launchd opens its persistent
++ * overrides. The seed recipe/UUID stays stable. Unknown contents are preserved;
++ * only the exact shipped XML and the exact result are accepted. This does not
++ * provide Bluetooth hardware. Atomic rename leaves old or new policy on disk.
++ */
++static const uint8_t picasso_jobs_before_sha[32] = {0xc5,0x49,0xe5,0x7f,0x02,0x60,0xf4,0x82,0x98,0x95,0x3f,0xa2,0x14,0xff,0x2e,0x73,0x2a,0xe9,0xa3,0xd8,0x4d,0x57,0x5c,0x74,0xea,0x16,0xd6,0xbc,0xb3,0xce,0x4e,0x17};
++static const uint8_t picasso_jobs_after_sha[32] = {0x78,0x53,0xda,0x13,0x46,0x3f,0x30,0x91,0x2b,0x95,0x19,0x31,0xe7,0xed,0xc3,0xdc,0x31,0xc2,0xd3,0xf9,0xed,0x64,0x70,0x62,0x08,0xdb,0x43,0x34,0x14,0x83,0x11,0x50};
++
++static int
++picasso_jobs_match(const uint8_t *bytes, size_t size, const uint8_t expected[32])
++{
++    uint8_t digest[32]; SHA256_CTX sha;
++    SHA256_Init(&sha); SHA256_Update(&sha, bytes, size); SHA256_Final(digest, &sha);
++    return memcmp(digest, expected, sizeof(digest)) == 0;
++}
++
++static int
++picasso_jobs_metadata(const char *path, int type, vfs_context_t ctx)
++{
++    vnode_t vp = NULLVP;
++    int error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++    if (error) return error;
++    struct vnode_attr va;
++    VATTR_INIT(&va);
++    VATTR_WANTED(&va, va_uid); VATTR_WANTED(&va, va_gid);
++    VATTR_WANTED(&va, va_mode); VATTR_WANTED(&va, va_nlink);
++    if (vnode_vtype(vp) != type) error = EINVAL;
++    if (!error) error = vnode_getattr(vp, &va, ctx);
++    if (!error && (!VATTR_IS_SUPPORTED(&va, va_uid) || !VATTR_IS_SUPPORTED(&va, va_gid) ||
++        !VATTR_IS_SUPPORTED(&va, va_mode) || !VATTR_IS_SUPPORTED(&va, va_nlink) ||
++        va.va_uid || va.va_gid || (va.va_mode & 0022) ||
++        (type == VREG && va.va_nlink != 1))) error = EPERM;
++    vnode_put(vp);
++    return error;
++}
++
++static int
++picasso_jobs_sync(const char *path, vfs_context_t ctx)
++{
++    vnode_t vp = NULLVP;
++    int error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++    if (!error) { error = VNOP_FSYNC(vp, MNT_WAIT, ctx); vnode_put(vp); }
++    return error;
++}
++
++static int
++picasso_jobs_enable(proc_t p, user_addr_t scratch)
++{
++    static const char file[] = "/private/var/db/com.apple.xpc.launchd/disabled.plist";
++    static const char temp[] = "/private/var/db/com.apple.xpc.launchd/.picasso-disabled.tmp";
++    static const char entry[] = "\t<key>com.apple.bluetoothd</key>\n\t<true/>\n";
++    const char *dirs[] = {"/private/var", "/private/var/db", "/private/var/db/com.apple.xpc.launchd"};
++    vfs_context_t ctx = vfs_context_current();
++    int error = 0, changed = 0;
++    int32_t result = 0;
++    uint8_t *bytes = NULL;
++    uint64_t size = 0;
++    for (unsigned i = 0; !error && i < 3; ++i) error = picasso_jobs_metadata(dirs[i], VDIR, ctx);
++    if (!error) error = picasso_jobs_metadata(file, VREG, ctx);
++    if (error) goto done;
++    bytes = kalloc_data(8192, Z_WAITOK);
++    if (!bytes) { error = ENOMEM; goto done; }
++    error = picasso_ifnamer_read(file, bytes, 8192, &size, ctx);
++    if (error || picasso_jobs_match(bytes, (size_t)size, picasso_jobs_after_sha)) goto done;
++    if (!picasso_jobs_match(bytes, (size_t)size, picasso_jobs_before_sha)) { error = EINVAL; goto done; }
++    size_t at;
++    for (at = 0; at + sizeof(entry) - 1 <= size; ++at)
++        if (!memcmp(bytes + at, entry, sizeof(entry) - 1)) break;
++    if (at + sizeof(entry) - 1 > size) { error = EINVAL; goto done; }
++    memmove(bytes + at, bytes + at + sizeof(entry) - 1, (size_t)size - at - (sizeof(entry) - 1));
++    size -= sizeof(entry) - 1;
++    if (!picasso_jobs_match(bytes, (size_t)size, picasso_jobs_after_sha)) { error = EINVAL; goto done; }
++    /* A power loss may leave our exclusive temporary file. Never follow links. */
++    error = picasso_jobs_metadata(temp, VREG, ctx);
++    if (!error) {
++        struct unlink_args args = {.path = scratch};
++        error = copyout(temp, scratch, sizeof(temp));
++        if (!error) error = unlink(p, &args, &result);
++    } else if (error == ENOENT) error = 0;
++    if (error) goto done;
++    vnode_t vp = NULLVP;
++    error = vnode_open(temp, FWRITE | O_CREAT | O_EXCL | O_NOFOLLOW, 0600, 0, &vp, ctx);
++    if (error) goto done;
++    int resid = 0;
++    error = vn_rdwr(UIO_WRITE, vp, (caddr_t)bytes, (int)size, 0, UIO_SYSSPACE,
++        IO_NOAUTH, vfs_context_ucred(ctx), &resid, p);
++    if (!error && resid) error = EIO;
++    if (!error) error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++    int closed = vnode_close(vp, FWRITE, ctx);
++    if (!error) error = closed;
++    if (error) goto done;
++    error = picasso_jobs_metadata(temp, VREG, ctx);
++    if (error) goto done;
++    uint64_t verify_size = 0;
++    error = picasso_ifnamer_read(temp, bytes, 8192, &verify_size, ctx);
++    if (!error && (verify_size != size || !picasso_jobs_match(bytes, (size_t)verify_size, picasso_jobs_after_sha))) error = EIO;
++    if (error) goto done;
++    struct rename_args args = {.from = scratch, .to = scratch + 0x200};
++    error = copyout(temp, args.from, sizeof(temp));
++    if (!error) error = copyout(file, args.to, sizeof(file));
++    if (!error) error = rename(p, &args, &result);
++    if (!error) { changed = 1; error = picasso_jobs_sync(dirs[2], ctx); }
++    if (!error) {
++        error = picasso_ifnamer_read(file, bytes, 8192, &verify_size, ctx);
++        if (!error && (verify_size != size || !picasso_jobs_match(bytes, (size_t)verify_size, picasso_jobs_after_sha))) error = EIO;
++    }
++done:
++    if (bytes) kfree_data(bytes, 8192);
++    printf("PICASSO_JOBS bluetoothd enabled=%u changed=%u error=%d\n", !error, changed, error);
++    return error;
++}
++
+ /* One read-only library union; signature/MAC/VM checks run normally on load. */
+ static void
+ picasso_ui_library_mount(proc_t p, user_addr_t scratch)
+@@ -9635,6 +9747,7 @@
+ 	if (!error) native_picasso_apps_mount(p, scratch);
+ 	if (!error) picasso_ui_library_mount(p, scratch);
+ 	if (!error) picasso_ifnamer_mount(p, scratch);
++	if (!error) (void)picasso_jobs_enable(p, scratch);
+ #endif
+ done:
+ 	if (data_root) vnode_put(data_root);

@@ -152,9 +152,12 @@ BUILDID_STRING = "picasso-research"
 # FAT payload containing the config, kernel, trust caches and ADT.
 [payload]
 volume = "PICASSOESP"
-# Volatile Data disables the jobs matched by the offline DENY policy.
+# Seed baseline: keep this list stable for existing persistent Data identity.
+# runtime_enabled_jobs below is applied before launchd to both new and restored Data.
 # Exact 20H392 labels, selected by job label, plist name or executable name.
 # watchdogd stays disabled; wdt=0 disables its checkin policy below.
+runtime_enabled_jobs = ["com.apple.bluetoothd"]
+# bluetoothd supplies the BTAudioHALPlugin service; radio hardware is unimplemented.
 offline_disabled_jobs = [
   "com.apple.BTServer.avrcp",
   "com.apple.BTServer.le",

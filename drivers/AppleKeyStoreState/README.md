@@ -10,14 +10,18 @@ while SpringBoard boots. Picasso now publishes this service with the explicit
 original AppleKeyStore class is absent. It describes the selected
 unprotected developer Data environment. Persistent mode remains unencrypted and without password/keybag protection. Protected Data is unsupported.
 
-The client establishes a real session with selector 0. For device context 0,
-selector 7 returns the unlocked-since-boot state and selectors 17/35 return the
-original DER state layout, including no passcode. Other contexts and operations
-return errors. In particular, selector 14 does **not** manufacture a system
-keybag handle, and bag creation, loading, saving, unlocking, key operations,
-assertions and asynchronous notifications are unsupported. Matching publication
-uses ordinary IOKit. `KeyOperationsAvailable=false` and `StateQueriesOnly=true`
-describe this boundary in the registry.
+The client establishes a session with selector 0. For compatibility with the
+reference implementation, selectors 4/5/9/12/13/26/27/55/101/102 now return success
+without performing an operation or returning data. Selector 14 returns synthetic
+handle 0. Selectors 7/17/35 return the unprotected device state and ignore the
+context handle; selector 31 returns an empty DER SET. These are development
+compatibility stubs, not authentication, keybag creation/loading, password
+protection, encryption or asynchronous notifications. They are permitted only
+under the existing unprotected Data gate. `KeyOperationsAvailable=false` and
+`CompatibilityStubs=true` describe this boundary in the registry.
+
+Output descriptors are prepared before writes and completed afterward, including
+short writes. Preparation, short-write and completion errors propagate to callers.
 
 `scripts/build-picasso-display.py` compiles the component with the real platform
 SDK command into the existing late archive and removes its automatic initializer

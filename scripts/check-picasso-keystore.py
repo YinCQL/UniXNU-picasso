@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the real state-only service with host IOKit stand-ins, retaining results."""
+"""Exercise the real development compatibility service with host IOKit stand-ins, retaining results."""
 import argparse
 import hashlib
 import importlib.util
@@ -58,7 +58,7 @@ def main():
         report['runs'].append({'asan': asan, 'pass': True, 'log': log})
     report['pass'] = True
     (out / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
-    print('PASS: state-only service, ordinary and sanitizer host tests')
+    print('PASS: development compatibility service, ordinary and sanitizer host tests')
 
 
 if __name__ == '__main__':

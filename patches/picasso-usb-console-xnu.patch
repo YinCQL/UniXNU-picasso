@@ -14,7 +14,7 @@ diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,3181 @@
+@@ -0,0 +1,3235 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -1429,7 +1429,7 @@ new file mode 100644
 +	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
 +};
 +static const uint8_t ud_cfg_desc[67] = {
-+	9, 2, 67, 0, 2, 1, 0, 0x80, 100,                /* config: 2 interfaces, 200 mA */
++	9, 2, 67, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA (2.5 W at 5 V) */
 +	9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 0,             /* control iface 0: CDC ACM */
 +	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
 +	5, 0x24, 0x01, 0x00, 1,                         /* call management: data iface 1 */
@@ -2200,11 +2200,58 @@ new file mode 100644
 +	}
 +}
 +
++/*
++ * A warm reset (APSS watchdog, PSCI SYSTEM_RESET) does not reset the USB PHY
++ * or the controller's D+ pull-up. If the device controller is still running
++ * when the SoC resets, the host never sees a disconnect: it keeps the dead CDC
++ * device, the boot loader's fastboot gadget never enumerates, and the next
++ * kernel's console enumerates but cannot move data. Stop the controller
++ * (RUN_STOP=0 drops the pull-up), clear the PHY suspend bits and leave the
++ * core in soft reset so the next gadget starts from a known state.
++ */
++/* Stock SM7250 dwc3/gadget.c: stopping requires acknowledging pending events. */
++static void
++picasso_usb_stop_controller(void)
++{
++	dwc_wr(DEVTEN, 0);
++	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++	unsigned wait;
++	for (wait = 0; wait < 100 && !(dwc_rd(DSTS) & DSTS_DEVCTRLHLT); ++wait) {
++		uint32_t pending = dwc_rd(GEVNTCOUNT) & 0xffffu;
++		if (pending) dwc_wr(GEVNTCOUNT, pending);
++		picasso_usb_busy_wait(1000);
++	}
++	if (!(dwc_rd(DSTS) & DSTS_DEVCTRLHLT))
++		printf("PICASSO USB: controller halt timed out\n");
++}
++
++static void
++picasso_usb_disconnect_for_reset(void)
++{
++	vm_offset_t dwc = ud.dwc;
++	if (!dwc) {
++		return;
++	}
++	printf("PICASSO CDC: disconnecting controller before reset\n");
++	picasso_usb_stop_controller();
++	unsigned wait;
++	uint32_t usb2phy = dwc_rd(GUSB2PHYCFG0);
++	dwc_wr(GUSB2PHYCFG0, usb2phy &
++	    ~(GUSB2PHYCFG_SUSPHY | GUSB2PHYCFG_ENBLSLPM));
++	dwc_wr(DCTL, DCTL_CSFTRST);
++	for (wait = 0; wait < 100 && (dwc_rd(DCTL) & DCTL_CSFTRST); wait++) {
++		picasso_usb_busy_wait(1000);
++	}
++	if (dwc_rd(DCTL) & DCTL_CSFTRST)
++		printf("PICASSO USB: controller soft reset timed out\n");
++}
++
 +static void
 +picasso_usb_system_reset(void)
 +{
 +	picasso_usb_watchdog_terminal();
 +	printf("PICASSO CDC: reset begin mode=%u\n", ud.reset_mode);
++	picasso_usb_disconnect_for_reset();
 +	(void)picasso_usb_arm_fastboot_reason();
 +	if (ud.reset_mode == PICASSO_USB_RESET_PSCI) {
 +		picasso_usb_psci_reset();
@@ -2807,6 +2854,13 @@ new file mode 100644
 +		printf("PICASSO USB: not in device mode; controller untouched\n");
 +		return;
 +	}
++	/*
++	 * A warm reset hands over a controller that may still be running the
++	 * boot loader's gadget. Stop it before any later guard can fail:
++	 * RUN_STOP=0 drops the D+ pull-up, so the host sees a disconnect even
++	 * when this console cannot start, and the next gadget begins clean.
++	 */
++	picasso_usb_stop_controller();
 +	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
 +	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +		printf("PICASSO USB: no DMA memory\n");
