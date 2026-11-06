@@ -3,7 +3,11 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#ifdef PICASSO_BRIGHTNESS_ARM_API
 extern "C" void *memcpy(void *, const void *, size_t);
+#else
+#include <string.h>
+#endif
 using IOReturn = int;
 enum { kIOReturnSuccess=0, kIOReturnNotReady=1, kIOReturnIOError=2,
        kIOReturnBadArgument=3, kIOReturnNoMemory=4, kIOReturnNotFound=5 };
