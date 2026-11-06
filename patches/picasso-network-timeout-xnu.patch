@@ -1,0 +1,290 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9318,6 +9318,220 @@
+     return 0;
+ }
+ 
++/* Apple configd's built-in InterfaceNamer reads these two supported timeouts.
++ * Keep the original 20H392 metadata and executable; let the original timer
++ * publish a real TIMEOUT after five seconds if IOKit is still busy. No fake
++ * interface, MAC address, QUIET marker or dynamic-store write is introduced.
++ * The narrow read-only view is refreshed before launchd, independently of seed.
++ */
++static const char picasso_ifnamer_plist[] =
++    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++    "<plist version=\"1.0\">\n"
++    "<dict>\n"
++    "\t<key>CFBundleName</key>\n"
++    "\t<string>com.apple.SystemConfiguration.InterfaceNamer</string>\n"
++    "\t<key>DTXcode</key>\n"
++    "\t<string>1430</string>\n"
++    "\t<key>DTSDKName</key>\n"
++    "\t<string>iphoneos16.7.internal</string>\n"
++    "\t<key>DTSDKBuild</key>\n"
++    "\t<string>20H343</string>\n"
++    "\t<key>CFBundleDevelopmentRegion</key>\n"
++    "\t<string>English</string>\n"
++    "\t<key>CFBundleVersion</key>\n"
++    "\t<string>1.21</string>\n"
++    "\t<key>BuildMachineOSBuild</key>\n"
++    "\t<string>22A380017</string>\n"
++    "\t<key>DTPlatformName</key>\n"
++    "\t<string>iphoneos</string>\n"
++    "\t<key>CFBundlePackageType</key>\n"
++    "\t<string>BNDL</string>\n"
++    "\t<key>CFBundleShortVersionString</key>\n"
++    "\t<string>1.21</string>\n"
++    "\t<key>CFBundleSupportedPlatforms</key>\n"
++    "\t<array>\n"
++    "\t\t<string>iPhoneOS</string>\n"
++    "\t</array>\n"
++    "\t<key>CFBundleInfoDictionaryVersion</key>\n"
++    "\t<string>6.0</string>\n"
++    "\t<key>CFBundleExecutable</key>\n"
++    "\t<string>InterfaceNamer</string>\n"
++    "\t<key>DTCompiler</key>\n"
++    "\t<string>com.apple.compilers.llvm.clang.1_0</string>\n"
++    "\t<key>UIRequiredDeviceCapabilities</key>\n"
++    "\t<array>\n"
++    "\t\t<string>arm64</string>\n"
++    "\t</array>\n"
++    "\t<key>MinimumOSVersion</key>\n"
++    "\t<string>16.7</string>\n"
++    "\t<key>CFBundleIdentifier</key>\n"
++    "\t<string>com.apple.SystemConfiguration.InterfaceNamer</string>\n"
++    "\t<key>UIDeviceFamily</key>\n"
++    "\t<array>\n"
++    "\t\t<integer>1</integer>\n"
++    "\t</array>\n"
++    "\t<key>Builtin</key>\n"
++    "\t<true/>\n"
++    "\t<key>DTPlatformVersion</key>\n"
++    "\t<string>16.7.3</string>\n"
++    "\t<key>DTXcodeBuild</key>\n"
++    "\t<string>14E6097d</string>\n"
++    "\t<key>CFBundleSignature</key>\n"
++    "\t<string>&#63;&#63;&#63;&#63;</string>\n"
++    "\t<key>DTPlatformBuild</key>\n"
++    "\t<string>20H343</string>\n"
++    "\t<key>WaitStackTimeout</key>\n"
++    "\t<integer>5</integer>\n"
++    "\t<key>WaitQuietTimeout</key>\n"
++    "\t<integer>5</integer>\n"
++    "</dict>\n"
++    "</plist>\n";
++
++static int
++picasso_ifnamer_directory(vnode_t vp, vfs_context_t ctx)
++{
++    char *buffer = kalloc_data(4096, Z_WAITOK);
++    uio_t uio = buffer ? uio_create(1, 0, UIO_SYSSPACE, UIO_READ) : NULL;
++    int error = uio ? 0 : ENOMEM, eof = 0;
++    unsigned found = 0;
++    for (unsigned batch = 0; !error && !eof && batch < 4; ++batch) {
++        uio_reset(uio, uio_offset(uio), UIO_SYSSPACE, UIO_READ);
++        error = uio_addiov(uio, CAST_USER_ADDR_T(buffer), 4096);
++        int entries = 0;
++        if (!error) error = VNOP_READDIR(vp, uio, 0, &eof, &entries, ctx);
++        if (error) break;
++        size_t used = 4096 - uio_resid(uio), at = 0;
++        const size_t header = offsetof(struct dirent, d_name);
++        while (at < used) {
++            if (used - at <= header) { error = EIO; break; }
++            const struct dirent *entry = (const struct dirent *)(buffer + at);
++            if (entry->d_reclen <= header || entry->d_reclen > used - at ||
++                entry->d_namlen >= entry->d_reclen - header || entry->d_name[entry->d_namlen]) {
++                error = EIO; break;
++            }
++            int dot = entry->d_namlen == 1 && entry->d_name[0] == '.';
++            int dotdot = entry->d_namlen == 2 && !memcmp(entry->d_name, "..", 2);
++            if (!dot && !dotdot) {
++                if (entry->d_namlen != sizeof("Info.plist") - 1 ||
++                    memcmp(entry->d_name, "Info.plist", sizeof("Info.plist") - 1) || ++found != 1) {
++                    error = EINVAL; break;
++                }
++            }
++            at += entry->d_reclen;
++        }
++        if (!used && !eof) error = EIO;
++    }
++    if (!error && (!eof || found != 1)) error = EINVAL;
++    if (uio) uio_free(uio);
++    if (buffer) kfree_data(buffer, 4096);
++    return error;
++}
++
++
++static int
++picasso_ifnamer_metadata(const char *path, int directory)
++{
++    vfs_context_t ctx = vfs_context_current();
++    vnode_t vp = NULLVP;
++    int error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++    if (error) return error;
++    if (vnode_vtype(vp) != (directory ? VDIR : VREG)) error = EINVAL;
++    struct vnode_attr va;
++    if (!error) {
++        VATTR_INIT(&va);
++        VATTR_SET(&va, va_uid, 0); VATTR_SET(&va, va_gid, 0);
++        VATTR_SET(&va, va_mode, directory ? 0755 : 0644);
++        error = vnode_setattr(vp, &va, ctx);
++    }
++    if (!error) {
++        VATTR_INIT(&va);
++        VATTR_WANTED(&va, va_uid); VATTR_WANTED(&va, va_gid); VATTR_WANTED(&va, va_mode);
++        error = vnode_getattr(vp, &va, ctx);
++        if (!error && (!VATTR_IS_SUPPORTED(&va, va_uid) || !VATTR_IS_SUPPORTED(&va, va_gid) ||
++            !VATTR_IS_SUPPORTED(&va, va_mode) || va.va_uid || va.va_gid ||
++            (va.va_mode & 07777) != (directory ? 0755 : 0644))) error = EPERM;
++    }
++    if (!error && directory == 2) error = picasso_ifnamer_directory(vp, ctx);
++    vnode_put(vp);
++    return error;
++}
++
++static int
++picasso_ifnamer_read(const char *path, uint8_t *buffer, size_t capacity, uint64_t *size, vfs_context_t ctx)
++{
++    vnode_t vp = NULLVP;
++    int error = vnode_open(path, FREAD | O_NOFOLLOW, 0, 0, &vp, ctx);
++    if (error) return error;
++    if (vnode_vtype(vp) != VREG) error = EINVAL;
++    struct vnode_attr va;
++    VATTR_INIT(&va); VATTR_WANTED(&va, va_data_size);
++    if (!error) error = vnode_getattr(vp, &va, ctx);
++    if (!error && (!VATTR_IS_SUPPORTED(&va, va_data_size) || va.va_data_size > capacity)) error = EFBIG;
++    if (!error) {
++        *size = va.va_data_size;
++        int resid = 0;
++        error = vn_rdwr(UIO_READ, vp, (caddr_t)buffer, (int)*size, 0, UIO_SYSSPACE,
++            IO_NOAUTH, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++        if (!error && resid) error = EIO;
++    }
++    int closed = vnode_close(vp, FREAD, ctx);
++    return error ? error : closed;
++}
++
++static void
++picasso_ifnamer_mount(proc_t p, user_addr_t scratch)
++{
++    static const char source[] = "/private/var/picasso/ifnamer";
++    static const char file[] = "/private/var/picasso/ifnamer/Info.plist";
++    static const char point[] = "/System/Library/SystemConfiguration/InterfaceNamer.bundle";
++    static const char original[] = "/System/Library/SystemConfiguration/InterfaceNamer.bundle/Info.plist";
++    static const uint8_t expected[32] = {0x06,0x65,0x4c,0xe2,0x0e,0xd8,0x9d,0x9c,0xcd,0x7a,0xa8,0xe6,0x8f,0xce,0x05,0x0b,0xd7,0xd2,0xac,0x0f,0x9e,0x4d,0xed,0xcd,0xb6,0x15,0xa6,0x2f,0xa0,0xa9,0xc7,0xa9};
++    uint8_t buffer[2048], digest[32];
++    uint64_t size = 0;
++    vfs_context_t ctx = vfs_context_current();
++    int error = picasso_ifnamer_read(original, buffer, sizeof(buffer), &size, ctx);
++    if (!error) {
++        SHA256_CTX sha;
++        SHA256_Init(&sha); SHA256_Update(&sha, buffer, (size_t)size); SHA256_Final(digest, &sha);
++        if (size != 843 || memcmp(digest, expected, sizeof(expected))) error = EINVAL;
++    }
++    const char *dirs[] = {"/private/var/picasso", source};
++    for (unsigned i = 0; !error && i < 2; ++i) {
++        error = picasso_ifnamer_metadata(dirs[i], 1);
++        if (error == ENOENT) {
++            struct mkdir_args args = {.path = scratch, .mode = 0755};
++            int32_t result = 0;
++            error = copyout(dirs[i], scratch, strlen(dirs[i]) + 1);
++            if (!error) error = mkdir(p, &args, &result);
++            if (!error || error == EEXIST) error = picasso_ifnamer_metadata(dirs[i], 1);
++        }
++    }
++    if (!error) {
++        error = picasso_ifnamer_metadata(file, 0);
++        if (error == ENOENT) error = 0;
++    }
++    if (!error) {
++        error = native_gpu_addon_write(file, (const uint8_t *)picasso_ifnamer_plist,
++            sizeof(picasso_ifnamer_plist) - 1, 0644, ctx);
++        if (error == -1) error = 0; /* already identical */
++    }
++    if (!error) error = picasso_ifnamer_metadata(file, 0);
++    if (!error) error = picasso_ifnamer_metadata(source, 2);
++    if (error) { printf("PICASSO_NETWORK config prepare error=%d\n", error); return; }
++    volatile int stage = 0, status = -1;
++    native_gpu_addon_mount(p, scratch, 0xc00, source, sizeof(source), point, sizeof(point),
++        "/System/Library/SystemConfiguration/InterfaceNamer.bundle/_CodeSignature/CodeResources",
++        original, &stage, &status);
++    size = 0;
++    if (stage == 5 && !status) {
++        error = picasso_ifnamer_read(original, buffer, sizeof(buffer), &size, ctx);
++        if (!error && (size != sizeof(picasso_ifnamer_plist) - 1 ||
++            memcmp(buffer, picasso_ifnamer_plist, (size_t)size))) error = EIO;
++    } else error = status ? status : EIO;
++    printf("PICASSO_NETWORK config stage=%d error=%d stack_s=5 quiet_s=5\n", stage, error);
++}
++
+ /* One read-only library union; signature/MAC/VM checks run normally on load. */
+ static void
+ picasso_ui_library_mount(proc_t p, user_addr_t scratch)
+@@ -9417,6 +9631,7 @@
+ #if DEVELOPMENT || DEBUG
+ 	if (!error) native_picasso_apps_mount(p, scratch);
+ 	if (!error) picasso_ui_library_mount(p, scratch);
++	if (!error) picasso_ifnamer_mount(p, scratch);
+ #endif
+ done:
+ 	if (data_root) vnode_put(data_root);
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4447,6 +4447,29 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++static void
++picasso_network_busy_observe(IOService *service, uint32_t busy)
++{
++    char name[32] = {};
++    proc_name(proc_selfpid(), name, sizeof(name));
++    if (strcmp(name, "configd") || service != IOService::getServiceRoot()) return;
++    static unsigned reports;
++    if (__atomic_fetch_add(&reports, 1U, __ATOMIC_RELAXED) >= 2) return;
++    IOLog("PICASSO_NETWORK configd root_busy=%u\n", busy);
++    if (!busy) return;
++    IORegistryIterator *it = IORegistryIterator::iterateOver(service, gIOServicePlane, kIORegistryIterateRecursively);
++    IORegistryEntry *entry;
++    unsigned visited = 0, reported = 0;
++    while (it && visited++ < 512 && (entry = it->getNextObject())) {
++        IOService *node = OSDynamicCast(IOService, entry);
++        if (!node || !node->getBusyState()) continue;
++        if (reported++ < 24) IOLog("PICASSO_NETWORK busy name=%s class=%s count=%u state=%llx\n",
++            node->getName(), node->getMetaClass()->getClassName(), node->getBusyState(), node->getState());
++    }
++    IOLog("PICASSO_NETWORK busy_scan visited=%u busy=%u valid=%u\n", visited, reported, it && it->isValid());
++    OSSafeReleaseNULL(it);
++}
++
+ /* Routine io_service_get_busy_state */
+ kern_return_t
+ is_io_service_get_busy_state(
+@@ -4456,6 +4479,7 @@
+ 	CHECK( IOService, _service, service );
+ 
+ 	*busyState = service->getBusyState();
++	picasso_network_busy_observe(service, *busyState);
+ 
+ 	return kIOReturnSuccess;
+ }
+@@ -4644,6 +4668,8 @@
+ 		picasso_service_end(trace, kIOReturnNotPermitted, kIOReturnNotPermitted, false);
+ #endif
+ /* PICASSO_SERVICE_TRACE_END */
++		if (!strcmp(service->getMetaClass()->getClassName(), "IONetworkStack"))
++			IOLog("PICASSO_NETWORK stack_open pid=%d service_mac_denied=1\n", proc_selfpid());
+ 		return kIOReturnNotPermitted;
+ 	}
+ #endif
+@@ -4854,6 +4880,9 @@
+ 
+ 	*connection = client;
+ 	*result = res;
++	if (!strcmp(service->getMetaClass()->getClassName(), "IONetworkStack"))
++		IOLog("PICASSO_NETWORK stack_open pid=%d type=%u error=%x result=%x client=%u\n",
++		    proc_selfpid(), connect_type, err, res, client != nullptr);
+ 
+ /* PICASSO_SERVICE_TRACE_BEGIN */
+ #if DEVELOPMENT || DEBUG

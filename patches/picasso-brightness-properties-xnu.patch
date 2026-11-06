@@ -1,13 +1,9 @@
 --- a/iokit/Kernel/IOUserClient.cpp
 +++ b/iokit/Kernel/IOUserClient.cpp
-@@ -47,6 +47,7 @@
- #include <libkern/OSDebug.h>
- #include <DriverKit/OSAction.h>
- #include <sys/proc.h>
-+#include <sys/vnode.h>
- #if DEVELOPMENT || DEBUG
- #include <kern/thread.h>
- #endif
+@@ -31,2 +31,3 @@
+ #include <libkern/c++/OSKext.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <libkern/c++/OSSharedPtr.h>
 @@ -4237,6 +4238,72 @@
  
  
@@ -17,23 +13,6 @@
 +// no rejected property is forwarded and no service/open permission is granted.
 +extern "C" bool picasso_brightness_is_service(IORegistryEntry *) __attribute__((weak_import));
 +#if CONFIG_MACF
-+static bool
-+picasso_brightness_caller(void)
-+{
-+	proc_t p = (proc_t)get_bsdtask_info(current_task());
-+	if (!p || !csproc_get_platform_binary(p)) return false;
-+	char name[32] = {};
-+	proc_name(proc_selfpid(), name, sizeof(name));
-+	if (strcmp(name, "backboardd")) return false;
-+	vnode_t vp = proc_getexecutablevnode(p);
-+	if (!vp) return false;
-+	char path[128] = {};
-+	int length = sizeof(path);
-+	int error = vn_getpath(vp, path, &length);
-+	vnode_put(vp);
-+	return !error && !strcmp(path, "/usr/libexec/backboardd");
-+}
-+
 +static int
 +picasso_iokit_set_properties_check(IORegistryEntry *entry, OSObject **object)
 +{
@@ -44,7 +23,7 @@
 +	int original = mac_iokit_check_set_properties(kauth_cred_get(), entry, *object);
 +	if (!board) return original;
 +	int verdict = original;
-+	bool projected = false;
++	bool projected = false, attempted = false;
 +	OSDictionary *dict = OSDynamicCast(OSDictionary, *object);
 +	OSNumber *level = dict ? OSDynamicCast(OSNumber, dict->getObject("brightness")) : nullptr;
 +	OSNumber *fade = dict ? OSDynamicCast(OSNumber, dict->getObject("FadePeriod")) : nullptr;
@@ -52,13 +31,16 @@
 +	// 20H392 CoreBrightness emits brightness, FadePeriod and optionally backlight-level.
 +	// The old board has no independent panel-brightness actuator. On MAC rejection,
 +	// negotiate the brightness-only subset; FadePeriod is not silently authorized.
++	// Do not gate a second policy check on a redundant process-name/platform/path
++	// heuristic. MAC checks the actual credential and service for every caller.
 +	bool valid = dict && level && level->unsigned64BitValue() <= 4095 &&
 +	    (!dict->getObject("FadePeriod") || (fade && fade->unsigned64BitValue() <= UINT32_MAX)) &&
 +	    (!dict->getObject("backlight-level") || (panel && panel->unsigned64BitValue() <= 4095)) &&
 +	    dict->getCount() == 1U + (fade ? 1U : 0U) + (panel ? 1U : 0U);
-+	if (original && valid && (fade || panel) && picasso_brightness_caller()) {
++	if (original && valid && (fade || panel)) {
 +		OSDictionary *subset = OSDictionary::withCapacity(1);
 +		if (subset && subset->setObject("brightness", level)) {
++			attempted = true;
 +			verdict = mac_iokit_check_set_properties(kauth_cred_get(), entry, subset);
 +			if (!verdict) {
 +				(*object)->release();
@@ -72,8 +54,22 @@
 +	static unsigned reports;
 +	unsigned ticket = __atomic_fetch_add(&reports, 1U, __ATOMIC_RELAXED);
 +	if (ticket < 128 || !(ticket & 63))
-+		IOLog("PICASSO_BRIGHTNESS mac original=%d final=%d brightness_only=%u valid=%u pid=%d\n",
-+		    original, verdict, projected, valid, proc_selfpid());
++		IOLog("PICASSO_BRIGHTNESS mac original=%d final=%d brightness_only=%u valid=%u attempted=%u pid=%d\n",
++		    original, verdict, projected, valid, attempted, proc_selfpid());
++	dict = OSDynamicCast(OSDictionary, *object);
++	if (dict && ticket < 16) {
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++		OSObject *key;
++		for (unsigned n = 0; it && n < 4 && (key = it->getNextObject()); ++n) {
++			OSString *name = OSDynamicCast(OSString, key);
++			OSObject *value = name ? dict->getObject(name->getCStringNoCopy()) : nullptr;
++			OSNumber *number = OSDynamicCast(OSNumber, value);
++			IOLog("PICASSO_BRIGHTNESS key=%s number=%u value=%llu dictionary=%u\n",
++			    name ? name->getCStringNoCopy() : "<invalid>", number != nullptr,
++			    number ? number->unsigned64BitValue() : 0ULL, OSDynamicCast(OSDictionary, value) != nullptr);
++		}
++		OSSafeReleaseNULL(it);
++	}
 +	return verdict;
 +}
 +#endif

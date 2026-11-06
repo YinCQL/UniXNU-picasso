@@ -22,21 +22,21 @@ public:
 static IOService board,other;
 static bool isService(IORegistryEntry *p){return p==&board;}
 static bool (*picasso_brightness_is_service)(IORegistryEntry *)=isService;
-using proc_t=void *;using vnode_t=void *;
-static bool process=true,platform=true,vnode=true,pathError=false,grant=false;
-static unsigned vnodeGets,vnodePuts,macCalls;static int original=1,subsetVerdict=0;
-static const char *processName="backboardd",*executable="/usr/libexec/backboardd";
-static void *current_task(){return nullptr;}
-static proc_t get_bsdtask_info(void *){return process?&board:nullptr;}
-static int kauth_cred_get(){return 0;}
-static bool csproc_get_platform_binary(proc_t){return platform;}
+static bool grant=false;
+static unsigned macCalls;static int original=1,subsetVerdict=0,credential=0;
+static int kauth_cred_get(){return credential;}
 static int proc_selfpid(){return 50;}
-static void proc_name(int,char *out,int n){snprintf(out,n,"%s",processName);}
-static vnode_t proc_getexecutablevnode(proc_t){if(vnode){++vnodeGets;return &board;}return nullptr;}
-static int vn_getpath(vnode_t,char *out,int *n){snprintf(out,*n,"%s",executable);return pathError;}
-static void vnode_put(vnode_t){++vnodePuts;}
+class OSString:public OSObject {public: const char *s;explicit OSString(const char *p):s(p){} const char *getCStringNoCopy(){return s;}};
+class OSCollectionIterator:public OSObject {
+    OSDictionary *dict;unsigned index=0;OSString key{""};
+public:
+    explicit OSCollectionIterator(OSDictionary *d):dict(d){}
+    static OSCollectionIterator *withCollection(OSDictionary *d){return new OSCollectionIterator(d);}
+    OSObject *getNextObject(){if(index==dict->count)return nullptr;key.s=dict->keys[index++];return &key;}
+};
 static bool native_sandbox_grant(IOService *){return grant;}
-static int mac_iokit_check_set_properties(int,IORegistryEntry *,OSObject *o){
+static int mac_iokit_check_set_properties(int cred,IORegistryEntry *,OSObject *o){
+    assert(cred==credential);
     ++macCalls;auto *d=dynamic_cast<OSDictionary *>(o);
     return d && d->getCount()==1 && d->getObject("brightness")?subsetVerdict:original;
 }
@@ -46,31 +46,29 @@ static void number(OSDictionary *d,const char *key,uint64_t value){auto *n=new O
 static OSDictionary *request(){auto *d=new OSDictionary;number(d,"brightness",2048);number(d,"FadePeriod",65536);number(d,"backlight-level",0);return d;}
 int main(){
     unsigned cases=0;
-    for(unsigned scenario=0;scenario<18;++scenario){
-        OSObject *o=request(),*before=o;IORegistryEntry *target=&board;
-        process=platform=vnode=true;pathError=grant=false;vnodeGets=vnodePuts=macCalls=0;original=1;subsetVerdict=0;
-        processName="backboardd";executable="/usr/libexec/backboardd";picasso_brightness_is_service=isService;
+    // The caller identity is policy-owned. Each credential must pass the
+    // actual brightness-only policy; no name, platform flag or path heuristic.
+    for(int cred=0;cred<3;++cred) for(unsigned scenario=0;scenario<12;++scenario){
+        credential=cred;OSObject *o=request(),*before=o;IORegistryEntry *target=&board;
+        grant=false;macCalls=0;original=1;subsetVerdict=cred==2?13:0;picasso_brightness_is_service=isService;
         switch(scenario){
-        case 1:processName="backboardd-copy";break;case 2:platform=false;break;case 3:process=false;break;
-        case 4:processName="Settings";break;case 5:executable="/tmp/backboardd";break;
-        case 6:vnode=false;break;case 7:pathError=true;break;
-        case 8:target=&other;break;case 9:subsetVerdict=13;break;
-        case 10:allocationFailure=true;break;case 11:propertyFailure=true;break;
-        case 12:number(static_cast<OSDictionary *>(o),"unexpected",1);break;
-        case 13:static_cast<OSNumber *>(static_cast<OSDictionary *>(o)->getObject("brightness"))->value=4096;break;
-        case 14:static_cast<OSNumber *>(static_cast<OSDictionary *>(o)->getObject("FadePeriod"))->value=UINT64_MAX;break;
-        case 15:original=0;break;case 16:grant=true;break;
-        case 17:picasso_brightness_is_service=nullptr;break;
+        case 1:target=&other;break;case 2:subsetVerdict=13;break;
+        case 3:allocationFailure=true;break;case 4:propertyFailure=true;break;
+        case 5:number(static_cast<OSDictionary *>(o),"unexpected",1);break;
+        case 6:static_cast<OSNumber *>(static_cast<OSDictionary *>(o)->getObject("brightness"))->value=4096;break;
+        case 7:static_cast<OSNumber *>(static_cast<OSDictionary *>(o)->getObject("FadePeriod"))->value=UINT64_MAX;break;
+        case 8:original=0;break;case 9:grant=true;break;
+        case 10:picasso_brightness_is_service=nullptr;break;
+        case 11:static_cast<OSNumber *>(static_cast<OSDictionary *>(o)->getObject("backlight-level"))->value=4096;break;
         }
         int result=picasso_iokit_set_properties_check(target,&o);
-        bool projected=scenario==0 || scenario==16;
-        assert((o!=before)==projected);assert(vnodeGets==vnodePuts);
+        bool projected=cred!=2 && (scenario==0 || scenario==9);
+        assert((o!=before)==projected);
         if(projected){assert(!result && macCalls==2);assert(static_cast<OSDictionary *>(o)->getCount()==1);}
-        else {assert(result==(scenario==15?0:scenario==9?13:1));}
+        else {assert(result==(scenario==8?0:scenario==2 || (cred==2 && (scenario==0 || scenario==9))?13:1));}
         o->release();allocationFailure=propertyFailure=false;++cases;
     }
-    // Foreign service grants retain their original behavior, without a new board grant.
     OSObject *o=request();grant=true;macCalls=0;
     assert(!picasso_iokit_set_properties_check(&other,&o) && !macCalls);o->release();++cases;
-    printf("PASS brightness MAC: %u production caller/subset/denial cases\n",cases);
+    printf("PASS brightness MAC: %u production credential/subset/denial cases\n",cases);
 }
