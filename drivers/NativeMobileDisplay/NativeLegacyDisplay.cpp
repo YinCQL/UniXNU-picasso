@@ -106,7 +106,7 @@ static volatile uint32_t *gDpuCb=nullptr;
 static IOLock *gDpuLock=nullptr;
 static uint32_t gDpuState=0,gDpuBank=0;
 static uint32_t dpuRead(uint32_t offset) {return gDpuSmmu?gDpuSmmu[offset/4]:0xffffffffu;}
-static void dpuWrite(uint32_t offset,uint32_t value) {if(gDpuSmmu)gDpuSmmu[offset/4]=value;}
+__attribute__((unused)) static void dpuWrite(uint32_t offset,uint32_t value) {if(gDpuSmmu)gDpuSmmu[offset/4]=value;}
 static void dpuClean(const void *start,size_t length) {
     for(size_t off=0;off<length;off+=64)__asm__ volatile("dc civac, %0"::"r"(static_cast<const uint8_t *>(start)+off):"memory");
     __asm__ volatile("dsb sy":::"memory");
@@ -120,7 +120,8 @@ static bool dpuTlbFlush(volatile uint32_t *cb) {
 static void dpuEnable(volatile uint32_t *cb,uint32_t bank,uint32_t oldSctlr) {
     const size_t bytes=(2+kDpuSlots*kDpuSlotTables)*4096;
     IOBufferMemoryDescriptor *tables=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-        (IOOptionBits)(kIODirectionInOut|kIOMemoryPhysicallyContiguous|kIOMemoryMapperNone),bytes,4096);
+        (IOOptionBits)kIODirectionInOut|(IOOptionBits)kIOMemoryPhysicallyContiguous|(IOOptionBits)kIOMemoryMapperNone,
+        bytes,4096);
     gDpuLock=IOLockAlloc();
     if(!tables || !gDpuLock) {gDpuState=0xdead0002u;return;}
     uint64_t *l1=(uint64_t *)tables->getBytesNoCopy();
@@ -1031,7 +1032,7 @@ public:
              * address register (retry a few times, releasing buffers that land above 4 GB). */
             for(unsigned attempt=0;attempt<6 && !sdeShadow;++attempt) {
                 IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withOptions(
-                    kIOMemoryPhysicallyContiguous|kIODirectionInOut,needed,4096);
+                    (IOOptionBits)kIOMemoryPhysicallyContiguous|(IOOptionBits)kIODirectionInOut,needed,4096);
                 if(!buffer) {printf("PICASSO_SDE selftest alloc failed attempt=%u\n",attempt);continue;}
                 IOByteCount segment=0;
                 const addr64_t pa=buffer->getPhysicalSegment(0,&segment,0);
@@ -1065,7 +1066,7 @@ public:
         const vm_size_t sizes[3]={1u<<20,12u<<20,64u<<20};
         for(unsigned i=0;i<3;i++) {
             IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withOptions(
-                kIOMemoryPhysicallyContiguous|kIODirectionInOut,sizes[i],4096);
+                (IOOptionBits)kIOMemoryPhysicallyContiguous|(IOOptionBits)kIODirectionInOut,sizes[i],4096);
             if(!buffer) {printf("PICASSO_SDE contig %llu failed\n",(unsigned long long)sizes[i]);continue;}
             IOByteCount segment=0;
             const addr64_t pa=buffer->getPhysicalSegment(0,&segment,0);
