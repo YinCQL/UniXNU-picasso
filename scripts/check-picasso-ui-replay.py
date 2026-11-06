@@ -56,7 +56,7 @@ def main():
     results = dict(scope=__doc__, revision=rev, original=original, patches=applied,
                    replayed={name: hashlib.sha256((xnu / name).read_bytes()).hexdigest() for name in FILES})
     (out / 'replay.json').write_text(json.dumps(results, indent=2) + '\n')
-    for script, label in [('check-picasso-ui-runtime.py', 'runtime'), ('check-picasso-ios16-surface-abi.py', 'surface'), ('check-picasso-nvram.py', 'nvram')]:
+    for script, label in [('check-picasso-ui-runtime.py', 'runtime'), ('check-picasso-ios16-surface-abi.py', 'surface'), ('check-picasso-nvram.py', 'nvram'), ('check-picasso-startup.py', 'startup')]:
         subprocess.run([sys.executable, '-X', 'utf8', '-B', str(ROOT / 'scripts' / script), '--xnu', str(xnu), '--output', str(out / label)], check=True)
     print('PASS pinned XNU cold replay, UI library/MAC helpers and display dispatch')
 

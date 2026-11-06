@@ -73,7 +73,7 @@ def check(tree, work, kernelcache, output):
     linked_image = native.macho(kernel.read_bytes())
     linked_names = {name for names in native.exports(kernel.read_bytes(), linked_image).values() for name in names}
     builder.require({'_picasso_backlight_start', '_picasso_backlight_power', '_picasso_backlight_level',
-                     '_picasso_backlight_current', '_picasso_brightness_allocate', '__GLOBAL__sub_I_PicassoBrightness.cpp'} <= linked_names, 'Missing physical display power backend')
+                     '_picasso_backlight_current', '_picasso_brightness_allocate', '_picasso_brightness_is_service', '__GLOBAL__sub_I_PicassoBrightness.cpp'} <= linked_names, 'Missing physical display power backend')
     report['hid'] = hid.verify(platform, aes, native, OriginalReference(kernelcache, board),
                                directory, kernel.read_bytes(), plan)
     config = (work / '.config').read_text()

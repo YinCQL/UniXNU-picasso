@@ -86,6 +86,8 @@ roots = [
   # Original IOAcceleratorES parent used by both display fallback and A620.
   "com.apple.iokit.IOGPUFamily",
   "com.apple.iokit.IOStorageFamily",
+  # InterfaceNamer needs the original IOBSD-matched stack, even before Wi-Fi.
+  "com.apple.iokit.IONetworkingFamily",
   "com.apple.kec.Libm",
   "com.apple.kec.corecrypto",
   "com.apple.kec.pthread",

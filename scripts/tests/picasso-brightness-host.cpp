@@ -106,6 +106,7 @@ int main() {
     assert(!b.state.adopt(b));reset();unsigned cases=0;
     auto *s=picasso_brightness_allocate();assert(s->start(&display));
     unsigned startAllocations=allocations,startProperties=propertyCalls;
+    assert(picasso_brightness_is_service(s) && !picasso_brightness_is_service(&other) && !picasso_brightness_is_service(nullptr));++cases;
     assert(s->getMetaClass()==&apple && s->getProperty("backlight-control") && published(s)==1023);++cases;
     assert(picasso_backlight_power(&other,false)==kIOReturnNotFound);++cases;
     unsigned ops=b.operations;
@@ -127,7 +128,7 @@ int main() {
     assert(!send(s,3000));b.fail=b.operations+1;fire(0);
     assert(b.state.failed && published(s)==2048 && s->getProperty("PicassoBrightnessError"));
     assert(send(s,4095)==kIOReturnNotReady);++cases;
-    s->stop(&display);assert(send(s,10)==kIOReturnNotReady);s->release();assert(locks==1);++cases;
+    s->stop(&display);assert(!picasso_brightness_is_service(s));assert(send(s,10)==kIOReturnNotReady);s->release();assert(locks==1);++cases;
     b.fail=0;b.state.failed=false;
     for(unsigned i=1;i<=startAllocations;++i) {
         reset();failAllocation=i;s=picasso_brightness_allocate();assert(!s->start(&display));

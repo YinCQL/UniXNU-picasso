@@ -323,7 +323,24 @@ static void publishAcceleratorStub(void) {
     if (power == 1) IOLog("PICASSO_POWER fixed power source published=%u\n", picasso_power_source_publish());
 }
 
+// IOBSD is published at this call site. Load the original software network
+// stack through its own personality; InterfaceNamer needs its real user client
+// even when there are no Wi-Fi/Ethernet controllers to enumerate yet.
+static void picasso_network_stack_start(void) {
+    IOService *resources = IOService::getResourceService();
+    if (!resources || !resources->getProperty("IOBSD")) {
+        IOLog("PICASSO_NETWORK stack skipped: IOBSD not published\n");
+        return;
+    }
+    kern_return_t loaded = OSKextLoadKextWithIdentifier("com.apple.iokit.IONetworkingFamily");
+    OSDictionary *match = !loaded ? IOService::serviceMatching("IONetworkStack") : nullptr;
+    IOService *stack = match ? IOService::waitForMatchingService(match, 1000000000ULL) : nullptr;
+    IOLog("PICASSO_NETWORK stack load=%x found=%u resource_busy=%u\n", loaded, stack != nullptr, resources->getBusyState());
+    OSSafeReleaseNULL(stack); OSSafeReleaseNULL(match);
+}
+
 extern "C" void native_legacy_display_late_probe(void) {
+    picasso_network_stack_start();
     picasso_keystore_probe();
     IOService *display = pendingDisplay;
     if (!display) return;

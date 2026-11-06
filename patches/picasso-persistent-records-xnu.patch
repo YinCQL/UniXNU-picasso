@@ -272,8 +272,8 @@
  		uint32_t rebuild = 0;
 -		if (PE_parse_boot_argn("picasso-ls-rebuild", &rebuild, sizeof(rebuild)) && rebuild == 1) {
 +		extern volatile uint32_t native_data_persist_state;
-+		if(native_data_persist_state==2)printf("PICASSO_CACHE restored Data: keep LaunchServices and MobileGestalt files\n");
-+		if (PE_parse_boot_argn("picasso-ls-rebuild", &rebuild, sizeof(rebuild)) && rebuild == 1 && native_data_persist_state != 2) {
++		if(native_data_persist_state==2)printf("PICASSO_CACHE restored Data: rebuild LaunchServices; retain MobileGestalt and application Data\n");
++		if (PE_parse_boot_argn("picasso-ls-rebuild", &rebuild, sizeof(rebuild)) && rebuild == 1) {
  			if (native_picasso_apps_stage == 5 && !native_picasso_apps_status &&
  			    found == 0xfff && resolved == 0xfff) {
 @@ -9332,4 +9356,7 @@

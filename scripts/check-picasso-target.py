@@ -41,6 +41,8 @@ def check_board(root=ROOT):
         raise ValueError('The native backend must retain the qualified 21H461 kernelcache')
     if prelink.get('early_security_init') != target.BACKEND_EARLY_SECURITY_INIT:
         raise ValueError('Retained 21H461 backend requires its audited AMFI initializer')
+    if prelink.get('roots', []).count('com.apple.iokit.IONetworkingFamily') != 1:
+        raise ValueError('InterfaceNamer requires the original IONetworkingFamily component')
     adt = board['payload']['adt']
     if adt.get('iphone_identity') is not True or adt.get('ipad_identity'):
         raise ValueError('Require only the iPhone identity in the payload')

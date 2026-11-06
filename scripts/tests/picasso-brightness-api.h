@@ -44,7 +44,9 @@ public:
     static OSDictionary *withCapacity(unsigned);
     bool setObject(const char *,OSObject *);
     OSObject *getObject(const char *);
+    unsigned getCount() const { return count; }
 };
+using IORegistryEntry = OSObject;
 class IOService:public OSObject {
     OSDictionary properties;
 public:

@@ -1,0 +1,96 @@
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -47,6 +47,7 @@
+ #include <libkern/OSDebug.h>
+ #include <DriverKit/OSAction.h>
+ #include <sys/proc.h>
++#include <sys/vnode.h>
+ #if DEVELOPMENT || DEBUG
+ #include <kern/thread.h>
+ #endif
+@@ -4237,6 +4238,72 @@
+ 
+ 
+ static bool native_sandbox_grant(IOService * service);
++// Only the live board service can select the brightness-only property protocol.
++// The fallback actually discards unsupported optional properties and reruns MAC;
++// no rejected property is forwarded and no service/open permission is granted.
++extern "C" bool picasso_brightness_is_service(IORegistryEntry *) __attribute__((weak_import));
++#if CONFIG_MACF
++static bool
++picasso_brightness_caller(void)
++{
++	proc_t p = (proc_t)get_bsdtask_info(current_task());
++	if (!p || !csproc_get_platform_binary(p)) return false;
++	char name[32] = {};
++	proc_name(proc_selfpid(), name, sizeof(name));
++	if (strcmp(name, "backboardd")) return false;
++	vnode_t vp = proc_getexecutablevnode(p);
++	if (!vp) return false;
++	char path[128] = {};
++	int length = sizeof(path);
++	int error = vn_getpath(vp, path, &length);
++	vnode_put(vp);
++	return !error && !strcmp(path, "/usr/libexec/backboardd");
++}
++
++static int
++picasso_iokit_set_properties_check(IORegistryEntry *entry, OSObject **object)
++{
++	IOService *service = OSDynamicCast(IOService, entry);
++	const bool board = picasso_brightness_is_service && picasso_brightness_is_service(entry);
++	// Preserve the existing policy for all other services.
++	if (!board && service && native_sandbox_grant(service)) return 0;
++	int original = mac_iokit_check_set_properties(kauth_cred_get(), entry, *object);
++	if (!board) return original;
++	int verdict = original;
++	bool projected = false;
++	OSDictionary *dict = OSDynamicCast(OSDictionary, *object);
++	OSNumber *level = dict ? OSDynamicCast(OSNumber, dict->getObject("brightness")) : nullptr;
++	OSNumber *fade = dict ? OSDynamicCast(OSNumber, dict->getObject("FadePeriod")) : nullptr;
++	OSNumber *panel = dict ? OSDynamicCast(OSNumber, dict->getObject("backlight-level")) : nullptr;
++	// 20H392 CoreBrightness emits brightness, FadePeriod and optionally backlight-level.
++	// The old board has no independent panel-brightness actuator. On MAC rejection,
++	// negotiate the brightness-only subset; FadePeriod is not silently authorized.
++	bool valid = dict && level && level->unsigned64BitValue() <= 4095 &&
++	    (!dict->getObject("FadePeriod") || (fade && fade->unsigned64BitValue() <= UINT32_MAX)) &&
++	    (!dict->getObject("backlight-level") || (panel && panel->unsigned64BitValue() <= 4095)) &&
++	    dict->getCount() == 1U + (fade ? 1U : 0U) + (panel ? 1U : 0U);
++	if (original && valid && (fade || panel) && picasso_brightness_caller()) {
++		OSDictionary *subset = OSDictionary::withCapacity(1);
++		if (subset && subset->setObject("brightness", level)) {
++			verdict = mac_iokit_check_set_properties(kauth_cred_get(), entry, subset);
++			if (!verdict) {
++				(*object)->release();
++				*object = subset;
++				subset = nullptr;
++				projected = true;
++			}
++		}
++		OSSafeReleaseNULL(subset);
++	}
++	static unsigned reports;
++	unsigned ticket = __atomic_fetch_add(&reports, 1U, __ATOMIC_RELAXED);
++	if (ticket < 128 || !(ticket & 63))
++		IOLog("PICASSO_BRIGHTNESS mac original=%d final=%d brightness_only=%u valid=%u pid=%d\n",
++		    original, verdict, projected, valid, proc_selfpid());
++	return verdict;
++}
++#endif
++
+ /* Routine io_registry_entry_set_properties */
+ kern_return_t
+ is_io_registry_entry_set_properties
+@@ -4272,11 +4339,7 @@
+ 			res = kIOReturnBadArgument;
+ 		}
+ #if CONFIG_MACF
+-		/* A service's grant (native_sandbox_grant) stands in for the sandbox's verdict on setting its properties as well: backboardd's
+-		 * profile refuses FadePeriod, which CoreBrightness sends with every brightness, on the panel backlight (int-276). */
+-		else if (!(OSDynamicCast(IOService, entry) && native_sandbox_grant(OSDynamicCast(IOService, entry)))
+-		    && 0 != mac_iokit_check_set_properties(kauth_cred_get(),
+-		    registry_entry, obj)) {
++		else if (0 != picasso_iokit_set_properties_check(entry, &obj)) {
+ 			res = kIOReturnNotPermitted;
+ 		}
+ #endif

@@ -1,0 +1,78 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9010,6 +9010,41 @@
+ 	return (int)count;
+ }
+ 
++/* Restoring Data is independent of trusting the previous boot's LS index.
++ * Wait for the complete Applications view before dropping regenerable stores.
++ * A restored Data volume already owns its Metal cache; never import an old aux copy.
++ */
++static void
++picasso_apps_cache_prepare(proc_t p, user_addr_t scratch, unsigned found, unsigned resolved)
++{
++	uint32_t rebuild = 0;
++	extern volatile uint32_t native_data_persist_state;
++	if(native_data_persist_state==2)printf("PICASSO_CACHE restored Data: rebuild LaunchServices; retain MobileGestalt and application Data\n");
++	if (PE_parse_boot_argn("picasso-ls-rebuild", &rebuild, sizeof(rebuild)) && rebuild == 1) {
++		if (native_picasso_apps_stage == 5 && !native_picasso_apps_status &&
++		    found == 0xfff && resolved == 0xfff) {
++			picasso_m2v_probe();
++			if (native_data_persist_state != 2) picasso_m2v_import(p, scratch);
++			/* Off by default: lsd treats a store restored from an earlier boot as stale and
++			 * prunes the application records (the home screen loses its icons), so the drop and
++			 * rescan stay the shipped path until that validation is understood. The aux window,
++			 * the export command and the restore code remain for A/B experiments
++			 * (picasso-ls-restore=1). */
++			uint32_t restore = 0;
++			PE_parse_boot_argn("picasso-ls-restore", &restore, sizeof(restore));
++			const int restored = restore && native_data_persist_state != 2 ? picasso_lsp_restore(p, scratch) : 0;
++			if (restored > 0) {
++				printf("PICASSO_LS_REBUILD restored=%d\n", restored);
++			} else {
++				native_picasso_ls_store_drop(p, scratch);
++			}
++		} else {
++			printf("PICASSO_LS_REBUILD skipped stage=%d status=%d found=%03x fileid=%03x\n",
++			    native_picasso_apps_stage, native_picasso_apps_status, found, resolved);
++		}
++	}
++}
++
+ static void
+ native_picasso_apps_mount(proc_t p, user_addr_t scratch)
+ {
+@@ -9092,32 +9127,7 @@
+ 		}
+ 		if (path) kfree_data(path, MAXPATHLEN);
+ 		printf("PICASSO_APPS_VIEW found=%03x fileid=%03x\n", found, resolved);
+-		uint32_t rebuild = 0;
+-		extern volatile uint32_t native_data_persist_state;
+-		if(native_data_persist_state==2)printf("PICASSO_CACHE restored Data: rebuild LaunchServices; retain MobileGestalt and application Data\n");
+-		if (PE_parse_boot_argn("picasso-ls-rebuild", &rebuild, sizeof(rebuild)) && rebuild == 1) {
+-			if (native_picasso_apps_stage == 5 && !native_picasso_apps_status &&
+-			    found == 0xfff && resolved == 0xfff) {
+-				picasso_m2v_probe();
+-				picasso_m2v_import(p, scratch);
+-				/* Off by default: lsd treats a store restored from an earlier boot as stale and
+-				 * prunes the application records (the home screen loses its icons), so the drop and
+-				 * rescan stay the shipped path until that validation is understood. The aux window,
+-				 * the export command and the restore code remain for A/B experiments
+-				 * (picasso-ls-restore=1). */
+-				uint32_t restore = 0;
+-				PE_parse_boot_argn("picasso-ls-restore", &restore, sizeof(restore));
+-				const int restored = restore ? picasso_lsp_restore(p, scratch) : 0;
+-				if (restored > 0) {
+-					printf("PICASSO_LS_REBUILD restored=%d\n", restored);
+-				} else {
+-					native_picasso_ls_store_drop(p, scratch);
+-				}
+-			} else {
+-				printf("PICASSO_LS_REBUILD skipped stage=%d status=%d found=%03x fileid=%03x\n",
+-				    native_picasso_apps_stage, native_picasso_apps_status, found, resolved);
+-			}
+-		}
++		picasso_apps_cache_prepare(p, scratch, found, resolved);
+ 	}
+ 	printf("PICASSO_APPS_MOUNT stage=%d status=%d\n", native_picasso_apps_stage, native_picasso_apps_status);
+ }

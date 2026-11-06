@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ORIGINAL_SHA256 = 'f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7'
 SLIDE = -0x1000000
 SANDBOX = 'com.apple.security.sandbox'
+NETWORK = 'com.apple.iokit.IONetworkingFamily'
 OLD_CLASS = b'AppleARMWatchdogTimer'
 NATIVE_CLASS = b'PicassoWatchdogDriver'
 ATOM_VA = 0xfffffff005838818
@@ -127,6 +128,36 @@ def verify_candidate(native, original, candidate, plan):
     require(rebuilt == candidate and expected == plan, 'Watchdog policy report does not reproduce the candidate')
 
 
+def verify_network_stack(native, original, candidate, plan):
+    """Require the original stack code and its real IOBSD matching personality."""
+    require(sha(original) == ORIGINAL_SHA256 and plan.get('original_sha256') == ORIGINAL_SHA256,
+            'Unaudited network-stack donor')
+    require(plan.get('candidate_sha256') == sha(candidate) and NETWORK in plan.get('components', []),
+            'Missing network-stack component or stale prelink report')
+    def entries(data):
+        image = native.macho(data)
+        info = next(s for s in image['segments'] if s['name'] == '__PRELINK_INFO')
+        raw = read_at(native, data, image, info['va'], info['filesize'])
+        return image, native.unserialize_xml(raw)['_PrelinkInfoDictionary']
+    old_image, old_entries = entries(original)
+    new_image, new_entries = entries(candidate)
+    source = [e for e in old_entries if e['CFBundleIdentifier'] == NETWORK]
+    selected = [e for e in new_entries if e['CFBundleIdentifier'] == NETWORK]
+    require(len(source) == len(selected) == 1, 'Ambiguous network-stack metadata')
+    personality = source[0]['IOKitPersonalities']['IONetworkStack']
+    require(personality['IOClass'] == 'IONetworkStack' and personality['IOProviderClass'] == 'IOResources'
+            and personality['IOResourceMatch'] == 'IOBSD', 'Unaudited original stack personality')
+    require(selected[0]['IOKitPersonalities']['IONetworkStack'] == personality,
+            'Network stack must keep its original matching and user client')
+    module = native.macho(original, native.backed_offset(old_image['segments'],
+                          source[0]['_PrelinkExecutableLoadAddr'], 32, len(original)))
+    code = next(s for s in module['segments'] if s['name'] == '__TEXT_EXEC')
+    before = read_at(native, original, old_image, code['va'], code['filesize'])
+    after = read_at(native, candidate, new_image, code['va'] + SLIDE, code['filesize'])
+    require(before == after and plan['original_executable_sha256'][NETWORK] == sha(before),
+            'Original network-stack instructions changed')
+
+
 def build(native, emitter, args):
     require(not args.output.exists() and not args.output.with_suffix('.json').exists(),
             'Refuse to overwrite an existing candidate or report')
@@ -143,6 +174,7 @@ def build(native, emitter, args):
     qualify_native(native, candidate, native.macho(candidate))
     candidate, plan = adapt_policy(native, original, candidate, plan)
     verify_candidate(native, original, candidate, plan)
+    verify_network_stack(native, original, candidate, plan)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open('xb') as stream:
         stream.write(candidate)

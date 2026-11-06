@@ -66,6 +66,7 @@ jobs:
           cp out/picasso/host-checks/ui-runtime/runtime/results.json out/picasso/logs/ui-runtime-host.json
           cp out/picasso/host-checks/ui-runtime/nvram/results.json out/picasso/logs/nvram-host.json
           cp out/picasso/host-checks/ui-runtime/surface/results.json out/picasso/logs/ui-surface-host.json
+          cp out/picasso/host-checks/ui-runtime/startup/results.json out/picasso/logs/startup-host.json
 
       - name: Check exact status bar library trust
         run: |

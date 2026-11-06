@@ -14,6 +14,11 @@
 extern "C" bool picasso_backlight_current(uint32_t *);
 extern "C" IOReturn picasso_backlight_level(uint32_t);
 
+static IOService *publishedBrightness;
+extern "C" bool picasso_brightness_is_service(IORegistryEntry *entry) {
+    return entry && entry == __atomic_load_n(&publishedBrightness, __ATOMIC_ACQUIRE);
+}
+
 class PicassoBrightness : public IOService {
     OSDeclareDefaultStructors(PicassoBrightness)
     IOWorkLoop *loop = nullptr;
@@ -22,7 +27,7 @@ class PicassoBrightness : public IOService {
     bool requestAdded = false, fadeAdded = false, accepting = false, compatible = false;
     const OSMetaClass *appleClass = nullptr;
     uint64_t mailbox = 0;
-    uint32_t level = 0, reports = 0;
+    uint32_t level = 0, reports = 0, propertyReports = 0;
     picasso_backlight::Fade fade;
 
     static uint64_t nowMs() {
@@ -85,6 +90,8 @@ class PicassoBrightness : public IOService {
         self->step();
     }
     void quiesce() {
+        IOService *expected = this;
+        __atomic_compare_exchange_n(&publishedBrightness, &expected, nullptr, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
         // setProperties never waits for the work-loop gate while holding this
         // lock. Removing the sources waits out callbacks before freeing them.
         if (requestLock) IOLockLock(requestLock);
@@ -128,12 +135,17 @@ public:
         __atomic_store_n(&compatible, true, __ATOMIC_RELEASE);
         if (!setProperty("backlight-control", true)) return false;
         __atomic_store_n(&accepting, true, __ATOMIC_RELEASE);
+        IOService *expected = nullptr;
+        if (!__atomic_compare_exchange_n(&publishedBrightness, &expected, this, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) return false;
         registerService();
         IOLog("PICASSO_BRIGHTNESS published range=0..4095 nonzero_min=42 initial=%u\n", level);
         return true;
     }
     IOReturn setProperties(OSObject *properties) override {
         auto *dict = OSDynamicCast(OSDictionary, properties);
+        unsigned ticket = __atomic_fetch_add(&propertyReports, 1U, __ATOMIC_RELAXED);
+        if (ticket < 128 || !(ticket & 63))
+            IOLog("PICASSO_BRIGHTNESS properties ticket=%u dictionary=%u keys=%u\n", ticket, dict != nullptr, dict ? dict->getCount() : 0);
         if (!dict) return kIOReturnBadArgument;
         auto *number = OSDynamicCast(OSNumber, dict->getObject("brightness"));
         if (!number) return kIOReturnBadArgument;
@@ -155,6 +167,9 @@ public:
             if (result) __atomic_store_n(&mailbox, 0ULL, __ATOMIC_RELEASE);
         }
         IOLockUnlock(requestLock);
+        if (result || ticket < 128 || !(ticket & 63))
+            IOLog("PICASSO_BRIGHTNESS queued=%u target=%u fade_ms=%u error=%x\n", result == 0,
+                picasso_backlight::clamp(uint32_t(raw)), uint32_t(ms), result);
         return result;
     }
     void stop(IOService *provider) override { quiesce(); IOService::stop(provider); }
