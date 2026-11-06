@@ -48,6 +48,9 @@ void native_novatek_touch_boot_report(unsigned now);
 // Probe diagnostics for the boot monitor.
 volatile uint32_t native_novatek_touch_stage_req, native_novatek_touch_stage, native_novatek_touch_step;
 volatile uint32_t native_novatek_touch_frames, native_novatek_touch_valid, native_novatek_touch_contacts;
+// Strong definition overrides the weak stub in PicassoBootProgressStubs.c: the panel probe is the only
+// publisher of physical-contact state, so the TOUCH row reports it instead of a permanent zero.
+volatile uint32_t native_touch_physical_active;
 volatile int native_novatek_touch_error;
 volatile int native_novatek_touch_last_x = -1, native_novatek_touch_last_y = -1;
 volatile uint32_t native_novatek_touch_id[6];
@@ -523,7 +526,7 @@ bool publish(const struct nvt_contact *out, int n) {
     pub.writer_lock = &native_touch_writer_lock;
     if (n > 0) picasso_hid_physical_contact();
     nvt_touch_publish(&pub, xs, ys, ids, static_cast<unsigned>(n));
-    if (published) physicalActive = n > 0;
+    if (published) native_touch_physical_active = (physicalActive = n > 0);
     return published;
 }
 

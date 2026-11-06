@@ -53,6 +53,9 @@ WEAK volatile uint32_t native_touch_seq;
 WEAK volatile uint32_t native_touch_count;
 // Referenced by the owned HID source (ShengHidInput) for its touch timeline.
 WEAK volatile uint32_t native_touch_hid_reports;
+// The Novatek probe overrides this with its last successfully published physical state.
+// Keep the monitor linkable when that producer is absent.
+WEAK volatile uint32_t native_touch_physical_active;
 WEAK volatile int native_touch_xs[12];
 WEAK volatile int native_touch_ys[12];
 WEAK volatile int native_touch_ids[12];

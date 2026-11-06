@@ -1422,6 +1422,28 @@ size_t boot_progress_profile_rows(char *out,size_t cap) {
       BP_ROW("\n");
     }
   }
+  // Touch pipeline per profile block: frames the panel probe sampled and published, HID reports the
+  // virtual digitizer sent, and the event-driver edge counters. A contact that appears in d_frames
+  // but not d_hid stops at publication; one that appears in d_hid but not on screen stops downstream.
+  {
+    extern volatile uint32_t native_novatek_touch_frames __attribute__((weak_import));
+    extern volatile uint32_t native_touch_hid_reports __attribute__((weak_import));
+    extern volatile uint32_t native_touch_edge_stats[4] __attribute__((weak_import));
+    extern volatile uint32_t native_touch_physical_active __attribute__((weak_import));
+    if(&native_novatek_touch_frames && &native_touch_hid_reports && &native_touch_edge_stats[0]) {
+      static uint32_t lf, lh, le1, le2, le3;
+      const uint32_t f = __atomic_load_n(&native_novatek_touch_frames, __ATOMIC_RELAXED);
+      const uint32_t h = __atomic_load_n(&native_touch_hid_reports, __ATOMIC_RELAXED);
+      const uint32_t e1 = __atomic_load_n(&native_touch_edge_stats[1], __ATOMIC_RELAXED);
+      const uint32_t e2 = __atomic_load_n(&native_touch_edge_stats[2], __ATOMIC_RELAXED);
+      const uint32_t e3 = __atomic_load_n(&native_touch_edge_stats[3], __ATOMIC_RELAXED);
+      BP_ROW("TOUCH d_frames=%u d_hid=%u d_begin=%u d_edge=%u d_skip=%u phys=%u count=%u\n",
+          f - lf, h - lh, e1 - le1, e2 - le2, e3 - le3,
+          &native_touch_physical_active ? (unsigned)native_touch_physical_active : 0u,
+          (unsigned)native_touch_count);
+      lf = f; lh = h; le1 = e1; le2 = e2; le3 = e3;
+    }
+  }
 #undef BP_ROW
   return at;
 }

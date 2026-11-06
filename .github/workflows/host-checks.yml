@@ -114,6 +114,12 @@ jobs:
             --output out/picasso/host-checks/display-policy
           cp out/picasso/host-checks/display-policy/results.json out/picasso/logs/display-policy-host.json
 
+      - name: Check reviewed PR19 probes and Linux host tool isolation
+        run: |
+          python3 scripts/check-picasso-pr19.py --output out/picasso/host-checks/pr19 \
+            --adt out/picasso/logs/adt-host-check/board-with-data.adt
+          cp out/picasso/host-checks/pr19/results.json out/picasso/logs/pr19-host.json
+
       - name: Check root input verifier failure paths
         run: |
           python3 scripts/check-picasso-root-inputs-host.py --output out/picasso/host-checks/root-inputs

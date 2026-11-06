@@ -54,6 +54,11 @@ volatile uint32_t native_cpufreq_frame[2];
 volatile uint32_t native_cpufreq_usage[8];
 extern volatile uint32_t native_adreno_method_stats[20][4] __attribute__((weak_import));
 extern volatile uint32_t native_hid_input_events[8] __attribute__((weak_import));
+// Live touch-pipeline counters: the panel probe owns the frame count and the physical-contact state,
+// the HID driver owns the reports and the edge counters, and the boot stubs define the rest weakly.
+extern volatile uint32_t native_novatek_touch_frames, native_touch_hid_reports;
+extern volatile uint32_t native_touch_count, native_touch_physical_active;
+extern volatile uint32_t native_touch_edge_stats[4];
 uint64_t sheng_cpu_idle_mach(int cpu);
 }
 
@@ -344,6 +349,18 @@ void governorThread(void *, wait_result_t) {
                    gDomain[2].va ? rd32(gDomain[2].va, kRegPerfState) : 0, windowKHz(gDomain[2]) / 1000,
                    cycMHz[2],
                    native_cpufreq_boosts);
+            // The TOUCH row rides this 10 s tick: CONFIG_XNU_BOOT_PROGRESS is off in this
+            // build, so the shared boot monitor's rows never run and the drivers report here.
+            {
+                static uint32_t lf, lh, le1, le2, le3;
+                const uint32_t f = native_novatek_touch_frames, h = native_touch_hid_reports;
+                const uint32_t e1 = native_touch_edge_stats[1], e2 = native_touch_edge_stats[2];
+                const uint32_t e3 = native_touch_edge_stats[3];
+                printf("TOUCH d_frames=%u d_hid=%u d_begin=%u d_edge=%u d_skip=%u phys=%u count=%u\n",
+                       f - lf, h - lh, e1 - le1, e2 - le2, e3 - le3,
+                       (unsigned)native_touch_physical_active, (unsigned)native_touch_count);
+                lf = f; lh = h; le1 = e1; le2 = e2; le3 = e3;
+            }
         }
     }
 }

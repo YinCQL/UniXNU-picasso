@@ -1,0 +1,51 @@
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1921,6 +1921,40 @@
+ #endif
+ /* PICASSO_SERVICE_WAIT_BSD_END */
+ 
++/* PICASSO_ABORTTEXT_BEGIN: the payload a UI service passes to abort_with_payload.
++ * CoreAnimation's create_fragment_shader aborts with "function=%s spec=%s\n%s"
++ * (the Metal error's description); the exit reason does not retain the text, so
++ * the syscall that receives it is the only place it can be read. */
++#if DEVELOPMENT || DEBUG
++static void
++picasso_abort_payload_text(proc_t p, uint32_t reason_namespace, uint64_t reason_code,
++    user_addr_t payload, uint32_t payload_size)
++{
++	static unsigned reports;
++	if (reason_namespace != OS_REASON_COREANIMATION) return;
++	if (strcmp(p->p_name, "backboardd") && strcmp(p->p_name, "SpringBoard")) return;
++	if (__atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED) >= 8) return;
++	char text[512];
++	uint32_t length = 0;
++	if (payload && payload_size) {
++		length = payload_size < sizeof(text) ? payload_size : (uint32_t)sizeof(text) - 1;
++		if (copyin(payload, text, length)) length = 0;
++	}
++	text[length] = '\0';
++	for (uint32_t i = 0; i < length; ++i) {
++		if ((unsigned char)text[i] < 0x20 || (unsigned char)text[i] > 0x7e) text[i] = ' ';
++	}
++	printf("PICASSO_ABORTTEXT pid=%d name=%s code=%llx size=%u text=%s\n",
++	    proc_getpid(p), p->p_name, (unsigned long long)reason_code, payload_size, text);
++}
++#else
++static inline void
++picasso_abort_payload_text(proc_t p, uint32_t ns, uint64_t code, user_addr_t payload, uint32_t size)
++{
++	(void)p; (void)ns; (void)code; (void)payload; (void)size;
++}
++#endif
++/* PICASSO_ABORTTEXT_END */
+ static int
+ abort_with_payload_internal(proc_t p,
+     uint32_t reason_namespace, uint64_t reason_code,
+@@ -1930,6 +1964,7 @@
+ {
+ 	os_reason_t exit_reason = OS_REASON_NULL;
+ 	kern_return_t kr = KERN_SUCCESS;
++	picasso_abort_payload_text(p, reason_namespace, reason_code, payload, payload_size);
+ #if DEVELOPMENT || DEBUG
+ 	static unsigned pid1_abort_count;
+ 	unsigned ticket = proc_getpid(p) == 1 ? picasso_pid1_trace_ticket(&pid1_abort_count, 8) : 0;

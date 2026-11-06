@@ -41,6 +41,7 @@ def main():
     fixture = root / 'scripts/tests/picasso-gop-handoff-host.cpp'
     gate = extract(display, 'void gpuComplete(')
     test = fixture.read_text().replace('// PRESENTER_METHODS', methods).replace('// DISPLAY_OFFER', offer).replace('// DISPLAY_COMPLETION', completion).replace('// DISPLAY_GATE', gate)
+    test = test.replace('// FRAME_TRACE', extract(display, 'static void picasso_frame_trace('))
     (out / 'handoff.cpp').write_text(test)
     spec = importlib.util.spec_from_file_location('host', root / 'scripts/check-picasso-user-fault.py')
     host = importlib.util.module_from_spec(spec)
