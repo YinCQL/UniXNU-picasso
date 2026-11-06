@@ -1,0 +1,29 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -7035,6 +7035,25 @@
+         printf("PICASSO_FBUC power change to %llu -> ret=%x hardware=%x\n",
+             (unsigned long long)args->scalarInput[0], ret, hardware);
+     }
++	/* iOS 16's compositor asks IOMobileFramebuffer for two records this iPadOS 17
++	 * driver does not implement at the same selector numbers. It gets
++	 * kIOReturnUnsupported, then aborts (SIGABRT) and launchd restarts it every
++	 * ~10 s. Answer "not ready" with a zeroed record, which the compositor
++	 * retries, instead of the fatal unsupported error. gpu6 traced selector 27
++	 * as the last framebuffer call before 28 of 32 backboardd exits, and 68
++	 * before the other 4. picasso-fb-soften=0 restores the old answer. */
++	{
++		unsigned soften = 1;
++		PE_parse_boot_argn("picasso-fb-soften", &soften, sizeof(soften));
++		if (soften && ret == kIOReturnUnsupported && (selector == 27 || selector == 68) &&
++		    !strncmp(getMetaClass()->getClassName(), "IOMobileFramebuffer", 19)) {
++			if (args->structureOutput && args->structureOutputSize && !args->structureOutputDescriptor) {
++				bzero(args->structureOutput, args->structureOutputSize);
++			}
++			ret = kIOReturnNotReady;
++			printf("PICASSO_FBUC soften selector=%u -> %x\n", selector, ret);
++		}
++	}
+ 	if (picassoFbTicket) {
+ 		printf("PICASSO_FBUC done=%u selector=%u ret=%x\n", picassoFbTicket, selector, ret);
+ 	}
