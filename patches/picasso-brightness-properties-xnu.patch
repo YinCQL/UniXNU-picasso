@@ -4,7 +4,7 @@
  #include <libkern/c++/OSKext.h>
 +#include <libkern/c++/OSCollectionIterator.h>
  #include <libkern/c++/OSSharedPtr.h>
-@@ -4237,6 +4238,73 @@
+@@ -4237,6 +4238,77 @@
  
  
  static bool native_sandbox_grant(IOService * service);
@@ -18,8 +18,12 @@
 +{
 +	IOService *service = OSDynamicCast(IOService, entry);
 +	const bool board = picasso_brightness_is_service && picasso_brightness_is_service(entry);
-+	// Preserve the existing policy for all other services.
-+	if (!board && service && native_sandbox_grant(service)) return 0;
++	// The board service is granted exactly like the other native services and
++	// validates the protocol itself (range, FadePeriod, normalized dictionaries).
++	// backboardd's sandbox profile refuses FadePeriod, which CoreBrightness sends
++	// with every brightness, on the panel backlight (int-276); the grant stands in
++	// for the verdict here as it did before the board-specific negotiation.
++	if (service && native_sandbox_grant(service)) return 0;
 +	int original = mac_iokit_check_set_properties(kauth_cred_get(), entry, *object);
 +	if (!board) return original;
 +	int verdict = original;

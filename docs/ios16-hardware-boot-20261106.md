@@ -271,3 +271,68 @@ first 20 GiB initialization needs the userdata tail blank — erase the
 partition, re-flash `userdata-root.img` and boot; the journal window and Data
 header are then empty and the replacement journal runs on that boot.
 
+## `picasso-wled=1` turns the panel black on this board (2026-11-06 15:00 CST)
+
+The merged board enables `picasso-wled=1` for the first time on this line. On
+the data-init boot (kernel `a1e1a21c`, shipping board args, fresh Data) the
+WLED driver adopted the firmware state (`PICASSO_WLED adopt … control_apid=287
+sink_apid=288`, `power=1 verified=1`, `level=1023`) and the boot logo was on
+the panel (`frame 2..10 kind=0 nonblack=29457 bounds=443,1025,636,1261`).
+
+Then backboardd set brightness 0 (a fresh Data has slider position 0):
+
+    PICASSO_BRIGHTNESS queued=1 target=0 fade_ms=0 error=0 normalized=1
+    PICASSO_BRIGHTNESS request=0 fade_ms=0 from=1023
+    PICASSO_WLED brightness=0 applied=0 deferred=0 error=0
+
+The panel went dark. CoreBrightness retried the saved value every 60 s and the
+kernel refused it:
+
+    PICASSO_BRIGHTNESS mac original=1 final=1 brightness_only=0 valid=1 attempted=1 pid=50
+    PICASSO_BRIGHTNESS key=FadePeriod number=1 value=4294901760 bits=32
+    PICASSO_BRIGHTNESS key=brightness number=1 value=2048 bits=32
+
+`original=1` is the MACF verdict on the full dict; `attempted=1` is the
+brightness-only subset retry; `final=1` means the subset was refused too. The
+old `zzwb-native-sandbox-grant-set-properties.patch` bypassed exactly this
+(backboardd's profile refuses `FadePeriod` on the panel backlight, int-276);
+the merged `picasso_iokit_set_properties_check` skips the grant when the entry
+is the board service and MAC denies both the full and subset checks.
+
+The WLED state machine then poisoned itself: every later display-power request
+returns `configuration` (-3), so the power button does nothing visible —
+
+    PICASSO_HID consumer s=1 page=c usage=30 down=1 options=0
+    request_power_change second_external 0 powerstate0 fdisplaytype 0
+    PICASSO_WLED power=0 error=-3 verified=0
+    PICASSO_FBUC power change to 0 -> ret=e00002ca hardware=e00002ca
+
+Every earlier usable boot (09:54, `val-usb500`, `val-rows`, the 14:19 rebased
+validation) had **no** `picasso-wled` argument: the firmware backlight stayed
+on and the panel worked. The immediate remedy is therefore a payload without
+`picasso-wled=1` (`boot-nowled.img`, built from the same kernel); the lasting
+fix restores the grant bypass in `picasso-brightness-properties-xnu.patch`
+(`if (service && native_sandbox_grant(service)) return 0;`, applied before the
+MAC check), after which `picasso-wled=1` can be re-enabled.
+
+### Payload rebuilds need the trust cache and the touch firmware
+
+Two inputs are not baked into the prepared tree and are easy to drop when a
+payload is rebuilt by hand:
+
+- `--trust-cache out/picasso/original-static-system.bundle` (SHA pinned in
+  `board.toml`, `eb1475f6…`). A payload built without it prints the kernel
+  banner and the first VM-zone lines, then resets into Fastboot before the USB
+  console registers (`boot-nowled.img`, 15:02).
+- `NOVATEK_TOUCH_FW=<novatek_nt36672c_g7a_fw01.bin>` for the kernel build.
+  Without it every boot since 14:19 reports `PICASSO_NVT stage4 disabled:
+  firmware is not supplied` and touch never starts. The pinned 128 KiB image
+  (SHA `f62db7d1…`) is at the release URL in
+  `scripts/picasso_touch_firmware.py`; download it and rebuild the kernel.
+
+The 15:05 boot with both inputs (`boot-nowled2.img`, kernel `80decb67`) draws
+the full lock screen (`frame 10 kind=0 nonblack=2583332 bounds=0,0,1079,2399`)
+with the panel lit by the firmware backlight.
+
+
+
