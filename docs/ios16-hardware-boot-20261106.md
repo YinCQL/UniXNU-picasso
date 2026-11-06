@@ -184,3 +184,49 @@ touching the phone, not by waiting.
 ufs-cache, keystore, staged-apps, data-host, ram-data, mach-ports, microtime,
 ios16-surface-abi). The repo's migration gate
 (`check-picasso-iphone-migration.py`) also passes after the `2b895dc` ADT fix.
+
+## Zero-copy direct scanout ported and working (2026-11-06 13:47 CST)
+
+The three iPadOS display commits are now on this line: `81ed071` (SDE/apps
+SMMU probe), `a180505` (`sheng-dpu-scanout=2`, four 32 MiB SMMU slots) and
+`5d7b9eb` (retire at the flip, per-frame latch timing) — commits `f1f66fa`,
+`b5bd519`, `934e60e`. `ed06a33` also brings the write-combine cost row
+(`wc_us`/`wc_reset`/`cache_us`) onto the GPU console line. `9233cad` makes the
+merged file compile under this kernel's stricter flags (each option cast to
+`IOOptionBits`, `dpuWrite` marked unused; no behaviour change) and the kernel
+built as `9f9f50e3…`.
+
+The controller's own probe proves the firmware geometry and the SMMU bank:
+
+    PICASSO_DPU smmu scr0=2d0406 idr0=4c017e51 idr1=6000003e groups=81 banks=62 pages=128
+    PICASSO_DPU stream smr=84020b40 s2cr=2 bank=2 cbar=1f000 sctlr=e0
+    PICASSO_DPU smmu state=80000002
+    PICASSO_DPU direct scanout on bank=2 window=10000000 boot=a0000000 stride=4320
+
+Booted as `out/picasso/boot/boot-dpu.img` (62 MB, payload cmdline carries
+`sheng-dpu-scanout=2`, no addon). Host-measured: fastboot boot at 13:47:14,
+first frame at 13:48:32 (77.5 s). In 5 minutes of idle lock screen:
+
+| Metric | Value |
+|---|---|
+| DPU flips | 510+ (2 surfaces, `maps=2`, `mapfails=0`, `fallbacks=0`, `latch_timeouts=0`) |
+| frame period | 19.1 ms in the first bucket, then ~100 ms (CA-paced static screen) |
+| latch (pipe flush → latched) | 3.4–8.8 ms, max 8.8 ms |
+| fence wait | 1 µs (no Metal plugin, so no GPU fences are outstanding) |
+| CPU copy samples | **0** (was 463 on the first boot, 1280 in `val-rows`) |
+| `PICASSO_DISPLAY frame` rows | 207, all `kind=3` (direct) |
+| aborts / SpringBoard starts | 0 / 1 |
+
+The panel is now fed by the display SMMU reading the compositor's own
+surfaces: the CPU copy, its commit and its fence all leave the frame. The
+`time_ms` field on this boot reads 940814 because the generic counter is not
+reset by a warm `fastboot boot`; the host timestamps above are the boot-time
+measurement.
+
+### Snapshot while direct scanout owns the pipe
+
+`patches/picasso-cdc-snapshot-xnu.patch` now calls the display driver's
+`native_legacy_direct_snapshot()` first (a weak import; absent backends keep
+the old path), so the CDC `snapshot` command copies the surface actually on
+screen into the GOP memory before it samples it. Without that call the GOP
+mapping is stale exactly while direct scanout is active.
