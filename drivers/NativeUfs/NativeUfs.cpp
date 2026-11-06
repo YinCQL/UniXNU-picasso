@@ -1168,6 +1168,9 @@ static uint32_t be32w (const uint8_t *at)
 
 }
 
+// Immutable after gStoreReady release; never registered as a write window.
+static uint64_t gModemFirst, gModemLast;
+
 // ---- Persistent Data store window (sheng-data-persist) ----------------------------------------------------------
 // The only part of this driver that ever writes. The consumer (NativeRamBlock's overlay) asks for a window of the given
 // size at the END of the userdata partition. Mode 1 (boot argument sheng-data-persist=1) only reads: it proves the window and
@@ -1472,6 +1475,7 @@ extern "C" unsigned native_ufs_store_gpt_check (void)
   return result;
 }
 
+#include "FirmwareRead.h"
 #include "PicassoPersistence.h"
 
 // One read-only window of the root image as a block device: 512-byte sectors on top of 4096-byte
@@ -2680,6 +2684,8 @@ bool NativeUfs::startRoot (IOService *provider)
   }
   gStoreGeometry = { true, layout->userdataFirst, layout->userdataLast, layout->imageBytes, layout->gptEntriesLba,
                      layout->gptHeaderCrc, layout->gptEntriesCrc, layout->gptEntryCount };
+  gModemFirst = layout->modemFirst;
+  gModemLast = layout->modemLast;
   __atomic_store_n(&gStoreReady,1U,__ATOMIC_RELEASE);
   const char *names[4] = {};
   for (unsigned i = 0; i < layout->windows; ++i) names[i] = layout->window[i].name;

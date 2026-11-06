@@ -51,7 +51,7 @@ jobs:
       - name: Install host compilers
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld
+          sudo apt-get install -y clang lld libssl-dev
 
       - name: Prepare the isolated upstream source
         run: |
@@ -103,6 +103,8 @@ jobs:
         run: |
           python3 scripts/check-picasso-adsp.py --output out/picasso/host-checks/adsp
           cp out/picasso/host-checks/adsp/results.json out/picasso/logs/adsp-host.json
+          python3 scripts/check-picasso-firmware.py --output out/picasso/host-checks/firmware
+          cp out/picasso/host-checks/firmware/results.json out/picasso/logs/firmware-host.json
 
       - name: Check GOP import and completion ownership
         if: github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-audio'

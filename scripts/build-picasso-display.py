@@ -248,7 +248,8 @@ def main():
                source_dir / 'NativeGOPPresenter.cpp', source_dir / 'NativeGOPGlue.cpp',
                ROOT / 'kits/picasso/PicassoPr13.cpp', ROOT / 'kits/picasso/PicassoBacklight.cpp',
                ROOT / 'kits/picasso/PicassoBrightness.cpp', ROOT / 'kits/picasso/PicassoSpmi.cpp',
-               ROOT / 'kits/picasso/PicassoAdsp.cpp']
+               ROOT / 'kits/picasso/PicassoAdsp.cpp', ROOT / 'kits/picasso/PicassoAdspFirmware.cpp',
+               ROOT / 'kits/picasso/PicassoFat.cpp']
     audit = None
     for source in sources:
         obj = out / (source.stem + '.o')
@@ -281,7 +282,8 @@ def main():
     sources += [ROOT / 'drivers/NativeNovatekTouch/TouchPublish.h']
     sources += [ROOT / 'kits/picasso/PicassoBacklightCore.h', ROOT / 'kits/picasso/PicassoButtonsCore.h',
                 ROOT / 'kits/picasso/PicassoSpmi.h', ROOT / 'kits/picasso/PicassoSpmiCore.h',
-                ROOT / 'kits/picasso/PicassoAdsp.h', ROOT / 'drivers/NativeWlan/WlanSmem.h']
+                ROOT / 'kits/picasso/PicassoAdsp.h', ROOT / 'drivers/NativeWlan/WlanSmem.h',
+                ROOT / 'kits/picasso/PicassoFat.h', ROOT / 'kits/picasso/PicassoAdspFirmwareProfile.h']
     sources += [ROOT / 'drivers/NativeAdreno/OriginalAcceleratorABI.h']
     pending = Path(tempfile.mkdtemp(prefix='qualified-display-', dir=out)) / 'libNativeLegacyDisplay.late.a'
     platform.run(['xcrun', 'ar', 'rcs', pending, *objects], out / 'archive.log')

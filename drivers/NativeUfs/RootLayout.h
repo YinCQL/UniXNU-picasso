@@ -14,6 +14,7 @@ struct RootWindow {
 
 struct RootLayout {
   uint64_t userdataFirst, userdataLast;   // 4096-byte LBAs on LUN 0
+  uint64_t modemFirst, modemLast;          // optional read-only firmware partition, LUN 0
   uint64_t imageBytes;                    // size of the flashed root image from the manifest (0 when none)
   uint64_t gptEntriesLba;                 // GPT facts recorded for the persistent store's before/after comparison
   uint32_t gptHeaderCrc, gptEntriesCrc, gptEntryCount;
@@ -115,6 +116,7 @@ static bool findRootLayout (RootLayout *layout, const char **why)
     return false;
   }
   static const char wanted[] = "userdata";
+  static const char firmware[] = "modem";
   bool found = false;
   for (uint32_t index = 0; index < count; index++) {
     const uint8_t *entry = gScratch + index * 128;
@@ -130,6 +132,16 @@ static bool findRootLayout (RootLayout *layout, const char **why)
         *why = "GPT partition overlap";
         return false;
       }
+    }
+    bool modem = true;
+    for (unsigned c = 0; c < 36; ++c) {
+      uint8_t expected = c < sizeof (firmware) ? static_cast<uint8_t> (firmware[c]) : 0;
+      if (entry[56 + 2 * c] != expected || entry[57 + 2 * c]) modem = false;
+    }
+    if (modem) {
+      // Ambiguous firmware must not invalidate a usable root, but is never exposed.
+      if (layout->modemFirst) layout->modemLast = 0;
+      else { layout->modemFirst = entryFirst; layout->modemLast = entryLast; }
     }
     bool match = true;
     for (unsigned c = 0; c < sizeof (wanted); c++) {
