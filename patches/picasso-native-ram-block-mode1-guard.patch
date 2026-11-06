@@ -56,7 +56,7 @@
 +    }
      bool write(uint64_t b, uint32_t n, const void *s) { return native_ufs_store_write(b, n, s); }
      bool sync() { return native_ufs_store_sync(); }
-@@ -75,14 +89,41 @@
+@@ -75,14 +89,49 @@
  public:
    // Called once, before the Data volume is mounted (native_ram_block_volume_seed): open the store window, put the pages that
 -  // earlier boots changed back into the sparse disk, and from then on write changed pages through. The seed identity
@@ -84,11 +84,19 @@
 +    // Called under gate, before publication, only after a read-only refusal and
 +    // the second GPT check. Never switch a mounted/restored disk back to its seed.
 +    if (!isBig || big.bytes != (4ULL<<30) || big.resident > kVolatileResidentLimit ||
-+        direct || directFailed || online || stopping || sparse.pages) return false;
++        direct || directFailed || online || stopping || sparse.pages) {
++      IOLog("PICASSO_DATASTORE fallback-refused reason=state big=%u bytes=%llu resident=%llu direct=%u failed=%u online=%u stopping=%u sparse_pages=%u\n",
++            isBig,big.bytes,big.resident,direct,directFailed,online,stopping,sparse.pages!=nullptr);
++      return false;
++    }
 +    uint64_t tableBytes=(big.bytes/4096)*sizeof(uint8_t *);
 +    auto **table=static_cast<uint8_t **>(IOMallocZero(tableBytes));
-+    if (!table) return false;
-+    if (!seedMoveToSparse(big,sparse,table)) { IOFree(table,tableBytes);return false; }
++    if (!table) { IOLog("PICASSO_DATASTORE fallback-refused reason=allocation bytes=%llu\n",tableBytes);return false; }
++    if (!seedMoveToSparse(big,sparse,table)) {
++      IOLog("PICASSO_DATASTORE fallback-refused reason=seed-layout seed_bytes=%llu sparse_bytes=%llu sparse_resident=%llu count=%llu capacity=%llu\n",
++            big.bytes,sparse.bytes,sparse.resident,big.count,big.capacity);
++      IOFree(table,tableBytes);return false;
++    }
 +    if (big.index) IOFree(big.index,(big.capacity?big.capacity:1)*sizeof(uint64_t));
 +    if (big.page) IOFree(big.page,(big.capacity?big.capacity:1)*sizeof(uint8_t *));
 +    big={};isBig=false;volatileFallback=true;overlay.active=false;
@@ -105,7 +113,7 @@
 +    if (storeAttached || stopping) { IOLockUnlock(gate); return; }
      storeAttached = true;
      unsigned mode = &native_ufs_store_mode ? native_ufs_store_mode() : 0;
-@@ -93,5 +134,7 @@
+@@ -93,5 +142,7 @@
        native_data_persist_pages = pages;
        native_data_persist_gpt = native_ufs_store_gpt_check();
 -      if (!native_ufs_store_open(persist::windowBlocks(pages), &first, &why)) {
@@ -114,7 +122,7 @@
 +      if (native_data_persist_gpt || !native_ufs_store_open(persist::windowBlocks(pages), &first, &why)) {
          native_data_persist_state = 4;
          IOLog("NativeRamBlock: persistent store refused: %s\n", why);
-@@ -101,8 +144,12 @@
+@@ -101,8 +152,12 @@
          overlayBits = static_cast<uint8_t *>(IOMallocZero(bb * persist::kBlock));
          stage = static_cast<uint8_t *>(IOMallocZero(kStagePages * persist::kBlock));
 -        StoreOps ops;
@@ -129,7 +137,7 @@
 +              first, persist::windowBlocks(pages), static_cast<int>(result), overlay.header, overlay.present);
          if (result == persist::Open::Failed) {
            native_data_persist_state = 4;
-@@ -113,6 +160,5 @@
+@@ -113,6 +168,5 @@
            native_data_persist_state = 7;
            overlay.active = false;
 -          IOLog("NativeRamBlock: the persistent store holds no Data of this seed (header %d); kept, Data runs from the seed: "
@@ -137,7 +145,7 @@
 +          IOLog("PICASSO_DATASTORE kept header=%d; unknown/foreign contents preserved; automatic reset disabled\n",overlay.header);
          } else if (result == persist::Open::Fresh) {
            native_data_persist_state = 3;
-@@ -122,4 +168,10 @@
+@@ -122,4 +176,10 @@
            direct = true;
            native_data_persist_state = 2;
 +        } else if (isBig) {
@@ -148,7 +156,7 @@
 +          IOLog("PICASSO_DATASTORE mode=%u isBig=1: no RAM-resident resume; large Data unavailable\n", mode);
          } else {
            struct Loader {
-@@ -148,6 +200,17 @@
+@@ -148,6 +208,17 @@
            }
          }
 +        if (isBig && mode != 2) {
@@ -162,11 +170,11 @@
 +        if (native_data_persist_gpt_after) { directFailed=true; direct=false; persistFailed(); }
 +        if (acceptsVolatileFallback(mode,result,overlay,native_data_persist_gpt_after))
 +          prepareVolatileFallback();
-+        IOLog("PICASSO_DATASTORE ready=%u failed=%u gpt_after=%u bytes=%llu\n",
-+              direct, directFailed, native_data_persist_gpt_after, pages * 4096);
++        IOLog("PICASSO_DATASTORE ready=%u direct=%u volatile=%u failed=%u gpt_after=%u bytes=%llu\n",
++              direct || volatileFallback,direct,volatileFallback,directFailed,native_data_persist_gpt_after,pages * 4096);
        }
      }
-@@ -158,7 +221,30 @@
+@@ -158,7 +229,30 @@
    bool seedInfo(uint64_t *base,uint64_t *bytes,uint8_t hash[32]) {
      if(!gate || !base || !bytes || !hash)return false;
 -    IOLockLock(gate);bool ready=available();
@@ -198,14 +206,14 @@
 +    thread_terminate(current_thread());
    }
    bool start(IOService *) override;
-@@ -171,5 +257,5 @@
+@@ -171,5 +265,5 @@
    char *getProductString() override { return const_cast<char *>("Owned RAM block storage"); }
    char *getRevisionString() override { return const_cast<char *>("1.0"); }
 -  char *getAdditionalDeviceInfoString() override { return const_cast<char *>("volatile storage; no persistent trust claim"); }
 +  char *getAdditionalDeviceInfoString() override { return const_cast<char *>(direct ? "unprotected developer persistent storage; no key operations" : "volatile storage; no persistent trust claim"); }
    IOReturn reportBlockSize(UInt64 *value) override { *value = 512; return kIOReturnSuccess; }
    IOReturn reportEjectability(bool *value) override { *value = false; return kIOReturnSuccess; }
-@@ -181,7 +267,14 @@
+@@ -181,7 +275,14 @@
    IOReturn reportWriteProtection(bool *value) override { *value = false; return kIOReturnSuccess; }
    IOReturn doSynchronizeCache() override {
 -    if (!online) return kIOReturnNotReady;
@@ -223,7 +231,7 @@
 +    return result;
    }
    IOReturn doSynchronize(UInt64, UInt64, IOOptionBits) override { return doSynchronizeCache(); }
-@@ -250,7 +343,9 @@
+@@ -250,7 +351,9 @@
    native_ram_block_sparse=(sparse.pages||isBig)?1:0;
    native_ram_block_resident_bytes=isBig?big.resident:sparse.pages?sparse.resident:logical;
 -  online = true;
@@ -236,7 +244,7 @@
 +  } else { online=true;native_ram_block_ready=1;registerService(); }
    return true;
  }
-@@ -296,8 +391,9 @@
+@@ -296,8 +399,9 @@
      struct Operations {
        IOMemoryDescriptor *buffer;
 -      uint8_t *allocate(){return static_cast<uint8_t *>(IOMallocZero(4096));}
@@ -248,7 +256,7 @@
 +    } ops={buffer,this};
      bool write=buffer->getDirection()==kIODirectionOut;
      if(direct){
-@@ -308,9 +404,9 @@
+@@ -308,9 +412,9 @@
        } bops={buffer};
        StoreOps store;bool storeError=false;
 -      if(write && directFailed)actual=0;
@@ -260,21 +268,21 @@
 +        directFailed=true;overlay.active=false;
          native_data_persist_state=5;__atomic_fetch_add(&native_data_persist_errors,1,__ATOMIC_RELAXED);
        }
-@@ -351,5 +447,5 @@
+@@ -351,5 +455,5 @@
  void NativeRamBlock::stop(IOService *provider)
  {
 -  if (gate) { IOLockLock(gate); online = false; IOLockUnlock(gate); }
 +  if (gate) { IOLockLock(gate); stopping=true; online = false; IOLockUnlock(gate); }
    IOBlockStorageDevice::stop(provider);
  }
-@@ -357,5 +453,5 @@
+@@ -357,5 +461,5 @@
  void NativeRamBlock::free()
  {
 -  if (overlayBits) { IOFree(overlayBits, persist::bitmapBlocks(sparse.bytes / 4096) * persist::kBlock); overlayBits = nullptr; }
 +  if (overlayBits) { IOFree(overlayBits, persist::bitmapBlocks((isBig ? big.bytes : sparse.bytes) / 4096) * persist::kBlock); overlayBits = nullptr; }
    if (stage) { IOFree(stage, kStagePages * persist::kBlock); stage = nullptr; }
    if (isBig) {
-@@ -380,4 +476,12 @@
+@@ -380,4 +484,12 @@
    *device = NODEV;
    path[0] = 0;
 +  // The persistence worker must finish before UUID matching. Its blank scan is
@@ -287,7 +295,7 @@
 +  }
    OSDictionary *matching = IOService::serviceMatching("IOMedia");
    OSDictionary *properties = OSDictionary::withCapacity(1);
-@@ -389,4 +493,8 @@
+@@ -389,4 +501,8 @@
    bool ready = properties->setObject("UUID", wanted) && matching->setObject("IOPropertyMatch", properties);
    wanted->release(); properties->release();
 +  if(ready && &native_ufs_store_mode && native_ufs_store_mode()==2) {
@@ -361,15 +369,17 @@
      if (!ops.sync ()) return Open::Failed;
 --- a/SeedDisk.h
 +++ b/SeedDisk.h
-@@ -94,2 +94,17 @@
+@@ -94,2 +94,19 @@
    fin(ctx, out);
  }
 +
-+// Move the immutable seed's owned pages into an empty array-backed disk without
++// Move the immutable seed's owned pages into an unallocated array-backed disk without
 +// copying their content. The caller provides a zeroed table and releases the old
 +// index/page arrays afterwards. Validate everything before transferring ownership.
 +static bool seedMoveToSparse(SeedDisk &seed, RamSparseDisk &disk, uint8_t **table) {
-+  if (!table || disk.pages || disk.bytes || disk.resident || !seed.bytes ||
++  // start() records the logical size before choosing SeedDisk or RamSparseDisk.
++  // A matching size with no page table/resident pages is still unallocated.
++  if (!table || disk.pages || (disk.bytes && disk.bytes != seed.bytes) || disk.resident || !seed.bytes ||
 +      (seed.bytes & 4095) || seed.bytes > (4ULL << 30) || seed.count > seed.capacity ||
 +      (seed.count && (!seed.index || !seed.page)) || seed.resident != seed.count*4096) return false;
 +  for (uint64_t k=0; k<seed.count; ++k)

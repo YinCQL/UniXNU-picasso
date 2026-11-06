@@ -27,6 +27,14 @@ def main():
                            ('fallback-allocate','  uint8_t *allocateSparsePage('),
                            ('fallback-prepare','  bool prepareVolatileFallback(')]:
         (out/(name+'.inc')).write_text(extractor.extract(ram,signature))
+    # Replay the real large-seed import and worker, including its declaration of
+    # sparse.bytes. Hand-constructed fallback state missed this in build163.
+    for name,signature in [('seed-import','  if(packedInput){'),
+                           ('fallback-attach','  void attachStore('),
+                           ('fallback-worker','  static void startPersistent('),
+                           ('fallback-available','  bool available('),
+                           ('fallback-seed-info','  bool seedInfo(')]:
+        (out/(name+'.inc')).write_text(extractor.extract(ram,signature))
     (out/'aux-claim.inc').write_text(extractor.extract((ROOT/'drivers/NativeUfs/PicassoPersistence.h').read_text(),'static bool picassoAuxClaim('))
     runs=[]
     for sanitized in (False,True):

@@ -108,6 +108,31 @@ static unsigned run() {
 namespace FallbackTest {
 static uint32_t native_data_persist_state;
 static uint64_t native_ram_block_resident_bytes;
+static uint32_t native_ram_block_ready=0,native_ram_block_attach_requested=1;
+static uint32_t native_data_persist_header=9,native_data_persist_gpt=0,native_data_persist_gpt_after=0;
+static uint64_t native_data_persist_pages=0,native_data_persist_loaded=0,native_data_persist_first_lba=0,native_data_persist_present=0;
+static Medium store;
+static unsigned gptCalls=0,terminated=0,publications=0;
+using wait_result_t=int;
+static void *current_thread(){return nullptr;}
+static void thread_terminate(void *){++terminated;}
+static void IOSleep(unsigned){assert(false && "unexpected worker wait");}
+static unsigned native_ufs_store_ready(){return 1;}
+static unsigned native_ufs_store_mode(){return 2;}
+static unsigned native_ufs_store_gpt_check(){++gptCalls;return 0;}
+static int native_ufs_store_open(uint64_t blocks,uint64_t *first,const char **why){assert(blocks==store.limit);*first=14019546;*why="";return 1;}
+static int native_ufs_store_read(uint64_t b,uint32_t n,void *p){return store.read(b,n,p);}
+static int native_ufs_store_write(uint64_t b,uint32_t n,const void *p){return store.write(b,n,p);}
+static int native_ufs_store_sync(){return store.sync();}
+#ifdef _MSC_VER
+#define __ATOMIC_ACQUIRE 1
+#ifndef __ATOMIC_RELEASE
+#define __ATOMIC_RELEASE 2
+#endif
+static uint32_t __atomic_load_n(uint32_t *p,int){return *p;}
+static void __atomic_store_n(uint32_t *p,uint32_t n,int){*p=n;}
+static uint64_t __atomic_fetch_add(uint64_t *p,uint64_t n,int){auto old=*p;*p+=n;return old;}
+#endif
 static bool allocationFail=false;
 static unsigned outstanding=0;
 static void *IOMallocZero(uint64_t n) { if(allocationFail)return nullptr;void *p=calloc(1,size_t(n));if(p)++outstanding;return p; }
@@ -117,16 +142,53 @@ struct NativeRamBlock {
     bool isBig=true,direct=false,directFailed=false,online=false,stopping=false,volatileFallback=false;
     static constexpr uint64_t kVolatileResidentLimit=2ULL<<30;
     SeedDisk big={};RamSparseDisk sparse={};persist::Overlay overlay;
+    void *gate=this;uint8_t *memory=nullptr;uint64_t capacity=(4ULL<<30)/512;
+    uint8_t seedHash[32]={1};uint8_t *overlayBits=nullptr,*stage=nullptr;
+    static constexpr uint32_t kStagePages=32;
+    bool storeAttached=false;unsigned releases=0;
+    static bool discardRequested(){return false;}
+    static bool initializeBlankRequested(){return true;}
+    struct StoreOps {
+        bool scanProgress=false;
+        bool read(uint64_t b,uint32_t n,void *p){return native_ufs_store_read(b,n,p);}
+        bool write(uint64_t b,uint32_t n,const void *p){return native_ufs_store_write(b,n,p);}
+        bool sync(){return native_ufs_store_sync();}
+    };
+    void persistFailed(){overlay.active=false;native_data_persist_state=5;}
+    void release(){assert(!locks);++releases;}
+    void registerService(){assert(!locks && online && native_ram_block_ready==1);++publications;}
+    #include "fallback-available.inc"
+    #include "fallback-seed-info.inc"
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpointer-bool-conversion"
+#endif
+    #include "fallback-attach.inc"
+    #include "fallback-worker.inc"
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
+    bool importSeed(uint8_t *data,uint64_t bytes) {
+        memory=data;uint64_t logical=bytes;bool packedInput=true;
+        #include "seed-import.inc"
+        memory=nullptr;capacity=logical/512;return true;
+    }
     #include "fallback-qualify.inc"
     #include "fallback-allocate.inc"
     #include "fallback-prepare.inc"
     NativeRamBlock() {
-        big.bytes=4ULL<<30;big.count=big.capacity=2;big.resident=8192;
-        big.index=(uint64_t *)IOMallocZero(16);big.page=(uint8_t **)IOMallocZero(2*sizeof(uint8_t *));
-        big.index[0]=3;big.index[1]=big.bytes/4096-1;
-        for(unsigned i=0;i<2;++i){big.page[i]=(uint8_t *)IOMallocZero(4096);memset(big.page[i],0x30+i,4096);}
+        // Two nonzero extents, exercising the production packed-import branch.
+        std::vector<uint8_t> packed(64+8192);
+        memcpy(packed.data(),"DBRDISK1",8);persist::put32(packed.data()+8,1);persist::put32(packed.data()+12,4096);
+        persist::put64(packed.data()+16,4ULL<<30);persist::put64(packed.data()+24,2);
+        persist::put64(packed.data()+32,3*4096);persist::put64(packed.data()+40,4096);
+        persist::put64(packed.data()+48,(4ULL<<30)-4096);persist::put64(packed.data()+56,4096);
+        memset(packed.data()+64,0x30,4096);memset(packed.data()+64+4096,0x31,4096);
+        assert(importSeed(packed.data(),packed.size()));
+        assert(isBig && sparse.bytes==(4ULL<<30) && !sparse.pages && !sparse.resident);
     }
     ~NativeRamBlock() {
+        IOFree(overlayBits,persist::bitmapBlocks(capacity*512/4096)*4096);IOFree(stage,kStagePages*4096);
         for(uint64_t i=0;i<big.count;++i)IOFree(big.page[i],4096);
         IOFree(big.index,16);IOFree(big.page,2*sizeof(uint8_t *));
         if(sparse.pages){for(uint64_t i=0;i<sparse.bytes/4096;++i)IOFree(sparse.pages[i],4096);IOFree(sparse.pages,sparse.bytes/4096*sizeof(uint8_t *));}
@@ -180,6 +242,33 @@ static unsigned run() {
     {
         NativeRamBlock ram;ram.big.index[1]=ram.big.index[0];
         assert(!ram.prepareVolatileFallback() && ram.isBig && !ram.sparse.pages && ram.big.page[0]);++cases;
+    }
+    assert(!outstanding);
+    {
+        NativeRamBlock ram;auto *page=ram.big.page[0];ram.sparse.bytes=2ULL<<30;
+        assert(!ram.prepareVolatileFallback() && ram.isBig && ram.big.page[0]==page && !ram.sparse.pages);++cases;
+    }
+    {
+        NativeRamBlock ram;ram.sparse.resident=4096;
+        assert(!ram.prepareVolatileFallback() && ram.isBig && !ram.sparse.pages);++cases;
+    }
+    {
+        NativeRamBlock ram;ram.sparse.bytes=0;
+        assert(ram.prepareVolatileFallback() && ram.sparse.bytes==(4ULL<<30));++cases;
+    }
+    // Run actual attachStore/startPersistent/seedInfo over a nonempty window:
+    // no persistent writes, exactly one publication, unchanged seed identity.
+    {
+        NativeRamBlock ram;store=Medium{};store.limit=persist::windowBlocks((4ULL<<30)/4096);
+        store.disk[786456][0]=0x55;gptCalls=terminated=publications=0;native_ram_block_ready=0;
+        auto *firstPage=ram.big.page[0];uint8_t digest[32];memcpy(digest,ram.seedHash,32);
+        NativeRamBlock::startPersistent(&ram,0);
+        assert(native_data_persist_state==8 && ram.volatileFallback && ram.online && !ram.direct && !ram.isBig);
+        assert(publications==1 && terminated==1 && ram.releases==1 && !locks && !store.writes && !store.syncs && gptCalls==2);++cases;
+        assert(ram.overlay.scan==persist::BlankScan::Nonzero && ram.overlay.scanBlock==786456 && ram.sparse.find(3)==firstPage);++cases;
+        uint64_t base=1,bytes=0;uint8_t hash[32]={};
+        assert(ram.seedInfo(&base,&bytes,hash) && !base && bytes==(4ULL<<30) && !memcmp(hash,digest,32));++cases;
+        auto reads=store.reads;ram.attachStore();assert(store.reads==reads && !store.writes && ram.online);++cases;
     }
     assert(!outstanding);return cases;
 }
