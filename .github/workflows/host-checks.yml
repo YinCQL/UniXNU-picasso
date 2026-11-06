@@ -41,6 +41,11 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Check target inputs and boot argument budget
+        run: |
+          python3 scripts/check-picasso-target.py --require-build-inputs \
+            --output out/picasso/logs/target-readiness.json
+
       # Compose performs the real iPhoneOS SDK build, codesign and exact CDHash
       # validation. Host regressions need only Linux clang and structural fixtures.
       - name: Install host compilers

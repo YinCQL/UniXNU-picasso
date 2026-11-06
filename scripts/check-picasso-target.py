@@ -23,8 +23,9 @@ ROOT = Path(__file__).resolve().parents[1]
 def check_board(root=ROOT):
     board = tomllib.loads((root / 'board.toml').read_text(encoding='utf-8'))
     arguments=board['payload']['kernel_args']
-    if len(' '.join(arguments).encode())>1000:
-        raise ValueError('Kernel arguments exceed the DarwinBoot 1000-byte budget')
+    argument_bytes = len(' '.join(arguments).encode('utf-8'))
+    if argument_bytes > 1000:
+        raise ValueError(f'Kernel arguments use {argument_bytes} bytes, exceeding the DarwinBoot 1000-byte budget')
     if any(a.startswith(('sheng-data-reset=', 'sheng-log=')) for a in arguments):
         raise ValueError('Legacy reset/log arguments conflict with guarded persistent storage')
     spec = board['ipsw']
@@ -127,10 +128,12 @@ def main():
     parser.add_argument('--require-build-inputs', '--require-build-ready', action='store_true',
                         help='check build inputs (the old option name remains an alias; runtime validation is separate)')
     args = parser.parse_args()
-    check_board()
+    board = check_board()
     if args.ipsw:
         check_ipsw(args.ipsw)
     report = dict(input_configuration_valid=True, build_inputs_valid=True,
+                  kernel_argument_bytes=len(' '.join(board['payload']['kernel_args']).encode('utf-8')),
+                  kernel_argument_budget=1000,
                   product=target.PRODUCT, version=target.VERSION,
                   build=target.BUILD, retail_firmware_darwin=22, kernel_darwin=23,
                   backend_build=target.BACKEND_IPSW['build'], runtime_qualified=False,

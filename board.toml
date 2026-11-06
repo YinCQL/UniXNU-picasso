@@ -245,10 +245,8 @@ kernel_args = [
   # Start the authenticated UFS root and required power-management nub.
   "native-ufs-root=1",
   "sheng-pmgr=2",
-  # Delay UFS publication until the USB console is available.
-  "native-ufs-start-delay=5",
-  # Use timebase/yield waits and bounded scan batches during early UFS startup.
-  "native-ufs-delay-yield=1",
+  # NativeUfs defaults already wait 5 s for USB and use timebase/yield waits.
+  # Omit these two redundant overrides to stay within the boot-argument budget.
   # Verbose UFS tracing uses its disabled default.
   # Allow interrupt-context diagnostics to reach the USB console.
   "nointr_consio=1",
