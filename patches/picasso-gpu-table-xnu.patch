@@ -14,13 +14,13 @@
 +		 * driver reports unavailable instead of failing the link. */
 +		extern char native_adreno_metal_rows[48][96] __attribute__((weak_import));
 +		extern volatile uint32_t native_adreno_metal_rows_seq __attribute__((weak_import));
-+		if (!&native_adreno_metal_rows) {
++		if (!&native_adreno_metal_rows || !&native_adreno_metal_rows_seq) {
 +			printf("PICASSO_GPU_TABLE unavailable\n");
 +		} else {
 +			printf("PICASSO_GPU_TABLE begin seq=%u\n", native_adreno_metal_rows_seq);
 +			for (unsigned row = 0; row < 48; ++row)
 +				if (native_adreno_metal_rows[row][0])
-+					printf("PICASSO_GPU_TABLE %u %s\n", row, native_adreno_metal_rows[row]);
++					printf("PICASSO_GPU_TABLE %u %.95s\n", row, native_adreno_metal_rows[row]);
 +			printf("PICASSO_GPU_TABLE end\n");
 +		}
  	} else if (ud_command_is(ud.cmd, "status")) {

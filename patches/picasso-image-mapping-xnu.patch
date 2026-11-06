@@ -53,7 +53,7 @@
      /* Failed access is already final. copyin uses the current task and fails
       * safely; no remote-task walk, texture writes or suppression of the fault. */
      uint64_t frame = get_saved_state_fp(state);
-@@ -1477,5 +1530,24 @@
+@@ -1477,5 +1530,16 @@
          int copied = copyin((user_addr_t)get_saved_state_reg(state, 19), data, sizeof(data));
          if (copied) bzero(data, sizeof(data));
 +#if defined(XNU_PICASSO_IMAGE_MAPPING) && XNU_PICASSO_IMAGE_MAPPING
@@ -65,14 +65,6 @@
 +                data[8] == 0x100000004ULL && data[13] == 4320 && data[14] == 0 &&
 +                data[4] <= UINT64_MAX - 2592000)
 +                picasso_image_mapping("astc-last", data[4] + 2592000 - 16);
-+            /* The decoder writes a 1080x2400 RGBA destination (10,368,000 bytes).
-+             * A destination region shorter than that is what an ASTC decode into
-+             * an undersized surface looks like, so qualify both ends of it. */
-+            if (data[3]) {
-+                picasso_image_mapping("astc-dst", data[3]);
-+                if (data[3] <= UINT64_MAX - 10368000)
-+                    picasso_image_mapping("astc-dst-last", data[3] + 10368000 - 16);
-+            }
 +        }
 +#endif
          printf("PICASSO_ASTC descriptor copy_error=%d dst=%llx src=%llx size=%llx/%llx block=%llx\n",

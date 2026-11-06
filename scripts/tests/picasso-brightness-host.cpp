@@ -22,13 +22,6 @@ const OSMetaClass *OSMetaClass::getMetaClassWithName(const OSSymbol *s) {
 OSNumber *OSNumber::withNumber(uint64_t v,unsigned bits) {
     if(failAlloc())return nullptr;auto *n=new OSNumber;n->value=v;n->bits=bits;return n;
 }
-OSSerialize *OSSerialize::binaryWithCapacity(unsigned n, void *editor, void *reference) {
-    assert(n==32 && !editor && !reference);return failAlloc()?nullptr:new OSSerialize;
-}
-bool OSNumber::serialize(OSSerialize *s) const {
-    s->words[0]=0xd3;s->words[1]=0x84000000U|bits;
-    s->words[2]=uint32_t(value);s->words[3]=uint32_t(value>>32);return true;
-}
 OSDictionary *OSDictionary::withCapacity(unsigned) { return failAlloc()?nullptr:new OSDictionary; }
 OSDictionary::~OSDictionary() { for(unsigned i=0;i<count;++i)values[i]->release(); }
 bool OSDictionary::setObject(const char *s,OSObject *v) {
@@ -74,7 +67,7 @@ struct TestBus {
     uint8_t regs[2][256]={};unsigned operations=0,writes=0,fail=0;
     TestBus() {
         regs[0][0x46]=0x80;regs[1][0x46]=0x70;regs[1][0x50]=0x80;
-        regs[1][0x53]=0xff;regs[1][0x54]=3;
+        regs[1][0x53]=0xff;regs[1][0x54]=3;regs[1][0x65]=3;
     }
     int read(bool s,uint8_t r,uint8_t &v) {if(++operations==fail)return -1;v=regs[s][r];return 0;}
     int write(bool s,uint8_t r,uint8_t v) {if(++operations==fail)return -1;++writes;regs[s][r]=v;return 0;}
@@ -83,6 +76,8 @@ struct TestBus {
 struct Backend:TestBus {
     picasso_backlight::State state;IOLock *lock=nullptr;IOService *display=nullptr;
     bool displayOn=true;uint32_t requested=1023;unsigned reports=0;
+    void report_error(int) {}
+
 };
 static Backend *backend;
 #include "brightness-backend.inc"
@@ -131,39 +126,43 @@ int main() {
     assert(!send(s,2048));fire(0);assert(b.state.on && b.state.level==2048);++cases;
     assert(send(s,4096)==kIOReturnBadArgument && send(s,UINT64_MAX)==kIOReturnBadArgument);
     assert(send(s,5,UINT64_MAX)==kIOReturnBadArgument && s->setProperties(&display)==kIOReturnBadArgument);++cases;
-    // The actual authorized 20H392 nested protocol. The API model stores the
-    // same binary64 bits as OSNumber::withFloat/withDouble; never integer-casts.
+    // Replay build170 ordering: a real 2999 command followed by zero
+    // DisplayBrightness telemetry must apply 2999, never switch the lamp off.
     auto *outer=OSDictionary::withCapacity(1), *nested=OSDictionary::withCapacity(4);
     auto *normalized=OSNumber::withNumber(0,64);
     outer->setObject("DisplayBrightness",nested);nested->setObject("Brightness",normalized);
-    const unsigned tags[]={31U,63U};
+    assert(!send(s,2999));
+    const unsigned tags[]={31U,63U,32U,64U};
+    const uint64_t telemetry[]={0ULL,0x3fe0000000000000ULL,0x3ff0000000000000ULL};
     for(unsigned tag: tags) {
         normalized->bits=tag;
-        for(unsigned i=0;i<=4095;++i) {
-            double f=double(i)/4095;memcpy(&normalized->value,&f,8);
-            assert(!s->setProperties(outer));fire(0);
-            assert(published(s)==picasso_backlight::clamp(i));
-        }
-        const uint64_t invalids[]={0xbfe0000000000000ULL,0x3ff0000000000001ULL,
-                0x7ff0000000000000ULL,0x7ff8000000000000ULL,0xfff0000000000000ULL};
-        for(uint64_t invalid: invalids) {
-            normalized->value=invalid;assert(s->setProperties(outer)==kIOReturnBadArgument);
-        }
-        const uint64_t zeros[]={0ULL,0x8000000000000000ULL,1ULL};
-        for(uint64_t zero: zeros) {
-            normalized->value=zero;assert(!s->setProperties(outer));fire(0);assert(!published(s));
+        for(uint64_t v: telemetry) {
+            normalized->value=v;assert(s->setProperties(outer)==kIOReturnUnsupported);++cases;
         }
     }
-    normalized->bits=32;normalized->value=1;
-    assert(!s->setProperties(outer));fire(0);assert(published(s)==4095);
-    normalized->value=2;assert(s->setProperties(outer)==kIOReturnBadArgument);
-    normalized->bits=63;normalized->value=0x3fe0000000000000ULL;
-    failAllocation=allocations+1;assert(s->setProperties(outer)==kIOReturnNoMemory);failAllocation=0;
-    assert(!picasso_backlight_power(&display,false));ops=b.operations;
-    assert(!s->setProperties(outer));fire(0);assert(b.operations==ops && b.requested==2048);
-    assert(!picasso_backlight_power(&display,true) && b.state.level==2048);
-    outer->setObject("brightness",normalized);assert(s->setProperties(outer)==kIOReturnBadArgument);
-    normalized->release();nested->release();outer->release();cases+=8208;
+    fire(0);assert(b.state.on && b.state.level==2999 && published(s)==2999);++cases;
+    assert(!timers[0]->armed);ops=b.operations;
+    assert(s->setProperties(outer)==kIOReturnUnsupported && b.operations==ops && !timers[0]->armed);++cases;
+    normalized->release();nested->release();outer->release();
+    // All raw actuator levels exercise actual service, backend and WLED writes.
+    for(unsigned i=0;i<=4095;++i) {
+        assert(!send(s,i));fire(0);assert(published(s)==picasso_backlight::clamp(i));++cases;
+    }
+    const unsigned badBits[]={31U,63U,0U,7U};
+    for(unsigned bits: badBits) {
+        auto *d=request(42);auto *n=static_cast<OSNumber *>(d->getObject("brightness"));n->bits=bits;
+        assert(s->setProperties(d)==kIOReturnBadArgument);d->release();++cases;
+    }
+    auto *extra=request(42);auto *n=OSNumber::withNumber(42,32);
+    extra->setObject("unrelated",n);n->release();
+    assert(s->setProperties(extra)==kIOReturnBadArgument);extra->release();++cases;
+    // A read-only configuration conflict rejects this request without publishing
+    // or autonomous retries. A later caller may retry once the conflict is gone.
+    uint32_t accepted=published(s);uint8_t source=b.regs[1][0x51];b.regs[1][0x51]^=1;
+    assert(!send(s,1023));fire(0);
+    assert(!b.state.failed && published(s)==accepted && !timers[0]->armed && !timers[1]->armed);
+    b.regs[1][0x51]=source;
+    assert(!send(s,1023));fire(0);assert(published(s)==1023);++cases;
     assert(!send(s,1000,0xffff0000));fire(0);assert(published(s)==1000 && !timers[1]->armed);
     assert(!send(s,2048));fire(0);
     timerFailure=true;assert(send(s,3000)==kIOReturnIOError);timerFailure=false;++cases;

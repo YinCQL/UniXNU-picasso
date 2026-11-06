@@ -5,7 +5,7 @@
 #include <stddef.h>
 using kern_return_t=int;
 using IOReturn=int;
-enum {kIOReturnBadArgument=5,kIOReturnNotFound=4,kIOReturnUnsupported=3,kIOReturnNotReady=1,kIOReturnIOError=2,kIOReturnSuccess=0};
+enum {kIOReturnBadArgument=5,kIOReturnNotFound=4,kIOReturnUnsupported=3,kIOReturnBusy=6,kIOReturnNotReady=1,kIOReturnIOError=2,kIOReturnSuccess=0};
 class OSSymbol;
 class OSMetaClass {
 public:
@@ -65,3 +65,11 @@ void IODelay(unsigned); void IOSleep(unsigned);
 thread_t current_thread(); void thread_set_thread_name(thread_t,const char *);
 int kernel_thread_start(void (*)(void *,wait_result_t),void *,thread_t *);
 void thread_deallocate(thread_t);
+
+// IOLocks API shapes for compiling the shared controller implementation.
+struct IOSimpleLock;
+using IOInterruptState=int;
+IOSimpleLock *IOSimpleLockAlloc();
+void IOSimpleLockFree(IOSimpleLock *);
+IOInterruptState IOSimpleLockLockDisableInterrupt(IOSimpleLock *);
+void IOSimpleLockUnlockEnableInterrupt(IOSimpleLock *,IOInterruptState);

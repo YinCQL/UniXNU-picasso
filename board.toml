@@ -244,7 +244,7 @@ kernel_args = [
   # Permit the library signature for bring-up; keep cs_enforcement_disable unset.
   "amfi_allow_any_signature=1",
   # Gate PM8150L WLED on verified OS display-power requests.
-  "picasso-wled=0",
+  "picasso-wled=1",
   # Keep the initial logo through blank swaps until UI pixels arrive (at most 300 s).
   "picasso-boot-logo-hold=1",
   # Start the authenticated UFS root and required power-management nub.

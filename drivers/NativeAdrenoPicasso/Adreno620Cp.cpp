@@ -57,9 +57,9 @@ extern "C" int (*native_adreno_dram_read32)(uint64_t physical, uint32_t *value);
 extern "C" int (*native_adreno_cached_read32)(uint64_t physical, uint32_t *value);
 extern "C" int (*native_adreno_dram_read_words)(uint64_t physical, uint32_t *out, size_t count);
 /* Write-combine maintenance cost (NativeAdrenoCpu.cpp) and the audit's reset count (NativeAdrenoSubmit.cpp). */
-extern "C" volatile uint64_t native_adreno_reassert_ticks;
-extern "C" volatile uint64_t native_adreno_cache_stats[5];
-extern "C" volatile uint32_t native_adreno_wc_audit[6];
+extern "C" volatile uint64_t native_adreno_reassert_ticks __attribute__((weak_import));
+extern "C" volatile uint64_t native_adreno_cache_stats[5] __attribute__((weak_import));
+extern "C" volatile uint32_t native_adreno_wc_audit[6] __attribute__((weak_import));
 /* One fresh mapping per page, kIOMapInhibitCache: a default-cache mapping of a physical page is cacheable, so it would both read a
  * stale cache line and leave one behind for the next reader (the earlier form omitted the flag and could report a zero the CPU had
  * cached, which is exactly the diagnostic this reader exists to answer). */

@@ -41,6 +41,14 @@ def main():
     brightness = (ROOT / 'package/PicassoBrightness.cpp').read_text()
     brightness = re.sub(r'^#include <[^>]+>[^\n]*\n', '', brightness, flags=re.M)
     (out / 'brightness-service.inc').write_text(brightness)
+    spmi = (ROOT / 'package/PicassoSpmi.cpp').read_text()
+    buttons = (ROOT / 'package/PicassoButtons.cpp').read_text()
+    assert 'picasso_spmi_read8(' in buttons and 'picasso_spmi_read8(' in backlight
+    assert 'picasso_spmi_write8(' in backlight and 'picasso_spmi_init()' in buttons and 'picasso_spmi_init()' in backlight
+    assert 'controllerLock' in spmi and spmi.count('IOSimpleLock *controllerLock;') == 1
+    assert 'IOSimpleLockLockDisableInterrupt' in spmi and 'IOSimpleLockUnlockEnableInterrupt' in spmi
+    assert 'va[offset' not in buttons and 'va[offset' not in backlight
+    assert "ROOT / 'kits/picasso/PicassoSpmi.cpp'" in (ROOT / 'scripts/build-picasso-display.py').read_text()
     runs = []
 
     def run(name, cmd, execute=False):
@@ -52,20 +60,22 @@ def main():
         if execute:
             run(name + '-run', [cmd[cmd.index('-o') + 1]])
 
-    for source in ('picasso-buttons-host.cpp', 'picasso-buttons-dispatch-host.cpp', 'picasso-backlight-host.cpp', 'picasso-brightness-host.cpp'):
+    for source in ('picasso-buttons-host.cpp', 'picasso-buttons-dispatch-host.cpp', 'picasso-backlight-host.cpp', 'picasso-brightness-host.cpp', 'picasso-spmi-host.cpp'):
         for sanitized in (False, True):
             name = Path(source).stem + ('-sanitized' if sanitized else '')
             exe = out / (name + ('.exe' if os.name == 'nt' else ''))
             cmd = [args.cc, '-std=c++17', '-Wall', '-Wextra', '-Werror', '-O1',
                    '-I', str(ROOT / 'package'), '-I', str(out),
                    str(ROOT / 'scripts/tests' / source), '-o', str(exe)]
+            if source == 'picasso-spmi-host.cpp' and os.name != 'nt':
+                cmd += ['-pthread']
             if sanitized:
                 cmd += ['-fsanitize=address' if os.name == 'nt' else '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
             run(name, cmd, True)
 
     # Compile entire production worker/bridge bodies, including inline ARM64 MMIO
     # barriers. These explicit API declarations are not a substitute for XNU headers.
-    for name in ('PicassoHidInput', 'PicassoButtons', 'PicassoBacklight'):
+    for name in ('PicassoHidInput', 'PicassoButtons', 'PicassoBacklight', 'PicassoSpmi'):
         body = (ROOT / 'package' / (name + '.cpp')).read_text()
         body = re.sub(r'^#include <[^>]+>[^\n]*\n', '', body, flags=re.M)
         source = out / (name + '.cpp')
@@ -82,10 +92,11 @@ def main():
         '-ffreestanding', '-fno-exceptions', '-fno-rtti', '-fno-threadsafe-statics', '-mgeneral-regs-only',
         '-Wall', '-Wextra', '-Werror', '-I', str(ROOT / 'scripts/tests'), '-I', str(ROOT / 'package'),
         '-c', str(source), '-o', str(out / 'PicassoBrightness.o')])
-    inputs = [ROOT / 'package' / n for n in ('PicassoButtonsCore.h', 'PicassoButtons.cpp', 'PicassoHidInput.cpp', 'PicassoBacklightCore.h', 'PicassoBacklight.cpp', 'PicassoBrightness.cpp')]
+    inputs = [ROOT / 'package' / n for n in ('PicassoButtonsCore.h', 'PicassoButtons.cpp', 'PicassoHidInput.cpp', 'PicassoBacklightCore.h', 'PicassoBacklight.cpp', 'PicassoBrightness.cpp', 'PicassoSpmi.cpp', 'PicassoSpmi.h', 'PicassoSpmiCore.h')]
     inputs += [ROOT / 'drivers/NativeHidInput/NativeHidInput.cpp', Path(__file__)]
+    inputs += [ROOT / 'scripts/build-picasso-display.py', ROOT / 'scripts/build-picasso-hid.py']
     inputs += [ROOT / 'scripts/tests' / n for n in ('picasso-backlight-host.cpp',
-        'picasso-brightness-host.cpp', 'picasso-brightness-api.h', 'picasso-input-kernel-api.h')]
+        'picasso-brightness-host.cpp', 'picasso-brightness-api.h', 'picasso-input-kernel-api.h', 'picasso-spmi-host.cpp')]
     (out / 'results.json').write_text(json.dumps(dict(passed=True, scope=__doc__, runs=runs,
         hardware_tested=False, kernel_sdk_compiled=False,
         inputs={str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}), indent=2) + '\n')

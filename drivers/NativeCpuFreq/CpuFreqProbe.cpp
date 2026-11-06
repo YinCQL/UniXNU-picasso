@@ -59,11 +59,6 @@ extern volatile uint32_t native_hid_input_events[8] __attribute__((weak_import))
 extern volatile uint32_t native_novatek_touch_frames, native_touch_hid_reports;
 extern volatile uint32_t native_touch_count, native_touch_physical_active;
 extern volatile uint32_t native_touch_edge_stats[4];
-// IPC census rows (patches/picasso-ipc-census-xnu.patch), declared under the patch's own gate so the
-// reference exists exactly when the definition does.
-#if DEVELOPMENT || DEBUG
-__SIZE_TYPE__ picasso_ipc_census_rows(char *, __SIZE_TYPE__);
-#endif
 uint64_t sheng_cpu_idle_mach(int cpu);
 }
 
@@ -354,7 +349,7 @@ void governorThread(void *, wait_result_t) {
                    gDomain[2].va ? rd32(gDomain[2].va, kRegPerfState) : 0, windowKHz(gDomain[2]) / 1000,
                    cycMHz[2],
                    native_cpufreq_boosts);
-            // The TOUCH and IPC rows ride this 10 s tick: CONFIG_XNU_BOOT_PROGRESS is off in this
+            // The TOUCH row rides this 10 s tick: CONFIG_XNU_BOOT_PROGRESS is off in this
             // build, so the shared boot monitor's rows never run and the drivers report here.
             {
                 static uint32_t lf, lh, le1, le2, le3;
@@ -366,13 +361,6 @@ void governorThread(void *, wait_result_t) {
                        (unsigned)native_touch_physical_active, (unsigned)native_touch_count);
                 lf = f; lh = h; le1 = e1; le2 = e2; le3 = e3;
             }
-#if DEVELOPMENT || DEBUG
-            {
-                // picasso-ipc-census=1 counters; no rows are produced unless the arg is set.
-                char row[320] = {0};
-                if (picasso_ipc_census_rows(row, sizeof row)) printf("%s\n", row);
-            }
-#endif
         }
     }
 }

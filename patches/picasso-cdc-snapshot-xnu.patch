@@ -1,17 +1,13 @@
 --- a/bsd/dev/picasso_usb.c
 +++ b/bsd/dev/picasso_usb.c
-@@ -2260,13 +2260,58 @@
+@@ -2260,13 +2260,54 @@
  }
-
+ 
  static void
 +ud_snapshot(void)
 +{
 +	extern volatile uint64_t picasso_snapshot_virtual;
 +	extern volatile uint32_t picasso_snapshot_width, picasso_snapshot_height, picasso_snapshot_stride;
-+	/* Direct scanout keeps the pipe on the compositor's surface; the GOP mapping this snapshot
-+	 * reads is stale then. Ask the display driver to copy the shown surface into it first. */
-+	extern void native_legacy_direct_snapshot(void) __attribute__((weak_import));
-+	if (&native_legacy_direct_snapshot) native_legacy_direct_snapshot();
 +	const uint64_t base = __atomic_load_n(&picasso_snapshot_virtual, __ATOMIC_ACQUIRE);
 +	const uint32_t width = picasso_snapshot_width, height = picasso_snapshot_height, stride = picasso_snapshot_stride;
 +	printf("PICASSO_SNAPSHOT base=%llx width=%u height=%u stride=%u\n",

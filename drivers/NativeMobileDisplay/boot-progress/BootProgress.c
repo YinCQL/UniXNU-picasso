@@ -1422,17 +1422,6 @@ size_t boot_progress_profile_rows(char *out,size_t cap) {
       BP_ROW("\n");
     }
   }
-  // Messages to and from pid 1 since the previous profile block (picasso-ipc-census=1): launchd's
-  // continuous Mach IPC keeps about a core of system time busy, and this row names the peer that
-  // sends to it and the peers it sends to. Absent when the census patch is not in the kernel.
-  {
-    extern size_t picasso_ipc_census_rows(char *,size_t) __attribute__((weak_import));
-    if(&picasso_ipc_census_rows) {
-      char row[320]={0};
-      const size_t got=picasso_ipc_census_rows(row,sizeof row);
-      if(got)BP_ROW("%s",row);
-    }
-  }
   // Touch pipeline per profile block: frames the panel probe sampled and published, HID reports the
   // virtual digitizer sent, and the event-driver edge counters. A contact that appears in d_frames
   // but not d_hid stops at publication; one that appears in d_hid but not on screen stops downstream.

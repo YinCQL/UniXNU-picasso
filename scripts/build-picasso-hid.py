@@ -167,7 +167,7 @@ def build(root, platform, native, record, out, board):
     _, _, symbols = platform.inspect_object(bindings, native)
     platform.require({s['name']: s['value'] for s in symbols if s['kind'] == 3} == audit['bindings'], 'Exact compiled HID aliases')
     objects.append(bindings)
-    sources += [root / 'kits/picasso/PicassoHidPlan.h', root / 'kits/picasso/PicassoButtonsCore.h',
+    sources += [root / 'kits/picasso/PicassoHidPlan.h', root / 'kits/picasso/PicassoButtonsCore.h', root / 'kits/picasso/PicassoSpmi.h',
                 root / 'scripts/build-picasso-hid.py', root / 'scripts/picasso_original_abi.py']
     return objects, sources
 

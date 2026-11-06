@@ -3,16 +3,6 @@
 #include <stdio.h>
 #include "PicassoButtonsCore.h"
 using namespace picasso_buttons;
-struct Bus {
-    unsigned writes=0, reads=0, delays=0, dataReads=0, doneAt=0;
-    uint32_t status=1, cmd=0;
-    void write(unsigned off,uint32_t v) {assert(off==0);++writes;cmd=v;}
-    uint32_t read(unsigned off) {
-        if(off==8)return reads++>=doneAt?status:0;
-        assert(off==0x18);++dataReads;return 0x1234;
-    }
-    void delay() {++delays;}
-};
 int main() {
     assert(!version_supported(0x40000000) && version_supported(0x50000000));
     assert(version_supported(0x50020000) && !version_supported(0x60000000));
@@ -28,15 +18,6 @@ int main() {
     assert(find_apid(read,pon_ppid)==21 && find_apid(read,up_ppid)==511);
     assert(find_apid(read,0x013)==-1 && observer_offset(511)+0x1c<=0x10000);
     maps[23]=pon_ppid<<8;assert(find_apid(read,pon_ppid)==23);
-    for(unsigned status=1;status<16;status+=2) {
-        Bus b;b.status=status;b.doneAt=3;uint8_t v=0xab;
-        int error=read8(b,0x10,v);
-        assert(b.writes==1 && b.cmd==0x08000100 && b.delays==3);
-        assert(error==int(status&0xe));
-        assert(error?(v==0xab && b.dataReads==0):(v==0x34 && b.dataReads==1));
-    }
-    Bus timeout;timeout.status=0;uint8_t v=0xcd;
-    assert(read8(timeout,0x46,v)==-1 && v==0xcd && timeout.delays==1000 && !timeout.dataReads);
     for(unsigned s=0;s<256;++s) {
         bool known=s==1||s==5||s==9||s==13||s==16||s==17;
         assert(gpio_input(16,s,0,0x80)==known);
@@ -69,5 +50,5 @@ int main() {
     assert(!reports.sample(0,150,send));success=false;
     assert(!reports.sample(0,170,send) && reports.delivered==2);
     success=true;assert(reports.sample(0,180,send) && reports.delivered==0);
-    puts("PASS: v5 APID/owner bounds, observer errors/timeouts, GPIO identity, polarity, held/combination and independent debounce");
+    puts("PASS: v5 APID/owner bounds, GPIO identity, polarity, held/combination and independent debounce");
 }
