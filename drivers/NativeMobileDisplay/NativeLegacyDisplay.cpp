@@ -53,6 +53,34 @@ extern "C" void native_legacy_vsync_notify(void *display,uint64_t timestamp,uint
 extern "C" bool native_legacy_set_refresh_properties(void *display);
 extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
 extern "C" uint64_t mach_continuous_time(void);
+extern "C" volatile uint64_t native_gop_last_take_tick,native_gop_last_complete_tick;
+// Optional timing only; retirement continues to require the presenter's completion.
+static void picasso_frame_trace(uint64_t offer_ticks)
+{
+    static int enabled=-1;
+    if(enabled<0){uint32_t value=0;enabled=(PE_parse_boot_argn("picasso-frame-trace",&value,sizeof value)&&value)?1:0;}
+    if(!enabled || !offer_ticks)return;
+    static uint64_t lastDone=0,count=0;
+    const uint64_t done=mach_absolute_time();
+    const uint64_t take=native_gop_last_take_tick,complete=native_gop_last_complete_tick;
+    uint64_t offer_ns=0,done_ns=0,svc_ns=0,gap_ns=0,take_ns=0,comp_ns=0,hand_ns=0;
+    absolutetime_to_nanoseconds(offer_ticks,&offer_ns);
+    absolutetime_to_nanoseconds(done,&done_ns);
+    absolutetime_to_nanoseconds(done-offer_ticks,&svc_ns);
+    if(lastDone && offer_ns>lastDone)gap_ns=offer_ns-lastDone;
+    lastDone=done_ns;
+    /* Split offer-to-done: scheduling (offer to the client taking it, including the page mapping), the client's
+     * present (take to its completion), and this handler (completion to the display driver seeing it). */
+    if(take>offer_ticks)absolutetime_to_nanoseconds(take-offer_ticks,&take_ns);
+    if(take>=offer_ticks && complete>=take && complete<=done) {
+        absolutetime_to_nanoseconds(complete-take,&comp_ns);
+        absolutetime_to_nanoseconds(done-complete,&hand_ns);
+    }
+    printf("PICASSO_FRAME n=%llu offer_ns=%llu done_ns=%llu svc_us=%llu gap_us=%llu take_us=%llu comp_us=%llu hand_us=%llu\n",
+        (unsigned long long)++count,(unsigned long long)offer_ns,(unsigned long long)done_ns,
+        (unsigned long long)(svc_ns/1000),(unsigned long long)(gap_ns/1000),
+        (unsigned long long)(take_ns/1000),(unsigned long long)(comp_ns/1000),(unsigned long long)(hand_ns/1000));
+}
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
@@ -110,6 +138,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     const OriginalLegacySwapRequest *gpuRequest=nullptr;
     uint64_t gpuLength=0;
     bool gpuBypass=false;
+    uint64_t gpuStartTick=0;
     // Preserve every accepted request until the original family retires it.
     // A full table rejects the new request without evicting a live entry.
     const OriginalLegacySwapRequest *validated[8]={};
@@ -212,7 +241,7 @@ public:
     void stop(IOService *provider) override {
         stopVsync();
         resetCopyShadow();
-        transferred=false;gpuRequest=nullptr;for(auto &entry: validated)entry=nullptr;
+        transferred=false;gpuRequest=nullptr;gpuStartTick=0;for(auto &entry: validated)entry=nullptr;
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
     }
@@ -226,9 +255,104 @@ public:
         Setter setter=reinterpret_cast<Setter *>(*reinterpret_cast<void **>(this))[354];
         setter(this,&request,false);
     }
+    static uint32_t sdeRead(volatile uint32_t *base,uint32_t offset) {return base[offset/4];}
+    void sdeProbe() {
+        static int enabled=-1;
+        if(enabled<0) { uint32_t value=0; enabled=(PE_parse_boot_argn("sheng-sde-probe",&value,sizeof value) && value)?1:0; }
+        if(enabled!=1 || !bootMapping)return;
+        PE_Video video={};if(PE_current_console(&video))return;
+        const uint64_t gop=bootMapping->getPhysicalAddress();
+        const uint32_t gopLo=(uint32_t)gop,gopHi=(uint32_t)(gop>>32);
+        printf("PICASSO_SDE gop_pa=%llx len=%llu panel=%ux%u\n",(unsigned long long)gop,
+            (unsigned long long)bootMapping->getLength(),(unsigned)video.v_width,(unsigned)video.v_height);
+        IOMemoryDescriptor *mdp=IOMemoryDescriptor::withPhysicalAddress(0xae00000,0x90000,kIODirectionIn);
+        IOMemoryMap *map=mdp?mdp->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
+        if(mdp)mdp->release();
+        if(!map || !map->getVirtualAddress()) {OSSafeReleaseNULL(map); printf("PICASSO_SDE mdp map failed\n"); return; }
+        volatile uint32_t *m=(volatile uint32_t *)map->getVirtualAddress();
+        printf("PICASSO_SDE version=%08x top",sdeRead(m,0));
+        for(uint32_t o=0;o<0x40;o+=4)printf(" %x",sdeRead(m,0x1000+o));
+        printf("\n");
+        const uint32_t sspp[5]={0x5000,0x7000,0x25000,0x27000,0x29000};
+        static const uint32_t ssppOffs[12]={0x0,0x4,0x8,0xc,0x10,0x14,0x18,0x1c,0x30,0x34,0x38,0x3c};
+        for(unsigned i=0;i<5;i++) {
+            printf("PICASSO_SDE sspp%u",i);
+            for(unsigned k=0;k<12;k++) {
+                const uint32_t value=sdeRead(m,sspp[i]+ssppOffs[k]);
+                printf(" %x",value);
+                if(value==gopLo || value==gopHi)printf("(gop)");
+            }
+            printf("\n");
+        }
+        const uint32_t ctl[4]={0x2000,0x2200,0x2400,0x2600};
+        for(unsigned i=0;i<4;i++) {
+            printf("PICASSO_SDE ctl%u",i);
+            for(uint32_t o=0;o<=0x30;o+=4)printf(" %x",sdeRead(m,ctl[i]+o));
+            printf("\n");
+        }
+        printf("PICASSO_SDE mixer0");
+        for(uint32_t o=0;o<=0x40;o+=4)printf(" %x",sdeRead(m,0x45000+o));
+        printf("\n");
+        printf("PICASSO_SDE pp0");
+        for(uint32_t o=0;o<=0x30;o+=4)printf(" %x",sdeRead(m,0x71000+o));
+        printf("\n");
+        printf("PICASSO_SDE intf1");
+        for(uint32_t o=0;o<=0x40;o+=4)printf(" %x",sdeRead(m,0x6b800+o));
+        printf("\n");
+        map->release();
+        IOMemoryDescriptor *vbif=IOMemoryDescriptor::withPhysicalAddress(0xaeb0000,0x1040,kIODirectionIn);
+        IOMemoryMap *vmap=vbif?vbif->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
+        if(vbif)vbif->release();
+        if(vmap && vmap->getVirtualAddress()) {
+            volatile uint32_t *v=(volatile uint32_t *)vmap->getVirtualAddress();
+            printf("PICASSO_SDE vbif");
+            for(uint32_t o=0;o<=0x40;o+=4)printf(" %x",sdeRead(v,o));
+            printf("\n");
+        }
+        OSSafeReleaseNULL(vmap);
+    }
+    void sdeDiag() {
+        static int enabled=-1;
+        if(enabled<0) { uint32_t value=0; enabled=(PE_parse_boot_argn("sheng-sde-probe",&value,sizeof value) && value)?1:0; }
+        if(enabled!=1)return;
+        /* The apps SMMU, read-only: which stream-match entry covers the display's stream (DT: SID 0xb40,
+         * mask 0x402), which context bank it uses, and whether that bank translates. Modeled on the sheng
+         * DPU port (NativeUfs.cpp): sMR at 0x800+4i, s2CR at 0xc00+4i, CBAR at 0x1000+4b, CBA2R 0x1800+4b,
+         * CBn at (pages+b)*4096 with pages from IDR1. */
+        IOMemoryDescriptor *smmu=IOMemoryDescriptor::withPhysicalAddress(0x15000000,0xd0000,kIODirectionIn);
+        IOMemoryMap *map=smmu?smmu->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
+        if(smmu)smmu->release();
+        if(!map || !map->getVirtualAddress()) {OSSafeReleaseNULL(map);printf("PICASSO_SMMU map failed\n");return;}
+        volatile uint32_t *s=(volatile uint32_t *)map->getVirtualAddress();
+        const uint32_t scr0=s[0],idr0=s[0x20/4],idr1=s[0x24/4];
+        const unsigned groups=(idr0&255)>128?128:(idr0&255),banks=idr1&255;
+        const unsigned pages=1u<<(((idr1>>28)&7)+1);
+        printf("PICASSO_SMMU scr0=%x idr0=%x idr1=%x groups=%u banks=%u pages=%u gfsr=%x\n",
+            scr0,idr0,idr1,groups,banks,pages,s[0x58/4]);
+        if((idr1&0x80000000u) || !banks || banks>128 || pages>128 || (pages+banks)*4096u>0xd0000u) {map->release();return;}
+        unsigned valid=0;
+        for(unsigned i=0;i<groups;i++) {
+            const uint32_t smr=s[(0x800+4*i)/4];
+            if(!(smr&0x80000000u))continue;
+            ++valid;
+            const uint32_t idLow=smr&0x7fff,maskHigh=(smr>>16)&0x7fff;
+            const bool hitLow=((0xb40u^idLow)&0x7fff&~maskHigh)==0;
+            if(!hitLow)continue;
+            const uint32_t s2cr=s[(0xc00+4*i)/4],bank=s2cr&255;
+            printf("PICASSO_SMMU match smr[%u]=%x layout=%s s2cr=%x bank=%u type=%u\n",
+                i,smr,"id-low",s2cr,bank,(s2cr>>16)&3);
+            if(bank>=banks)continue;
+            volatile uint32_t *cb=s+(pages+bank)*(4096/4);
+            printf("PICASSO_SMMU cbar=%x cba2r=%x sctlr=%x ttbr0=%x%08x tcr2=%x tcr=%x mair=%x fsr=%x\n",
+                s[(0x1000+4*bank)/4],s[(0x1800+4*bank)/4],cb[0x00/4],
+                cb[0x24/4],cb[0x20/4],cb[0x10/4],cb[0x30/4],cb[0x38/4],cb[0x58/4]);
+        }
+        printf("PICASSO_SMMU valid-smrs=%u\n",valid);
+        map->release();
+    }
     bool start(IOService *provider) override {
         if(!startDisplay(provider))return false;
-        startVsync();return true;
+        startVsync();sdeProbe();sdeDiag();return true;
     }
     bool startDisplay(IOService *provider) {
         if(!IOMobileFramebufferLegacy::start(provider))return false;
@@ -396,6 +520,7 @@ public:
             // differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
             copyShadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
+            gpuStartTick=mach_absolute_time();
             // The completion callback retires only after the consumer has
             // finished reading. Failed imports/copies retry this request on CPU.
             return;
@@ -511,10 +636,12 @@ public:
     // CPU copy for the next kick.
     void finishGpuSwap(int status) {
         const OriginalLegacySwapRequest *request=gpuRequest;
+        const uint64_t offer=gpuStartTick;gpuStartTick=0;
         if(!request)return;
         gpuRequest=nullptr;
         if(status==0) {
             native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
+            picasso_frame_trace(offer);
             finishTransfer(request,true);return;
         }
         native_legacy_gpu_fallback_observed(status);

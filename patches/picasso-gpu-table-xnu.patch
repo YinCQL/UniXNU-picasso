@@ -1,0 +1,28 @@
+--- a/bsd/dev/picasso_usb.c
++++ b/bsd/dev/picasso_usb.c
+@@ -2359,9 +2359,24 @@
+ 	ud.commands++;
+ 	printf("PICASSO CDC: command '%s'\n", ud.cmd);
+ 	if (ud_command_is(ud.cmd, "help")) {
+-		printf("PICASSO CDC: commands: help | status | ps | snapshot | save-ls | panic-test | reset-test | hang-test | reboot-fastboot\n");
++		printf("PICASSO CDC: commands: help | status | ps | snapshot | save-ls | gpu-table | panic-test | reset-test | hang-test | reboot-fastboot\n");
+ 	} else if (ud_command_is(ud.cmd, "snapshot")) {
+ 		ud_snapshot();
++	} else if (ud_command_is(ud.cmd, "gpu-table")) {
++		/* The Metal bridge's telemetry table as the plugin last sent it (marker rows
++		 * 0xC000/0x8000 through the publish channel). Weak: an image without the GPU
++		 * driver reports unavailable instead of failing the link. */
++		extern char native_adreno_metal_rows[48][96] __attribute__((weak_import));
++		extern volatile uint32_t native_adreno_metal_rows_seq __attribute__((weak_import));
++		if (!&native_adreno_metal_rows || !&native_adreno_metal_rows_seq) {
++			printf("PICASSO_GPU_TABLE unavailable\n");
++		} else {
++			printf("PICASSO_GPU_TABLE begin seq=%u\n", native_adreno_metal_rows_seq);
++			for (unsigned row = 0; row < 48; ++row)
++				if (native_adreno_metal_rows[row][0])
++					printf("PICASSO_GPU_TABLE %u %.95s\n", row, native_adreno_metal_rows[row]);
++			printf("PICASSO_GPU_TABLE end\n");
++		}
+ 	} else if (ud_command_is(ud.cmd, "status")) {
+ 		printf("PICASSO CDC: configured=%u host_open=%u live=%u panic=%u "
+ 		    "watchdog=%u armed=%u reset=%u events=%llu tx=%llu "

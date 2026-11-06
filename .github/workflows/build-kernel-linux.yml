@@ -76,6 +76,8 @@ jobs:
         run: |
           sudo python3 "$UNIXNU_TREE/scripts/linux/setup-toolchain.py" --host-only \
             2>&1 | tee out/picasso/logs/linux-host-tools.log
+          # Save host compilers before the target-only LLVM is added to PATH.
+          echo "PICASSO_HOST_PATH=$PATH" >> "$GITHUB_ENV"
 
       - name: Install the fixed Linux toolchain Release
         env:
@@ -137,6 +139,7 @@ jobs:
 
       - name: Verify compiled Data UUID, seed and FAT handoff
         run: |
+          export PATH="$PICASSO_HOST_PATH"
           python3 scripts/check-picasso-data-artifacts.py --tree out/picasso/tree --work out/picasso \
             --output out/picasso/logs/data-artifacts.json
           python3 scripts/check-picasso-display-policy.py \
@@ -145,6 +148,7 @@ jobs:
 
       - name: Check iOS16 ports, framebuffer adapters and microtime
         run: |
+          export PATH="$PICASSO_HOST_PATH"
           python3 scripts/check-picasso-mach-ports.py --xnu out/picasso/tree/.cache/xnu-work --output out/picasso/host-checks/mach-ports
           python3 scripts/check-picasso-fb-method-trace.py --xnu out/picasso/tree/.cache/xnu-work --output out/picasso/host-checks/fb-method-trace
           python3 scripts/check-picasso-ios16-surface-abi.py --xnu out/picasso/tree/.cache/xnu-work --output out/picasso/host-checks/ios16-surface-abi

@@ -15,6 +15,7 @@ constexpr int kIOReturnSuccess=0,kIOReturnUnsupported=1,kIOReturnNoMemory=2,
 constexpr unsigned kIOMapAnywhere=1,kMillisecondScale=1,THREAD_ABORTSAFE=0,THREAD_AWAKENED=0;
 volatile uint64_t native_gop_gpu_offers,native_gop_gpu_failures,native_gop_gpu_completions,native_gop_gpu_abandoned,native_gop_wait_stats[7];
 volatile uint64_t native_legacy_early_retires,native_legacy_early_failures;
+volatile uint64_t native_gop_last_take_tick,native_gop_last_complete_tick;
 static unsigned callbacks;
 static int lastStatus;
 static void native_legacy_gpu_complete(void *,int status) {++callbacks;lastStatus=status;}
@@ -34,6 +35,7 @@ struct IOWorkLoop {
 static uint64_t mockNow=1;
 static uint64_t mach_absolute_time() {return mockNow;}
 static void absolutetime_to_nanoseconds(uint64_t value,uint64_t *out) {*out=value;}
+// FRAME_TRACE
 static void clock_interval_to_deadline(uint32_t,unsigned,uint64_t *out) {*out=1;}
 struct IOLock {int held=0;};
 static void IOLockLock(IOLock *gate) {assert(!gate->held);gate->held=1;}
@@ -88,7 +90,7 @@ struct Display : OSObject {
     IORecursiveLock *kickLock=&queueLock;
     Presenter *presenter=nullptr;
     IOMemoryDescriptor *memory=nullptr;
-    uint64_t sourceStride=64,length=4096,gpuLength=0;
+    uint64_t sourceStride=64,length=4096,gpuLength=0,gpuStartTick=0;
     uint32_t width=16,height=64;
     const OriginalLegacySwapRequest *pendingRequest=nullptr,*gpuRequest=nullptr;
     bool gpuBypass=false,transferred=false,gpuRetired=false,copyShadowValid=true;

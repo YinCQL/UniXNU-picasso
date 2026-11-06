@@ -62,7 +62,7 @@
  
  /* PICASSO_SERVICE_TRACE_BEGIN */
  #if __arm64__ && (DEVELOPMENT || DEBUG)
-+	if (!strcmp(p->p_name,"SpringBoard") || !strcmp(p->p_name,"Preferences")) {
++	if (!strcmp(p->p_name,"SpringBoard") || !strcmp(p->p_name,"Preferences") || !strcmp(p->p_name,"Setup")) {
 +		static unsigned exits;
 +		unsigned sample=picasso_pid1_trace_ticket(&exits,32);
 +		if(sample) printf("PICASSO_UI_EXIT sample=%u pid=%d name=%s rv=%x namespace=%u code=%llx\n",

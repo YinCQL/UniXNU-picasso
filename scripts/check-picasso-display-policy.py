@@ -84,7 +84,8 @@ def main():
             run = {'asan': asan, 'compile_exit': result.returncode, 'compile_log': str(compile_log)}
             report['runs'].append(run)
             if result.returncode:
-                raise RuntimeError('Display policy compilation failed: ' + str(compile_log))
+                raise RuntimeError('Display policy compilation failed: ' + str(compile_log) + '\n' +
+                                   compile_log.read_text(encoding='utf-8', errors='replace'))
             if vcvars:
                 result = host.batch_run(out, label + '-run', f'{exe} {scale} > {run_log.name} 2>&1\nexit /b %errorlevel%\n', vcvars)
             else:
