@@ -31,7 +31,7 @@ def main():
 
     body = re.sub(r'^#include <[^>]+>[^\n]*\n', '', (ROOT/'package/PicassoAop.cpp').read_text(), flags=re.M)
     (out/'PicassoAop-body.inc').write_text(body, encoding='utf8', newline='\n')
-    includes = ['-I', str(out), '-I', str(ROOT/'package'), '-I', str(ROOT/'scripts/tests')]
+    includes = ['-I', str(out), '-I', str(ROOT/'package'), '-I', str(ROOT/'scripts/tests'), '-I', str(ROOT/'drivers/NativeWlan')]
     core = ROOT/'package/PicassoQmp.cpp'
     for sanitized in (False, True):
         suffix = '-asan' if sanitized else ''
@@ -42,7 +42,9 @@ def main():
             run(name + '-compile' + suffix, [a.cxx, '-std=c++17', '-O1', '-Wall', '-Wextra', '-Werror',
                 *flags, *includes, str(ROOT/f'scripts/tests/picasso-{name}-host.cpp'), str(core), '-o', str(exe)])
             cases = ('normal',) if name == 'qmp' else (
-                'normal', 'alloc-ram', 'alloc-ipcc', 'map-ram', 'map-ipcc', 'timeout', 'close-timeout', 'bad', 'busy', 'rx')
+                'normal', 'alloc-ram', 'alloc-ipcc', 'map-ram', 'map-ipcc', 'timeout', 'close-timeout', 'bad', 'busy', 'rx',
+                'load-normal','load-timeout','load-off-timeout','load-close-timeout','load-busy','load-rx',
+                'load-bad','load-map','load-handshake-timeout','load-disconnect')
             for case in cases:
                 run(name + '-' + case + suffix, [str(exe), case])
     arm = out/'aop-arm.cpp'
@@ -55,7 +57,7 @@ def main():
         run(name + '-arm64', [a.cxx, '-target', 'arm64-apple-ios17.0', '-std=c++17', '-ffreestanding',
             '-fno-exceptions', '-fno-rtti', '-fno-threadsafe-statics', '-mgeneral-regs-only', '-Wall', '-Wextra',
             '-Werror', *includes, '-c', str(source), '-o', str(out/(name+'.o'))])
-    inputs = ['package/PicassoQmp.h', 'package/PicassoQmp.cpp', 'package/PicassoAop.cpp',
+    inputs = ['package/PicassoQmp.h', 'package/PicassoQmp.cpp', 'package/PicassoAop.cpp', 'package/PicassoAdspBoot.h',
               'package/PicassoAdspFirmware.cpp', 'scripts/build-picasso-display.py',
               'scripts/check-picasso-qmp.py', 'scripts/tests/picasso-qmp-host.cpp',
               'scripts/tests/picasso-aop-host.cpp', 'scripts/tests/picasso-wlan-kernel-api.h',

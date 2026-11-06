@@ -9,7 +9,7 @@ static uint32_t regs[0x10000/4], db[0x20000/4];
 static unsigned maps,unmaps,allocs,frees,sleeps,delays,writes,commands,failMap,zeroMap,failCommand;
 static unsigned ticks,triggerAt,active,dbReads;
 static bool noMemory,unstable,reenter,entered;
-static uint32_t addresses[10],values[10];
+static uint32_t addresses[32],values[32];
 void IOMemoryMap::release(){++unmaps;}
 bool mapPhysical(uint64_t base,uint64_t bytes,Mapping &m) {
     assert(base==0x18220000 || base==0x80860000);++maps;

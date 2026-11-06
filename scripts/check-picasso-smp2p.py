@@ -54,7 +54,7 @@ def main():
             '-fno-exceptions','-fno-rtti','-fno-threadsafe-statics','-mgeneral-regs-only','-Wall','-Wextra','-Werror',
             *includes,'-c',str(source),'-o',str(out/(name+'.o'))])
     inputs = ['package/PicassoSmp2p.h','package/PicassoSmp2p.cpp','package/PicassoSmp2pDevice.cpp',
-        'package/PicassoSmemLock.h','drivers/NativeWlan/WlanSmem.h','drivers/NativeAdrenoPicasso/PicassoRpmh.h',
+        'package/PicassoSmemLock.h','package/PicassoAdspBoot.h','package/PicassoAdsp.h','drivers/NativeWlan/WlanSmem.h','drivers/NativeAdrenoPicasso/PicassoRpmh.h',
         'scripts/check-picasso-smp2p.py','scripts/tests/picasso-smp2p-host.cpp','scripts/tests/picasso-smp2p-device-host.cpp',
         'scripts/tests/picasso-wlan-kernel-api.h','scripts/build-picasso-display.py',
         'scripts/check-picasso-display-artifacts.py','.github/workflows/host-checks.yml']

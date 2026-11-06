@@ -132,15 +132,54 @@ static void fatTests() {
     assert(picasso_fat_open(&v,"file.bin",&f)==FatReadError);
     puts("PASS firmware FAT: mirrors, cycles, aliases, duplicate names, LFN ordinal, bounds, read failure");
 }
+static void loaderTests() {
+    int error=0;
+    PicassoAdspImage *image=picasso_adsp_image_open(&error);assert(image && !error);
+    auto *f=reinterpret_cast<Firmware *>(image);
+    const size_t guard=4096,bytes=picassoAdspBytes;
+    auto *allocation=static_cast<uint8_t *>(malloc(bytes+guard*2));
+    auto *expected=static_cast<uint8_t *>(malloc(bytes));assert(allocation && expected);
+    memset(allocation,0xa5,bytes+guard*2);memset(expected,0xa5,bytes);
+    auto *to=allocation+guard;
+    for(unsigned i=0;i<f->plan.count;++i){
+        const auto &s=f->plan.segments[i];
+        if(s.fileBytes)assert(!picasso_fat_read(&f->volume,&f->files[s.index],0,expected+s.memoryOffset,s.fileBytes));
+        memset(expected+s.memoryOffset+s.fileBytes,0,s.zeroBytes);
+    }
+    calls=0;assert(!picasso_adsp_image_load(image,to,bytes));unsigned reads=calls;
+    assert(!memcmp(to,expected,bytes));
+    auto guards=[&](){for(size_t i=0;i<guard;++i)assert(allocation[i]==0xa5 && allocation[guard+bytes+i]==0xa5);};
+    guards();assert(picasso_adsp_image_load(image,to,bytes-1)==-22);
+    assert(picasso_adsp_image_load(nullptr,to,bytes)==-22);
+    auto saved=f->plan;
+    f->plan.count=33;assert(picasso_adsp_image_load(image,to,bytes)==-22);f->plan=saved;
+    f->plan.segments[0].memoryOffset=UINT32_MAX;assert(picasso_adsp_image_load(image,to,bytes)==-22);f->plan=saved;
+    const unsigned failAt[]={1,2,17,reads/2,reads};
+    for(unsigned n:failAt){calls=0;failRead=n;assert(picasso_adsp_image_load(image,to,bytes)==FatReadError);guards();}
+    failRead=0;
+    uint64_t at=f->volume.data_offset+(uint64_t)(f->files[2].first_cluster-2)*f->volume.cluster_bytes;
+    disk[at]^=1;assert(picasso_adsp_image_load(image,to,bytes)==-8);disk[at]^=1;guards();
+    f->deadline=0;assert(picasso_adsp_image_load(image,to,bytes)==FatReadError);f->deadline=UINT64_MAX;
+    // Exercise the separate BSS deadline, without doing a transport read first.
+    f->plan.segments[0]=saved.segments[31];f->deadline=0;
+    assert(picasso_adsp_image_load(image,to,bytes)==-60);f->plan=saved;guards();
+    picasso_adsp_image_close(image);assert(allocated==freed);
+    noPartition=true;assert(!picasso_adsp_image_open(&error)&&error==-2);noPartition=false;
+    disk[at]^=1;assert(!picasso_adsp_image_open(&error)&&error==-8);disk[at]^=1;
+    failRead=calls+1;assert(!picasso_adsp_image_open(&error)&&error);failRead=0;
+    assert(allocated==freed);free(expected);free(allocation);
+    printf("PASS actual stock loader: 32 segment copies/BSS, full 40MiB comparison and guards, %u reads, tamper-after-open, short/failed reads, bounds/deadlines and reopen cleanup\n",reads);
+}
 int main(int argc,char **argv) {
     fatTests();planTests();
     assert(argc>1);const char *mode=argv[1];
-    if(!strcmp(mode,"stock") || !strcmp(mode,"stock-aop-fail") || !strcmp(mode,"stock-plan-fail")) {
+    if(!strcmp(mode,"stock") || !strcmp(mode,"stock-aop-fail") || !strcmp(mode,"stock-plan-fail") || !strcmp(mode,"stock-load")) {
         aopFailed=!strcmp(mode,"stock-aop-fail");
         alterAfterValidation=!strcmp(mode,"stock-plan-fail");
         assert(argc==3);FILE *in=fopen(argv[2],"rb");assert(in);
         fseek(in,0,SEEK_END);diskBytes=(size_t)ftell(in);rewind(in);free(disk);disk=(uint8_t *)malloc(diskBytes);assert(disk);
         assert(fread(disk,1,diskBytes,in)==diskBytes);fclose(in);calls=failRead=0;
+        if(!strcmp(mode,"stock-load")){loaderTests();free(disk);return 0;}
         auto *f=(Firmware *)calloc(1,sizeof(Firmware));assert(f);unsigned failed;uint64_t checked;f->deadline=UINT64_MAX;
         assert(!validateFirmware(f,335544320,&failed,&checked));assert(failed==fileCount && checked>21000000);
         printf("PASS actual stock firmware: %u files, %llu bytes, %u reads\n",fileCount,(unsigned long long)checked,calls);

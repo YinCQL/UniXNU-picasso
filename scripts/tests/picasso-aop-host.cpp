@@ -11,6 +11,8 @@ static unsigned allocations,mappings,releases,unmaps,lines,sleeps;
 static unsigned failAlloc,failMap;
 static uint64_t ticks;
 static bool stalled,closeStalled,opened;
+static bool messages,sendStalled,disconnect;
+static unsigned consumed;
 enum {kIOMapAnywhere=1,kIOMapInhibitCache=2,OSNoRetain=0,kSecondScale=1};
 class IOMemoryMap {
 public:
@@ -52,6 +54,16 @@ static void IOSleep(unsigned n) {
     ram[10]=0xffff;
     if(ram[11]==0xffff)opened=true;
     if(!(closeStalled && opened && ram[11]==0xffff0000))ram[12]=ram[11];
+    if(messages && ram[0x200/4]) {
+        assert(ram[0x200/4]==96);
+        const char *text=reinterpret_cast<const char *>(ram)+0x204;
+        const char *expected=consumed?"{class: image, res: load_state, name: adsp, val: off}":
+            "{class: image, res: load_state, name: adsp, val: on}";
+        assert(!strcmp(text,expected));
+        for(unsigned i=unsigned(strlen(expected));i<96;++i)assert(!text[i]);
+        if(disconnect){ram[3]=0xffff0000;ram[0x200/4]=0;return;}
+        if(!sendStalled){ram[0x200/4]=0;++consumed;}
+    }
 }
 #include "PicassoAop-body.inc"
 int main(int argc,char **argv) {
@@ -59,6 +71,41 @@ int main(int argc,char **argv) {
     ram[0]=0x4d41494c;ram[1]=1;ram[3]=ram[5]=0xffff;
     ram[7]=ram[13]=256;ram[8]=0x100;ram[14]=0x200;
     for(auto &v:ipcc)v=0x5aa55aa5;
+    if(!strncmp(mode,"load-",5)) {
+        mode+=5;messages=true;
+        bool timeout=!strcmp(mode,"timeout"),offTimeout=!strcmp(mode,"off-timeout");
+        bool closing=!strcmp(mode,"close-timeout"),busy=!strcmp(mode,"busy"),rx=!strcmp(mode,"rx");
+        bool mapFail=!strcmp(mode,"map"),handshake=!strcmp(mode,"handshake-timeout");
+        bool bad=!strcmp(mode,"bad");
+        disconnect=!strcmp(mode,"disconnect");sendStalled=timeout;stalled=handshake;
+        if(mapFail)failMap=2;
+        if(busy)ram[0x200/4]=96;
+        if(rx)ram[0x100/4]=4;
+        if(bad)ram[14]=60;
+        int on=picasso_aop_load_state(true);
+        if(mapFail||busy||rx||bad){assert(on<0 && !consumed && unmaps==mappings-!!failMap);assert(!picasso_aop_finish());}
+        else if(timeout||disconnect||handshake){
+            assert(on==-115 && !consumed && !unmaps);
+            assert(picasso_aop_load_state(false)==-115 && picasso_aop_finish()==-115);
+            if(timeout)assert(ram[0x200/4]==96);
+        } else {
+            assert(!on && consumed==1 && !unmaps && load.on);
+            assert(picasso_aop_load_state(true)==-16);
+            assert(picasso_aop_finish()==-115); // Cannot close a live on request.
+            sendStalled=offTimeout;
+            int off=picasso_aop_load_state(false);
+            if(offTimeout){assert(off==-115 && !unmaps && consumed==1 && ram[0x200/4]==96);}
+            else {
+                assert(!off && consumed==2 && !load.on);closeStalled=closing;
+                int end=picasso_aop_finish();
+                if(closing)assert(end<0 && !unmaps && load.uncertain);
+                else assert(!end && unmaps==2 && !load.ram && !picasso_aop_finish());
+            }
+        }
+        for(unsigned n=0;n<1024;++n)if(n!=3)assert(ipcc[n]==0x5aa55aa5);
+        puts("PASS actual AOP load-state adapter: exact on/off bytes, consumed completion, stale pending/disconnect, retained mappings and close");
+        return 0;
+    }
     if(!strcmp(mode,"alloc-ram"))failAlloc=1;
     if(!strcmp(mode,"alloc-ipcc"))failAlloc=2;
     if(!strcmp(mode,"map-ram"))failMap=1;

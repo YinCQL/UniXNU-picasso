@@ -30,7 +30,7 @@ def main():
 
     cp = (ROOT/'drivers/NativeAdrenoPicasso/Adreno620Cp.cpp').read_text()
     owner = cp[cp.index('constexpr uint64_t kAppsRscDrv2Base'):cp.index('/* wf119:')]
-    exports = cp[cp.index('extern "C" int picasso_rpmh_active_write'):cp.index('extern "C" int native_adreno620_cp_start')]
+    exports = cp[cp.index('extern "C" int picasso_rpmh_active_write'):cp.index('// PIL calls and the reserved metadata')]
     body = 'namespace {\n'+owner+'\n}\n'+exports
     assert 'if (rpmhVoteCryptoPath() != 7) return false;' in cp
     (out/'PicassoRpmh-owner-body.inc').write_text(body,encoding='utf8',newline='\n')

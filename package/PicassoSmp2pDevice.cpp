@@ -9,6 +9,8 @@
 #include "PicassoSmp2p.h"
 #include "PicassoSmemLock.h"
 #include "PicassoRpmh.h"
+#include "PicassoAdspBoot.h"
+#include "PicassoAdsp.h"
 
 // Display also builds without the optional Adreno archive. A missing shared
 // owner means no power plan; never create an independent RSC writer.
@@ -79,6 +81,20 @@ int prepare(SmemDevice *d, const PicassoSmemIo *io, PicassoSmp2p *s) {
     __atomic_store_n(&allocatorGate, 0U, __ATOMIC_RELEASE);
     return error;
 }
+struct BootEvents { SmemDevice *device; const PicassoSmemIo *io; PicassoSmp2p *state; };
+int bootPoll(void *context, PicassoSmp2pEvent *event) {
+    auto *b=static_cast<BootEvents *>(context);
+    int error=picasso_smp2p_service(b->io,b->state,event);
+    if(!error && event->kick)smpKick(b->device);
+    return error;
+}
+int bootSnapshot(void *context) {
+    auto *b=static_cast<BootEvents *>(context);
+    picasso_adsp_snapshot s={};picasso_adsp_survey(&b->io->reader,&s);
+    IOLog("PICASSO_ADSP boot snapshot crash_error=%d reason=%.79s glink_error=%d fifo=%x/%x/%x/%x\n",
+        s.crash_error,s.crash,s.glink_error,s.fifo[0],s.fifo[1],s.fifo[2],s.fifo[3]);
+    return s.glink_error;
+}
 void logAudit(const PicassoSmp2p &s) {
     const auto &a = s.audit;
     IOLog("PICASSO_ADSP smem phase=%s entry=%u/%u offset=%x size=%x flags=%x hosts=%08x line=%x reserved=%x free=%x/%x siii=%x region=%x base=%08x%08x items=%u\n",
@@ -112,13 +128,16 @@ extern "C" void picasso_smp2p_start(void) {
     logAudit(s);
     if (error) return;
     smpKick(&d);
+    BootEvents boot={&d,&io,&s};
+    PicassoAdspEvents events={&boot,bootPoll,bootSnapshot};
+    picasso_adsp_boot(&events);
     unsigned missing = 0, logs = 0;
     bool wasOpen = false, hadValue = false;
     for (;;) {
         PicassoSmp2pEvent event = {};
         error = picasso_smp2p_service(&io, &s, &event);
         if (error && error != -2 && error != -11) {
-            IOLog("PICASSO_ADSP smp2p stage=peer error=%d stopped=1 authenticated=0\n", error);
+            IOLog("PICASSO_ADSP smp2p stage=peer error=%d stopped=1 observer=1\n", error);
             logAudit(s);
             return; // Preserve the published item; no blind teardown or reuse.
         }
@@ -126,14 +145,14 @@ extern "C" void picasso_smp2p_start(void) {
             if (event.kick) smpKick(&d);
             if ((!wasOpen || event.hasValue != hadValue || event.changed || event.restart) && logs < 64) {
                 ++logs;
-                IOLog("PICASSO_ADSP smp2p peer=1 entry=%u value=%x changed=%x features=%x restart=%u ready=%u fatal=%u handover=%u stop_ack=%u authenticated=0 pcm=0\n",
+                IOLog("PICASSO_ADSP smp2p peer=1 entry=%u value=%x changed=%x features=%x restart=%u ready=%u fatal=%u handover=%u stop_ack=%u observer=1 pcm=0\n",
                     event.hasValue, event.value, event.changed, event.features, event.restart,
                     !!(event.value & 2), !!(event.value & 1), !!(event.value & 4), !!(event.value & 8));
             }
             wasOpen = true;
             hadValue = event.hasValue;
         } else if (missing == 0 || missing == 250 || missing == 1500) {
-            IOLog("PICASSO_ADSP smp2p peer=0 error=%d elapsed_ms=%u pending=power-pas authenticated=0\n", error, missing * 20);
+            IOLog("PICASSO_ADSP smp2p peer=0 error=%d elapsed_ms=%u observer=1 retry=0\n", error, missing * 20);
         }
         if (missing < 1501) ++missing;
         IOSleep(20);

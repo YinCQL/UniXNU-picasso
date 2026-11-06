@@ -113,7 +113,9 @@ static inline int picasso_arc_lookup(const uint8_t *db, uint32_t size, const cha
                 if (!k && level) return -22;
                 if (k && !level) padding = true;
                 if (level && (padding || level < prior)) return -22;
-                if (!padding && !selected && level >= minimum) {result = {address, k, level}; selected = true;}
+                if (!padding && ((!selected && level >= minimum) || minimum == UINT32_MAX-1)) {
+                    result = {address, k, level}; selected = true;
+                }
                 prior = level;
             }
             if (!selected) return -34;
@@ -125,5 +127,7 @@ static inline int picasso_arc_lookup(const uint8_t *db, uint32_t size, const cha
 // Defined alongside the existing GPU RSC owner so GPU and future PAS callers
 // share the same gate and permanent timeout quarantine.
 extern "C" int picasso_rpmh_adsp_plan(void);
+extern "C" int picasso_rpmh_adsp_resources(PicassoArcResource rails[3]);
+extern "C" int picasso_rpmh_crypto_ready(void);
 extern "C" int picasso_rpmh_active_write(uint32_t address, uint32_t value);
 #endif

@@ -73,6 +73,7 @@ int main() {
     setup();irqChanged=true;assert(!picasso_rsc_send(&io,0,0x30000,3,&r) && regs[0xd00/4]==0x80a5);
     database();PicassoArcResource a;
     assert(!picasso_arc_lookup(db,sizeof db,"lcx.lvl",384,&a) && a.address==0x30000 && a.index==3 && a.level==384);
+    assert(!picasso_arc_lookup(db,sizeof db,"lcx.lvl",UINT32_MAX-1,&a) && a.index==4 && a.level==416);
     assert(!picasso_arc_lookup(db,sizeof db,"xo.lvl",UINT32_MAX,&a) && a.address==0x30008);
     assert(picasso_arc_lookup(db,sizeof db,"none",384,&a)==-2);
     assert(picasso_arc_lookup(db,sizeof db,"lcx.lvl",500,&a)==-34);

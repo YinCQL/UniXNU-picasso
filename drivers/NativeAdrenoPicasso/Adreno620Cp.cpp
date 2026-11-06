@@ -26,6 +26,7 @@
 #include "Adreno620Probe.h"
 #include "Adreno620ProbeCore.h"
 #include "PicassoRpmh.h"
+#include "PicassoPas.h"
 #include "NativeAdrenoABI.h"
 #include "NativeAdrenoA620HwInit.h"
 #include "NativeAdrenoGpuContext.h"
@@ -393,8 +394,8 @@ ScmReply scmSipCall(uint32_t function, uint32_t arginfo, uint64_t arg0,
     register uint64_t x6 __asm__("x6") = arg6;
     register uint64_t x7 __asm__("x7") = 0;
     __asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3),
-        "+r"(x6), "+r"(x7)
-        : "r"(x4), "r"(x5)
+        "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
+        :
         : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16",
           "x17", "memory");
     return ScmReply{uint32_t(x0), uint32_t(x1), uint32_t(x2), uint32_t(x3), x6};
@@ -402,6 +403,18 @@ ScmReply scmSipCall(uint32_t function, uint32_t arginfo, uint64_t arg0,
 
 void scmProbe()
 {
+    if (picasso_pas_acquire()) return;
+    struct Lease { bool uncertain=false; ~Lease(){picasso_pas_release(uncertain);} } lease;
+    auto probeCall=[&lease](uint32_t fn,uint32_t info,uint64_t arg) {
+        if(lease.uncertain)return ScmReply{1,0,0,0,0};
+        auto reply=scmSipCall(fn,info,arg);
+        for(unsigned i=0;reply.a0==1 && i<64;++i) {
+            IOSleep(1);
+            reply=scmSipCall(1,info,arg,0,0,0,reply.a6);
+        }
+        if(reply.a0==1)lease.uncertain=true;
+        return reply;
+    };
     constexpr uint32_t kSipOwner = 2u;              /* ARM_SMCCC_OWNER_SIP */
     constexpr uint32_t kOwnerShift = 24;
     constexpr uint32_t kFastCall = 1u << 31;        /* ARM_SMCCC_FAST_CALL */
@@ -413,13 +426,13 @@ void scmProbe()
         (kSvcInfo << 8) | kIsCallAvail);
     const uint64_t selector = (uint64_t(kSipOwner) << kOwnerShift) |
         uint64_t((kSvcPil << 8) | kPasInitImage);
-    const ScmReply init = scmSipCall(avail, 1, selector);
+    const ScmReply init = probeCall(avail, 1, selector);
     const uint64_t setupSelector = (uint64_t(kSipOwner) << kOwnerShift) |
         uint64_t((kSvcPil << 8) | kPasMemSetup);
-    const ScmReply setup = scmSipCall(avail, 1, setupSelector);
+    const ScmReply setup = probeCall(avail, 1, setupSelector);
     const uint64_t resetSelector = (uint64_t(kSipOwner) << kOwnerShift) |
         uint64_t((kSvcPil << 8) | kPasAuthAndReset);
-    const ScmReply reset = scmSipCall(avail, 1, resetSelector);
+    const ScmReply reset = probeCall(avail, 1, resetSelector);
     printf("PICASSO_GPU scm: is-call-avail init a0=%08x a1=%08x a2=%08x a3=%08x\n",
         init.a0, init.a1, init.a2, init.a3);
     printf("PICASSO_GPU scm: is-call-avail memsetup a0=%08x a1=%08x; auth %08x/%08x\n",
@@ -432,22 +445,22 @@ void scmProbe()
     const uint32_t availStd = (kSmc64 | (kSipOwner << kOwnerShift) |
         (kSvcInfo << 8) | kIsCallAvail);
     printf("PICASSO_GPU scm: calling std is-call-avail\n");
-    const ScmReply stdInfo = scmSipCall(availStd, 1, selector);
+    const ScmReply stdInfo = probeCall(availStd, 1, selector);
     printf("PICASSO_GPU scm: std is-call-avail a0=%08x a1=%08x\n",
         stdInfo.a0, stdInfo.a1);
     /* wf110: does the PIL service answer at all for this platform? PAS_IS_SUPPORTED (SVC_PIL 0x02,
      * cmd 0x07, ARGS(1) = pas id) reads no memory and touches no GPU state. If it answers for the
      * GPU's pas id 0x0d, the PIL service is live and the wf106-wf109 hang is specific to
      * PAS_INIT_IMAGE's metadata handling; if it hangs too, the PIL service is not usable from this
-     * boot environment at all. Pas id 1 (modem on this platform) is the control. */
+     * boot environment at all. Pas id 1 is ADSP on this platform. */
     {
         constexpr uint32_t kStdSipSmc64 = 0x40000000u | 0x02000000u;
         printf("PICASSO_GPU scm: calling pas-supported(13)\n");
-        const ScmReply gpu = scmSipCall(kStdSipSmc64 | (0x02u << 8) | 0x07u,
+        const ScmReply gpu = probeCall(kStdSipSmc64 | (0x02u << 8) | 0x07u,
             0x01u, 0x0du);
         printf("PICASSO_GPU scm: pas-supported(13) a0=%08x a1=%08x\n", gpu.a0, gpu.a1);
         printf("PICASSO_GPU scm: calling pas-supported(1)\n");
-        const ScmReply modem = scmSipCall(kStdSipSmc64 | (0x02u << 8) | 0x07u,
+        const ScmReply modem = probeCall(kStdSipSmc64 | (0x02u << 8) | 0x07u,
             0x01u, 0x01u);
         printf("PICASSO_GPU scm: pas-supported(1) a0=%08x a1=%08x\n", modem.a0, modem.a1);
     }
@@ -1062,6 +1075,8 @@ void heartbeatThread(void *, wait_result_t)
  * QCOM_SCM_INTERRUPTED (retry), as __scm_smc_do_quirk does. */
 bool loadZap()
 {
+    if (picasso_pas_acquire()) return false;
+    struct Lease { bool uncertain = false; ~Lease() { picasso_pas_release(uncertain); } } lease;
     /* wf116: vote the crypto engine's NoC path before TZ runs PAS, the way
      * subsys-pil-tz.c's scm_pas_enable_bw() does around every PAS call. */
     if (rpmhVoteCryptoPath() != 7) return false;
@@ -1354,7 +1369,7 @@ bool loadZap()
             read32(gic, 0x120), read32(gic, 0x1a0), read32(gic, 0xc44));
         if (gic.keep) gic.keep->release();
     };
-    auto pasCall = [&dumpGic](uint32_t function, uint32_t arginfo, uint64_t arg0,
+    auto pasCall = [&dumpGic, &lease](uint32_t function, uint32_t arginfo, uint64_t arg0,
         uint64_t arg1, uint64_t arg2, bool maskFirst) {
         uint64_t begin = 0, end = 0;
         uint64_t pmr = 0, daif = 0;
@@ -1386,8 +1401,10 @@ bool loadZap()
                 uint32_t(reply.a6), uint32_t(reply.a6 >> 32), attempt);
             if (attempt == 1)
                 dumpGic();
-            reply = scmSipCall(1u, arginfo, arg0, arg1, arg2, reply.a6);
+            IOSleep(1);
+            reply = scmSipCall(1u, arginfo, arg0, arg1, arg2, 0, reply.a6);
         }
+        if (reply.a0 == 1) lease.uncertain = true;
         return reply;
     };
     /* wf119: dump the TZ log from another core while this thread sits in EL3. */
@@ -1461,6 +1478,15 @@ bool loadZap()
             auth.a0, auth.a1);
         ok = auth.a0 == 0 && auth.a1 == 0;
     }
+    // ADSP can use the same reserved metadata slot next. A failed GPU PIL
+    // transaction must be shut down before that slot can be overwritten.
+    if (!ok && altMap && !lease.uncertain) {
+        const auto stopped = pasCall(kScmSipStd | (kPasSvc << 8) | 6u,
+            1u, kGpuPasId, 0, 0, true);
+        if (stopped.a0 || stopped.a1) lease.uncertain = true;
+        printf("PICASSO_GPU zap: failed transaction shutdown=%x/%x quarantined=%u\n",
+            stopped.a0,stopped.a1,unsigned(lease.uncertain));
+    }
 
     /* wf125: the vendor never returns the relocatable region to the allocator
      * — pil_alloc_region() caches priv->region and only pil_release_region() /
@@ -1474,7 +1500,7 @@ bool loadZap()
     uint32_t keepRegion = 1;
     const bool retainRegion = !PE_parse_boot_argn("sheng-gpu-keep-region",
         &keepRegion, static_cast<int>(sizeof keepRegion)) || keepRegion;
-    if (retainRegion) {
+    if (retainRegion || lease.uncertain) {
         printf("PICASSO_GPU zap: region retained phys=%08x span=%x\n",
             uint32_t(regionPhys), uint32_t(regionBytes));
     } else {
@@ -1482,7 +1508,7 @@ bool loadZap()
         regionBuffer->complete();
         regionBuffer->release();
     }
-    if (altMap) altMap->release();
+    if (altMap && !lease.uncertain) altMap->release();
     metadataMap->release();
     metadata->complete();
     metadata->release();
@@ -2134,8 +2160,9 @@ extern "C" int picasso_rpmh_active_write(uint32_t address, uint32_t value)
     return error;
 }
 
-extern "C" int picasso_rpmh_adsp_plan(void)
+extern "C" int picasso_rpmh_adsp_resources(PicassoArcResource rails[3])
 {
+    if (!rails) return -22;
     if (!rpmhEnter()) return -16;
     Mapping db = {};
     auto *copy = static_cast<uint8_t *>(IOMalloc(kRpmhCmdDbBytes));
@@ -2150,13 +2177,22 @@ extern "C" int picasso_rpmh_adsp_plan(void)
         for (unsigned i = 0; i < kRpmhCmdDbBytes; i += 4)
             if (picasso_db32(copy + i) != read32(db, i)) { error = -11; break; }
         printf("PICASSO_ADSP rpmh cmd_db_version=%x stable=%u vote_sent=0\n", picasso_db32(copy), !error);
-        PicassoArcResource rails[3] = {};
         const char *names[] = {"lcx.lvl", "lmx.lvl", "xo.lvl"};
         for (unsigned i = 0; !error && i < 3; ++i) {
             error = picasso_arc_lookup(copy, kRpmhCmdDbBytes, names[i], i < 2 ? 384 : UINT32_MAX, &rails[i]);
             printf("PICASSO_ADSP rpmh resource=%s error=%d address=%x index=%u level=%u vote_sent=0\n",
                 names[i], error, rails[i].address, i < 2 ? rails[i].index : 3, rails[i].level);
         }
+        // No trustworthy prior DRV2 ARC request is available. Use the highest
+        // supported level so an inherited higher vote cannot be lowered, and
+        // retain it until a shared aggregate owner can restore prior requests.
+        for (unsigned i=0; !error && i<2; ++i) {
+            error=picasso_arc_lookup(copy,kRpmhCmdDbBytes,names[i],UINT32_MAX-1,&rails[i]);
+            if(!error && rails[i].level<384)error=-34;
+            printf("PICASSO_ADSP rpmh resource=%s boot_floor=%u index=%u retained=1 error=%d\n",
+                names[i],rails[i].level,rails[i].index,error);
+        }
+        rails[2].index=3;
         // XO is the stock ARC on-value 3, not a voltage-table index chosen for
         // the rails. No vote until a PAS transaction owns their full lifetime.
         if (!error && (rails[0].address == rails[1].address || rails[0].address == rails[2].address ||
@@ -2166,6 +2202,60 @@ extern "C" int picasso_rpmh_adsp_plan(void)
     if (copy) IOFree(copy, kRpmhCmdDbBytes);
     rpmhLeave();
     printf("PICASSO_ADSP rpmh stage=plan error=%d vote_sent=0 pending=pas-lifecycle\n", error);
+    return error;
+}
+
+extern "C" int picasso_rpmh_adsp_plan(void) {
+    PicassoArcResource rails[3]={};
+    return picasso_rpmh_adsp_resources(rails);
+}
+extern "C" int picasso_rpmh_crypto_ready(void) { return rpmhVoteCryptoPath()==7 ? 0 : -5; }
+
+// PIL calls and the reserved metadata slot are shared with the GPU ZAP loader.
+static unsigned pasGate, pasPoisoned;
+extern "C" int picasso_pas_acquire(void) {
+    for (unsigned n = 0; n < 30000; ++n) {
+        if (__atomic_load_n(&pasPoisoned, __ATOMIC_ACQUIRE)) return -115;
+        if (!__atomic_exchange_n(&pasGate, 1U, __ATOMIC_ACQ_REL)) {
+            if (!__atomic_load_n(&pasPoisoned, __ATOMIC_ACQUIRE)) return 0;
+            __atomic_store_n(&pasGate, 0U, __ATOMIC_RELEASE); return -115;
+        }
+        IOSleep(1);
+    }
+    return -16;
+}
+extern "C" void picasso_pas_release(bool uncertain) {
+    if (uncertain) __atomic_store_n(&pasPoisoned, 1U, __ATOMIC_RELEASE);
+    __atomic_store_n(&pasGate, 0U, __ATOMIC_RELEASE);
+}
+static PicassoPasReply adspScm(void *, uint32_t function, uint32_t arginfo,
+    uint64_t pas, uint64_t address, uint64_t bytes, uint64_t session, bool first) {
+    uint64_t pmr = 0, daif = 0;
+    if (first) {
+        __asm__ volatile("mrs %0, icc_pmr_el1" : "=r"(pmr));
+        __asm__ volatile("mrs %0, daif" : "=r"(daif));
+        __asm__ volatile("msr daifset, #2" ::: "memory");
+        __asm__ volatile("msr icc_pmr_el1, %0" :: "r"(UINT64_C(0)) : "memory");
+        __asm__ volatile("isb" ::: "memory");
+    }
+    const auto r = scmSipCall(function, arginfo, pas, address, bytes, 0, session);
+    if (first) {
+        __asm__ volatile("msr icc_pmr_el1, %0" :: "r"(pmr) : "memory");
+        __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+        __asm__ volatile("isb" ::: "memory");
+    }
+    return {r.a0, r.a1, r.a2, r.a3, r.a6};
+}
+static void adspScmDelay(void *, unsigned ms) { IOSleep(ms); }
+extern "C" int picasso_pas_adsp(unsigned command, uint64_t address, uint64_t bytes) {
+    if (!__atomic_load_n(&pasGate, __ATOMIC_ACQUIRE) || __atomic_load_n(&pasPoisoned, __ATOMIC_ACQUIRE)) return -115;
+    PicassoPasIo io = {nullptr, adspScm, adspScmDelay}; PicassoPasReply reply = {};
+    printf("PICASSO_ADSP pas stage=call command=%u address=%llx bytes=%llx\n",
+        command,(unsigned long long)address,(unsigned long long)bytes);
+    int error = picasso_pas_execute(&io, command, address, bytes, &reply);
+    printf("PICASSO_ADSP pas command=%u error=%d a0=%x a1=%x session=%llx\n",
+        command, error, reply.a0, reply.a1, (unsigned long long)reply.a6);
+    if (error == -115) __atomic_store_n(&pasPoisoned, 1U, __ATOMIC_RELEASE);
     return error;
 }
 

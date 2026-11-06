@@ -8,6 +8,7 @@
 #include <libkern/c++/OSSharedPtr.h>
 #include <kern/clock.h>
 #include "PicassoQmp.h"
+#include "PicassoAdspBoot.h"
 
 namespace {
 struct Aop { uintptr_t ram, ipcc; };
@@ -71,4 +72,58 @@ extern "C" int picasso_aop_probe(void) {
     // Mapping lifetime ends here. No load_state on/off is sent before a real
     // PAS lifecycle owns LCX/LMX/XO and has installed ready/fatal handlers.
     return result == QmpOpen && closed == QmpClosed ? 0 : (result < 0 ? result : closed);
+}
+
+namespace {
+struct LoadState {
+    IOMemoryMap *ram, *ipcc;
+    Aop context;
+    PicassoQmp q;
+    bool attempted, on, uncertain;
+};
+static LoadState load;
+void releaseLoad() {
+    if(load.ipcc)load.ipcc->release();
+    if(load.ram)load.ram->release();
+    load.ipcc=load.ram=nullptr;
+}
+}
+extern "C" int picasso_aop_load_state(bool on) {
+    if (load.uncertain) return -115;
+    if (on) {
+        if (load.attempted) return -16;
+        load.attempted=true;
+        load.ram=aopMap(0x0c300000);load.ipcc=aopMap(0x00408000);
+        load.context={load.ram?uintptr_t(load.ram->getVirtualAddress()):0,
+                      load.ipcc?uintptr_t(load.ipcc->getVirtualAddress()):0};
+        if(!load.context.ram || !load.context.ipcc){releaseLoad();return -12;}
+        QmpIo io={&load.context,aopRead,aopWrite,aopBarrier,aopKick};
+        int state=picasso_qmp_begin(&load.q,&io,0x1000,deadline());
+        if(state>=0)state=wait(&load.q);
+        if(state!=QmpOpen){
+            int closed=picasso_qmp_close(&load.q,deadline());
+            if(closed==QmpClosing)closed=wait(&load.q);
+            load.uncertain=load.q.owned;
+            if(!load.uncertain)releaseLoad();
+            return load.uncertain?-115:state<0?state:-5;
+        }
+    } else if (!load.on) return -22;
+    int state=picasso_qmp_send(&load.q,on?
+        "{class: image, res: load_state, name: adsp, val: on}":
+        "{class: image, res: load_state, name: adsp, val: off}",deadline());
+    if(state==QmpSending)state=wait(&load.q);
+    if(state!=QmpOpen)load.uncertain=true;
+    else load.on=on;
+    IOLog("PICASSO_ADSP aop stage=load_state on=%u state=%d consumed=%u uncertain=%u\n",
+        on,state,state==QmpOpen,load.uncertain);
+    return state==QmpOpen?0:-115;
+}
+extern "C" int picasso_aop_finish(void) {
+    if(load.uncertain || load.on)return -115;
+    if(!load.ram)return 0;
+    int state=picasso_qmp_close(&load.q,deadline());
+    if(state==QmpClosing)state=wait(&load.q);
+    load.uncertain=load.q.owned;
+    if(!load.uncertain)releaseLoad();
+    return state==QmpClosed?0:state;
 }

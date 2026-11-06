@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // First ADSP bring-up stage following unixnu.com/porting/power. Picasso uses
 // APR (apr_audio_svc), not the reference SM8550 AudioReach/GPR firmware.
-// Observe reserved SMEM only. No LPASS MMIO, PAS call, SMEM allocation or IRQ
-// acknowledgement is valid until clock/rail/mailbox ownership is implemented.
+// Observe reserved SMEM only. The independent boot worker owns PAS and power;
+// these snapshots never claim authentication or create an audio channel.
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -34,10 +34,10 @@ extern "C" void picasso_adsp_poll(void) {
     picasso_adsp_survey(&io,&s);
     IOLog("PICASSO_ADSP sample=%u partition_error=%d partition=%x size=%x in_error=%d slave=%x out_error=%d master=%x\n",
         tick,s.partition_error,s.partition.offset,s.partition.size,s.inbound_error,s.inbound,s.outbound_error,s.outbound);
-    IOLog("PICASSO_ADSP observed ready=%u fatal=%u handover=%u stop_ack=%u glink_error=%d fifo=%x/%x/%x/%x authenticated=0 channel_open=0\n",
+    IOLog("PICASSO_ADSP observed ready=%u fatal=%u handover=%u stop_ack=%u glink_error=%d fifo=%x/%x/%x/%x observer=1 channel_open=0\n",
         !s.inbound_error && !!(s.inbound&2),!s.inbound_error && !!(s.inbound&1),
         !s.inbound_error && !!(s.inbound&4),!s.inbound_error && !!(s.inbound&8),
         s.glink_error,s.fifo[0],s.fifo[1],s.fifo[2],s.fifo[3]);
     IOLog("PICASSO_ADSP crash_error=%d previous_reason=%s\n",s.crash_error,s.crash);
-    if (!tick) IOLog("PICASSO_ADSP pending=power-mailbox-pas firmware=adsp pas=1 carveout=89200000+2800000 protocol=apr channel=apr_audio_svc pcm=0\n");
+    if (!tick) IOLog("PICASSO_ADSP boot_owner=firmware-worker firmware=adsp pas=1 carveout=89200000+2800000 protocol=apr channel=apr_audio_svc pcm=0\n");
 }

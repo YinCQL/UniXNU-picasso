@@ -5,6 +5,8 @@
 #include <stdarg.h>
 #include <string.h>
 #include "PicassoSmp2p.h"
+#include "PicassoAdspBoot.h"
+extern "C" void picasso_adsp_boot(const PicassoAdspEvents *e) { assert(e && e->poll && e->snapshot); }
 static uint32_t ram[WLAN_SMEM_SIZE/4], mutexRam[1024], ipccRam[1024];
 static unsigned allocations,mappings,releases,unmaps,lines,sleeps,preempt,plans,kicks;
 static unsigned failAlloc,failMap,zeroMap;

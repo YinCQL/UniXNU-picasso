@@ -66,7 +66,7 @@ def check(tree, work, kernelcache, output):
         'hid-original-bindings.o', 'NativeGOPPresenter.late.o', 'NativeGOPGlue.o',
         'PicassoPr13.o', 'PicassoButtons.o', 'PicassoBacklight.o', 'PicassoBrightness.late.o',
         'PicassoSpmi.o', 'PicassoAdsp.o', 'PicassoAdspFirmware.o', 'PicassoFat.o',
-        'PicassoQmp.o', 'PicassoAop.o', 'PicassoSmp2p.o', 'PicassoSmp2pDevice.o'}, 'Wrong display/state/input archive members')
+        'PicassoQmp.o', 'PicassoAop.o', 'PicassoSmp2p.o', 'PicassoSmp2pDevice.o', 'PicassoAdspBoot.o'}, 'Wrong display/state/input archive members')
     kernel = work / 'kernel/kernel.macho'
     plan = json.loads(kernel.with_suffix('.json').read_text())
     report = builder.verify_kernel(aes, native, original, kernel.read_bytes(), plan, audit)
@@ -74,6 +74,11 @@ def check(tree, work, kernelcache, output):
     from picasso_original_abi import OriginalReference
     linked_image = native.macho(kernel.read_bytes())
     linked_names = {name for names in native.exports(kernel.read_bytes(), linked_image).values() for name in names}
+    builder.require({'_picasso_adsp_boot', '_picasso_adsp_image_open', '_picasso_adsp_image_load',
+                     '_picasso_adsp_image_close', '_picasso_aop_load_state', '_picasso_aop_finish',
+                     '_picasso_pas_acquire', '_picasso_pas_release', '_picasso_pas_adsp',
+                     '_picasso_rpmh_adsp_resources', '_picasso_rpmh_crypto_ready'} <= linked_names,
+                    'Missing ADSP boot transaction or shared GPU power/PAS owner')
     builder.require({'_picasso_backlight_start', '_picasso_backlight_power', '_picasso_backlight_level',
                      '_picasso_backlight_current', '_picasso_brightness_allocate', '_picasso_brightness_is_service', '__GLOBAL__sub_I_PicassoBrightness.cpp'} <= linked_names, 'Missing physical display power backend')
     report['hid'] = hid.verify(platform, aes, native, OriginalReference(kernelcache, board),
