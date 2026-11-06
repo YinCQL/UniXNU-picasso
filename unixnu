@@ -31,13 +31,14 @@ def prepare(device=DEVICE, source=None):
         raise ValueError('upstream.rev must contain a full Git commit ID')
     patch = device / 'patches/unixnu-source-kernel.patch'
     usb_patch = device / 'patches/picasso-usb-console-xnu.patch'
+    census_patch = device / 'patches/picasso-ipc-census-xnu.patch'
     overlays = [device / ('patches/picasso-' + name + '-xnu.patch')
                 for name in LATE_OVERLAYS]
     ram_block_patch = device / 'patches/picasso-native-ram-block-mode1-guard.patch'
     linux_patch = device / 'patches/picasso-linux-toolchain-v1.patch'
     seed_patch = device / 'patches/picasso-large-seed-setup.patch'
     fingerprint = hashlib.sha256(b'\0'.join(
-        p.read_bytes() for p in [patch, usb_patch, ram_block_patch, linux_patch, seed_patch, *overlays])).hexdigest()
+        p.read_bytes() for p in [patch, usb_patch, census_patch, ram_block_patch, linux_patch, *overlays])).hexdigest()
     cache = device / '.cache'
     target = cache / f'upstream-{revision[:12]}-{fingerprint[:12]}'
     if target.is_dir():
@@ -89,6 +90,11 @@ def prepare(device=DEVICE, source=None):
         for index, (name, overlay) in enumerate(zip(LATE_OVERLAYS, overlays)):
             installed = 'z' * (24 + index) + '-picasso-' + name + '.patch'
             (tree / 'patches/xnu' / installed).write_bytes(overlay.read_bytes())
+        # IPC census (read-only): counts kernel IPC traffic by port and name so the launchd/audiomxd
+        # storm can be attributed. BootProgress.c calls its row exporter; the function must be linked
+        # in even when no census boot argument is present. Applies last.
+        (tree / 'patches/xnu' / (('z' * 60) + '-picasso-ipc-census.patch')).write_bytes(
+            census_patch.read_bytes())
         tree.rename(target)
     return target
 
