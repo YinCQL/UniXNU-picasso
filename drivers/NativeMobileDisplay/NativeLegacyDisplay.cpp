@@ -587,6 +587,16 @@ public:
         kicking=false;
     }
     void kickOnce() {
+        // The GPU client owns one frame until it completes it; the presenter's flip timeout normally takes a
+        // stalled frame back. If that timer was never created (no work loop) or the completion never reached this
+        // driver, do not wait forever: take the frame back here and use the CPU path for this kick.
+        if(transferred && gpuStartTick) {
+            uint64_t held=0;absolutetime_to_nanoseconds(mach_absolute_time()-gpuStartTick,&held);
+            if(held>=1500000000ull) {
+                gpuRequest=nullptr;gpuLength=0;transferred=false;gpuBypass=true;gpuStartTick=0;
+                native_legacy_gpu_fallback_observed(kIOReturnTimeout);
+            }
+        }
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
