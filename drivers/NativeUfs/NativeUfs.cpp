@@ -37,6 +37,7 @@ extern const uint8_t verified_root_key[];
 #include "RootReadDiagnostics.h"
 #include "TransferPoll.h"
 #include "SmmuTakeover.h"
+#include "FirmwareWindow.h"
 
 static UfsRootDiagnostics gRootDiagnostic;
 static bool gRootDiagnosticEnabled;
