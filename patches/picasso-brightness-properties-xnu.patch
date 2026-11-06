@@ -4,7 +4,7 @@
  #include <libkern/c++/OSKext.h>
 +#include <libkern/c++/OSCollectionIterator.h>
  #include <libkern/c++/OSSharedPtr.h>
-@@ -4237,6 +4238,72 @@
+@@ -4237,6 +4238,73 @@
  
  
  static bool native_sandbox_grant(IOService * service);
@@ -64,9 +64,10 @@
 +			OSString *name = OSDynamicCast(OSString, key);
 +			OSObject *value = name ? dict->getObject(name->getCStringNoCopy()) : nullptr;
 +			OSNumber *number = OSDynamicCast(OSNumber, value);
-+			IOLog("PICASSO_BRIGHTNESS key=%s number=%u value=%llu dictionary=%u\n",
++			IOLog("PICASSO_BRIGHTNESS key=%s number=%u value=%llu bits=%u dictionary=%u\n",
 +			    name ? name->getCStringNoCopy() : "<invalid>", number != nullptr,
-+			    number ? number->unsigned64BitValue() : 0ULL, OSDynamicCast(OSDictionary, value) != nullptr);
++			    number && number->numberOfBits() != 31 && number->numberOfBits() != 63 ? number->unsigned64BitValue() : 0ULL,
++			    number ? number->numberOfBits() : 0, OSDynamicCast(OSDictionary, value) != nullptr);
 +		}
 +		OSSafeReleaseNULL(it);
 +	}
@@ -77,7 +78,7 @@
  /* Routine io_registry_entry_set_properties */
  kern_return_t
  is_io_registry_entry_set_properties
-@@ -4272,11 +4339,7 @@
+@@ -4272,11 +4340,7 @@
  			res = kIOReturnBadArgument;
  		}
  #if CONFIG_MACF

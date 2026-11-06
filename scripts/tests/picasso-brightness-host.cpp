@@ -19,8 +19,15 @@ const OSSymbol *OSSymbol::withCString(const char *s) {
 const OSMetaClass *OSMetaClass::getMetaClassWithName(const OSSymbol *s) {
     return applePresent && !strcmp(s->name,"AppleARMBacklight")?&apple:nullptr;
 }
-OSNumber *OSNumber::withNumber(uint64_t v,unsigned) {
-    if(failAlloc())return nullptr;auto *n=new OSNumber;n->value=v;return n;
+OSNumber *OSNumber::withNumber(uint64_t v,unsigned bits) {
+    if(failAlloc())return nullptr;auto *n=new OSNumber;n->value=v;n->bits=bits;return n;
+}
+OSSerialize *OSSerialize::binaryWithCapacity(unsigned n, void *editor, void *reference) {
+    assert(n==32 && !editor && !reference);return failAlloc()?nullptr:new OSSerialize;
+}
+bool OSNumber::serialize(OSSerialize *s) const {
+    s->words[0]=0xd3;s->words[1]=0x84000000U|bits;
+    s->words[2]=uint32_t(value);s->words[3]=uint32_t(value>>32);return true;
 }
 OSDictionary *OSDictionary::withCapacity(unsigned) { return failAlloc()?nullptr:new OSDictionary; }
 OSDictionary::~OSDictionary() { for(unsigned i=0;i<count;++i)values[i]->release(); }
@@ -124,6 +131,41 @@ int main() {
     assert(!send(s,2048));fire(0);assert(b.state.on && b.state.level==2048);++cases;
     assert(send(s,4096)==kIOReturnBadArgument && send(s,UINT64_MAX)==kIOReturnBadArgument);
     assert(send(s,5,UINT64_MAX)==kIOReturnBadArgument && s->setProperties(&display)==kIOReturnBadArgument);++cases;
+    // The actual authorized 20H392 nested protocol. The API model stores the
+    // same binary64 bits as OSNumber::withFloat/withDouble; never integer-casts.
+    auto *outer=OSDictionary::withCapacity(1), *nested=OSDictionary::withCapacity(4);
+    auto *normalized=OSNumber::withNumber(0,64);
+    outer->setObject("DisplayBrightness",nested);nested->setObject("Brightness",normalized);
+    const unsigned tags[]={31U,63U};
+    for(unsigned tag: tags) {
+        normalized->bits=tag;
+        for(unsigned i=0;i<=4095;++i) {
+            double f=double(i)/4095;memcpy(&normalized->value,&f,8);
+            assert(!s->setProperties(outer));fire(0);
+            assert(published(s)==picasso_backlight::clamp(i));
+        }
+        const uint64_t invalids[]={0xbfe0000000000000ULL,0x3ff0000000000001ULL,
+                0x7ff0000000000000ULL,0x7ff8000000000000ULL,0xfff0000000000000ULL};
+        for(uint64_t invalid: invalids) {
+            normalized->value=invalid;assert(s->setProperties(outer)==kIOReturnBadArgument);
+        }
+        const uint64_t zeros[]={0ULL,0x8000000000000000ULL,1ULL};
+        for(uint64_t zero: zeros) {
+            normalized->value=zero;assert(!s->setProperties(outer));fire(0);assert(!published(s));
+        }
+    }
+    normalized->bits=32;normalized->value=1;
+    assert(!s->setProperties(outer));fire(0);assert(published(s)==4095);
+    normalized->value=2;assert(s->setProperties(outer)==kIOReturnBadArgument);
+    normalized->bits=63;normalized->value=0x3fe0000000000000ULL;
+    failAllocation=allocations+1;assert(s->setProperties(outer)==kIOReturnNoMemory);failAllocation=0;
+    assert(!picasso_backlight_power(&display,false));ops=b.operations;
+    assert(!s->setProperties(outer));fire(0);assert(b.operations==ops && b.requested==2048);
+    assert(!picasso_backlight_power(&display,true) && b.state.level==2048);
+    outer->setObject("brightness",normalized);assert(s->setProperties(outer)==kIOReturnBadArgument);
+    normalized->release();nested->release();outer->release();cases+=8208;
+    assert(!send(s,1000,0xffff0000));fire(0);assert(published(s)==1000 && !timers[1]->armed);
+    assert(!send(s,2048));fire(0);
     timerFailure=true;assert(send(s,3000)==kIOReturnIOError);timerFailure=false;++cases;
     assert(!send(s,3000));b.fail=b.operations+1;fire(0);
     assert(b.state.failed && published(s)==2048 && s->getProperty("PicassoBrightnessError"));

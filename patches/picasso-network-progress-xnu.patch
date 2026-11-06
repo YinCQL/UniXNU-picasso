@@ -1,0 +1,45 @@
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1723,10 +1723,10 @@
+ {
+ 	static const char * const names[] = {
+ 		"backboardd", "SpringBoard", "mediaserverd", "audiomxd",
+-		"notifyd", "powerd", "mobiletimerd", "liveactivitiesd", "Preferences"
++		"notifyd", "powerd", "mobiletimerd", "liveactivitiesd", "Preferences", "configd"
+ 	};
+-	static unsigned counts[9];
+-	for (unsigned index = 0; index < 9; ++index) {
++	static unsigned counts[10];
++	for (unsigned index = 0; index < 10; ++index) {
+ 		if (strncmp(p->p_name, names[index], sizeof(p->p_name))) continue;
+ 		unsigned ticket = picasso_pid1_trace_ticket(&counts[index], 4);
+ 		if (!ticket) return;
+@@ -1840,6 +1840,11 @@
+ 	(void)unused;
+ 	proc_t p=picasso_dump_named_proc("Preferences");
+ 	if(p!=PROC_NULL)proc_rele(p);
++    // Capture the notification producer with its consumer; bounded, read-only.
++    if (taken < 6 || !(taken % 3)) {
++        proc_t network = picasso_dump_named_proc("configd");
++        if (network != PROC_NULL) proc_rele(network);
++    }
+ 	if(++taken<30) {
+ 		uint64_t interval=0;
+ 		nanoseconds_to_absolutetime(20ULL*NSEC_PER_SEC,&interval);
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -3372,6 +3372,14 @@
+ 		userNotify = NULL;
+ 	}
+ 
++    char caller[32] = {};
++    proc_name(proc_selfpid(), caller, sizeof(caller));
++    if (!strcmp(caller, "configd")) {
++        static unsigned reports;
++        if (__atomic_fetch_add(&reports, 1U, __ATOMIC_RELAXED) < 8)
++            IOLog("PICASSO_NETWORK interest type=%s class=%s error=%x\n",
++                type_of_interest, service->getMetaClass()->getClassName(), err);
++    }
+ 	return err;
+ }
+ 

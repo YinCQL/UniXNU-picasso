@@ -6,7 +6,7 @@
 class OSObject { public: unsigned refs=1; virtual ~OSObject(){}; void release(){if(!--refs)delete this;} };
 class IORegistryEntry:public OSObject{};
 class IOService:public IORegistryEntry{};
-class OSNumber:public OSObject{ public: uint64_t value; explicit OSNumber(uint64_t v):value(v){};uint64_t unsigned64BitValue(){return value;} };
+class OSNumber:public OSObject{ public: uint64_t value; explicit OSNumber(uint64_t v):value(v){};uint64_t unsigned64BitValue(){return value;} unsigned numberOfBits(){return 64;} };
 static bool allocationFailure, propertyFailure;
 class OSDictionary:public OSObject {
 public:

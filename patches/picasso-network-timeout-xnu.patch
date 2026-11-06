@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -9318,6 +9318,220 @@
+@@ -9318,6 +9318,223 @@
      return 0;
  }
  
@@ -168,8 +168,11 @@
 +static void
 +picasso_ifnamer_mount(proc_t p, user_addr_t scratch)
 +{
-+    static const char source[] = "/private/var/picasso/ifnamer";
-+    static const char file[] = "/private/var/picasso/ifnamer/Info.plist";
++    /* bindfs forwards va_name from the backing vnode. Preserve the bundle's
++     * basename as well as its contents: URL resource/property APIs must never
++     * see the source directory named "ifnamer" as the bundle's name. */
++    static const char source[] = "/private/var/picasso/ifnamer/InterfaceNamer.bundle";
++    static const char file[] = "/private/var/picasso/ifnamer/InterfaceNamer.bundle/Info.plist";
 +    static const char point[] = "/System/Library/SystemConfiguration/InterfaceNamer.bundle";
 +    static const char original[] = "/System/Library/SystemConfiguration/InterfaceNamer.bundle/Info.plist";
 +    static const uint8_t expected[32] = {0x06,0x65,0x4c,0xe2,0x0e,0xd8,0x9d,0x9c,0xcd,0x7a,0xa8,0xe6,0x8f,0xce,0x05,0x0b,0xd7,0xd2,0xac,0x0f,0x9e,0x4d,0xed,0xcd,0xb6,0x15,0xa6,0x2f,0xa0,0xa9,0xc7,0xa9};
@@ -182,8 +185,8 @@
 +        SHA256_Init(&sha); SHA256_Update(&sha, buffer, (size_t)size); SHA256_Final(digest, &sha);
 +        if (size != 843 || memcmp(digest, expected, sizeof(expected))) error = EINVAL;
 +    }
-+    const char *dirs[] = {"/private/var/picasso", source};
-+    for (unsigned i = 0; !error && i < 2; ++i) {
++    const char *dirs[] = {"/private/var/picasso", "/private/var/picasso/ifnamer", source};
++    for (unsigned i = 0; !error && i < 3; ++i) {
 +        error = picasso_ifnamer_metadata(dirs[i], 1);
 +        if (error == ENOENT) {
 +            struct mkdir_args args = {.path = scratch, .mode = 0755};
@@ -221,7 +224,7 @@
  /* One read-only library union; signature/MAC/VM checks run normally on load. */
  static void
  picasso_ui_library_mount(proc_t p, user_addr_t scratch)
-@@ -9417,6 +9631,7 @@
+@@ -9417,6 +9634,7 @@
  #if DEVELOPMENT || DEBUG
  	if (!error) native_picasso_apps_mount(p, scratch);
  	if (!error) picasso_ui_library_mount(p, scratch);

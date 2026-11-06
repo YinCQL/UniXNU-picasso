@@ -11,6 +11,20 @@ constexpr int mismatch = -2, configuration = -3;
 // enable (stock wled5_sample_hold_control). Keep that unqualified path out.
 constexpr uint32_t min_level = 42, max_level = 4095;
 inline uint32_t clamp(uint32_t n) { return n ? n<min_level?min_level:n>max_level?max_level:n : 0; }
+// Decode a finite IEEE binary64 normalized value with integer arithmetic only.
+// Reject negative (except -0), NaN, infinity and >1; round to the nearest level.
+inline bool normalized(uint64_t ieee, uint32_t *level) {
+    uint64_t magnitude = ieee & 0x7fffffffffffffffULL;
+    if ((ieee >> 63) && magnitude) return false;
+    if (magnitude > 0x3ff0000000000000ULL) return false;
+    unsigned exponent = unsigned(magnitude >> 52);
+    if (exponent < 1010) { *level = 0; return true; }
+    unsigned shift = 1075 - exponent; // [52,65]; product needs 65 bits.
+    uint64_t significand = (magnitude & 0xfffffffffffffULL) | (1ULL << 52);
+    unsigned __int128 scaled = (unsigned __int128)significand * max_level;
+    *level = uint32_t((scaled + ((unsigned __int128)1 << (shift - 1))) >> shift);
+    return true;
+}
 struct Fade {
     uint32_t from=0,to=0,duration=0;uint64_t start=0;
     void begin(uint32_t current,uint32_t target,uint32_t ms,uint64_t now) {

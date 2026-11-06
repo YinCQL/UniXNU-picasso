@@ -8,6 +8,8 @@
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSSymbol.h>
+#include <libkern/c++/OSSerialize.h>
+#include <string.h>
 #include <kern/clock.h>
 #include "PicassoBacklightCore.h"
 
@@ -34,6 +36,32 @@ class PicassoBrightness : public IOService {
         uint64_t ns = 0;
         absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
         return ns / 1000000;
+    }
+    // OSNumber's 31/63-bit tags contain an IEEE binary64 value. The kernel
+    // build forbids FP registers: obtain the documented serialization instead
+    // of calling unsigned64BitValue (which truncates 0..1 to zero) or touching
+    // OSNumber private layout. Only one number is serialized, never a graph.
+    static IOReturn normalizedLevel(OSNumber *number, uint32_t *value) {
+        if (!number) return kIOReturnBadArgument;
+        unsigned bits = number->numberOfBits();
+        if (bits != 31 && bits != 63) {
+            uint64_t integer = number->unsigned64BitValue();
+            if (integer > 1) return kIOReturnBadArgument;
+            *value = uint32_t(integer) * picasso_backlight::max_level;
+            return kIOReturnSuccess;
+        }
+        OSSerialize *serialized = OSSerialize::binaryWithCapacity(32);
+        if (!serialized) return kIOReturnNoMemory;
+        uint32_t words[4] = {};
+        bool ok = number->serialize(serialized) && serialized->getLength() == sizeof(words);
+        if (ok) memcpy(words, serialized->text(), sizeof(words));
+        serialized->release();
+        // OSSerializeBinary.h: signature, end-of-collection | number | bit count.
+        if (!ok || words[0] != 0xd3 || words[1] != (0x84000000U | bits))
+            return kIOReturnBadArgument;
+        uint64_t ieee = uint64_t(words[2]) | (uint64_t(words[3]) << 32);
+        if (!picasso_backlight::normalized(ieee, value)) return kIOReturnBadArgument;
+        return kIOReturnSuccess;
     }
     bool publishLevel(uint32_t value) {
         OSDictionary *brightness = OSDictionary::withCapacity(3);
@@ -147,15 +175,37 @@ public:
         if (ticket < 128 || !(ticket & 63))
             IOLog("PICASSO_BRIGHTNESS properties ticket=%u dictionary=%u keys=%u\n", ticket, dict != nullptr, dict ? dict->getCount() : 0);
         if (!dict) return kIOReturnBadArgument;
-        auto *number = OSDynamicCast(OSNumber, dict->getObject("brightness"));
-        if (!number) return kIOReturnBadArgument;
-        uint64_t raw = number->unsigned64BitValue();
-        auto *period = OSDynamicCast(OSNumber, dict->getObject("FadePeriod"));
-        if (raw > picasso_backlight::max_level ||
-            (dict->getObject("FadePeriod") && !period) ||
-            (period && period->unsigned64BitValue() > UINT32_MAX)) return kIOReturnBadArgument;
-        uint64_t ms = period ? (period->unsigned64BitValue() * 1000) >> 16 : 0;
-        if (ms > 5000) ms = 5000;
+        if (ticket < 8) {
+            auto *display = OSDynamicCast(OSDictionary, dict->getObject("DisplayBrightness"));
+            auto *brightness = display ? OSDynamicCast(OSNumber, display->getObject("Brightness")) : nullptr;
+            if (display) IOLog("PICASSO_BRIGHTNESS normalized fields=%u number=%u bits=%u\n",
+                display->getCount(), brightness != nullptr, brightness ? brightness->numberOfBits() : 0);
+        }
+        uint32_t raw = 0, ms = 0;
+        const bool normalized = dict->getObject("DisplayBrightness") != nullptr;
+        if (normalized) {
+            // 20H392 __DisplayUpdateSlider publishes this dictionary through
+            // IORegistryEntrySetCFProperty. Brightness is the normalized slider
+            // position; Nits/EDR fields are telemetry, not WLED register values.
+            if (dict->getCount() != 1) return kIOReturnBadArgument;
+            auto *display = OSDynamicCast(OSDictionary, dict->getObject("DisplayBrightness"));
+            auto *number = display ? OSDynamicCast(OSNumber, display->getObject("Brightness")) : nullptr;
+            IOReturn error = normalizedLevel(number, &raw);
+            if (error) return error;
+        } else {
+            auto *number = OSDynamicCast(OSNumber, dict->getObject("brightness"));
+            auto *period = OSDynamicCast(OSNumber, dict->getObject("FadePeriod"));
+            if (!number || number->numberOfBits() == 31 || number->numberOfBits() == 63 ||
+                number->unsigned64BitValue() > picasso_backlight::max_level ||
+                (dict->getObject("FadePeriod") && !period) ||
+                (period && (period->numberOfBits() == 31 || period->numberOfBits() == 63 ||
+                    period->unsigned64BitValue() > UINT32_MAX))) return kIOReturnBadArgument;
+            raw = uint32_t(number->unsigned64BitValue());
+            // CoreBrightness also uses -1.0 (0xffff0000) for an immediate update.
+            uint32_t fixed = period ? uint32_t(period->unsigned64BitValue()) : 0;
+            ms = (fixed & 0x80000000U) ? 0 : uint32_t((uint64_t(fixed) * 1000) >> 16);
+            if (ms > 5000) ms = 5000;
+        }
         if (!requestLock) return kIOReturnNotReady;
         IOLockLock(requestLock);
         IOReturn result = kIOReturnNotReady;
@@ -168,8 +218,8 @@ public:
         }
         IOLockUnlock(requestLock);
         if (result || ticket < 128 || !(ticket & 63))
-            IOLog("PICASSO_BRIGHTNESS queued=%u target=%u fade_ms=%u error=%x\n", result == 0,
-                picasso_backlight::clamp(uint32_t(raw)), uint32_t(ms), result);
+            IOLog("PICASSO_BRIGHTNESS queued=%u target=%u fade_ms=%u error=%x normalized=%u\n", result == 0,
+                picasso_backlight::clamp(uint32_t(raw)), uint32_t(ms), result, normalized);
         return result;
     }
     void stop(IOService *provider) override { quiesce(); IOService::stop(provider); }

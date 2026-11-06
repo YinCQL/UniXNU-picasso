@@ -3,6 +3,7 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+extern "C" void *memcpy(void *, const void *, size_t);
 using IOReturn = int;
 enum { kIOReturnSuccess=0, kIOReturnNotReady=1, kIOReturnIOError=2,
        kIOReturnBadArgument=3, kIOReturnNoMemory=4, kIOReturnNotFound=5 };
@@ -31,11 +32,22 @@ public:
     const OSMetaClass *getSuperClass() const { return parent; }
     static const OSMetaClass *getMetaClassWithName(const OSSymbol *);
 };
+class OSSerialize;
 class OSNumber:public OSObject {
 public:
     uint64_t value;
+    unsigned bits=64;
+    bool serialize(OSSerialize *) const;
+    unsigned numberOfBits() const { return bits; }
     static OSNumber *withNumber(uint64_t,unsigned);
     uint64_t unsigned64BitValue() { return value; }
+};
+class OSSerialize:public OSObject {
+public:
+    uint32_t words[4]={};
+    static OSSerialize *binaryWithCapacity(unsigned, void *editor=nullptr, void *reference=nullptr);
+    unsigned getLength() const { return sizeof(words); }
+    char *text() { return reinterpret_cast<char *>(words); }
 };
 class OSDictionary:public OSObject {
 public:
