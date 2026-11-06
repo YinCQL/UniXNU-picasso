@@ -11,11 +11,18 @@ struct PicassoSmemIo {
     void (*barrier)(void *);
     bool (*locked)(void *);
 };
+// Capture under the allocator lock; the adapter logs only after unlocking.
+struct PicassoSmemAudit {
+    const char *phase;
+    uint32_t index, count, offset, size, flags, hosts, cacheline, reserved;
+    uint32_t infoMagic, infoSize, infoBaseLow, infoBaseHigh, items;
+};
 struct PicassoSmp2p {
     struct wlan_smem_partition partition;
     wlan_smem_item out;
     uint32_t last, features, flags;
     bool created, negotiated, failed;
+    PicassoSmemAudit audit;
 };
 struct PicassoSmp2pEvent {
     uint32_t value, changed, features, flags;

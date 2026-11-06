@@ -55,6 +55,7 @@ IOMemoryMap *smemMap(uint64_t base, uint64_t bytes) {
     m->release(); return map;
 }
 int prepare(SmemDevice *d, const PicassoSmemIo *io, PicassoSmp2p *s) {
+    s->audit.phase = "lock";
     if (__atomic_exchange_n(&allocatorGate, 1U, __ATOMIC_ACQ_REL)) return -16;
     PicassoSmemLockIo lock = {d, lockRead, lockWrite, smemBarrier};
     int error = -60;
@@ -78,11 +79,22 @@ int prepare(SmemDevice *d, const PicassoSmemIo *io, PicassoSmp2p *s) {
     __atomic_store_n(&allocatorGate, 0U, __ATOMIC_RELEASE);
     return error;
 }
+void logAudit(const PicassoSmp2p &s) {
+    const auto &a = s.audit;
+    IOLog("PICASSO_ADSP smem phase=%s entry=%u/%u offset=%x size=%x flags=%x hosts=%08x line=%x reserved=%x free=%x/%x siii=%x region=%x base=%08x%08x items=%u\n",
+        a.phase ? a.phase : "none", a.index, a.count, a.offset, a.size, a.flags, a.hosts,
+        a.cacheline, a.reserved, s.partition.uncached, s.partition.cached,
+        a.infoMagic, a.infoSize, a.infoBaseHigh, a.infoBaseLow, a.items);
+}
 }
 
 extern "C" void picasso_smp2p_start(void) {
     // The existing firmware worker becomes the sole SMP2P service thread.
     if (__atomic_exchange_n(&started, 1U, __ATOMIC_ACQ_REL)) return;
+    // Independent, read-only command DB discovery, including SMEM failures.
+    // This does not acquire the allocator lock or send DSP power votes.
+    if (picasso_rpmh_adsp_plan) (void)picasso_rpmh_adsp_plan();
+    else IOLog("PICASSO_ADSP rpmh stage=plan error=-6 vote_sent=0 pending=shared-owner\n");
     OSSharedPtr<IOMemoryMap> ram(smemMap(WLAN_SMEM_BASE, WLAN_SMEM_SIZE), OSNoRetain);
     OSSharedPtr<IOMemoryMap> mutex(smemMap(0x01f43000, 0x1000), OSNoRetain);
     OSSharedPtr<IOMemoryMap> ipcc(smemMap(0x00408000, 0x1000), OSNoRetain);
@@ -97,10 +109,9 @@ extern "C" void picasso_smp2p_start(void) {
     int error = prepare(&d, &io, &s);
     IOLog("PICASSO_ADSP smp2p stage=prepare error=%d created=%u partition=%x/%x out=%x/%x owner=%x irq=0 authenticated=0\n",
         error, s.created, s.partition.offset, s.partition.size, s.out.offset, s.out.size, lockRead(&d));
+    logAudit(s);
     if (error) return;
     smpKick(&d);
-    if (picasso_rpmh_adsp_plan) (void)picasso_rpmh_adsp_plan();
-    else IOLog("PICASSO_ADSP rpmh stage=plan error=-6 vote_sent=0 pending=shared-owner\n");
     unsigned missing = 0, logs = 0;
     bool wasOpen = false, hadValue = false;
     for (;;) {
@@ -108,6 +119,7 @@ extern "C" void picasso_smp2p_start(void) {
         error = picasso_smp2p_service(&io, &s, &event);
         if (error && error != -2 && error != -11) {
             IOLog("PICASSO_ADSP smp2p stage=peer error=%d stopped=1 authenticated=0\n", error);
+            logAudit(s);
             return; // Preserve the published item; no blind teardown or reuse.
         }
         if (!error) {

@@ -287,6 +287,7 @@ def main():
                 ROOT / 'kits/picasso/PicassoSpmi.h', ROOT / 'kits/picasso/PicassoSpmiCore.h',
                 ROOT / 'kits/picasso/PicassoAdsp.h', ROOT / 'drivers/NativeWlan/WlanSmem.h',
                 ROOT / 'kits/picasso/PicassoFat.h', ROOT / 'kits/picasso/PicassoAdspFirmwareProfile.h',
+                ROOT / 'kits/picasso/PicassoAdspLoadPlan.h',
                 ROOT / 'kits/picasso/PicassoQmp.h', ROOT / 'kits/picasso/PicassoSmp2p.h',
                 ROOT / 'kits/picasso/PicassoSmemLock.h']
     sources += [ROOT / 'drivers/NativeAdreno/OriginalAcceleratorABI.h', ROOT / 'drivers/NativeUfs/FirmwareWindow.h',

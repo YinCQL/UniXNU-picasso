@@ -42,6 +42,7 @@ public:
     T *operator->()const{return p;}
 };
 static void IOLog(const char *fmt,...) {
+    assert(!preempt);
     va_list a;va_start(a,fmt);vprintf(fmt,a);va_end(a);++lines;
 }
 static void disable_preemption(){assert(!preempt);++preempt;}
@@ -67,13 +68,17 @@ static void IOSleep(unsigned ms) {
     if(sleeps==1602)ram[(part+48+36)/4]=1; // External mutation stops service.
 }
 #include "PicassoSmp2pDevice-body.inc"
-extern "C" int picasso_rpmh_adsp_plan(){assert(!preempt && !mutexRam[0]);++plans;return 0;}
+extern "C" int picasso_rpmh_adsp_plan(){assert(!preempt && !allocations);++plans;return 0;}
 int main(int argc,char **argv) {
     assert(argc==2);const char *mode=argv[1];
     ram[0x5c/4]=12U<<16;ram[toc/4]=0x434f5424;ram[toc/4+1]=1;ram[toc/4+2]=1;
     ram[toc/4+8]=part;ram[toc/4+9]=0x30000;ram[toc/4+11]=2U<<16;ram[toc/4+12]=64;
     ram[part/4]=0x54525024;ram[part/4+1]=2U<<16;ram[part/4+2]=0x30000;
     ram[part/4+3]=32;ram[part/4+4]=0x30000;
+    // Include the two real XBL reservations in the device-adapter fixture.
+    ram[toc/4+2]=3;
+    ram[(toc+80)/4]=toc;ram[(toc+84)/4]=4096;ram[(toc+88)/4]=1;ram[(toc+92)/4]=0xffffffff;
+    ram[(toc+132)/4]=4096;ram[(toc+136)/4]=3;ram[(toc+140)/4]=0xffffffff;
     if(!strncmp(mode,"alloc",5))failAlloc=unsigned(mode[5]-'0');
     if(!strncmp(mode,"map",3))failMap=unsigned(mode[3]-'0');
     if(!strncmp(mode,"zero",4))zeroMap=unsigned(mode[4]-'0');
@@ -91,10 +96,10 @@ int main(int argc,char **argv) {
     assert(allocations==3 && releases==3-!!failAlloc && mappings==releases && unmaps==mappings-!!failMap && !preempt);
     if(!strcmp(mode,"normal") || peer) {
         assert(plans==1 && sleeps==1602 && kicks==(peer?2U:1U));
-        assert(lines==(peer?67U:5U));assert(ram[(part+12)/4]==(peer?752U:392U));
+        assert(lines==(peer?69U:7U));assert(ram[(part+12)/4]==(peer?752U:392U));
         assert(!allocatorGate && !mutexRam[0]);
     } else {
-        assert(!plans && !kicks && ram[(part+12)/4]==32);
+        assert(plans==1 && !kicks && ram[(part+12)/4]==32);
         assert(sleeps==(!strcmp(mode,"remote")?100U:0U));
         if(strcmp(mode,"gate"))assert(!allocatorGate);
     }

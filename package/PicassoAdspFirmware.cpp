@@ -7,6 +7,7 @@
 #include <libkern/crypto/sha2.h>
 #include "PicassoFat.h"
 #include "PicassoAdspFirmwareProfile.h"
+#include "PicassoAdspLoadPlan.h"
 #include "FirmwareWindow.h"
 #include "PicassoQmp.h"
 #include "PicassoSmp2p.h"
@@ -23,6 +24,8 @@ struct Firmware {
     uint8_t seen[8192], bounce[4096], chunk[65536];
     uint64_t deadline;
     unsigned calls;
+    uint8_t metadata[picassoAdspMetadataBytes];
+    PicassoAdspLoadPlan plan;
 };
 int readFirmware(void *context, uint64_t at, void *to, size_t length) {
     auto *f = static_cast<Firmware *>(context);
@@ -68,6 +71,34 @@ int validateFirmware(Firmware *f, uint64_t bytes, unsigned *failed, uint64_t *ch
     *failed = fileCount;
     return 0;
 }
+int planFirmware(Firmware *f) {
+    static_assert(fileCount == picassoAdspHeaders, "Pinned split file profile changed");
+    f->plan = {};
+    f->plan.phase = "metadata-read";
+    f->plan.index = ~0U;
+    // Re-read into owned storage and re-hash it. The earlier FAT/hash survey
+    // cannot authorize different metadata read later from the same volume.
+    int error = picasso_fat_read(&f->volume, &f->files[fileCount - 1], 0, f->metadata, sizeof f->metadata);
+    if (error) return error;
+    SHA256_CTX hash; uint8_t digest[32];
+    SHA256_Init(&hash); SHA256_Update(&hash, f->metadata, sizeof f->metadata); SHA256_Final(digest, &hash);
+    f->plan.phase = "metadata-hash";
+    if (memcmp(digest, picassoAdspFiles[fileCount - 1].sha256, sizeof digest)) return -8;
+    f->plan.phase = "metadata-split";
+    unsigned at = 0;
+    for (unsigned i = 0; i < 2; ++i) {
+        uint32_t n = f->files[i].size;
+        if (n > sizeof f->metadata - at) return -22;
+        if ((error = picasso_fat_read(&f->volume, &f->files[i], 0, f->chunk, n))) return error;
+        if (memcmp(f->chunk, f->metadata + at, n)) return -8;
+        at += n;
+    }
+    if (at != sizeof f->metadata) return -22;
+    uint32_t pieces[picassoAdspHeaders] = {};
+    // b00..b32 are present; b33 is pure BSS and must not be read from disk.
+    for (unsigned i = 0; i < fileCount - 1; ++i) pieces[i] = f->files[i].size;
+    return picasso_adsp_load_plan(f->metadata, sizeof f->metadata, pieces, picassoAdspHeaders, &f->plan);
+}
 void worker(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "picasso-adsp-fw");
     unsigned ready = 0;
@@ -97,6 +128,12 @@ void worker(void *, wait_result_t) {
         f->window.lun, static_cast<unsigned long long>(f->window.first), static_cast<unsigned long long>(f->window.last),
         static_cast<unsigned long long>(bytes), error, failed < fileCount ? picassoAdspFiles[failed].path : "volume",
         static_cast<unsigned long long>(checked), error ? (failed < fileCount ? failed : 0) : fileCount);
+    if (!error) {
+        error = planFirmware(f);
+        const auto &p = f->plan;
+        IOLog("PICASSO_ADSP firmware stage=load-plan error=%d phase=%s segment=%u count=%u entry=%x copy=%u zero=%u image=%u alignment=%x memory_written=0 authenticated=0\n",
+            error, p.phase, p.index, p.count, p.entry, p.fileBytes, p.zeroBytes, p.imageBytes, p.alignment);
+    }
     if (!error) IOLog("PICASSO_ADSP firmware validated=1 pas=1 carveout=89200000+2800000 pending=power-mailbox-pas pcm=0\n");
     // Do not retain tens of MiB or stale handles before the PAS lifecycle exists.
     // A future loader must re-open/revalidate input as part of its own transaction.

@@ -36,7 +36,8 @@ static uint64_t ticks;
 static bool noPartition, noMemory, noThread, neverReady;
 static unsigned pending;
 static unsigned aopProbes, smpStarts;
-static bool aopFailed;
+static bool aopFailed, alterAfterValidation;
+static uint64_t metadataAt;
 extern "C" int picasso_aop_probe() { assert(freed == 1); ++aopProbes; return aopFailed ? -60 : 0; }
 extern "C" void picasso_smp2p_start() {assert(aopProbes==1 && freed==1); ++smpStarts;}
 static int readDisk(void *, uint64_t at, void *to, size_t n) {
@@ -56,6 +57,7 @@ static void bzero(void *p, size_t n) {memset(p,0,n);}
 #endif
 static void IOLog(const char *fmt, ...) {
     va_list args; va_start(args,fmt); vprintf(fmt,args); va_end(args); ++lines;
+    if (alterAfterValidation && strstr(fmt,"firmware source=modem lun=")) disk[metadataAt]^=1;
 }
 using wait_result_t = int; using kern_return_t = int; using thread_t = void *;
 enum {KERN_SUCCESS=0, kSecondScale=1};
@@ -66,6 +68,38 @@ static kern_return_t kernel_thread_start(void (*fn)(void *,wait_result_t),void *
 }
 static void thread_deallocate(thread_t) {++released;}
 #include "PicassoAdspFirmware-body.inc"
+static void planTests() {
+    uint8_t m[picassoAdspMetadataBytes]={}, good[sizeof m];uint32_t pieces[34]={};
+    auto put=[&](unsigned at,uint32_t v){for(unsigned j=0;j<4;++j)m[at+j]=uint8_t(v>>(8*j));};
+    put(0,0x464c457f);put(4,0x10101);put(16,2|(164U<<16));put(20,1);put(24,picassoAdspBase);
+    put(28,52);put(40,52|(32U<<16));put(44,34);
+    put(52+16,1140);put(52+24,0x07000000);pieces[0]=1140;
+    put(84+4,4096);put(84+12,picassoAdspBase+picassoAdspBytes);put(84+16,8200);
+    put(84+20,12288);put(84+24,0x02200000);pieces[1]=8200;
+    for(unsigned i=2;i<34;++i) {
+        unsigned at=52+32*i;put(at,1);put(at+4,0x4000+(i-2)*4096);
+        put(at+12,picassoAdspBase+(i-2)*0x100000);pieces[i]=i==33?0:64;put(at+16,pieces[i]);
+        put(at+20,i==33?0x900000:0x100000);put(at+24,0x08000005);put(at+28,0x100000);
+    }
+    memcpy(good,m,sizeof m);PicassoAdspLoadPlan p={};
+    auto parse=[&](){return picasso_adsp_load_plan(m,sizeof m,pieces,34,&p);};
+    assert(!parse() && p.count==32 && p.fileBytes==31*64 && p.zeroBytes==picassoAdspBytes-31*64);
+    assert(p.segments[31].index==33 && !p.segments[31].fileBytes && p.segments[31].zeroBytes==0x900000);
+    for(unsigned n=0;n<sizeof m;++n)assert(picasso_adsp_load_plan(m,n,pieces,34,&p)==-22);
+    assert(picasso_adsp_load_plan(m,sizeof m,pieces,33,&p)==-22);
+    const unsigned badHeader[]={0,4,16,20,28,40,44};
+    for(unsigned at:badHeader){memcpy(m,good,sizeof m);put(at,0xffffffff);assert(parse()==-22);}
+    const unsigned badSeg[]={0,4,12,16,20,24,28};
+    for(unsigned field:badSeg){memcpy(m,good,sizeof m);put(116+field,0xffffffff);assert(parse()==-22);}
+    memcpy(m,good,sizeof m);put(148+12,picassoAdspBase);assert(parse()==-22 && !strcmp(p.phase,"overlap"));
+    memcpy(m,good,sizeof m);put(148+4,0x4000);assert(parse()==-22 && !strcmp(p.phase,"file"));
+    memcpy(m,good,sizeof m);put(84+24,0x08000005);assert(parse()==-22 && !strcmp(p.phase,"metadata"));
+    memcpy(m,good,sizeof m);put(24,picassoAdspBase+picassoAdspBytes);assert(parse()==-22);
+    memcpy(m,good,sizeof m);put(52+33*32+20,0x8fffff);assert(parse()==-22);
+    memcpy(m,good,sizeof m);pieces[33]=1;assert(parse()==-22);pieces[33]=0;
+    memcpy(m,good,sizeof m);put(116+24,0x08000004);put(148+24,0x08000005);assert(parse()==-22); // Entry not executable.
+    puts("PASS ELF load plan: truncation, headers, hash exclusion, overflow, relocation, overlaps, entry, missing BSS piece");
+}
 static void put16(size_t at, unsigned v) {disk[at]=(uint8_t)v;disk[at+1]=(uint8_t)(v>>8);}
 static void put32(size_t at, unsigned v) {put16(at,v);put16(at+2,v>>16);}
 static constexpr unsigned fat1=512, fatBytes=32*512, fat2=fat1+fatBytes, root=fat2+fatBytes, data=root+512;
@@ -99,24 +133,34 @@ static void fatTests() {
     puts("PASS firmware FAT: mirrors, cycles, aliases, duplicate names, LFN ordinal, bounds, read failure");
 }
 int main(int argc,char **argv) {
-    fatTests();
+    fatTests();planTests();
     assert(argc>1);const char *mode=argv[1];
-    if(!strcmp(mode,"stock") || !strcmp(mode,"stock-aop-fail")) {
+    if(!strcmp(mode,"stock") || !strcmp(mode,"stock-aop-fail") || !strcmp(mode,"stock-plan-fail")) {
         aopFailed=!strcmp(mode,"stock-aop-fail");
+        alterAfterValidation=!strcmp(mode,"stock-plan-fail");
         assert(argc==3);FILE *in=fopen(argv[2],"rb");assert(in);
         fseek(in,0,SEEK_END);diskBytes=(size_t)ftell(in);rewind(in);free(disk);disk=(uint8_t *)malloc(diskBytes);assert(disk);
         assert(fread(disk,1,diskBytes,in)==diskBytes);fclose(in);calls=failRead=0;
         auto *f=(Firmware *)calloc(1,sizeof(Firmware));assert(f);unsigned failed;uint64_t checked;f->deadline=UINT64_MAX;
         assert(!validateFirmware(f,335544320,&failed,&checked));assert(failed==fileCount && checked>21000000);
         printf("PASS actual stock firmware: %u files, %llu bytes, %u reads\n",fileCount,(unsigned long long)checked,calls);
+        calls=0;assert(!planFirmware(f));unsigned planReads=calls;
+        assert(f->plan.count==32 && f->plan.imageBytes==21500076 && f->plan.alignment==0x100000);
+        assert(f->plan.segments[31].zeroBytes==0x5a3000 && !f->plan.segments[31].fileBytes);
+        printf("PASS stock load plan: copy=%u zero=%u segments=%u reads=%u\n",f->plan.fileBytes,f->plan.zeroBytes,f->plan.count,planReads);
+        for(unsigned n=1;n<=planReads;++n){calls=0;failRead=n;assert(planFirmware(f));}failRead=0;
+        metadataAt=f->volume.data_offset+(uint64_t)(f->files[fileCount-1].first_cluster-2)*f->volume.cluster_bytes;
+        disk[metadataAt]^=1;assert(planFirmware(f)==-8 && !strcmp(f->plan.phase,"metadata-hash"));disk[metadataAt]^=1;
         // Corrupt an actual ADSP piece byte: CRC/FAT success cannot hide it.
         uint64_t at=f->volume.data_offset+(uint64_t)(f->files[0].first_cluster-2)*f->volume.cluster_bytes;
-        disk[at]^=1;memset(f,0,sizeof(*f));f->deadline=UINT64_MAX;
+        disk[at]^=1;assert(planFirmware(f)==-8 && !strcmp(f->plan.phase,"metadata-split"));
+        memset(f,0,sizeof(*f));f->deadline=UINT64_MAX;
         assert(validateFirmware(f,335544320,&failed,&checked)==-8 && failed==0);
         disk[at]^=1;memset(f,0,sizeof(*f));f->deadline=0;
         assert(validateFirmware(f,335544320,&failed,&checked)==FatReadError);
         free(f);
-        picasso_adsp_firmware_start();assert(starts==1&&allocated==1&&freed==1&&lines==2&&aopProbes==1&&smpStarts==!aopFailed);
+        picasso_adsp_firmware_start();assert(starts==1&&allocated==1&&freed==1&&lines==(alterAfterValidation?2U:3U));
+        assert(aopProbes==!alterAfterValidation && smpStarts==(!alterAfterValidation&&!aopFailed));
         puts("PASS stock worker cleanup, altered firmware rejection and deadline");
     } else {
         neverReady=!strcmp(mode,"not-ready");pending=!strcmp(mode,"late-ready")?3:0;

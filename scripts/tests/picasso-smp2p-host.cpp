@@ -36,6 +36,14 @@ static void setup() {
     p32(part,0x54525024);p16(part+4,0);p16(part+6,2);p32(part+8,partSize);
     p32(part+12,32);p32(part+16,partSize);
 }
+static void stockToc() {
+    // XBL order: TOC reservation, private partition(s), global, header page.
+    memmove(ram+toc+80,ram+toc+32,48);memset(ram+toc+32,0,48);p32(toc+8,4);
+    p32(toc+32,toc);p32(toc+36,4096);p32(toc+40,1);p32(toc+44,0xffffffff);
+    p32(toc+128,4096);p32(toc+132,part-4096);p32(toc+136,3);p32(toc+140,0xfffefffe);p32(toc+144,32);
+    p32(toc+180,4096);p32(toc+184,3);p32(toc+188,0xffffffff);
+    p32(toc+224,0x49494953);p32(toc+228,WLAN_SMEM_SIZE);p32(toc+232,0x80900000);p16(toc+240,512);
+}
 static unsigned inbound(unsigned features=1,unsigned value=2,unsigned flags=0) {
     unsigned at=part+r32(part+12);p16(at,0xa5a5);p16(at+2,443);p32(at+4,344);p16(at+8,4);
     p32(part+12,r32(part+12)+360);at+=16;
@@ -76,6 +84,30 @@ static void tests() {
     setup();p32(toc+80,0x49494953);p32(toc+84,WLAN_SMEM_SIZE);p32(toc+88,0x80900000);p16(toc+96,400);
     assert(picasso_smp2p_prepare(&io,&s)==-22 && !writes);
     setup();p32(part+12,56);p16(part+32,0);assert(picasso_smp2p_prepare(&io,&s)==-22 && !writes);
+    setup();stockToc();assert(!picasso_smp2p_prepare(&io,&s));
+    assert(s.audit.reserved==3 && s.audit.items==512 && !strcmp(s.audit.phase,"prepared"));
+    held=false;assert(picasso_smp2p_service(&io,&s,&e)==-2);inbound();assert(!picasso_smp2p_service(&io,&s,&e));
+    // A forged descriptor cannot make a target overlap or boundary escape safe.
+    const unsigned reservations[] = {32,176};
+    for(unsigned at: reservations) {
+        for(unsigned field=0;field<=16;field+=4) {
+            setup();stockToc();p32(toc+at+field,r32(toc+at+field)^8);
+            assert(picasso_smp2p_prepare(&io,&s)==-22 && !writes);
+        }
+    }
+    setup();stockToc();memcpy(ram+toc+176,ram+toc+32,48);
+    assert(picasso_smp2p_prepare(&io,&s)==-22 && !writes && s.audit.index==3);
+    setup();stockToc();p32(toc+132,part); // The fffe global partition is allocatable.
+    assert(picasso_smp2p_prepare(&io,&s)==-22 && !writes && !strcmp(s.audit.phase,"overlap"));
+    setup();stockToc();p32(toc+236,1);
+    assert(picasso_smp2p_prepare(&io,&s)==-22 && !writes && s.audit.infoBaseHigh==1);
+    setup();stockToc();p32(toc+32,part); // Invalid-host impersonation in real memory.
+    assert(picasso_smp2p_prepare(&io,&s)==-22 && !writes && !strcmp(s.audit.phase,"reserved"));
+    setup();stockToc();assert(!picasso_smp2p_prepare(&io,&s));unsigned stockReads=reads;
+    for(unsigned n=1;n<=stockReads;++n) {
+        setup();stockToc();failRead=n;assert(picasso_smp2p_prepare(&io,&s));
+        assert(r32(part+12)==32 || r32(part+12)==392);
+    }
     // Inject every allocation read/write failure. Before commit the free mark
     // remains unchanged; after commit it is never decremented or freed.
     for(unsigned n=1;n<=maxReads;++n) {setup();failRead=n;assert(picasso_smp2p_prepare(&io,&s));assert(r32(part+12)==32 || r32(part+12)==392);}

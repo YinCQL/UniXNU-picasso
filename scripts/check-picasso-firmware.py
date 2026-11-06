@@ -82,6 +82,7 @@ def main():
                 if a.stock:
                     run('stock'+suffix, [str(exe), 'stock', str(a.stock)])
                     run('stock-aop-fail'+suffix, [str(exe), 'stock-aop-fail', str(a.stock)])
+                    run('stock-plan-fail'+suffix, [str(exe), 'stock-plan-fail', str(a.stock)])
     arm = out/'firmware-arm.cpp'
     arm.write_text('#include "picasso-firmware-kernel-api.h"\n'+body, encoding='utf8', newline='\n')
     transport = out/'firmware-transport-arm.cpp'
@@ -92,7 +93,7 @@ def main():
             '-fno-rtti', '-fno-threadsafe-statics', '-mgeneral-regs-only', '-Wall', '-Wextra', '-Werror', *includes,
             '-I', str(ROOT/'scripts/tests'), '-c', str(source), '-o', str(out/(name+'.o'))])
     inputs = ['package/PicassoFat.cpp', 'package/PicassoFat.h', 'package/PicassoAdspFirmware.cpp',
-              'package/PicassoAdspFirmwareProfile.h', 'package/PicassoQmp.h', 'package/PicassoSmp2p.h', 'drivers/NativeUfs/FirmwareRead.h',
+              'package/PicassoAdspFirmwareProfile.h', 'package/PicassoAdspLoadPlan.h', 'package/PicassoQmp.h', 'package/PicassoSmp2p.h', 'drivers/NativeUfs/FirmwareRead.h',
               'drivers/NativeUfs/NativeUfs.cpp', 'drivers/NativeUfs/RootLayout.h', 'package/PicassoPr13.cpp',
               'scripts/build-picasso-display.py', 'scripts/check-picasso-firmware.py',
               'scripts/tests/picasso-firmware-host.cpp', 'scripts/tests/picasso-firmware-ufs.cpp',
