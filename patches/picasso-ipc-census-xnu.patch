@@ -1,0 +1,467 @@
+diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
+index 390f5c3..e38bf4e 100644
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -5201,6 +5201,452 @@ ipc_kmsg_copyin_from_kernel(
+ 	return MACH_MSG_SUCCESS;
+ }
+ 
++#if DEVELOPMENT || DEBUG
++#include <kern/clock.h>
++/*
++ * Picasso IPC census (boot argument picasso-ipc-census=1): bounded per-peer message counts
++ * for pid 1. A steady home screen spends about a core of system time in launchd, whose sampled
++ * kernel PCs are the Mach IPC paths (mqueue send/receive, port and kmsg allocation) inside the
++ * sandbox kext, i.e. launchd serves a continuous message stream. These counters name the peer:
++ * who sends to pid 1 and whom pid 1 sends to. The profile block prints per-round deltas.
++ * Counting runs at the single place every send reaches with the destination port locked; it
++ * adds two pointer reads and, only for pid 1 traffic, one atomic increment.
++ */
++#define PICASSO_IPC_BUCKETS 512
++static uint32_t picasso_ipc_to1[PICASSO_IPC_BUCKETS];       /* count keyed by sender pid */
++static uint32_t picasso_ipc_from1[PICASSO_IPC_BUCKETS];     /* count keyed by receiver pid */
++static int32_t picasso_ipc_to1_key[PICASSO_IPC_BUCKETS];    /* pid that wrote the slot */
++static int32_t picasso_ipc_from1_key[PICASSO_IPC_BUCKETS];
++static uint32_t picasso_ipc_sink[2];                        /* kernel-space peer, [0] to1, [1] from1 */
++static uint64_t picasso_ipc_to1_total, picasso_ipc_from1_total;
++/* Message id census of pid-1 traffic: the id names the protocol (bootstrap lookup, XPC, ...). */
++#define PICASSO_IPC_IDS 64
++static uint32_t picasso_ipc_id_count[PICASSO_IPC_IDS];
++static uint32_t picasso_ipc_id_key[PICASSO_IPC_IDS];
++static uint32_t picasso_ipc_id_seen[PICASSO_IPC_IDS];
++/* Body samples: bounded, only after the first two minutes, so the explicit examples are the
++ * steady-state loop and not the boot's own traffic. The sampler runs with the destination
++ * port's mqueue lock held, so it must not print: it copies what it wants to show into these
++ * records, and picasso_ipc_census_dump() prints them from the profile thread, which holds no
++ * IPC lock. (v5 printed from inside the lock; the console path could then hold a hot IPC
++ * spinlock long enough to starve the compositor and to let an unrelated thread's AST IPI ack
++ * time out.) */
++#define PICASSO_IPC_SAMPLE_RECORDS 8
++#define PICASSO_IPC_REPLY_RECORDS 4
++#define PICASSO_IPC_SAMPLE_RAW 128
++
++struct picasso_ipc_sample_record {
++	uint32_t taken;         /* 0 free, 3 filling, 1 ready */
++	uint32_t no;
++	int32_t from, to;
++	uint32_t id, size, bits, type;
++	char text[96];
++	char bare[120];
++	uint32_t raw_bytes;
++	uint8_t raw[PICASSO_IPC_SAMPLE_RAW];
++};
++
++struct picasso_ipc_reply_record {
++	uint32_t taken;
++	uint32_t no;
++	int32_t from, to;
++	uint32_t id, size, bits, type;
++	uint32_t words[8];
++	uint32_t raw_bytes;
++	uint8_t raw[PICASSO_IPC_SAMPLE_RAW];
++};
++
++static struct picasso_ipc_sample_record picasso_ipc_samples[PICASSO_IPC_SAMPLE_RECORDS];
++static struct picasso_ipc_reply_record picasso_ipc_replies[PICASSO_IPC_REPLY_RECORDS];
++static unsigned picasso_ipc_sample_count;
++static unsigned picasso_ipc_reply_samples;
++static uint64_t picasso_ipc_first_tick;
++
++static bool
++picasso_ipc_sample_ready(void)
++{
++	const uint64_t now = mach_absolute_time();
++	if (!picasso_ipc_first_tick) {
++		picasso_ipc_first_tick = now;
++		return false;
++	}
++	uint64_t elapsed = 0;
++	absolutetime_to_nanoseconds(now - picasso_ipc_first_tick, &elapsed);
++	return elapsed >= 120ull * 1000000000ull;
++}
++
++static bool
++picasso_ipc_sample_slot(struct picasso_ipc_sample_record **out)
++{
++	for (unsigned i = 0; i < PICASSO_IPC_SAMPLE_RECORDS; i++) {
++		uint32_t expected = 0;
++		if (__atomic_compare_exchange_n(&picasso_ipc_samples[i].taken, &expected, 3,
++		    false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
++			*out = &picasso_ipc_samples[i];
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Printable NUL-terminated runs in the message body, at most three of them. A bootstrap
++ * lookup carries its service name as such a string; the row then names what is being asked
++ * for instead of only who asks. Copies only: the caller holds the destination port's lock. */
++static void
++picasso_ipc_sample(ipc_kmsg_t kmsg, int sender, int receiver)
++{
++	struct picasso_ipc_sample_record *record = NULL;
++	if (picasso_ipc_sample_count >= 24 || !picasso_ipc_sample_ready()) {
++		return;
++	}
++	const mach_msg_header_t *hdr = ikm_header(kmsg);
++	const uint32_t size = hdr->msgh_size;
++	if (size < sizeof(*hdr) || size > 8192 || (hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
++		return;
++	}
++	/* The user data of a kmsg is not always inline after the header: a message whose data does
++	 * not fit in the kmsg's inline buffer (IKM_SMALL_MSG_SIZE) keeps it in kmsg->ikm_udata, and
++	 * reading hdr + 1 then reads the zero padding after the header instead of the payload. */
++	const uint8_t *body = (const uint8_t *)ikm_udata_from_header(kmsg);
++	const uint32_t body_size = size - (uint32_t)sizeof(*hdr);
++	char text[96] = {};
++	unsigned used = 0, runs = 0;
++	for (uint32_t i = 0; i < body_size && used < sizeof text - 2 && runs < 3;) {
++		unsigned len = 0;
++		while (i + len < body_size && body[i + len] >= 0x20 && body[i + len] < 0x7f &&
++		    len < 40) {
++			len++;
++		}
++		if (len >= 4 && i + len < body_size && body[i + len] == 0) {
++			if (used) {
++				text[used++] = '|';
++			}
++			for (unsigned k = 0; k < len && used < sizeof text - 1; k++) {
++				text[used++] = (char)body[i + k];
++			}
++			runs++;
++			i += len;
++		} else {
++			i++;
++		}
++	}
++	/* XPC serializes strings with a length prefix and no terminator, so the NUL-run scan above
++	 * misses the service name in an XPC body. The bare scan collects name-like runs (the
++	 * characters of a Mach service name) whether or not they end in a NUL. */
++	char bare[120] = {};
++	unsigned bused = 0, bruns = 0;
++	for (uint32_t i = 0; i < body_size && bused < sizeof bare - 2 && bruns < 4;) {
++		unsigned len = 0;
++		while (i + len < body_size && body[i + len] >= 0x20 && body[i + len] < 0x7f &&
++		    len < 48) {
++			len++;
++		}
++		bool nameish = len >= 6;
++		for (unsigned k = 0; nameish && k < len; k++) {
++			const char c = (char)body[i + k];
++			if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++			    (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_' ||
++			    c == '/' || c == ':' || c == ' ')) {
++				nameish = false;
++			}
++		}
++		if (nameish) {
++			if (bused) {
++				bare[bused++] = '|';
++			}
++			for (unsigned k = 0; k < len && bused < sizeof bare - 1; k++) {
++				bare[bused++] = (char)body[i + k];
++			}
++			bruns++;
++		}
++		i += len ? len : 1;
++	}
++	if (!picasso_ipc_sample_slot(&record)) {
++		return;
++	}
++	record->no = ++picasso_ipc_sample_count;
++	record->from = sender;
++	record->to = receiver;
++	record->id = (uint32_t)hdr->msgh_id;
++	record->size = size;
++	record->bits = (uint32_t)hdr->msgh_bits;
++	record->type = (uint32_t)kmsg->ikm_type;
++	memcpy(record->text, text, sizeof text);
++	memcpy(record->bare, bare, sizeof bare);
++	record->raw_bytes = 0;
++	if (record->no <= 4) {
++		uint32_t n = body_size < PICASSO_IPC_SAMPLE_RAW ? body_size :
++		    PICASSO_IPC_SAMPLE_RAW;
++		if (n) {
++			memcpy(record->raw, body, n);
++		}
++		record->raw_bytes = n;
++	}
++	__atomic_store_n(&record->taken, 1, __ATOMIC_RELEASE);
++}
++
++/* The reply direction (launchd -> client), eight samples after the same gate: the reply's first
++ * words carry the result of the repeated request. */
++static void
++picasso_ipc_sample_reply(ipc_kmsg_t kmsg, int sender, int receiver)
++{
++	struct picasso_ipc_reply_record *record = NULL;
++	if (picasso_ipc_reply_samples >= 8 || !picasso_ipc_sample_ready()) {
++		return;
++	}
++	const mach_msg_header_t *hdr = ikm_header(kmsg);
++	const uint32_t size = hdr->msgh_size;
++	if (size < sizeof(*hdr) || size > 8192 || (hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
++		return;
++	}
++	const uint8_t *body = (const uint8_t *)ikm_udata_from_header(kmsg);
++	const uint32_t body_size = size - (uint32_t)sizeof(*hdr);
++	for (unsigned i = 0; i < PICASSO_IPC_REPLY_RECORDS; i++) {
++		uint32_t expected = 0;
++		if (__atomic_compare_exchange_n(&picasso_ipc_replies[i].taken, &expected, 3,
++		    false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
++			record = &picasso_ipc_replies[i];
++			break;
++		}
++	}
++	if (record == NULL) {
++		return;
++	}
++	record->no = ++picasso_ipc_reply_samples;
++	record->from = sender;
++	record->to = receiver;
++	record->id = (uint32_t)hdr->msgh_id;
++	record->size = size;
++	record->bits = (uint32_t)hdr->msgh_bits;
++	record->type = (uint32_t)kmsg->ikm_type;
++	memset(record->words, 0, sizeof record->words);
++	if (body_size >= sizeof record->words) {
++		memcpy(record->words, body, sizeof record->words);
++	}
++	record->raw_bytes = 0;
++	{
++		uint32_t n = body_size < PICASSO_IPC_SAMPLE_RAW ? body_size :
++		    PICASSO_IPC_SAMPLE_RAW;
++		if (n) {
++			memcpy(record->raw, body, n);
++		}
++		record->raw_bytes = n;
++	}
++	__atomic_store_n(&record->taken, 1, __ATOMIC_RELEASE);
++}
++
++/* Profile-thread side: print the records the in-lock sampler filled. No IPC lock is held
++ * here, so printf is safe. */
++static void
++picasso_ipc_census_dump(void)
++{
++	for (unsigned i = 0; i < PICASSO_IPC_SAMPLE_RECORDS; i++) {
++		struct picasso_ipc_sample_record copy;
++		if (__atomic_load_n(&picasso_ipc_samples[i].taken, __ATOMIC_ACQUIRE) != 1) {
++			continue;
++		}
++		copy = picasso_ipc_samples[i];
++		__atomic_store_n(&picasso_ipc_samples[i].taken, 0, __ATOMIC_RELEASE);
++		printf("PICASSO_IPC msg s=%u from=%d to=%d id=%x size=%u bits=%x type=%u "
++		    "body=%.80s bare=%.100s\n", copy.no, copy.from, copy.to, copy.id,
++		    copy.size, copy.bits, copy.type, copy.text, copy.bare);
++		for (uint32_t at = 0; at < copy.raw_bytes && at < 256; at += 16) {
++			uint32_t words[4] = {};
++			const uint32_t n = copy.raw_bytes - at < sizeof words ?
++			    copy.raw_bytes - at : (uint32_t)sizeof words;
++			memcpy(words, copy.raw + at, n);
++			printf("PICASSO_IPC dump s=%u o=%u %08x %08x %08x %08x\n", copy.no, at,
++			    words[0], words[1], words[2], words[3]);
++		}
++	}
++	for (unsigned i = 0; i < PICASSO_IPC_REPLY_RECORDS; i++) {
++		struct picasso_ipc_reply_record copy;
++		if (__atomic_load_n(&picasso_ipc_replies[i].taken, __ATOMIC_ACQUIRE) != 1) {
++			continue;
++		}
++		copy = picasso_ipc_replies[i];
++		__atomic_store_n(&picasso_ipc_replies[i].taken, 0, __ATOMIC_RELEASE);
++		printf("PICASSO_IPC reply s=%u from=%d to=%d id=%x size=%u bits=%x type=%u "
++		    "%08x %08x %08x %08x %08x %08x %08x %08x\n", copy.no, copy.from, copy.to,
++		    copy.id, copy.size, copy.bits, copy.type, copy.words[0], copy.words[1],
++		    copy.words[2], copy.words[3], copy.words[4], copy.words[5], copy.words[6],
++		    copy.words[7]);
++		for (uint32_t at = 0; at < copy.raw_bytes && at < 256; at += 16) {
++			uint32_t words[4] = {};
++			const uint32_t n = copy.raw_bytes - at < sizeof words ?
++			    copy.raw_bytes - at : (uint32_t)sizeof words;
++			memcpy(words, copy.raw + at, n);
++			printf("PICASSO_IPC rdump s=%u o=%u %08x %08x %08x %08x\n", copy.no, at,
++			    words[0], words[1], words[2], words[3]);
++		}
++	}
++}
++
++static bool
++picasso_ipc_census_enabled(void)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		unsigned value = 0;
++		extern int PE_parse_boot_argn(const char *, void *, int);
++		enabled = PE_parse_boot_argn("picasso-ipc-census", &value, sizeof value) &&
++		    value != 0;
++	}
++	return enabled == 1;
++}
++
++/* The caller (ipc_kmsg_send) holds the destination port's mqueue lock, which is the lock
++ * ipc_port_get_receiver_task_locked() and ip_get_receiver() require. */
++static void
++picasso_ipc_census_note(ipc_port_t port, ipc_kmsg_t kmsg)
++{
++	if (!picasso_ipc_census_enabled()) {
++		return;
++	}
++	task_t sender_task = current_task();
++	const int sender = sender_task != TASK_NULL ? task_pid(sender_task) : -1;
++	int receiver = -1;
++	ipc_space_t space = ip_get_receiver(port);
++	if (space != IPC_SPACE_NULL && space->is_task != TASK_NULL) {
++		receiver = task_pid(space->is_task);
++	}
++	if (receiver == 1) {
++		os_atomic_inc(&picasso_ipc_to1_total, relaxed);
++		if (sender >= 0) {
++			uint32_t slot = (uint32_t)sender % PICASSO_IPC_BUCKETS;
++			picasso_ipc_to1_key[slot] = sender;
++			os_atomic_inc(&picasso_ipc_to1[slot], relaxed);
++		} else {
++			os_atomic_inc(&picasso_ipc_sink[0], relaxed);
++		}
++		const mach_msg_header_t *hdr = ikm_header(kmsg);
++		const uint32_t idslot = (uint32_t)hdr->msgh_id % PICASSO_IPC_IDS;
++		picasso_ipc_id_key[idslot] = (uint32_t)hdr->msgh_id;
++		os_atomic_inc(&picasso_ipc_id_count[idslot], relaxed);
++		picasso_ipc_sample(kmsg, sender, receiver);
++	}
++	if (sender == 1) {
++		os_atomic_inc(&picasso_ipc_from1_total, relaxed);
++		if (receiver >= 0) {
++			uint32_t slot = (uint32_t)receiver % PICASSO_IPC_BUCKETS;
++			picasso_ipc_from1_key[slot] = receiver;
++			os_atomic_inc(&picasso_ipc_from1[slot], relaxed);
++		} else {
++			os_atomic_inc(&picasso_ipc_sink[1], relaxed);
++		}
++		picasso_ipc_sample_reply(kmsg, sender, receiver);
++	}
++}
++
++/* Two rows per profile block: the round's pid-1 traffic ranked by peer, with process names. */
++static uint32_t picasso_ipc_to1_seen[PICASSO_IPC_BUCKETS];
++static uint32_t picasso_ipc_from1_seen[PICASSO_IPC_BUCKETS];
++static uint64_t picasso_ipc_to1_seen_total, picasso_ipc_from1_seen_total;
++
++static size_t
++picasso_ipc_rank_row(char *out, size_t cap, const char *tag,
++    uint32_t *now, uint32_t *seen, int32_t *keys, uint64_t total_now, uint64_t *total_seen,
++    uint32_t sink)
++{
++	extern void proc_name(int, char *, int);
++	size_t at = 0;
++	int w = snprintf(out, cap, "IP %s d=%llu", tag,
++	    (unsigned long long)(total_now - *total_seen));
++	if (w > 0) {
++		at += (size_t)w;
++	}
++	*total_seen = total_now;
++	/* Six busiest peers this round; the counters are cumulative, so compare deltas. */
++	for (unsigned rank = 0; rank < 6; rank++) {
++		unsigned best = PICASSO_IPC_BUCKETS;
++		uint32_t best_delta = 0;
++		for (unsigned i = 0; i < PICASSO_IPC_BUCKETS; i++) {
++			uint32_t delta = now[i] - seen[i];
++			if (delta > best_delta) {
++				best_delta = delta;
++				best = i;
++			}
++		}
++		if (best == PICASSO_IPC_BUCKETS) {
++			break;
++		}
++		seen[best] = now[best];
++		char name[24] = "?";
++		if (keys[best] > 0) {
++			proc_name(keys[best], name, sizeof name);
++		} else {
++			strlcpy(name, "kernel", sizeof name);
++		}
++		w = snprintf(out + at, cap > at ? cap - at : 0, " %d:%.23s=%u",
++		    keys[best], name, best_delta);
++		if (w > 0) {
++			at += (size_t)w;
++		}
++		if (at >= cap) {
++			return cap - 1;
++		}
++	}
++	if (sink) {
++		snprintf(out + at, cap > at ? cap - at : 0, " kernel-port=%u", sink);
++	}
++	return at;
++}
++
++size_t
++picasso_ipc_census_rows(char *out, size_t cap)
++{
++	if (!picasso_ipc_census_enabled() || cap < 160) {
++		return 0;
++	}
++	picasso_ipc_census_dump();
++	size_t at = 0;
++	size_t used = picasso_ipc_rank_row(out, cap, "to1", picasso_ipc_to1,
++	    picasso_ipc_to1_seen, picasso_ipc_to1_key,
++	    os_atomic_load(&picasso_ipc_to1_total, relaxed), &picasso_ipc_to1_seen_total,
++	    picasso_ipc_sink[0]);
++	at += used;
++	if (at < cap) {
++		out[at++] = '\n';
++	}
++	used = picasso_ipc_rank_row(out + at, cap - at, "from1", picasso_ipc_from1,
++	    picasso_ipc_from1_seen, picasso_ipc_from1_key,
++	    os_atomic_load(&picasso_ipc_from1_total, relaxed), &picasso_ipc_from1_seen_total,
++	    picasso_ipc_sink[1]);
++	at += used;
++	if (at + 1 < cap) {
++		out[at++] = '\n';
++	}
++	/* The message ids pid 1 received this round, by delta: the id names the protocol. */
++	{
++		int w = snprintf(out + at, cap - at, "IP ids");
++		if (w > 0) {
++			at += (size_t)w;
++		}
++		for (unsigned rank = 0; rank < 4 && at + 24 < cap; rank++) {
++			unsigned best = PICASSO_IPC_IDS;
++			uint32_t best_delta = 0;
++			for (unsigned i = 0; i < PICASSO_IPC_IDS; i++) {
++				uint32_t delta = os_atomic_load(&picasso_ipc_id_count[i], relaxed) -
++				    picasso_ipc_id_seen[i];
++				if (delta > best_delta) {
++					best_delta = delta;
++					best = i;
++				}
++			}
++			if (best == PICASSO_IPC_IDS) {
++				break;
++			}
++			picasso_ipc_id_seen[best] = os_atomic_load(&picasso_ipc_id_count[best], relaxed);
++			w = snprintf(out + at, cap - at, " %x=%u", picasso_ipc_id_key[best], best_delta);
++			if (w > 0) {
++				at += (size_t)w;
++			}
++		}
++	}
++	return at;
++}
++#endif /* DEVELOPMENT || DEBUG */
++
+ /*
+  *	Routine:	ipc_kmsg_send
+  *	Purpose:
+@@ -5366,6 +5812,9 @@ retry:
+ 		 */
+ 		ipc_special_reply_port_msg_sent(port);
+ 
++#if DEVELOPMENT || DEBUG
++		picasso_ipc_census_note(port, kmsg);
++#endif /* DEVELOPMENT || DEBUG */
+ 		error = ipc_mqueue_send_locked(&port->ip_messages, kmsg,
+ 		    options, send_timeout);
+ 		/* port unlocked */
