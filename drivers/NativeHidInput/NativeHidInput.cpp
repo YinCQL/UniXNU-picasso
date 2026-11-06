@@ -29,8 +29,8 @@ extern "C" {
 extern volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
 extern volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
 }
-// Keyboard Application collection ensures the original generic keyboard
-// personality can match. Report 2 carries the Consumer buttons, bit 0 Menu (Home),
+// Keep the Keyboard Application collection so the original generic keyboard
+// personality can match any DeviceUsagePairs entry. Report 2 carries the Consumer buttons, bit 0 Menu (Home),
 // bit 1 Power, bit 2 Volume Increment, bit 3 Volume Decrement. Report 1 is an
 // ordinary boot keyboard report.
 static const unsigned char descriptor[]={
@@ -157,6 +157,17 @@ static void dispatch(IOService *self,OSObject *event,IOOptionBits options) {
     if(event && call<uint32_t,IOOptionBits>(event,kGetType,kDivGetType,0)==kDigitizer) {
         ++digitizerDispatches;
         OSArray *children=*reinterpret_cast<OSArray **>(reinterpret_cast<uint8_t *>(event)+24);
+        static unsigned routeLogs;
+        if(routeLogs<8 || (digitizerDispatches%256==0 && routeLogs<16)) {
+            ++routeLogs;
+            // handleIsOpen in the retained event service checks its client
+            // dictionary. This distinguishes generation from a subscribed
+            // service; it still does not prove userspace consumed the event.
+            printf("PICASSO_HID route registry=%llx open=%u event=%u mask=%x touch=%u\n",
+                self->getRegistryEntryID(), self->isOpen()?1u:0u, digitizerDispatches,
+                (unsigned)call<int32_t,uint32_t,IOOptionBits>(event,kGetInteger,kDivGetInteger,kMask,0),
+                (unsigned)call<int32_t,uint32_t,IOOptionBits>(event,kGetInteger,kDivGetInteger,kTouch,0));
+        }
         if(children && OSDynamicCast(OSArray,children) && children->getCount()) {
             // A collection (the driver's touch-screen dispatch): its mask is the union of its fingers', so it takes the bit as well.
             bool any=false;
@@ -286,8 +297,8 @@ class NativeHidInput : public IOHIDDevice {
     uint8_t buttons=0;   // report 2 bits held by the hardware buttons
     bool buttonsStopping=false; // serialized by inputLoop
     bool touchEnabled=false;
-    // The digitizer is a separate service from the keyboard: backboardd matches digitizers by primary usage page/usage
-    // (Digitizer/Touch Screen) and the Built-In flag, which a combined keyboard-first descriptor would not provide.
+    // Optional separate digitizer. The default combined device also advertises
+    // Touch Screen as its primary application collection, before registration.
     bool touchOnly=false;
     bool eventDriverFound=false;
     IOReturn submitReport(IOMemoryDescriptor *report) {
@@ -514,10 +525,15 @@ public:
         size_t size;
         if(touchOnly){size=sizeof(touchDescriptor);memcpy(combined,touchDescriptor,size);}
         else{
-            size=sizeof(descriptor);memcpy(combined,descriptor,size);
-            // Default: one device, keyboard collection first, digitizer second (the arrangement whose event driver
-            // and user client attach on hardware); the separate digitizer device is the opt-in sheng-touch-split.
-            if(touchEnabled){memcpy(combined+size,touchDescriptor,sizeof(touchDescriptor));size+=sizeof(touchDescriptor);}
+            size=0;
+            // IOHIDDevice::publishProperties and IOHIDEventService both derive
+            // PrimaryUsage from DeviceUsagePairs[0]. Publish the real digitizer
+            // identity on the device/interface/event service from the start;
+            // changing only two registry properties after matching is too late
+            // for clients that already cached a keyboard service. The retained
+            // keyboard personality matches any pair, not just the first one.
+            if(touchEnabled){memcpy(combined,touchDescriptor,sizeof(touchDescriptor));size=sizeof(touchDescriptor);}
+            memcpy(combined+size,descriptor,sizeof(descriptor));size+=sizeof(descriptor);
         }
         *out=IOBufferMemoryDescriptor::withBytes(combined,size,kIODirectionNone);
         return *out?kIOReturnSuccess:kIOReturnNoMemory;

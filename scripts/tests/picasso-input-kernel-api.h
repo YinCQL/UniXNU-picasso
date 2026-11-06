@@ -17,7 +17,9 @@ public:
 class OSObject {public: void retain(); void release();};
 class OSIterator:public OSObject {public:OSObject *getNextObject();};
 class OSSymbol:public OSObject {public:static const OSSymbol *withCString(const char *);void release() const;};
-class OSDictionary:public OSObject {};
+class OSDictionary:public OSObject {public:OSObject *getObject(const char *);};
+class OSArray:public OSObject {public:unsigned getCount();OSObject *getObject(unsigned);};
+class OSNumber:public OSObject {public:unsigned unsigned32BitValue();};
 extern OSObject *kOSBooleanTrue;
 extern const char *gIOServicePlane;
 class IORegistryEntry:public OSObject {
@@ -25,6 +27,7 @@ public:
  void *metaCast(const char *);
  OSIterator *getChildIterator(const char *);
  OSObject *getProperty(const char *);
+ unsigned long long getRegistryEntryID();
  bool setProperty(const char *,OSObject *);
  bool setProperty(const char *,unsigned long long,unsigned);
  IORegistryEntry *getParentEntry(const char *);

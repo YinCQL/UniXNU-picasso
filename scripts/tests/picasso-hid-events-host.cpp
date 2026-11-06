@@ -6,7 +6,8 @@
 #include <string.h>
 using IOOptionBits=unsigned;
 struct OSMetaClass {const char *name; const char *getClassName()const{return name;}};
-struct IOService {uintptr_t *table; OSMetaClass *meta; const OSMetaClass *getMetaClass()const{return meta;}};
+struct IOService {uintptr_t *table; OSMetaClass *meta; const OSMetaClass *getMetaClass()const{return meta;}
+    unsigned long long getRegistryEntryID()const{return 123;}bool isOpen()const{return true;}};
 using IORegistryEntry=IOService;
 struct OSArray;
 struct OSObject {

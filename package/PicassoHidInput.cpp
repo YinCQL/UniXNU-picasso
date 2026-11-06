@@ -6,6 +6,8 @@
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSIterator.h>
 #include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSArray.h>
+#include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSSymbol.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
@@ -130,25 +132,39 @@ static IORegistryEntry *eventDriver(IORegistryEntry *parent, unsigned depth) {
     return found;
 }
 
+static unsigned hidNumber(OSObject *object) {
+    OSNumber *number = OSDynamicCast(OSNumber, object);
+    return number ? number->unsigned32BitValue() : 0;
+}
+
+static void logHidIdentity(IORegistryEntry *entry, const char *node) {
+    if (!entry) return;
+    OSArray *pairs = OSDynamicCast(OSArray, entry->getProperty("DeviceUsagePairs"));
+    OSDictionary *first = pairs && pairs->getCount() ? OSDynamicCast(OSDictionary, pairs->getObject(0)) : nullptr;
+    IOLog("PICASSO_HID identity node=%s registry=%llx page=%x usage=%x pairs=%u first=%x/%x built_in=%u integrated=%u\n",
+        node, entry->getRegistryEntryID(), hidNumber(entry->getProperty("PrimaryUsagePage")),
+        hidNumber(entry->getProperty("PrimaryUsage")), pairs ? pairs->getCount() : 0,
+        first ? hidNumber(first->getObject("DeviceUsagePage")) : 0,
+        first ? hidNumber(first->getObject("DeviceUsage")) : 0,
+        entry->getProperty("Built-In") == kOSBooleanTrue,
+        entry->getProperty("DisplayIntegrated") == kOSBooleanTrue);
+}
+
 extern "C" void native_hid_live_checkpoint(IOService *device) {
-    // The combined keyboard collection must match first; classify the attached
-    // event service as a built-in digitizer only after matching, once per service.
-    static IORegistryEntry *published;
+    // Classification is now derived from the descriptor before registration.
+    // Observe all three nodes without racing the family's property publication
+    // or rewriting a service that userspace has already discovered.
+    static uint64_t published[2]; // one combined device, or the two opt-in split devices
     IORegistryEntry *driver = eventDriver(device, 4);
     if (!driver) return;
-    if (device->getProperty("Built-In") && published != driver) {
-        driver->setProperty("Built-In", kOSBooleanTrue);
-        driver->setProperty("DisplayIntegrated", kOSBooleanTrue);
-        driver->setProperty("PrimaryUsagePage", (unsigned long long)0x0d, 32);
-        driver->setProperty("PrimaryUsage", (unsigned long long)4, 32);
-        if (IORegistryEntry *interface = driver->getParentEntry(gIOServicePlane)) {
-            interface->setProperty("Built-In", kOSBooleanTrue);
-            interface->setProperty("DisplayIntegrated", kOSBooleanTrue);
-            interface->setProperty("PrimaryUsagePage", (unsigned long long)0x0d, 32);
-            interface->setProperty("PrimaryUsage", (unsigned long long)4, 32);
-        }
-        published = driver;
-        IOLog("PICASSO_HID digitizer event service ready\n");
+    const uint64_t identity = driver->getRegistryEntryID();
+    unsigned slot = 0;
+    while (slot < 2 && published[slot] && published[slot] != identity) ++slot;
+    if (slot < 2 && !published[slot]) {
+        published[slot] = identity;
+        logHidIdentity(device, "device");
+        logHidIdentity(driver->getParentEntry(gIOServicePlane), "interface");
+        logHidIdentity(driver, "event-service");
     }
     driver->release();
 }
