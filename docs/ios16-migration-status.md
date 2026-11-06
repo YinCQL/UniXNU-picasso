@@ -182,3 +182,36 @@ Setup to the `PICASSO_UI_EXIT` probe in `11b4b3b`):
 
 `out/gpu10/picasso/boot/gpu10.img` (`46c5ba2f...`) remains the proven GPU
 baseline.
+
+## Zero-copy direct scanout verified with the Setup UI (2026-11-06 20:12 CST)
+
+After the phone was reconnected and charged, `out/gpu11/picasso/boot/gpu11.img`
+(`74f952e8...`, gpu10 plus `sheng-dpu-scanout=2`) booted and the direct path
+engaged on the first userland draw:
+
+    PICASSO_DPU smmu scr0=2d0406 idr0=4c017e51 idr1=6000003e groups=81 banks=62 pages=128
+    PICASSO_DPU smmu state=80000002
+    PICASSO_DPU direct scanout on bank=2 window=10000000 boot=a0000000 stride=4320
+
+By 20:12 the run had 17,400 flips over ~9.3 minutes. In steady state the
+DPU frame period is 16.4-18.6 ms (~60 fps) with `fence_us=0` (the submit fence
+is already retired when the flip happens) and `latch_us` between 0.5 and
+13.7 ms; `maps=3 mapfails=0 fallbacks=0 latch_timeouts=0`, so the three surface
+slots are reused and no flip fell back to the copy path. The 53-98 ms period
+spikes line up with app launches (the Setup relaunch loop), not with the DPU
+latch. `PICASSO_GPU submits live` reached 17,315 submissions / 59,221 IBs with
+`max=44` IBs per submit, and `PICASSO_INJECT Setup` opened the injected dylib,
+i.e. real userland command buffers are being presented through the direct path.
+
+The panel content is the actual setup assistant: the user reports a red status
+bar and the "你好" Hello screen. A CDC `snapshot` at the same moment matches it
+(sampled row 0 `ffff6c64`, an orange-red bar; the remaining rows white), which
+confirms `directSnapshot()` reads what the DPU scans out. The earlier all-black
+snapshot was taken before the first userland draw and is not a scanout failure.
+`PICASSO_DISPLAY ... nonblack=0` stays at zero by design: direct scanout
+bypasses the `native_legacy_gpu_offer` accounting that feeds that counter.
+
+Open in this image: the Setup app still relaunches (12 `PICASSO_INJECT Setup`
+starts observed); the `PICASSO_UI_EXIT` Setup probe needs the newer kernel in
+gpu12/gpu13, which have not been booted on hardware yet. The red status bar
+tint has not been triaged.
