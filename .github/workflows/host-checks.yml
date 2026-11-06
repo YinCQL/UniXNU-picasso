@@ -107,6 +107,10 @@ jobs:
           cp out/picasso/host-checks/firmware/results.json out/picasso/logs/firmware-host.json
           python3 scripts/check-picasso-qmp.py --output out/picasso/host-checks/qmp
           cp out/picasso/host-checks/qmp/results.json out/picasso/logs/qmp-host.json
+          python3 scripts/check-picasso-smp2p.py --output out/picasso/host-checks/smp2p
+          cp out/picasso/host-checks/smp2p/results.json out/picasso/logs/smp2p-host.json
+          python3 scripts/check-picasso-rpmh.py --output out/picasso/host-checks/rpmh
+          cp out/picasso/host-checks/rpmh/results.json out/picasso/logs/rpmh-host.json
 
       - name: Check GOP import and completion ownership
         if: github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-audio'

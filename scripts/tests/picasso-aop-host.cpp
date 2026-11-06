@@ -69,7 +69,8 @@ int main(int argc,char **argv) {
     if(rx)ram[0x100/4]=4;
     if(bad)ram[14]=60;
     uint32_t original[1024];memcpy(original,ram,sizeof ram);
-    picasso_aop_probe();picasso_aop_probe();
+    int result=picasso_aop_probe();assert(picasso_aop_probe()==-16);
+    assert((result==0)==!(failAlloc || failMap || bad || busy || rx || stalled || closeStalled));
     assert(allocations==2 && releases==2-!!failAlloc);
     assert(mappings==releases && unmaps==mappings-!!failMap);
     assert(lines==((failAlloc || failMap)?1:2));

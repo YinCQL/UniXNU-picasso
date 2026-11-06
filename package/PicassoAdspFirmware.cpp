@@ -9,6 +9,7 @@
 #include "PicassoAdspFirmwareProfile.h"
 #include "FirmwareWindow.h"
 #include "PicassoQmp.h"
+#include "PicassoSmp2p.h"
 
 extern "C" unsigned native_ufs_store_ready(void);
 extern "C" void picasso_adsp_firmware_start(void);
@@ -100,7 +101,7 @@ void worker(void *, wait_result_t) {
     // Do not retain tens of MiB or stale handles before the PAS lifecycle exists.
     // A future loader must re-open/revalidate input as part of its own transaction.
     IOFree(f, sizeof(Firmware));
-    if (!error) picasso_aop_probe();
+    if (!error && !picasso_aop_probe()) picasso_smp2p_start();
 }
 }
 

@@ -25,6 +25,7 @@
 #include "Adreno620Firmware.h"
 #include "Adreno620Probe.h"
 #include "Adreno620ProbeCore.h"
+#include "PicassoRpmh.h"
 #include "NativeAdrenoABI.h"
 #include "NativeAdrenoA620HwInit.h"
 #include "NativeAdrenoGpuContext.h"
@@ -766,10 +767,6 @@ constexpr uint64_t kAppsRscBytes = 0x10000u;
 constexpr uint64_t kRscTcsOffset = 0xd00u;           /* DT qcom,tcs-offset */
 constexpr uint64_t kRpmhCmdDbBase = 0x80860000u;     /* DT cmd-db memory region */
 constexpr uint64_t kRpmhCmdDbBytes = 0x20000u;
-constexpr uint32_t kRscAmcModeEnable = 1u << 16;
-constexpr uint32_t kRscAmcModeTrigger = 1u << 24;
-constexpr uint32_t kRscCmdMsgidWrite = 8u | (1u << 8) | (1u << 16);  /* LEN|RESP|WRITE */
-constexpr uint32_t kRscCmdStatusCompl = 1u << 16;
 constexpr uint32_t kBcmVoteMax = 0x3fffu;            /* BCM_TCS_CMD_VOTE_MASK */
 constexpr uint32_t kBcmAcvApps = 0x8;                /* BCM_TCS_CMD_ACV_APPS */
 
@@ -803,6 +800,32 @@ struct CmdDbBcm {
     uint8_t vcd;
     bool found;
 };
+
+static unsigned rpmhGate, rpmhPoisoned;
+static bool rpmhEnter() {
+    for (unsigned i = 0; i < 100; ++i) {
+        if (!__atomic_exchange_n(&rpmhGate, 1U, __ATOMIC_ACQ_REL)) {
+            if (!__atomic_load_n(&rpmhPoisoned, __ATOMIC_ACQUIRE)) return true;
+            __atomic_store_n(&rpmhGate, 0U, __ATOMIC_RELEASE); return false;
+        }
+        IOSleep(1);
+    }
+    return false;
+}
+static void rpmhLeave() { __atomic_store_n(&rpmhGate, 0U, __ATOMIC_RELEASE); }
+static uint32_t rscRead(void *ctx, uint32_t at) { return read32(*static_cast<Mapping *>(ctx), at); }
+static void rscWrite(void *ctx, uint32_t at, uint32_t v) { write32(*static_cast<Mapping *>(ctx), at, v); }
+static void rscBarrier(void *) { barrier(); }
+static void rscDelay(void *, unsigned us) { IODelay(us); }
+static int rscSend(Mapping &rsc, unsigned tcs, uint32_t address, uint32_t value) {
+    PicassoRscIo io = {&rsc, rscRead, rscWrite, rscBarrier, rscDelay};
+    PicassoRscResult result;
+    int error = picasso_rsc_send(&io, tcs, address, value, &result);
+    if (result.poisoned) __atomic_store_n(&rpmhPoisoned, 1U, __ATOMIC_RELEASE);
+    printf("PICASSO_RPMH tcs=%u address=%x data=%x error=%d irq=%x status=%x command=%x initial_control=%x initial_enable=%x spins=%u poisoned=%u\n",
+        tcs, address, value, error, result.irq, result.status, result.command, result.control, result.enabled, result.spins, result.poisoned);
+    return error;
+}
 
 /* cmd_db_read_addr() + cmd_db_read_aux_data(struct bcm_db). */
 CmdDbBcm cmdDbBcmLookup(const Mapping &db, const char *name)
@@ -845,11 +868,14 @@ CmdDbBcm cmdDbBcmLookup(const Mapping &db, const char *name)
  * boot, and the PAS result is what the caller measures. */
 unsigned rpmhVoteCryptoPath()
 {
+    if (!rpmhEnter()) { printf("PICASSO_GPU rpmh: shared owner busy or quarantined\n"); return 0; }
     Mapping rsc = {};
     Mapping db = {};
     if (!mapPhysical(kAppsRscDrv2Base, kAppsRscBytes, rsc)) {
         printf("PICASSO_GPU rpmh: RSC at %08x did not map\n",
             uint32_t(kAppsRscDrv2Base));
+        if (rsc.keep) rsc.keep->release();
+        rpmhLeave();
         return 0;
     }
     const bool dbMapped = mapPhysical(kRpmhCmdDbBase, kRpmhCmdDbBytes, db);
@@ -864,12 +890,6 @@ unsigned rpmhVoteCryptoPath()
     printf("PICASSO_GPU rpmh: drv-id=%08x tcs-stride=%u cmd-stride=%u irq-enable=%08x\n",
         drvId, layout.tcsStride, layout.cmdStride, irqEnable);
 
-    /* The TX-done line is a GIC SPI this kernel has no handler for. Mask only
-     * the two TCSs this vote uses for the duration of the vote and restore the
-     * register afterwards; IRQ_STATUS still records completion. */
-    write32(rsc, tcsBase + 0x00, irqEnable & ~3u);
-    barrier();
-
     struct Vote {
         const char *name;
         bool acv;
@@ -879,61 +899,8 @@ unsigned rpmhVoteCryptoPath()
         {"MC0", false}, {"ACV", true}, {"CN0", false},
     };
 
-    auto waitIdle = [&](uint64_t tcsAt) {
-        uint32_t status = 0;
-        for (unsigned spin = 0; spin < 200; ++spin) {
-            status = read32(rsc, tcsAt + layout.status);
-            if (status) break;
-            IODelay(10);
-        }
-        return status;
-    };
-
     auto sendBcm = [&](unsigned tcs, uint32_t address, uint32_t data) {
-        const uint64_t tcsAt = tcsBase + uint64_t(layout.tcsStride) * tcs;
-        waitIdle(tcsAt);
-        /* __tcs_set_trigger(false): clear the AMC trigger, then the mode. */
-        uint32_t control = read32(rsc, tcsAt + layout.control);
-        control &= ~kRscAmcModeTrigger;
-        write32(rsc, tcsAt + layout.control, control);
-        control &= ~kRscAmcModeEnable;
-        write32(rsc, tcsAt + layout.control, control);
-        write32(rsc, tcsAt + layout.cmdEnable, 0);
-        barrier();
-        write32(rsc, tcsAt + layout.cmdMsgid, kRscCmdMsgidWrite);
-        write32(rsc, tcsAt + layout.cmdAddr, address);
-        write32(rsc, tcsAt + layout.cmdData, data);
-        write32(rsc, tcsAt + layout.cmdEnable, 1u);
-        barrier();
-        /* __tcs_set_trigger(true), with the synchronous readbacks rpmh-rsc.c
-         * relies on between the mode enable and the trigger. */
-        write32(rsc, tcsAt + layout.control, kRscAmcModeEnable);
-        (void)read32(rsc, tcsAt + layout.control);
-        write32(rsc, tcsAt + layout.control, kRscAmcModeEnable | kRscAmcModeTrigger);
-        (void)read32(rsc, tcsAt + layout.control);
-        uint32_t irqStatus = 0, status = 0, cmdStatus = 0;
-        unsigned spins = 0;
-        for (; spins < 500; ++spins) {
-            irqStatus = read32(rsc, tcsBase + layout.irqStatus);
-            status = read32(rsc, tcsAt + layout.status);
-            cmdStatus = read32(rsc, tcsAt + layout.cmdStatus);
-            if ((irqStatus & (1u << tcs)) || (cmdStatus & kRscCmdStatusCompl))
-                break;
-            IODelay(10);
-        }
-        write32(rsc, tcsBase + layout.irqClear, 1u << tcs);
-        write32(rsc, tcsAt + layout.cmdEnable, 0);
-        control = read32(rsc, tcsAt + layout.control);
-        control &= ~kRscAmcModeTrigger;
-        write32(rsc, tcsAt + layout.control, control);
-        control &= ~kRscAmcModeEnable;
-        write32(rsc, tcsAt + layout.control, control);
-        barrier();
-        const bool done = (irqStatus & (1u << tcs)) ||
-            (cmdStatus & kRscCmdStatusCompl);
-        printf("PICASSO_GPU rpmh: tcs=%u irq=%08x status=%08x cmd-status=%08x "
-               "spins=%u\n", tcs, irqStatus, status, cmdStatus, spins);
-        return done;
+        return rscSend(rsc, tcs, address, data) == 0;
     };
 
     unsigned voted = 0;
@@ -953,14 +920,14 @@ unsigned rpmhVoteCryptoPath()
         printf("PICASSO_GPU rpmh: %s addr=%x unit=%u width=%u vcd=%u data=%08x tcs=%u done=%d\n",
             votes[index].name, bcm.address, bcm.unit, unsigned(bcm.width),
             unsigned(bcm.vcd), data, tcs, int(done));
+        if (!done) break;
         ++voted;
     }
-    write32(rsc, tcsBase + 0x00, irqEnable);
-    barrier();
-    if (dbMapped && db.keep) db.keep->release();
+    if (db.keep) db.keep->release();
     if (rsc.keep) rsc.keep->release();
     printf("PICASSO_GPU rpmh: crypto path voted %u/%u\n", voted,
         unsigned(sizeof(votes) / sizeof(votes[0])));
+    rpmhLeave();
     return voted;
 }
 
@@ -1093,7 +1060,7 @@ bool loadZap()
 {
     /* wf116: vote the crypto engine's NoC path before TZ runs PAS, the way
      * subsys-pil-tz.c's scm_pas_enable_bw() does around every PAS call. */
-    rpmhVoteCryptoPath();
+    if (rpmhVoteCryptoPath() != 7) return false;
 
     /* wf117: the interrupted-SMC quirk requires the normal world to take the
      * interrupt that ended the secure call before the session is resumed.
@@ -2143,6 +2110,50 @@ bool acquireBuffers()
 }
 
 } // namespace
+
+extern "C" int picasso_rpmh_active_write(uint32_t address, uint32_t value)
+{
+    if (!rpmhEnter()) return -16;
+    Mapping rsc = {};
+    int error = mapPhysical(kAppsRscDrv2Base, kAppsRscBytes, rsc) ? rscSend(rsc, 0, address, value) : -12;
+    if (rsc.keep) rsc.keep->release();
+    rpmhLeave();
+    return error;
+}
+
+extern "C" int picasso_rpmh_adsp_plan(void)
+{
+    if (!rpmhEnter()) return -16;
+    Mapping db = {};
+    auto *copy = static_cast<uint8_t *>(IOMalloc(kRpmhCmdDbBytes));
+    int error = -12;
+    if (copy && mapPhysical(kRpmhCmdDbBase, kRpmhCmdDbBytes, db)) {
+        for (unsigned i = 0; i < kRpmhCmdDbBytes; i += 4) {
+            uint32_t w = read32(db, i);
+            for (unsigned j = 0; j < 4; ++j) copy[i + j] = uint8_t(w >> (8 * j));
+        }
+        barrier();
+        error = 0;
+        for (unsigned i = 0; i < kRpmhCmdDbBytes; i += 4)
+            if (picasso_db32(copy + i) != read32(db, i)) { error = -11; break; }
+        PicassoArcResource rails[3] = {};
+        const char *names[] = {"lcx.lvl", "lmx.lvl", "xo.lvl"};
+        for (unsigned i = 0; !error && i < 3; ++i) {
+            error = picasso_arc_lookup(copy, kRpmhCmdDbBytes, names[i], i < 2 ? 384 : UINT32_MAX, &rails[i]);
+            printf("PICASSO_ADSP rpmh resource=%s error=%d address=%x index=%u level=%u vote_sent=0\n",
+                names[i], error, rails[i].address, i < 2 ? rails[i].index : 3, rails[i].level);
+        }
+        // XO is the stock ARC on-value 3, not a voltage-table index chosen for
+        // the rails. No vote until a PAS transaction owns their full lifetime.
+        if (!error && (rails[0].address == rails[1].address || rails[0].address == rails[2].address ||
+                       rails[1].address == rails[2].address)) error = -22;
+    }
+    if (db.keep) db.keep->release();
+    if (copy) IOFree(copy, kRpmhCmdDbBytes);
+    rpmhLeave();
+    printf("PICASSO_ADSP rpmh stage=plan error=%d vote_sent=0 pending=pas-lifecycle\n", error);
+    return error;
+}
 
 extern "C" int native_adreno620_cp_start(void)
 {

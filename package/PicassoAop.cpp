@@ -45,16 +45,16 @@ int wait(PicassoQmp *q) {
 }
 }
 
-extern "C" void picasso_aop_probe(void) {
+extern "C" int picasso_aop_probe(void) {
     // One attempt per boot. A timeout cannot cause a second owner to take over.
     static unsigned attempted;
-    if (__atomic_exchange_n(&attempted, 1U, __ATOMIC_ACQ_REL)) return;
+    if (__atomic_exchange_n(&attempted, 1U, __ATOMIC_ACQ_REL)) return QmpBusy;
     OSSharedPtr<IOMemoryMap> ram(aopMap(0x0c300000), OSNoRetain);
     OSSharedPtr<IOMemoryMap> ipcc(aopMap(0x00408000), OSNoRetain);
     Aop context = {ram ? static_cast<uintptr_t>(ram->getVirtualAddress()) : 0,
                    ipcc ? static_cast<uintptr_t>(ipcc->getVirtualAddress()) : 0};
     if (!context.ram || !context.ipcc) {
-        IOLog("PICASSO_ADSP aop stage=map error=-12 authenticated=0\n"); return;
+        IOLog("PICASSO_ADSP aop stage=map error=-12 authenticated=0\n"); return -12;
     }
     QmpIo io = {&context, aopRead, aopWrite, aopBarrier, aopKick};
     PicassoQmp q = {};
@@ -70,4 +70,5 @@ extern "C" void picasso_aop_probe(void) {
         closed, !q.owned);
     // Mapping lifetime ends here. No load_state on/off is sent before a real
     // PAS lifecycle owns LCX/LMX/XO and has installed ready/fatal handlers.
+    return result == QmpOpen && closed == QmpClosed ? 0 : (result < 0 ? result : closed);
 }

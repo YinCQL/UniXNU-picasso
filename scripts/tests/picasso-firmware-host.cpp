@@ -35,8 +35,10 @@ static unsigned calls, failRead, sleepCount, allocated, freed, starts, released,
 static uint64_t ticks;
 static bool noPartition, noMemory, noThread, neverReady;
 static unsigned pending;
-static unsigned aopProbes;
-extern "C" void picasso_aop_probe() { assert(freed == 1); ++aopProbes; }
+static unsigned aopProbes, smpStarts;
+static bool aopFailed;
+extern "C" int picasso_aop_probe() { assert(freed == 1); ++aopProbes; return aopFailed ? -60 : 0; }
+extern "C" void picasso_smp2p_start() {assert(aopProbes==1 && freed==1); ++smpStarts;}
 static int readDisk(void *, uint64_t at, void *to, size_t n) {
     if (++calls == failRead || at > diskBytes || n > diskBytes - at) return -1;
     memcpy(to, disk + at, n); return 0;
@@ -99,7 +101,8 @@ static void fatTests() {
 int main(int argc,char **argv) {
     fatTests();
     assert(argc>1);const char *mode=argv[1];
-    if(!strcmp(mode,"stock")) {
+    if(!strcmp(mode,"stock") || !strcmp(mode,"stock-aop-fail")) {
+        aopFailed=!strcmp(mode,"stock-aop-fail");
         assert(argc==3);FILE *in=fopen(argv[2],"rb");assert(in);
         fseek(in,0,SEEK_END);diskBytes=(size_t)ftell(in);rewind(in);free(disk);disk=(uint8_t *)malloc(diskBytes);assert(disk);
         assert(fread(disk,1,diskBytes,in)==diskBytes);fclose(in);calls=failRead=0;
@@ -113,14 +116,14 @@ int main(int argc,char **argv) {
         disk[at]^=1;memset(f,0,sizeof(*f));f->deadline=0;
         assert(validateFirmware(f,335544320,&failed,&checked)==FatReadError);
         free(f);
-        picasso_adsp_firmware_start();assert(starts==1&&allocated==1&&freed==1&&lines==2&&aopProbes==1);
+        picasso_adsp_firmware_start();assert(starts==1&&allocated==1&&freed==1&&lines==2&&aopProbes==1&&smpStarts==!aopFailed);
         puts("PASS stock worker cleanup, altered firmware rejection and deadline");
     } else {
         neverReady=!strcmp(mode,"not-ready");pending=!strcmp(mode,"late-ready")?3:0;
         noPartition=!strcmp(mode,"partition");noMemory=!strcmp(mode,"alloc");noThread=!strcmp(mode,"thread");
         calls=sleepCount=0;picasso_adsp_firmware_start();picasso_adsp_firmware_start();assert(starts==1);
         assert(released==!noThread);assert(allocated==(!noThread&&!neverReady));
-        assert(freed==(!noThread&&!noMemory&&!neverReady));assert(lines==1 && !aopProbes);
+        assert(freed==(!noThread&&!noMemory&&!neverReady));assert(lines==1 && !aopProbes && !smpStarts);
         if(neverReady)assert(sleepCount==120);if(!strcmp(mode,"late-ready"))assert(sleepCount>=3);
     }
     free(disk);

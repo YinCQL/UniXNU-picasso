@@ -30,5 +30,5 @@ int picasso_qmp_begin(PicassoQmp *, const QmpIo *, uint32_t ramBytes, uint64_t d
 int picasso_qmp_step(PicassoQmp *, uint64_t now);
 int picasso_qmp_send(PicassoQmp *, const char *, uint64_t deadline);
 int picasso_qmp_close(PicassoQmp *, uint64_t deadline);
-extern "C" void picasso_aop_probe(void);
+extern "C" int picasso_aop_probe(void);
 #endif

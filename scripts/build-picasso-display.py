@@ -250,13 +250,14 @@ def main():
                ROOT / 'kits/picasso/PicassoBrightness.cpp', ROOT / 'kits/picasso/PicassoSpmi.cpp',
                ROOT / 'kits/picasso/PicassoAdsp.cpp', ROOT / 'kits/picasso/PicassoAdspFirmware.cpp',
                ROOT / 'kits/picasso/PicassoFat.cpp', ROOT / 'kits/picasso/PicassoQmp.cpp',
-               ROOT / 'kits/picasso/PicassoAop.cpp']
+               ROOT / 'kits/picasso/PicassoAop.cpp', ROOT / 'kits/picasso/PicassoSmp2p.cpp',
+               ROOT / 'kits/picasso/PicassoSmp2pDevice.cpp']
     audit = None
     for source in sources:
         obj = out / (source.stem + '.o')
         command = platform.compile_command(record, source, obj, ROOT) + ['-I', str(out), '-I', str(source_dir),
             '-I', str(ROOT / 'drivers/NativeAdreno'), '-I', str(ROOT / 'drivers/NativeWlan'),
-            '-I', str(ROOT / 'drivers/NativeUfs'), '-mgeneral-regs-only']
+            '-I', str(ROOT / 'drivers/NativeUfs'), '-I', str(ROOT / 'drivers/NativeAdrenoPicasso'), '-mgeneral-regs-only']
         platform.run(command, obj.with_suffix('.compile.log'), record['directory'])
         if source.stem == 'NativeLegacyDisplay':
             audit = audit_object(platform, native, obj, slots, aliases, names)
@@ -286,8 +287,10 @@ def main():
                 ROOT / 'kits/picasso/PicassoSpmi.h', ROOT / 'kits/picasso/PicassoSpmiCore.h',
                 ROOT / 'kits/picasso/PicassoAdsp.h', ROOT / 'drivers/NativeWlan/WlanSmem.h',
                 ROOT / 'kits/picasso/PicassoFat.h', ROOT / 'kits/picasso/PicassoAdspFirmwareProfile.h',
-                ROOT / 'kits/picasso/PicassoQmp.h']
-    sources += [ROOT / 'drivers/NativeAdreno/OriginalAcceleratorABI.h', ROOT / 'drivers/NativeUfs/FirmwareWindow.h']
+                ROOT / 'kits/picasso/PicassoQmp.h', ROOT / 'kits/picasso/PicassoSmp2p.h',
+                ROOT / 'kits/picasso/PicassoSmemLock.h']
+    sources += [ROOT / 'drivers/NativeAdreno/OriginalAcceleratorABI.h', ROOT / 'drivers/NativeUfs/FirmwareWindow.h',
+                ROOT / 'drivers/NativeAdrenoPicasso/PicassoRpmh.h']
     pending = Path(tempfile.mkdtemp(prefix='qualified-display-', dir=out)) / 'libNativeLegacyDisplay.late.a'
     platform.run(['xcrun', 'ar', 'rcs', pending, *objects], out / 'archive.log')
     members = platform.check_archive_members(platform.run(['xcrun', 'ar', 't', pending], out / 'members.log').splitlines(), objects)
