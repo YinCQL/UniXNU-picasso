@@ -27,6 +27,8 @@ def main():
     state = source[source.index('    uint32_t lastSeq=0;'):source.index('    // One finger set')]
     send = extract(source, '    void touchSend()').replace('__asm__ volatile("dmb ish":::"memory");', 'host_fence();')
     (out / 'touch.inc').write_text(state + send, newline='\n')
+    bridge = (ROOT / 'package/PicassoHidInput.cpp').read_text()
+    (out / 'touch-observed.inc').write_text(extract(bridge, 'extern "C" void native_hid_input_observed('), newline='\n')
     tick = extract(source, '    static void tick(')
     assert 'if(self->touchRetry && (self->touchEnabled || self->touchOnly))self->touchSend();' in tick
     usb = (ROOT / 'patches/picasso-usb-console-xnu.patch').read_text()
@@ -66,7 +68,7 @@ def main():
         try: sparse.check(image)
         except ValueError: pass
         else: raise AssertionError('invalid sparse accepted')
-    names = ['drivers/NativeHidInput/NativeHidInput.cpp', 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp', 'package/PicassoKeyStore.cpp', 'drivers/NativeAdrenoPicasso/Adreno620Cp.cpp', 'patches/picasso-usb-console-xnu.patch', 'patches/unixnu-source-kernel.patch', 'scripts/build-wf-payload.py', 'scripts/make-android-sparse.py', 'scripts/check-picasso-pr18.py', 'scripts/tests/picasso-touch-retry-host.cpp', 'scripts/tests/picasso-usb-stop-host.cpp']
+    names = ['drivers/NativeHidInput/NativeHidInput.cpp', 'package/PicassoHidInput.cpp', 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp', 'package/PicassoKeyStore.cpp', 'drivers/NativeAdrenoPicasso/Adreno620Cp.cpp', 'patches/picasso-usb-console-xnu.patch', 'patches/unixnu-source-kernel.patch', 'scripts/build-wf-payload.py', 'scripts/make-android-sparse.py', 'scripts/check-picasso-pr18.py', 'scripts/tests/picasso-touch-retry-host.cpp', 'scripts/tests/picasso-usb-stop-host.cpp']
     (out / 'results.json').write_text(json.dumps(dict(passed=True, runs=runs, malformed_sparse_cases=len(cases), inputs={n:hashlib.sha256((ROOT/n).read_bytes()).hexdigest() for n in names}), indent=2)+'\n')
     print('PASS PR18 production touch retry/USB stop and sparse roundtrip/malformed format')
 

@@ -77,6 +77,11 @@ def main():
     result = dict(scope=__doc__, runs=runs, passed=True, hardware_tested=False,
                   report_bodies_sha256=hashlib.sha256(report_bodies.encode()).hexdigest(),
                   producer_bodies_sha256=hashlib.sha256(bodies.encode()).hexdigest())
+    inputs = [ROOT / 'package/PicassoHidInput.cpp', Path(__file__)]
+    inputs += [source / n for n in ('TouchProbe.cpp', 'TouchPublish.h', 'TouchBoard.h',
+        'NvtProtocol.c', 'NvtProtocol.h', 'NvtTouchCore.c', 'NvtTouchCore.h', 'Test/main.c')]
+    inputs += [ROOT / 'scripts/tests' / n for n in ('picasso-touch-handoff-host.cpp', 'picasso-touch-report-host.cpp')]
+    result['inputs'] = {str(p.relative_to(ROOT)).replace('\\', '/'): hashlib.sha256(p.read_bytes().replace(b'\r\n', b'\n')).hexdigest() for p in inputs}
     (out / 'results.json').write_text(json.dumps(result, indent=2) + '\n')
     print('PASS: touch protocol and production producer handoff, normal and ASan')
 

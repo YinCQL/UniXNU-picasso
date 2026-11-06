@@ -19,7 +19,7 @@ struct OSArray {OSObject *entries[2];unsigned count;unsigned getCount(){return c
 static uintptr_t originalDispatch;
 static uintptr_t kOriginalEventDriverMethods[220];
 static bool fromEdge[256];
-static unsigned native_touch_edge_stats[4],consumerReports,allocated,forwarded,logs;
+static unsigned native_touch_edge_stats[4],consumerReports,allocated,forwarded,logs,digitizerDispatches;
 enum:uint16_t {kDivGetType=0,kDivGetInteger=0,kDivGetFixed=0,kDivSetInteger=0};
 static void *IOMalloc(size_t n){allocated=unsigned(n);return malloc(n);}
 static int trace(const char *format,...) {if(strstr(format,"PICASSO_HID consumer"))++logs;return 0;}
@@ -61,5 +61,15 @@ int main(){
     e.mask=2;e.touch=0;dispatch(&d,&e,0x42);assert((e.mask&0x800) && !fromEdge[1]);
     e.mask=2;e.touch=1;e.y=32000;dispatch(&d,&e,0x42);assert(!(e.mask&0x800));
     expectedEvent=nullptr;dispatch(&d,nullptr,0x42);assert(forwarded==96);
+    // Distinct synthetic/physical IDs preserve independent edge lifetimes.
+    expectedEvent=&e;e.index=255;e.mask=2;e.touch=1;e.y=65000;
+    dispatch(&d,&e,0x42);assert(fromEdge[255]);
+    OSObject finger=e;finger.index=1;finger.mask=2;finger.y=32000;
+    e.mask=2;e.touch=0;
+    OSArray children={{&finger,&e},2};OSObject collection={};collection.table=vt;collection.type=11;collection.children=&children;
+    expectedEvent=&collection;dispatch(&d,&collection,0x42);
+    assert(!(finger.mask&0x800) && (e.mask&0x800) && !fromEdge[255] && !fromEdge[1]);
+    assert(collection.mask&0x800);
+    assert(digitizerDispatches==5 && forwarded==98);
     puts("PASS actual HID wrapper, 220-slot extent, unchanged Consumer events and bounded diagnostics");
 }

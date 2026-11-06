@@ -37,6 +37,7 @@ static PicassoHidPlan gesture;
 static void (*touchSink)(void *);
 static void *touchContext;
 static int results[8];
+static unsigned reportErrors[8];
 static unsigned autoStop;
 
 extern "C" void picasso_hid_content_presented(void) {
@@ -107,7 +108,9 @@ extern "C" void native_hid_input_observed(unsigned event, int result) {
     if (event >= 8) return;
     __atomic_store_n(&results[event], result, __ATOMIC_RELEASE);
     unsigned n = __atomic_add_fetch(&native_hid_input_events[event], 1, __ATOMIC_ACQ_REL);
-    if (event < 3 || ((event == 4 || event == 5 || event == 6) && result && n <= 8))
+    const bool reportError = (event == 4 || event == 5 || event == 6) && result &&
+        __atomic_add_fetch(&reportErrors[event], 1, __ATOMIC_RELAXED) <= 8;
+    if (event < 3 || reportError)
         IOLog("PICASSO_HID event=%u sample=%u result=%x\n", event, n, result);
 }
 
@@ -165,7 +168,9 @@ extern "C" void picasso_hid_frame_presented(void) {
 static void notifyPublished(void *) { native_touch_notify(); }
 
 static void publishContact(unsigned count, int y) {
-    const int x = 15240, id = 1;
+    // Novatek owns IDs 1..10. A physical takeover must release the synthetic
+    // contact, not continue its gesture and inherited edge state as ID 1.
+    const int x = 15240, id = 255;
     nvt_touch_publication publication = {&native_touch_seq, &native_touch_count,
         native_touch_xs, native_touch_ys, native_touch_ids, 12, notifyPublished, nullptr, &native_touch_writer_lock};
     nvt_touch_publish_if(&publication, &x, &y, &id, count, &autoStop);

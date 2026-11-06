@@ -587,7 +587,7 @@ void frameLoop(Session &s) {
     if (!pollOnly) irqArmed = armTouchIrq(s);
     printf("PICASSO_NVT stage4 loop irq=%u\n", irqArmed ? 1u : 0u);
     uint32_t seen = gIrqEvents;
-    unsigned printed = 0;
+    unsigned printed = 0, transitions = 0;
     struct nvt_contact last[NVT_REPORT_POINTS];
     int lastN = 0;
     for (;;) {
@@ -607,6 +607,7 @@ void frameLoop(Session &s) {
         if (sample < 0) { fail(50, sample); return; }
         ++native_novatek_touch_valid;
         if (sample && publish(out, n)) {
+            const bool changed = !sameFingerSet(out, n, last, lastN);
             memcpy(last, out, sizeof(out[0]) * static_cast<size_t>(n));
             lastN = n;
             ++native_novatek_touch_frames;
@@ -616,14 +617,14 @@ void frameLoop(Session &s) {
                 native_novatek_touch_last_x = point.x;
                 native_novatek_touch_last_y = point.y;
             }
-            if (printed < 6) {
-                printf("PICASSO_NVT report contacts=%d%s%s\n", n, n > 0 ? "" : " (lift)",
-                       n > 0 ? " first" : "");
-                ++printed;
-            }
-            if (n > 0 && printed <= 6) {
-                printf("PICASSO_NVT point id=%d x=%d y=%d\n", out[0].tracking_id, out[0].x, out[0].y);
-                ++printed;
+            // Motion must not consume the entire press/lift diagnostic budget.
+            if ((changed && transitions < 24) || (!changed && printed < 8)) {
+                if (changed) ++transitions; else ++printed;
+                printf("PICASSO_NVT report seq=%u contacts=%d transition=%u id=%d panel=%d/%d hid=%d/%d samples=%u frames=%u\n",
+                    native_touch_seq, n, changed ? 1u : 0u, n ? out[0].tracking_id : -1,
+                    n ? out[0].x : 0, n ? out[0].y : 0,
+                    n ? native_novatek_touch_last_x : 0, n ? native_novatek_touch_last_y : 0,
+                    native_novatek_touch_valid, native_novatek_touch_frames);
             }
         }
         if (!irqArmed) IOSleep(pollOnly ? 4 : 10);
