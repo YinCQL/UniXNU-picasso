@@ -4,6 +4,7 @@
 // /tmp/wlan-probe/real/ipa_fws), the matching .mdt/.b00.../.elf files are read read-only and cross-checked.
 #include "WlanBoard.h"
 #include "WlanFirmware.h"
+#include "WlanSmem.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -240,6 +241,72 @@ static void probe_tests(void) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+
+static uint8_t smem_fixture[WLAN_SMEM_SIZE];
+static unsigned smem_reads,smem_mutate;
+static int smem_read_test(void *ctx,uint32_t offset,void *out,uint32_t size) {
+    (void)ctx;CHECK(offset<=sizeof smem_fixture && size<=sizeof smem_fixture-offset);
+    ++smem_reads;memcpy(out,smem_fixture+offset,size);
+    if (smem_mutate && size==20 && offset==0x1000) ((uint8_t *)out)[12]^=8;
+    return 0;
+}
+static void smem_prepare(void) {
+    memset(smem_fixture,0,sizeof smem_fixture);smem_reads=smem_mutate=0;
+    put32(smem_fixture,0x5c,12U<<16);
+    unsigned toc=WLAN_SMEM_SIZE-4096;uint8_t *t=smem_fixture+toc;
+    memcpy(t,"$TOC",4);put32(t,4,1);put32(t,8,1);
+    put32(t,32,0x1000);put32(t,36,0x1000);t[46]=1;put32(t,48,64);
+    uint8_t *h=smem_fixture+0x1000;memcpy(h,"$PRT",4);h[6]=1;
+    put32(h,8,0x1000);put32(h,12,32+16+344);put32(h,16,0x1000);
+    h[32]=0xa5;h[33]=0xa5;h[34]=435&255;h[35]=435>>8;put32(h,36,344);h[40]=4;
+    uint8_t *v=h+48;memcpy(v,"$SMP",4);v[4]=1;v[8]=1;v[12]=16;v[14]=1;
+    memcpy(v+20,"wlan",5);put32(v,36,3);
+}
+static void smem_tests(void) {
+    struct wlan_smem_io io={NULL,smem_read_test};struct wlan_smem_partition p;
+    struct wlan_smem_item item;uint32_t value;
+    smem_prepare();CHECK(!wlan_smem_partition(&io,0,1,&p));CHECK(p.offset==0x1000 && p.size==0x1000);
+    CHECK(!wlan_smem_find(&io,&p,435,&item));CHECK(item.offset==0x1030 && item.size==340);
+    CHECK(!wlan_smp2p_wlan(&io,&item,1,0,&value) && value==3);
+    CHECK(wlan_smem_find(&io,&p,428,&item)==-2);
+    CHECK(wlan_smp2p_wlan(&io,&item,0,1,&value)==-22);
+    for (unsigned n=0;n<10;++n) {
+        smem_prepare();uint8_t *t=smem_fixture+WLAN_SMEM_SIZE-4096,*h=smem_fixture+0x1000;
+        switch(n) {
+        case 0:t[0]=0;break;case 1:put32(t,8,65);break;case 2:put32(t,36,0xffffffff);break;
+        case 3:put32(t,48,3);break;case 4:h[6]=2;break;case 5:put32(h,12,16);break;
+        case 6:put32(h,16,4097);break;case 7:put32(h,12,4096);put32(h,16,4088);break;
+        case 8:put32(t,8,2);memcpy(t+80,t+32,48);break;case 9:put32(smem_fixture,0x5c,11U<<16);break;
+        }
+        CHECK(wlan_smem_partition(&io,0,1,&p)==-22);
+    }
+    for (unsigned n=0;n<7;++n) {
+        smem_prepare();CHECK(!wlan_smem_partition(&io,0,1,&p));uint8_t *h=smem_fixture+0x1000;
+        switch(n) {
+        case 0:h[32]=0;break;case 1:put32(h,36,0xffffffff);break;case 2:h[40]=255;h[41]=255;break;
+        case 3:h[42]=255;h[43]=255;break;case 4:put32(h,36,343);break;
+        case 5:smem_mutate=1;break;case 6:p.cacheline=0;break;
+        }
+        CHECK(wlan_smem_find(&io,&p,435,&item)==(n==5?-11:-22));CHECK(smem_reads<270);
+    }
+    // Cached items live below an aligned header, not after it.
+    smem_prepare();uint8_t *h=smem_fixture+0x1000;put32(h,12,32);put32(h,16,4096-64-384);
+    memmove(h+4096-64-384,h+48,340);memmove(h+4096-64,h+32,16);put32(h,4096-64+4,384);h[4096-64+8]=44;
+    CHECK(!wlan_smem_partition(&io,0,1,&p));CHECK(!wlan_smem_find(&io,&p,435,&item));
+    CHECK(item.offset==0x1000+4096-64-384 && item.size==340);
+    CHECK(!wlan_smp2p_wlan(&io,&item,1,0,&value));
+    struct wlan_smem_item outside={WLAN_SMEM_SIZE-8,340};
+    unsigned before=smem_reads;
+    CHECK(wlan_smp2p_wlan(&io,&outside,1,0,&value)==-22 && before==smem_reads);
+    for(unsigned n=0;n<4;++n) {
+        smem_prepare();CHECK(!wlan_smem_partition(&io,0,1,&p));CHECK(!wlan_smem_find(&io,&p,435,&item));
+        uint8_t *v=smem_fixture+item.offset;
+        if(n==0)v[0]=0;if(n==1)v[4]=2;if(n==2)v[14]=17;if(n==3)item.size=339;
+        CHECK(wlan_smp2p_wlan(&io,&item,1,0,&value)==-22);
+    }
+    puts("PASS: bounded SMEM/SMP2P partition, cached/uncached items, identity, truncation and concurrent allocation");
+}
+
 int main(int argc, char **argv) {
     uint8_t sha[WLAN_MBN_HASH_LEN];
     static const uint8_t abc[] = {'a', 'b', 'c'};
@@ -399,6 +466,7 @@ int main(int argc, char **argv) {
     CHECK(wlan_bdf_name(name, sizeof name, 0x1000, 0x0a, WLAN_BDF_NAME_CHIP) == WLAN_ERR_INVAL);
     CHECK(wlan_bdf_name(name, sizeof name, 0x390, 0x100, WLAN_BDF_NAME_BOARD) == WLAN_ERR_INVAL);
 
+    smem_tests();
     handshake_tests(&m);
     probe_tests();
     real_mdt_test(argc > 1 ? argv[1] : NULL);

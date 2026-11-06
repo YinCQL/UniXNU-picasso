@@ -8,7 +8,7 @@ CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Werror
 CPPFLAGS += -I..
 REAL ?=
 OBJECTS = main.o WlanFirmware.o WlanBoard.o
-HEADERS = ../WlanBoard.h ../WlanFirmware.h
+HEADERS = ../WlanBoard.h ../WlanFirmware.h ../WlanSmem.h
 
 test: $(OBJECTS) Makefile
 	$(CXX) -o wlan_tests $(OBJECTS)

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // picasso (SM7250 "lito") WLAN bring-up probe. `sheng-wlan=<n>`:
-//   1  map the icnss/WCSS block read-only, snapshot its identity window, validate the five regulator rails
+// Always: inspect the reserved SMEM/SMP2P metadata once, without starting MPSS.
+//   1  report the WCSS mission-mode prerequisite, validate the five regulator rail descriptions
 //   2  read the apps-SMMU geometry and the SMR entry for stream 0xc0, compute the MSA page plan, touch MSA page 0
 //   3  parse/verify a caller-supplied MBN and publish the WLFW/QMI handshake plan as far as it can be specified
 //   4  publish the transport conclusion (integrated SNOC/CE; no PCIe link training or SDIO enumeration exists)
@@ -18,6 +19,7 @@
 extern "C" {
 #include "WlanBoard.h"
 #include "WlanFirmware.h"
+#include "WlanSmem.h"
 }
 
 extern "C" {
@@ -73,16 +75,47 @@ int fail(unsigned step, int code) {
 }
 
 struct Session {
-    Region icnss, smmu, msa;
+    Region smmu, msa;
 };
 
-// Stage 1: read-only identity. The register block has no public field map for this build, so the probe reports
-// the first eight words verbatim and does not guess at names. No write of any kind.
-int stage1(void *ctx) {
-    Session *s = static_cast<Session *>(ctx);
+// A first MPSS control-plane survey can run even with no WLAN firmware. The
+// reserved SMEM mapping is read-only in our code; never read the WCSS register
+// window before MPSS/WLFW reports mission mode (Raphael exposed that hazard).
+static int smemRead(void *context, uint32_t offset, void *out, uint32_t size) {
+    Region *region = static_cast<Region *>(context);
+    volatile const uint8_t *source = reinterpret_cast<volatile const uint8_t *>(region->va);
+    for (uint32_t i=0;i<size;++i) static_cast<uint8_t *>(out)[i]=source[offset+i];
+    return 0;
+}
+static void smemSurvey() {
+    Region region = {};
+    if (!mapRegion(WLAN_SMEM_BASE, WLAN_SMEM_SIZE, region)) {
+        printf("PICASSO_WLAN smem map error=%d\n", WLAN_ERR_NOMEM); return;
+    }
+    struct wlan_smem_io io = {&region, smemRead};
+    struct wlan_smem_partition partition = {};
+    int error = wlan_smem_partition(&io, 0, 1, &partition);
+    // Match stock qcom_smem_get: global only when the private partition is absent.
+    if (error == -2) error = wlan_smem_partition(&io, 0xfffe, 0xfffe, &partition);
+    printf("PICASSO_WLAN smem error=%d partition=%x size=%x free=%x..%x radio_started=0\n",
+        error, partition.offset, partition.size, partition.uncached, partition.cached);
+    if (error) return;
+    const uint16_t ids[] = {WLAN_SMEM_IN, WLAN_SMEM_OUT};
+    for (unsigned i=0;i<2;++i) {
+        struct wlan_smem_item item = {};
+        uint32_t value=0;
+        int found=wlan_smem_find(&io,&partition,ids[i],&item);
+        int parsed=found ? found : wlan_smp2p_wlan(&io,&item,i ? 0 : 1,i ? 1 : 0,&value);
+        printf("PICASSO_WLAN smp2p item=%u found=%d parsed=%d wlan=%x\n",ids[i],found,parsed,value);
+    }
+}
+
+// Stage 1: validate static rail descriptions. No WCSS MMIO before mission mode.
+int stage1(void *) {
     native_wlan_step = 11;
-    if (!mapRegion(WLAN_ICNSS_BASE, WLAN_ICNSS_SIZE, s->icnss)) return fail(11, WLAN_ERR_NOMEM);
-    for (unsigned i = 0; i < 8; ++i) native_wlan_regs[i] = rd32(s->icnss.va, 4 * i);
+    // WCSS register access is not valid before the firmware enters mission mode.
+    // Keep the old stage interface but report the explicit prerequisite.
+    printf("PICASSO_WLAN stage1 WCSS MMIO deferred: MPSS/WLFW mission mode unavailable\n");
 
     native_wlan_step = 12;
     unsigned rails = 0;
@@ -95,12 +128,10 @@ int stage1(void *ctx) {
     }
     native_wlan_rails = rails;
 
-    // There is no clock or interconnect specifier in the icnss DT node, and this tree has no PMIC/SPMI backend.
-    // Nothing is written: see WlanBoard.h for why a guessed GCC write would be unsafe.
+    // The display/button SPMI backend does not implement WLAN rail ownership.
+    // Nothing is written: see WlanBoard.h for the board's clock/interconnect facts.
     native_wlan_step = 13;
-    printf("PICASSO_WLAN stage1 icnss=%08x %08x %08x %08x %08x %08x %08x %08x rails=%u clocks=%u ic=%u\n",
-           native_wlan_regs[0], native_wlan_regs[1], native_wlan_regs[2], native_wlan_regs[3],
-           native_wlan_regs[4], native_wlan_regs[5], native_wlan_regs[6], native_wlan_regs[7],
+    printf("PICASSO_WLAN stage1 mmio_read=0 rails_validated=%u clocks=%u ic=%u\n",
            rails, static_cast<unsigned>(WLAN_CLOCK_SPECIFIERS),
            static_cast<unsigned>(WLAN_ICNSS_INTERCONNECTS));
     return 0;
@@ -252,10 +283,13 @@ extern "C" void native_wlan_set_firmware(const uint8_t *data, size_t size) {
     __atomic_store_n(&gFirmware, data, __ATOMIC_RELEASE);
 }
 
-// Callable from the boot monitor. `sheng-wlan=<n>` selects the last stage to run; without it the probe does
-// nothing. The entry point depends only on IOKit and its own pure helpers, so a boot monitor can declare it
+// Callable from the boot monitor. Always performs one bounded SMEM survey;
+// `sheng-wlan=<n>` selects additional legacy diagnostic stages. The entry point
+// depends only on IOKit and its own pure helpers, so a boot monitor can declare it
 // weak_import and link whether or not this driver is included.
 extern "C" void native_wlan_probe(void) {
+    static bool surveyed;
+    if (!surveyed) { surveyed=true; smemSurvey(); }
     unsigned stage = 0;
     if (!PE_parse_boot_argn("sheng-wlan", &stage, sizeof stage) || stage < 1) return;
     if (native_wlan_stage_req) return;
