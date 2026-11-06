@@ -150,3 +150,35 @@ Hardware result (gpu10, `picasso-wled=0`): no `PICASSO_ABORTTEXT` and no
 with 0 failures in 62 s (~60 fps) on the 1080x2400 panel. This is the first run
 where backboardd survives CA fragment pipeline creation and the display keeps
 receiving presented frames; touch injection is still a separate open item.
+
+## Zero-copy scanout prepared; battery cut the run short (2026-11-06 19:10 CST)
+
+The iPadOS zero-copy path is already ported in this tree (`3732ae6`
+`sheng-dpu-scanout=2` through the display SMMU slot window, `6ce848a` early
+retire at the flip, `3103dd0` the build fix). The kernel carries the direct
+scanout code and the fence interface (`native_adreno_fences` in
+NativeAdrenoPublish.cpp); only the payload has not enabled it. With GPU pixels
+proven by gpu10, `out/gpu11/picasso/boot/gpu11.img` (`74f952e8...`) is gpu10
+plus `sheng-dpu-scanout=2`; its joined command line is 999 bytes, just under
+the 1000-byte DarwinBoot limit.
+
+At 18:45:39 the gpu10 session stopped printing and the phone disappeared from
+USB; the hub reports no connected port and the user reports the battery was
+flat. The kernel asks for 500 mA of USB power (config descriptor 250 x 2 mA),
+but the idle audiomxd storm plus the Setup launch loop and GPU submits
+(42,498 in that boot) outran the charger. The phone is charging; while
+`temp/hold-in-fastboot` exists, `temp/control-watch.sh` keeps it in fastboot
+instead of booting iOS below charge.
+
+Setup diagnostic images for the next powered session (kernel sha256
+`cf3099a44573a86c70a0b0b414e6b75cf98e1dd032f3a60c14620ef5bcb3df59`, which adds
+Setup to the `PICASSO_UI_EXIT` probe in `11b4b3b`):
+
+- `out/gpu12/picasso/boot/gpu12.img` (`5bb194a3...`) — probe only, default
+  app injection.
+- `out/gpu13/picasso/boot/gpu13.img` (`f342bbb7...`) — same kernel with
+  `picasso_inject_apps=0`, isolating whether the statusbar dylib injected into
+  Setup is why the app relaunches every ~20 s.
+
+`out/gpu10/picasso/boot/gpu10.img` (`46c5ba2f...`) remains the proven GPU
+baseline.
