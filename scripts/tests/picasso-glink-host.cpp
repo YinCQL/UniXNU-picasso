@@ -39,6 +39,7 @@ static void local187Tests();
 static void fastrpcTests();
 static void tftpTests();
 static void afeTests();
+static void registryQmiTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -124,7 +125,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
+    registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -483,6 +484,28 @@ static unsigned frameworkReady(PicassoGlink &s) {
     packet(s,rx,1,reinterpret_cast<const uint8_t *>(state),36);message(s,rx,14,7,91);
     step(s);drain(s);assert(s.apr.ready && !s.apr.fw.sent);return rx;
 }
+__attribute__((noinline)) static void registryQmiTests() {
+    PicassoGlink s={};unsigned rx=discoveredQmi(s);
+    for(auto &d:s.qrtr.qmi.domains) { d.sent=true;d.completed=true;d.stateValid=true;d.state=0x1fffffff; }
+    picasso_qmi_registry_idle(&s.qrtr.qmi,1283);
+    p32(s.desc.offset,(s.txHead+8)%s.tx.size);
+    for(unsigned n=0;n<10;++n)step(s);
+    assert(s.qrtr.qmi.round==1 && !s.qrtr.qmi.domains[0].sent && !s.qrtrRemote[0].busy);
+    drain(s);unsigned at=s.txHead;step(s);drain(s);
+    assert(s.qrtr.qmi.domains[0].pending && s.qrtrRemote[0].busy);
+    bool found=false;for(unsigned n=at;n+68<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x20009) {
+        assert(picasso_qmi_u16(ram+s.tx.offset+n+49)==4);found=true;
+    }assert(found);
+    const uint8_t stale[]={2,1,0,0x21,0,14,0,2,4,0,0,0,0,0,0x10,4,0,0xff,0xff,0xff,0x1f};
+    uint32_t data[14]={1,1,5,3,0,21,1,0x186};memcpy(data+8,stale,sizeof stale);
+    qrtrPacket(s,rx,s.qrtrLocal[0].id,data,56);step(s);drain(s);
+    assert(s.qrtr.qmi.domains[0].pending && !s.qrtr.qmi.domains[0].stateValid);
+    reinterpret_cast<uint8_t *>(data+8)[1]=4;
+    qrtrPacket(s,rx,s.qrtrLocal[0].id,data,56);step(s);drain(s);
+    assert(s.qrtr.qmi.domains[0].stateValid && s.qrtr.qmi.domains[0].completed && !s.failed);
+    picasso_glink_stop(&s);assert(!s.qrtr.qmi.domains[0].stateValid && !s.qrtr.qmi.bound);
+    puts("PASS registry QMI refresh through GLINK under TX pressure, stale response rejection and shutdown");
+}
 static unsigned locatorAnnounceReady(PicassoGlink &s) {
     unsigned rx=connectQrtr(s);s.apr.error=-60;
     const uint32_t grant[]={0x20005,1,512,0};frame(s,rx,grant,16);step(s);drain(s);step(s);drain(s);
@@ -524,6 +547,26 @@ __attribute__((noinline)) static void afeTests() {
     pending();basic[6]=3;receive(basic,sizeof basic);assert(a.afe.error==-5 && a.afe.status==3 && a.afe.responded && !a.afe.valid && a.ready);
     uint32_t v0[14]={0x00380150,0x404,0x504,0x20520001,0x10106};memcpy(v0+5,response+8,36);
     pending();receive(v0,sizeof v0);assert(a.afe.valid && a.afe.config[3]==48000);
+    // 21:10 hardware captured header/size/opcode, not its payload bytes. Model
+    // both status outcomes of the firmware's 48-byte allocated payload, with
+    // nonzero spare capacity to prove it is not interpreted as config data.
+    uint32_t allocated[20];memcpy(allocated,response,sizeof response);
+    allocated[0]=0x00500181;allocated[17]=0xaaaaaaaa;allocated[18]=0xbbbbbbbb;allocated[19]=0xcccccccc;
+    pending();receive(allocated,sizeof allocated);
+    assert(a.afe.valid && a.afe.responded && a.afe.payloadBytes==48 && a.afe.headerBytes==32 && a.afe.config[3]==48000 && a.afe.raw[11]==0xcccccccc);
+    pending();allocated[8]=2;receive(allocated,sizeof allocated);
+    assert(a.afe.responded && !a.afe.valid && !a.afe.pending && a.afe.status==2 && a.afe.error==-5 && a.ready);
+    allocated[8]=0;
+    pending();allocated[11]=19;receive(allocated,sizeof allocated);
+    assert(a.afe.pending && !a.afe.valid && a.afe.rejected==1 && a.afe.raw[3]==19);
+    for(unsigned i=0;i<10;++i)receive(allocated,sizeof allocated);
+    assert(a.afe.rejected==4 && a.afe.events==4);allocated[11]=20;
+    for(unsigned bytes=0;bytes<sizeof allocated;++bytes) {
+        if(bytes==68)continue; // legitimate compact form
+        pending();uint32_t h=allocated[0];allocated[0]=(bytes<<16)|0x181;
+        receive(allocated,bytes);assert(!a.afe.valid);allocated[0]=h;
+    }
+    pending();allocated[12]=2;receive(allocated,sizeof allocated);assert(!a.afe.valid && a.afe.pending);allocated[12]=1;
     const unsigned payloads[]={4,16,36};for(unsigned payload:payloads) {
         pending();v0[0]=((20+payload)<<16)|0x150;v0[5]=7;receive(v0,20+payload);
         assert(a.afe.responded && !a.afe.pending && !a.afe.valid && a.afe.status==7 && a.afe.error==-5);
@@ -537,6 +580,9 @@ __attribute__((noinline)) static void afeTests() {
     packet(s,rx,1,reinterpret_cast<uint8_t *>(response)+29,39,0,true);step(s);drain(s);
     assert(s.apr.afe.valid && s.apr.ready && !s.failed);
     picasso_glink_stop(&s);assert(!s.apr.afe.valid && !s.apr.afe.pending && s.apr.afe.error==-104);
+    rx=afeReady(s);step(s);drain(s);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(allocated),sizeof allocated);step(s);drain(s);
+    assert(s.apr.afe.valid && s.apr.afe.payloadBytes==48 && !s.apr.malformed && s.apr.ready);
     // Too-small intents request the actual packet size. Denial stays local to
     // this optional probe; the CORE/framework and file transport stay usable.
     rx=afeReady(s);s.remoteIntent[0].size=20;at=s.txHead;step(s);drain(s);

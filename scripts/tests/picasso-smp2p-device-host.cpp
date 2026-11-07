@@ -179,7 +179,9 @@ int main(int argc,char **argv) {
     logRpcRequest(record,0xffffffffU);
     PicassoAprProbe apr={};apr.afe.valid=true;
     apr.afe.token=apr.afe.opcode=apr.afe.api=apr.afe.status=0xffffffffU;apr.afe.error=-2147483647;
-    for(auto &v:apr.afe.config)v=0xffffffffU;logAfe(apr);
+    for(auto &v:apr.afe.config)v=0xffffffffU;
+    apr.afe.payloadBytes=48;apr.afe.headerBytes=32;apr.afe.rejected=4;
+    for(auto &v:apr.afe.raw)v=0xffffffffU;logAfe(apr);
     PicassoRpcIdle idle={};for(unsigned n=0;n<1000;++n)assert(!picasso_rpc_idle(idle,0));
     assert(!picasso_rpc_idle(idle,1287));for(unsigned n=0;n<99;++n)assert(!picasso_rpc_idle(idle,1287));
     assert(picasso_rpc_idle(idle,1287));for(unsigned n=0;n<1000;++n)assert(!picasso_rpc_idle(idle,1287));

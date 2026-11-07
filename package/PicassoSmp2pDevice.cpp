@@ -105,6 +105,12 @@ void logAfe(const PicassoAprProbe &a) {
     const auto &v=a.afe;
     IOLog("PICASSO_ADSP afe sent=%u pending=%u responded=%u valid=%u api=%u token=%x opcode=%x status=%u error=%d port=1002 pcm=0\n",
         v.sent,v.pending,v.responded,v.valid,v.api,v.token,v.opcode,v.status,v.error);
+    if(v.payloadBytes) {
+        IOLog("PICASSO_ADSP afe-wire header_bytes=%u payload_bytes=%u rejected=%u status=%u module=%x param=%x size_reserved=%x\n",
+            v.headerBytes,v.payloadBytes,v.rejected,v.raw[0],v.raw[1],v.raw[2],v.raw[3]);
+        IOLog("PICASSO_ADSP afe-data words=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x pcm=0\n",
+            v.raw[4],v.raw[5],v.raw[6],v.raw[7],v.raw[8],v.raw[9],v.raw[10],v.raw[11]);
+    }
     if(v.valid)IOLog("PICASSO_ADSP afe-config port=1002 minor=%u bits=%u channel=%u mono_stereo=%u ws=%u rate=%u format=%u pcm=0\n",
         v.config[0],v.config[1]&65535,v.config[1]>>16,v.config[2]&65535,v.config[2]>>16,v.config[3],v.config[4]&65535);
 }
@@ -227,6 +233,8 @@ void bootService(void *context) {
             bool idle=picasso_rpc_idle(b->rpcIdle[n],d.requests);
             if(trace || idle)logRpcRequest(d,b->rpcTrace[n].repeated);
             if(idle) {
+                if(n==1 && d.stage==5 && !d.error && !g->fastrpc.stopped)
+                    picasso_qmi_registry_idle(&g->qrtr.qmi,d.requests);
                 IOLog("PICASSO_ADSP rpc-idle pd=%u count=%u ticks=100 stage=%u queued=%u/%u pending=%u/%u complete=%u/%u error=%d sensor_init=unknown\n",
                     d.pd,d.requests,d.stage,d.call[0].queued,d.call[1].queued,d.call[0].pending,d.call[1].pending,
                     d.call[0].complete,d.call[1].complete,d.error);
@@ -255,12 +263,14 @@ void bootService(void *context) {
                 q.payloadWords[0],q.payloadWords[1],q.payloadWords[2],q.payloadWords[3]);
             b->qrtrEvents=q.events; b->qrtrReceived=q.received; b->qrtrError=q.error; ++b->qrtrLogs;
         }
-        if(q.qmi.events!=b->qmiEvents && b->qmiLogs<16) {
+        if(q.qmi.events!=b->qmiEvents && b->qmiLogs<32) {
             b->qmiEvents=q.qmi.events;++b->qmiLogs;
+            IOLog("PICASSO_ADSP qmi-phase round=%u registry_requests=%u refresh_requested=%u\n",
+                q.qmi.round,q.qmi.registryRequests,q.qmi.refreshRequested);
             for(unsigned n=0;n<PicassoQmiDomains;++n) {
                 const auto &d=q.qmi.domains[n];
                 IOLog("PICASSO_ADSP qmi domain=%s server=%u/%x bound=%u txn=%u sent=%u pending=%u complete=%u state_valid=%u state=%x result=%u remote_error=%u error=%d\n",
-                    picasso_qmi_domain(n),q.qmi.node,q.qmi.port,q.qmi.bound,n+1,d.sent,d.pending,d.completed,d.stateValid,d.state,d.result,d.remoteError,d.error);
+                    picasso_qmi_domain(n),q.qmi.node,q.qmi.port,q.qmi.bound,picasso_qmi_transaction(&q.qmi,n),d.sent,d.pending,d.completed,d.stateValid,d.state,d.result,d.remoteError,d.error);
             }
         }
     }

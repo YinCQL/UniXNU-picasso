@@ -57,12 +57,22 @@ inline void picasso_apr_receive(PicassoAprProbe *p, const uint8_t *data, uint32_
         } else if(p->opcode==0x10106) {
             if(bytes<4) { ++p->malformed;return; }
             uint32_t status=wlan_sm32(b);
-            if(!status && (bytes!=36 || wlan_sm32(b+4)!=0x1020c || wlan_sm32(b+8)!=0x1020d ||
+            // Picasso firmware b01ed1f0..b01ed2e8 allocates param_hdr(12) +
+            // requested payload_size(32) + status(4). The reported param_size
+            // describes actual data, not the capacity of this 48-byte reply.
+            // Stock q6afe also sends 32 here. Keep its wire contract and allow
+            // the 12 unused capacity bytes; never decode them as parameters.
+            if((bytes!=36 && bytes!=48) && (!status || (bytes!=4 && bytes!=16))) {
+                ++p->malformed;return;
+            }
+            v.status=status;v.opcode=p->opcode;v.payloadBytes=bytes;v.headerBytes=headerBytes;
+            for(unsigned i=0;i<12;++i)v.raw[i]=i<bytes/4?wlan_sm32(b+i*4):0;
+            if(!status && (wlan_sm32(b+4)!=0x1020c || wlan_sm32(b+8)!=0x1020d ||
                 wlan_sm32(b+12)!=20 || wlan_sm32(b+16)!=1 || (wlan_sm32(b+32)>>16))) {
+                if(v.rejected<4) { ++v.rejected;++v.events; }
                 ++p->malformed;return;
             }
             // A nonzero DSP status is an actual response, never a usable route.
-            if(status && bytes!=4 && bytes!=16 && bytes!=36) { ++p->malformed;return; }
             v.status=status;v.opcode=p->opcode;v.pending=false;v.responded=true;v.valid=!status;v.error=status?-5:0;
             if(!status)for(unsigned i=0;i<5;++i)v.config[i]=wlan_sm32(b+16+i*4);
             ++v.events;

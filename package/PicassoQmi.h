@@ -12,14 +12,23 @@ struct PicassoQmiDomain {
 };
 struct PicassoQmi {
     PicassoQmiDomain domains[PicassoQmiDomains];
-    uint32_t node, port, events, received, malformed, ignored;
-    bool bound, lost;
+    uint32_t node, port, events, received, malformed, ignored, round, registryRequests;
+    bool bound, lost, refreshRequested;
 };
 inline const char *picasso_qmi_domain(unsigned n) {
     return n==0?"msm/adsp/root_pd":n==1?"msm/adsp/sensor_pd":"msm/adsp/audio_pd";
 }
 inline uint32_t picasso_qmi_u16(const uint8_t *p) { return p[0]|(uint32_t(p[1])<<8); }
 inline uint32_t picasso_qmi_u32(const uint8_t *p) { return picasso_qmi_u16(p)|(picasso_qmi_u16(p+2)<<16); }
+inline unsigned picasso_qmi_transaction(const PicassoQmi *q,unsigned domain) {
+    return q->round*PicassoQmiDomains+domain+1;
+}
+// One later observation after registry activity goes quiet. Do not reuse the
+// initial transaction IDs: a delayed startup reply must not pass as new state.
+inline void picasso_qmi_registry_idle(PicassoQmi *q,uint32_t requests) {
+    if(!requests || q->round || q->lost || q->refreshRequested)return;
+    q->registryRequests=requests;q->refreshRequested=true;++q->events;
+}
 inline void picasso_qmi_lost(PicassoQmi *q) {
     if (!q->bound) return;
     q->bound=false; q->lost=true; ++q->events;
@@ -28,6 +37,14 @@ inline void picasso_qmi_lost(PicassoQmi *q) {
 inline int picasso_qmi_due(PicassoQmi *q) {
     int due=-1;
     if (!q->bound) return due;
+    if(q->refreshRequested && !q->round) {
+        bool finished=true;
+        for(const auto &d:q->domains)if(!d.sent || d.pending)finished=false;
+        if(finished) {
+            for(auto &d:q->domains)d={};
+            q->round=1;q->refreshRequested=false;++q->events;
+        }
+    }
     for(unsigned n=0;n<PicassoQmiDomains;++n) {
         auto &d=q->domains[n];
         if (d.pending && ++d.ticks>100) { d.pending=false; d.error=-60; ++q->events; }
@@ -44,7 +61,8 @@ inline uint32_t picasso_qmi_query(const PicassoQmi *q,unsigned domain,uint8_t *p
     const char *name=picasso_qmi_domain(domain);unsigned len=0;while(name[len])++len;
     unsigned payload=10+len;
     put(0,1);put(4,1);put(8,1);put(12,PicassoQmiPort);put(20,payload);put(24,q->node);put(28,q->port);
-    p[32]=0;p[33]=uint8_t(domain+1);p[35]=0x21;p[37]=uint8_t(3+len);
+    unsigned transaction=picasso_qmi_transaction(q,domain);
+    p[32]=0;p[33]=uint8_t(transaction);p[34]=uint8_t(transaction>>8);p[35]=0x21;p[37]=uint8_t(3+len);
     p[39]=1;p[40]=uint8_t(len);for(unsigned n=0;n<len;++n)p[42+n]=uint8_t(name[n]);
     return 32+((payload+3)&~3U);
 }
@@ -53,7 +71,8 @@ inline bool picasso_qmi_receive(PicassoQmi *q,uint32_t sn,uint32_t sp,uint32_t d
     ++q->received;
     if (size<7 || picasso_qmi_u16(p+5)!=size-7) { ++q->malformed; return true; }
     unsigned txn=picasso_qmi_u16(p+1);
-    if(p[0]!=2 || picasso_qmi_u16(p+3)!=0x21 || txn<1 || txn>PicassoQmiDomains || !q->domains[txn-1].pending) {
+    unsigned first=picasso_qmi_transaction(q,0);
+    if(p[0]!=2 || picasso_qmi_u16(p+3)!=0x21 || txn<first || txn>=first+PicassoQmiDomains || !q->domains[txn-first].pending) {
         ++q->ignored;return true;
     }
     bool resultSeen=false,stateSeen=false;uint32_t result=0,remoteError=0,state=0;
@@ -74,7 +93,7 @@ inline bool picasso_qmi_receive(PicassoQmi *q,uint32_t sn,uint32_t sp,uint32_t d
         (!result && stateSeen && state!=0x0fffffff && state!=0x1fffffff && state!=0x2fffffff && state!=0x7fffffff)) {
         ++q->malformed;return true;
     }
-    auto &d=q->domains[txn-1];d.pending=false;d.completed=true;d.result=result;d.remoteError=remoteError;
+    auto &d=q->domains[txn-first];d.pending=false;d.completed=true;d.result=result;d.remoteError=remoteError;
     d.state=state;d.stateValid=!result && stateSeen;d.error=result?-5:0;++q->events;return true;
 }
 #endif
