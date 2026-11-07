@@ -39,8 +39,8 @@ struct NativeAdrenoMetalDiag {
     char reader[3][17];      /* process names that read a registry property of the accelerator, newest first */
     char name_reader[17];    /* latest process that read MetalPluginName specifically */
     char starter[3][17];     /* processes that sent plugin marker 1 (the plugin's initWithAcceleratorPort: started), newest first */
-    char report[64];         /* the plugin's own result line (SetMetadata text), latest */
-    char report2[64];        /* the plugin's Turnip-phase line (text starting "T " or "W "), latest */
+    char report[512];        /* the plugin's own result line (SetMetadata text), latest */
+    char report2[512];       /* the plugin's Turnip-phase line (text starting "T " or "W "), latest */
     uint32_t grants;         /* opens granted to the render server by this driver in place of the sandbox verdict (the view in GpuPowerProbe.cpp ends before this) */
 } native_adreno_metal_diag;
 /* BO CPU views (clientMemoryForType for a BO token): [0] calls, [1] new descriptors, [2] served from the view cache, [3] refused (not a BO / out of
@@ -1189,7 +1189,7 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
                  * rewrites report2 every ten seconds, so cap the number of lines. wf238: enough lines for the scanout
                  * serve loop's periodic PF lines (the self-test consumes most of the old 64-line budget). */
                 static unsigned lines;
-                if(line[0] && lines++<256) printf("PICASSO_GPU text: %s\n", line);
+                if(line[0] && lines++<8192) printf("PICASSO_GPU text: %s\n", line);
                 line=value==0x7fff?native_adreno_metal_diag.report2:native_adreno_metal_diag.report;
                 /* A line from a process other than the render server goes to that process's own row (native_adreno_client_text): the render server
                  * rewrites report2 every ten seconds, so the reason another process's device failed would be gone from it. */

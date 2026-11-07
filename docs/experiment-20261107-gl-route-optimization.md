@@ -77,3 +77,17 @@ snapshot pass) and absorbs ~90 % of the draws. Measuring real fill needs GPU har
   (off by default), fill probes (off by default), heartbeat probes.
 - `scripts/build-wf-payload.py`: `sheng-touch-hid=1` stripped from the board text.
 - Images: `out/gpu55..gpu60`; logs: `temp/runs/gpu5*.log`, `temp/runs/gpu56c.log`, `glab.log`.
+
+## 2026-11-07: solid text blocks -- the IOSurface table ran out (gpu69/gpu71)
+
+Long text (Calendar's lunar labels and many date runs) came out as solid rectangles of the text
+colour: black for black dates, red for the red ones. The shader is CoreAnimation's glyph pass
+("vec4(t0.a)" -- the mask is the sample's alpha) over an A008 surface, so an unreadable mask means
+the texture was never uploaded. The library registers every IOSurface CoreAnimation shows in a
+fixed table (256 entries) and -texImageIOSurface: returned NO once it was full: the surface's
+texture answered (0,0,0,1) and every glyph quad became opaque. The home screen stays under the
+cap; Calendar's month view (a surface per label) went past it -- gpu69's log reads `eagl inew ...
+n254..255`, with the blocks on screen. The table is now 1024 entries with least-recently-used
+eviction instead of refusal (never a target, never a texture bound this frame). gpu71 runs the
+same app at n=291..293 with the text correct, and the home screen keeps gpu57's rate (16.6 ms
+median, 60 fps, best 84 fps), so the fix costs nothing.

@@ -154,6 +154,10 @@ static long eagl_missing(void *context, unsigned offset);
 #include "eagl_gen.h"
 #undef EAGL_GEN_DECLARATIONS
 
+void nativegl_text(const char *text);
+
+static int say_kernel;                  /* boot-arg glsay=1: mirror say() into the kernel's text stream */
+
 static void
 say(const char *format, ...)
 {
@@ -168,6 +172,14 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+	/* The window server's stderr is not the console: with glsay=1 mirror the line into the kernel too. */
+	if (say_kernel && line[0] != '\0') {
+		static size_t sent;
+		if (sent < 1500) {
+			sent++;
+			nativegl_text(line);
+		}
+	}
 }
 
 /*
@@ -197,7 +209,7 @@ nativegl_text(const char *text)
 		if (IOServiceOpen(service, mach_task_self(), 0x41470000u | 0x7fff, &connection) == KERN_SUCCESS && connection != 0) {
 			IOServiceClose(connection);
 		}
-		for (size_t i = 0; i < length && i < 60; i++) {
+		for (size_t i = 0; i < length && i < 480; i++) {
 			connection = 0;
 			if (IOServiceOpen(service, mach_task_self(), 0x41470000u | (0x7000u | (unsigned char)text[i]), &connection) == KERN_SUCCESS &&
 			    connection != 0) {
@@ -332,7 +344,7 @@ struct eagl {
 	id object;                      /* the EAGLContext */
 	struct hakios_gl *gl;
 	unsigned long api;
-	struct image images[256];
+	struct image images[1024];
 	unsigned image_count;
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
@@ -396,7 +408,7 @@ struct eagl {
 	/* NATIVEGL: what the beat's hashing and registrations were (one boot: why glBindTexture costs what it does) */
 	uint64_t beat_hash_kb[256];
 	unsigned beat_hash_calls[256];
-	unsigned image_news, changed_trues, lock_fails;
+	unsigned image_news, image_evicted, changed_trues, lock_fails;
 	/* glfill=1: the pixels drawn this frame, and (per beat) by which of CoreAnimation's functions */
 	uint64_t fill_px, view_px;
 	unsigned fill_calls, scissor_on;
@@ -600,6 +612,8 @@ note_format(const char *how, GLenum internal, GLenum format, GLenum type, GLsize
 		use->type = type;
 		say("hakios-gl: a new kind of texture: %s, internal format %#x, format %#x, type %#x, %d x %d\n", how, internal,
 		    format, type, width, height);
+		/* The same, into the kernel console: say() goes to the window server's stderr, which is not the console. */
+		ktrace("texk %s i%x f%x t%x %dx%d", how, internal, format, type, width, height);
 	}
 	if ((unsigned)width > use->widest) {
 		use->widest = (unsigned)width;
@@ -656,10 +670,47 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 	e->image_news++;
 	if (image == NULL) {
 		if (e->image_count == sizeof(e->images) / sizeof(e->images[0])) {
-			say("hakios-gl: more textures with IOSurfaces than there is room for\n");
-			return NULL;
+			/*
+			 * The table is full. Every new surface CoreAnimation shows needs an entry for its
+			 * upload, and a surface without one is never uploaded: sampled, its texture answers
+			 * (0, 0, 0, 1), and a glyph mask that should be the alpha comes out opaque (every
+			 * text run a solid block). Take back the entry used least recently instead, never
+			 * one something is drawing into now and never a target.
+			 */
+			struct image *oldest = NULL;
+
+			for (unsigned i = 0; i < e->image_count; i++) {
+				struct image *candidate = &e->images[i];
+				bool bound = false;
+
+				if (candidate->target) {
+					continue;
+				}
+				for (unsigned unit = 0; unit < 8; unit++) {
+					if (candidate->texture == e->bound[unit]) {
+						bound = true;
+					}
+				}
+				if (bound) {
+					continue;
+				}
+				if (oldest == NULL || candidate->looked < oldest->looked) {
+					oldest = candidate;
+				}
+			}
+			if (oldest == NULL) {
+				say("hakios-gl: more textures with IOSurfaces than there is room for\n");
+				return NULL;
+			}
+			e->image_evicted++;
+			if (oldest->mirror != 0) {
+				glDeleteTextures(1, &oldest->mirror);
+			}
+			CFRelease(oldest->surface);
+			image = oldest;
+		} else {
+			image = &e->images[e->image_count++];
 		}
-		image = &e->images[e->image_count++];
 	} else {
 		if (image->mirror != 0) {
 			glDeleteTextures(1, &image->mirror);
@@ -3720,7 +3771,20 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 		group_forget(e, e->bound[e->unit]);
 	}
 	uint64_t began = slow_calls_us != 0 ? now_us() : 0;
+	while (glGetError() != 0) {
+	}
 	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
+	{
+		/* A texture CoreAnimation made that the library refused: what it asked for, so a format
+		 * the driver does not take (the glyph masks) can be told from one it does. */
+		GLenum error = glGetError();
+		static unsigned texture_errors;
+
+		if (error != 0 && texture_errors < 48) {
+			texture_errors++;
+			ktrace("texerr %x i%x f%x t%x %dx%d", error, internal, format, type, width, height);
+		}
+	}
 	if (began != 0 && now_us() - began >= slow_calls_us) {
 		/* (with glslow=US: which pictures take long to hand over) */
 		say("tl: slow-tex %dx%d level %d format %#x type %#x%s %llu at %llu\n", width, height, level, format, type,
@@ -3747,6 +3811,15 @@ my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y, 
 		group_forget(e, e->bound[e->unit]);
 	}
 	glTexSubImage2D(target, level, x, y, width, height, format, type, pixels);
+	{
+		GLenum error = glGetError();
+		static unsigned texture_errors;
+
+		if (error != 0 && texture_errors < 48) {
+			texture_errors++;
+			ktrace("tserr %x f%x t%x %d,%d %dx%d", error, format, type, x, y, width, height);
+		}
+	}
 	EAGL_LEAVE(e, 0x9a0);
 }
 
@@ -4137,7 +4210,25 @@ say_long(const char *what, const char *text)
 {
 	say("hakios-gl: %s:\n", what);
 	for (size_t at = 0, length = strlen(text); at < length; at += 900) {
-		write(2, text + at, length - at < 900 ? length - at : 900);
+		size_t n = length - at < 900 ? length - at : 900;
+
+		write(2, text + at, n);
+		/* The kernel's text stream takes one line at a time: mirror this in chunks, newlines flattened. */
+		static unsigned mirrored;
+		if (mirrored < 3000) {
+			for (size_t off = 0; off < n && mirrored < 3000; off += 380) {
+				char chunk[400];
+				size_t take = n - off < 380 ? n - off : 380;
+
+				for (size_t i = 0; i < take; i++) {
+					char c = text[at + off + i];
+					chunk[i] = c == '\n' || c == '\r' ? '|' : c;
+				}
+				chunk[take] = '\0';
+				mirrored++;
+				nativegl_text(chunk);
+			}
+		}
 	}
 	say("\n");
 }
@@ -4546,6 +4637,7 @@ install(void)
 			trace_placed = 1;
 		}
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
+		say_kernel = strstr(arguments, "glsay=1") != NULL;
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
