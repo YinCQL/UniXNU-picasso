@@ -25,6 +25,9 @@
 
 extern "C" void proc_selfname(char *, int);
 extern "C" volatile uint32_t native_adreno_table_switches[8];
+/* The RB performance counters (Adreno620Cp.cpp): 3D output pixels, 2D valid pixels, RB busy cycles. Present
+ * when the Picasso CP driver is linked; the sheng-gpu-perf=1 sampler below reads them while the ring is busy. */
+extern "C" void native_adreno620_perf_read(uint64_t *value) __attribute__((weak_import));
 /* The plugin's telemetry table (rows of text the Metal bridge keeps), sent as markers: 0xC000|row starts a row, 0x8000|(a<<7)|b appends two characters. */
 extern "C" {char native_adreno_metal_rows[48][96];volatile uint32_t native_adreno_metal_rows_seq;}
 
@@ -209,6 +212,14 @@ extern "C" {volatile uint32_t native_adreno_recovery[8];}
  * [7] the last poll time in microseconds. A starved thread shows [5] rising while [0] stalls; a false-progress CP
  * shows [2] unchanged while [3] moves. */
 extern "C" {volatile uint32_t native_adreno_hangcheck[8];}
+/* The published fence wait, counted in runCore: [0] completed waits, [1] sum of their waited microseconds, [2] loop
+ * iterations, [3] the longest wait, [4] iterations that found the fence pending. The busy report samples these to show
+ * whether a wait sleeps in the kernel or repeats the call. */
+extern "C" {extern volatile uint64_t native_adreno_wait_outer[5];}
+/* Fence waits by the timeout the caller asked for, which says whether the parking branch can ever run: [0] calls with timeout 0,
+ * [1] calls with a positive timeout, [2] the last timeout requested in us, [3] the largest, [4] calls that parked in IOSleep,
+ * [5] calls answered Timeout. gpu18's wait loop answered ~18.7k calls/s at ~8 us each, so most callers ask with 0 there. */
+static volatile uint64_t native_wait_kind[6];
 /* SMMU context faults ended before a restart (NativeAdrenoGpuContext::endFault): [0] how many, then the last one's FSR, FAR lo, FAR hi,
  * FSYNR0. A latched FSR fails every later table operation's proof of the bank, so a restart that left it would poison the tables. */
 extern "C" {volatile uint32_t native_adreno_recovery_fault[5];}
@@ -219,19 +230,93 @@ extern "C" void native_adreno_set_restart(NativeAdrenoRestart restart,void *cook
     g.restart=restart;g.restart_cookie=cookie;
     if(g.lock)IOLockUnlock(g.lock);
 }
+/* The first time the CP's fence word was seen at each of the last 64 fence numbers, sampled by the hangcheck thread every
+ * millisecond: [i&63][0] the fence, [i&63][1] the time the word first read at or above it (us). A job's retire can then be the
+ * moment the CP really wrote its fence, not the moment a client's next wait happened to look: the two are far apart when the
+ * frames crawl, and only the first is the GPU's own latency. */
+extern "C" {volatile uint64_t native_adreno_fence_done[64][2];}
 /* msm's hangcheck timer: every DRM_MSM_HANGCHECK_DEFAULT_PERIOD (500 ms, msm_gpu.h) the ring is checked for progress; a hang restarts the
  * GPU through the board's hook and replays the other submissions (recover_worker). Without a hook a hang is only counted. */
 static void nativeAdrenoHangcheck(void *,wait_result_t)
 {
     uint32_t printed_fence=~0u,printed_second=~0u;
     for(;;) {
-        IOSleep(500);
+        /* Sample the fence word every millisecond for the 500 ms period. The CP's write is the frame's real completion; the
+         * timeline's retire uses the first sighting, so its age separates GPU execution from the wait after it. */
+        for(unsigned tick=0;tick<500;++tick) {
+            IOSleep(1);
+            uint32_t value=0;
+            static uint32_t last_value;
+            if(g.published && g.ring && !g.ring->fenceValue(&value) && (int32_t)(value-last_value)>0) {
+                const uint64_t seen=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
+                uint32_t new_fences=value-last_value;
+                if(new_fences>64)new_fences=64;
+                for(uint32_t i=1;i<=new_fences;++i) {
+                    const uint32_t f=last_value+i;
+                    native_adreno_fence_done[f&63][0]=f;
+                    native_adreno_fence_done[f&63][1]=seen;
+                }
+                last_value=value;
+            }
+        }
         native_adreno_hangcheck[0]=native_adreno_hangcheck[0]+1;
         /* A plain IOLockLock hides whether the 500 ms thread is starved of g.lock by the wait/stall path;
          * count the polls that had to wait instead. */
         if(!IOLockTryLock(g.lock)) {native_adreno_hangcheck[5]=native_adreno_hangcheck[5]+1;IOLockLock(g.lock);}
         const uint64_t poll_now=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
         native_adreno_hangcheck[7]=uint32_t(poll_now);
+        /* Sampling RBBM_STATUS every poll says whether the frames' cost is GPU execution or a late completion:
+         * an idle ring reports kIOReturnSuccess, a busy one kIOReturnTimeout (a non-empty queue also counts busy). */
+        {
+            static uint64_t busy_samples,busy_hits;
+            static uint32_t busy_report;
+            if(g.ring && g.clock.now_us) {
+                ++busy_samples;
+                if(g.ring->idle(&g.clock,0)==kIOReturnTimeout)++busy_hits;
+            }
+            if(++busy_report>=120) {
+                busy_report=0;
+                printf("PICASSO_GPU busy: samples=%llu busy=%llu wait_calls=%llu loops=%llu waited_us=%llu max_us=%llu pending=%llu "
+                    "wait_kind=%llu/%llu last_us=%llu max_to=%llu parked=%llu tmo=%llu\n",
+                    (unsigned long long)busy_samples,(unsigned long long)busy_hits,
+                    (unsigned long long)native_adreno_wait_outer[0],(unsigned long long)native_adreno_wait_outer[2],
+                    (unsigned long long)native_adreno_wait_outer[1],(unsigned long long)native_adreno_wait_outer[3],
+                    (unsigned long long)native_adreno_wait_outer[4],
+                    (unsigned long long)native_wait_kind[0],(unsigned long long)native_wait_kind[1],
+                    (unsigned long long)native_wait_kind[2],(unsigned long long)native_wait_kind[3],
+                    (unsigned long long)native_wait_kind[4],(unsigned long long)native_wait_kind[5]);
+            }
+        }
+        /* sheng-gpu-perf=1: the RB performance counters, read every 500 ms and printed every 2 s -- 3D output
+         * pixels, 2D valid pixels and RB busy cycles. With the display's frame count in the same log these give
+         * pixels a frame and how much of the clock the RB is busy. Read only while the ring is busy, so the
+         * GPU's register window is powered. */
+        {
+            static int wanted=-1;
+            static bool started;
+            static uint64_t last[3],sum[3];
+            static unsigned reports;
+            if(wanted<0) {
+                unsigned on=0;
+                wanted=PE_parse_boot_argn("sheng-gpu-perf",&on,sizeof on)&&on==1;
+            }
+            if(wanted && native_adreno620_perf_read && g.ring && g.clock.now_us &&
+                g.ring->idle(&g.clock,0)==kIOReturnTimeout) {
+                uint64_t now[3]={0,0,0};
+                native_adreno620_perf_read(now);
+                if(!started) {last[0]=now[0];last[1]=now[1];last[2]=now[2];started=true;}
+                else {
+                    /* 32-bit deltas: a 32-bit counter wrapping between two polls is still a valid count. */
+                    for(int i=0;i<3;++i) {sum[i]+=uint32_t(now[i]-last[i]);last[i]=now[i];}
+                }
+                if(++reports>=4) {
+                    printf("PICASSO_GPU perf: px3d=%llu px2d=%llu rb_busy=%llu in_2s\n",
+                        (unsigned long long)sum[0],(unsigned long long)sum[1],(unsigned long long)sum[2]);
+                    sum[0]=sum[1]=sum[2]=0;
+                    reports=0;
+                }
+            }
+        }
         bool hung=false;
         if(g.submit && !g.submit->hangCheck(&hung) && hung) {
             native_adreno_recovery[0]=native_adreno_recovery[0]+1;
@@ -690,8 +775,11 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         NativeAdrenoAbiWaitFence poll{};
         memcpy(&poll,input,sizeof(poll));
         const uint64_t timeout_us=poll.timeout_ns/1000,began=g.clock.now_us(g.clock.cookie);
+        if(timeout_us==0)native_wait_kind[0]=native_wait_kind[0]+1;else native_wait_kind[1]=native_wait_kind[1]+1;
+        native_wait_kind[2]=timeout_us;
+        if(timeout_us>native_wait_kind[3])native_wait_kind[3]=timeout_us;
         poll.timeout_ns=0;
-        uint64_t waited=0;
+        uint64_t waited=0,slept=0;
         status=kIOReturnTimeout;
         for(;;) {
             waited=g.clock.now_us(g.clock.cookie)-began;
@@ -704,7 +792,23 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
                 polled=true;
                 waited=g.clock.now_us(g.clock.cookie)-began;
                 if(status!=kIOReturnTimeout || waited>=timeout_us)break;
-            } else native_adreno_wait_outer[4]=native_adreno_wait_outer[4]+1;
+            } else {
+                native_adreno_wait_outer[4]=native_adreno_wait_outer[4]+1;
+                /* The caller asked for a deadline, so park here instead of handing it a Timeout it can only answer by
+                 * calling again: the render server's wait arrived about 1500 times per submission, each call spending
+                 * the GPU's whole frame time waiting for g.lock, which is the idle heat and the CPU its frames need.
+                 * The sleep is outside the lock; the cap keeps one call bounded (the caller's retry on Timeout is the
+                 * behavior it has always had, so returning after 20 ms is safe even if its deadline is longer). */
+                /* The render server asks for exactly 1000 us (gpu20's histogram: 1,004,953 of 1,008,746 calls, none parked because
+                 * this branch required a timeout above it) and it re-calls on the Timeout, so parking the full 1 ms is exactly
+                 * the wait it asked for: it turns that 16.8k-calls/s loop into about 1k sleeps/s and gives the CPU back. */
+                if(timeout_us>=1000 && slept<20000) {
+                    native_adreno_wait_outer[2]=native_adreno_wait_outer[2]+1;
+                    native_wait_kind[4]=native_wait_kind[4]+1;
+                    IOSleep(1);slept+=1000;
+                    continue;
+                }
+            }
             native_adreno_wait_outer[2]=native_adreno_wait_outer[2]+1;
             if(!g.clock.idle || g.clock.idle(g.clock.cookie)) {
                 if(!polled) {
@@ -718,6 +822,7 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         }
         native_adreno_wait_outer[0]=native_adreno_wait_outer[0]+1;native_adreno_wait_outer[1]=native_adreno_wait_outer[1]+waited;
         if(waited>native_adreno_wait_outer[3])native_adreno_wait_outer[3]=waited;
+        if(status==kIOReturnTimeout)native_wait_kind[5]=native_wait_kind[5]+1;
     } else {
         /* A BoAlloc's system pages are made and wired before the lock is taken (NativeAdrenoMemory::prepareSystem): i14aef633e spent 4.0 s
          * in 5454 allocations under it, while every other process's submit, map and wait poll queued behind. The lock is held briefly
@@ -797,6 +902,55 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
     }
     return status;
 }
+static const char *callName(uint16_t method)
+{
+    static const char *const names[]={"?","Query","BoAlloc","BoMap","BoFree","Submit","WaitFence","Timestamp","Status","SetMeta",
+        "GetMeta","Queue","CloseQueue","BoCpuMap","BoCpuUnmap","DeviceInfo","BoImport","Prio","Note"};
+    return method<sizeof(names)/sizeof(names[0])?names[method]:"?";
+}
+/* Allocate the clients' call ring (262144 records of 32 bytes, 8 MiB) once, on the first diagnostic attach. Until this ran,
+ * AGXDeviceUserClient::run recorded nothing because the ring pointer stayed null, so every "where does the render server's
+ * kernel time go" question had to be answered by guesswork. sheng-diag=1 only. */
+extern "C" void native_adreno_call_start(void)
+{
+    if(!native_adreno_call_ring)
+        native_adreno_call_ring=(NativeAdrenoCallRec *)IOMallocZero(sizeof(NativeAdrenoCallRec)*262144ull);
+    printf("PICASSO_GPU calls attach: ring=%p\n",(void *)native_adreno_call_ring);
+}
+/* What the published clients' calls cost, as the monitor's delta: aggregate the new records of the call ring by (pid, method)
+ * and print the six that spent the most kernel time. lock_us is the part of us spent waiting for g.lock, so a starved wait and
+ * a method that is itself slow look different; kib is the BoAlloc payload size. */
+extern "C" void native_adreno_call_report(void)
+{
+    static uint32_t last;
+    NativeAdrenoCallRec *ring=native_adreno_call_ring;
+    const uint32_t now=native_adreno_call_count;
+    if(!ring || now==last)return;
+    uint32_t first=last;
+    if(now-first>65536)first=now-65536;
+    struct Slot {int32_t pid;uint16_t method;uint64_t count,us,lock,peak,kib;};
+    Slot slots[16]={};
+    for(uint32_t i=first;i<now;++i) {
+        const NativeAdrenoCallRec &r=ring[i&262143ull];
+        if(r.method>=32)continue;
+        Slot *slot=nullptr;
+        for(Slot &s:slots)if(s.count && s.pid==r.pid && s.method==r.method) {slot=&s;break;}
+        if(!slot)for(Slot &s:slots)if(!s.count) {slot=&s;s.pid=r.pid;s.method=r.method;break;}
+        if(!slot)continue;
+        ++slot->count;slot->us+=r.us;slot->lock+=r.lock_us;if(r.us>slot->peak)slot->peak=r.us;slot->kib+=r.kib;
+    }
+    last=now;
+    for(uint32_t rank=0;rank<6;++rank) {
+        Slot *best=nullptr;
+        for(Slot &s:slots)if(s.count && (!best || s.us>best->us))best=&s;
+        if(!best || !best->us)break;
+        printf("PICASSO_GPU calls: pid=%d m=%s n=%llu us=%llu max=%llu lock=%llu kib=%llu\n",
+            best->pid,callName(best->method),(unsigned long long)best->count,(unsigned long long)best->us,
+            (unsigned long long)best->peak,(unsigned long long)best->lock,(unsigned long long)best->kib);
+        best->count=0;
+    }
+}
+
 /* The processes' notes (NativeAdrenoMethodNote): rows of [words used, pid, the record's words], 512 of each kind, allocated at the first
  * note (the kernel's data segment has no room for them as arrays). The board's export reads the two pointers. */
 enum { NativeAdrenoNoteRows = 512, NativeAdrenoNoteRowWords = 2+NativeAdrenoNoteWords };
@@ -975,6 +1129,41 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
      * that a sandbox that admits neither selectors nor mapping, or a crash, still leaves a trace of how far it got. */
     if((type>>16)==NativeAdrenoPluginOpenType && (type&0xffff)) {
         const uint32_t value=type&0xffff,slot=native_adreno_metal_diag.marks_total&15;
+        /* 0x6000..0x60ff: per-program RB-counter attribution (libNativeGL glperf=2). 0x60ss opens slot ss, 0x64ss
+         * (0x6040|ss) closes it -- the caller has finished the GPU at both marks, so the difference is that
+         * segment's output -- and 0x60f0 prints the largest three and starts a new window. */
+        if(value>=0x6000 && value<0x6100) {
+            static uint64_t pm_px[64],pm_busy[64],pm_calls[64],pm_start_px[64],pm_start_busy[64];
+            static uint8_t pm_open[64];
+            const unsigned slot=value&0x3f;
+            uint64_t now[3]={0,0,0};
+            if(native_adreno620_perf_read)native_adreno620_perf_read(now);
+            if(value<0x6040) {
+                pm_start_px[slot]=now[0];pm_start_busy[slot]=now[2];pm_open[slot]=1;
+            } else if(value<0x60f0) {
+                if(pm_open[slot]) {
+                    pm_px[slot]+=uint32_t(now[0]-pm_start_px[slot]);
+                    pm_busy[slot]+=uint32_t(now[2]-pm_start_busy[slot]);
+                    pm_calls[slot]++;
+                    pm_open[slot]=0;
+                }
+            } else {
+                uint64_t total=0;
+                for(unsigned i=0;i<64;++i)total+=pm_px[i];
+                printf("PICASSO_GPU pm: total=%llu",(unsigned long long)total);
+                for(unsigned k=0;k<8;++k) {
+                    unsigned t=0;
+                    for(unsigned i=0;i<64;++i)if(pm_px[i]>pm_px[t])t=i;
+                    if(!pm_px[t])break;
+                    printf(" %u:%llu/%llu/%llu",t,(unsigned long long)pm_px[t],(unsigned long long)pm_busy[t],
+                        (unsigned long long)pm_calls[t]);
+                    pm_px[t]=0;
+                }
+                printf("\n");
+                for(unsigned i=0;i<64;++i) {pm_px[i]=0;pm_busy[i]=0;pm_calls[i]=0;}
+            }
+            return kIOReturnUnsupported;
+        }
         /* Text stream into report2, one character per marker: 0x7fff starts a line, 0x70cc appends character cc. It needs no connection,
          * so the plugin's Turnip watchdog can report while Turnip itself holds its connection slot. Not counted as markers. */
         if(value>=0x8000) {

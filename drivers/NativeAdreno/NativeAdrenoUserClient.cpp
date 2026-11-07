@@ -38,7 +38,7 @@ static void noteImportState(uint64_t handle,uint64_t state)
 }
 extern "C" volatile uint32_t native_adreno_io_coherent;
 /* Per kernel method: [method][0] calls, [1] calls that returned non-zero, [2] last status, [3] total time (us, 32-bit). Method numbers are the ABI's (1..16). */
-extern "C" {extern uint64_t (*native_adreno_vm_now_us)(void);volatile uint32_t native_adreno_method_stats[20][4];volatile uint32_t native_adreno_map_fail[7][2];}
+extern "C" {extern uint64_t (*native_adreno_vm_now_us)(void);volatile uint32_t native_adreno_method_stats[20][4];volatile uint32_t native_adreno_map_fail[7][2];volatile uint32_t native_adreno_submit_result[8];}
 static void noteImport(IOReturn status,uint32_t stage,uint64_t bytes,uint64_t address)
 {
     if(!status)return;
@@ -454,6 +454,18 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     submit_->nextRole(currentGpuRole());
     const IOReturn status=submit_->submit(vm_,buffers,request->buffer_count,
         queue_base_+request->queue,&fence,clock);
+    /* The ring's answer to a client submission: [0] accepted, [1] refused, [2] the last IOReturn, [3] bad arguments, [4] not ready,
+     * [5] timeout, [6] busy/no resources, [7] calls. gpu19 lost the Metal device after the plain path began emitting CP stamps,
+     * so this says whether the ring refused the submissions or the client stopped issuing them. */
+    if(status) {
+        native_adreno_submit_result[1]=native_adreno_submit_result[1]+1;
+        native_adreno_submit_result[2]=(uint32_t)status;
+        if(status==kIOReturnBadArgument)native_adreno_submit_result[3]=native_adreno_submit_result[3]+1;
+        else if(status==kIOReturnNotReady)native_adreno_submit_result[4]=native_adreno_submit_result[4]+1;
+        else if(status==kIOReturnTimeout)native_adreno_submit_result[5]=native_adreno_submit_result[5]+1;
+        else if(status==kIOReturnBusy||status==kIOReturnNoResources)native_adreno_submit_result[6]=native_adreno_submit_result[6]+1;
+    } else native_adreno_submit_result[0]=native_adreno_submit_result[0]+1;
+    native_adreno_submit_result[7]=native_adreno_submit_result[7]+1;
     if(status)return status;
     reply->fence=fence;
     return kIOReturnSuccess;
