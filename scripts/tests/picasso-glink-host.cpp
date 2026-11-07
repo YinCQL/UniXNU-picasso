@@ -1542,9 +1542,9 @@ static unsigned playResponse(PicassoGlink &s,uint32_t (&reply)[12],unsigned stat
     for(auto &v:reply)v=0;
     reply[0]=0x00280181;reply[1]=request[2];reply[2]=request[1];reply[3]=request[3];reply[4]=0x110e8;
     reply[8]=request[4];reply[9]=status;unsigned bytes=40;
-    if(!status && phase==4) {reply[0]=0x00240181;reply[4]=0x10d93;reply[8]=0x7788;bytes=36;}
-    if(!status && phase==5) {reply[4]=0x10329;reply[8]=0;reply[9]=0;} // COPP zero is valid
-    if(phase==8) {reply[0]=0x00300081;reply[4]=0x10d99;reply[8]=0x80000000;reply[9]=1;reply[10]=s.apr.play.handle;reply[11]=status;bytes=48;}
+    if(!status && phase==PicassoPlayMapBuffer) {reply[0]=0x00240181;reply[4]=0x10d93;reply[8]=0x7788;bytes=36;}
+    if(!status && phase==PicassoPlayOpenCopp) {reply[4]=0x10329;reply[8]=0;reply[9]=0;} // COPP zero is valid
+    if(phase==PicassoPlayWrite) {reply[0]=0x00300081;reply[4]=0x10d99;reply[8]=0x80000000;reply[9]=1;reply[10]=s.apr.play.handle;reply[11]=status;bytes=48;}
     return bytes;
 }
 static void playAck(PicassoGlink &s,unsigned status=0) {
@@ -1559,25 +1559,50 @@ static unsigned playAt(PicassoGlink &s,unsigned phase) {
 static void playCleanup(PicassoGlink &s,unsigned rx) {
     for(unsigned n=0;n<12 && !s.apr.play.done;++n) {
         step(s);drain(s);
-        if(s.apr.play.pending) {assert(s.apr.play.phase>=9);playAck(s);playRelease(s,rx);}
+        if(s.apr.play.pending) {assert(s.apr.play.phase>=PicassoPlayClose);playAck(s);playRelease(s,rx);}
     }assert(s.apr.play.done);
 }
+// Only model the stock AFE configuration lifetime, independently of host phases.
+// Firmware: SET b05a340c -> configured; START b01ecb80 requires configured;
+// STOP b01ecdc4 clears it. START's state rejection returns ADSP_EALREADY=9.
+struct StockAfeLifetime {
+    bool configured=false,running=false;
+    unsigned command(const uint32_t *w) {
+        if(w[4]==0x100ef) {
+            const uint32_t body[]={0x201002,0,0,0,0x1020c,0x1020d,20,1,0x10010,0x10001,48000,0};
+            if(running || (w[0]>>16)!=68 || memcmp(w+5,body,sizeof body))return 2;
+            configured=true;
+        } else if(w[4]==0x100e5) {
+            if(!configured || running)return 9;
+            running=true;configured=false;
+        } else if(w[4]==0x100e6) {configured=running=false;}
+        return 0;
+    }
+};
 __attribute__((noinline)) static void playTests() {
     static PicassoGlink s;unsigned rx=playReady(s);step(s);drain(s);uint32_t request[18];
-    for(unsigned phase=0;phase<14;++phase) {
+    StockAfeLifetime stock;
+    picasso_afe_request(1,request);assert(!stock.command(request));
+    picasso_port_request(0,request);assert(!stock.command(request));
+    picasso_port_request(1,request);assert(!stock.command(request));
+    picasso_port_request(0,request);assert(stock.command(request)==9); // observed old restart
+    for(unsigned phase=0;phase<PicassoPlayDone;++phase) {
         auto &v=s.apr.play;assert(v.pending && v.phase==phase);
         unsigned bytes=picasso_play_request(s.apr,request);
         assert(request[3]==0x20570001+phase && (request[0]>>16)==bytes);
-        if(phase==5) {const uint32_t adm[]={0x00300250,0x10020508,0x10020408,0x20570006,0x10326,0x12000,0xffff1002,0x10312,0x100002,48000,0x201,0};assert(!memcmp(request,adm,sizeof adm));}
-        if(phase==6) {const uint32_t route[]={0x00240250,0x508,0x408,0x20570007,0x10325,0,1,0x10001,0};assert(!memcmp(request,route,sizeof route));}
-        if(phase==7)assert(bytes==32 && request[4]==0x10daa && !request[5] && !request[6] && !request[7]);
-        if(phase==8) {const uint32_t write[]={0x00340250,0x01010507,0x01010407,0x20570009,0x10dab,0x80000000,1,0x7788,4096,1,0,0,0};assert(!memcmp(request,write,sizeof write) && silenceCalls==1);}
+        assert(!stock.command(request)); // removing/moving SET reproduces status9
+        if(phase==PicassoPlayConfigure)assert(bytes==68 && request[4]==0x100ef && !s.apr.play.pins.active);
+        if(phase==PicassoPlayStart)assert(stock.running && s.apr.play.pins.active);
+        if(phase==PicassoPlayOpenCopp) {const uint32_t adm[]={0x00300250,0x10020508,0x10020408,0x20570007,0x10326,0x12000,0xffff1002,0x10312,0x100002,48000,0x201,0};assert(!memcmp(request,adm,sizeof adm));}
+        if(phase==PicassoPlayRoute) {const uint32_t route[]={0x00240250,0x508,0x408,0x20570008,0x10325,0,1,0x10001,0};assert(!memcmp(request,route,sizeof route));}
+        if(phase==PicassoPlayRun)assert(bytes==32 && request[4]==0x10daa && !request[5] && !request[6] && !request[7]);
+        if(phase==PicassoPlayWrite) {const uint32_t write[]={0x00340250,0x01010507,0x01010407,0x2057000a,0x10dab,0x80000000,1,0x7788,4096,1,0,0,0};assert(!memcmp(request,write,sizeof write) && silenceCalls==1);}
         uint32_t reply[12];bytes=playResponse(s,reply);
         for(unsigned n=0;n<bytes;++n)picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(reply),n);
         for(unsigned i=1;i<=4;++i){reply[i]^=1;picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(reply),bytes);reply[i]^=1;}
         reply[0]^=0x100;picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(reply),bytes);reply[0]^=0x100;
-        if(phase==8)for(unsigned i=8;i<=10;++i) {reply[i]^=1;picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(reply),bytes);reply[i]^=1;}
-        if(phase==4 || phase==5 || phase==8) {
+        if(phase==PicassoPlayWrite)for(unsigned i=8;i<=10;++i) {reply[i]^=1;picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(reply),bytes);reply[i]^=1;}
+        if(phase==PicassoPlayMapBuffer || phase==PicassoPlayOpenCopp || phase==PicassoPlayWrite) {
             uint32_t ack[]={0x00280181,request[2],request[1],request[3],0x110e8,0,0,0,request[4],0};
             picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),sizeof ack);
         }
@@ -1585,37 +1610,57 @@ __attribute__((noinline)) static void playTests() {
         packet(s,rx,1,reinterpret_cast<uint8_t *>(reply),bytes);step(s);drain(s);
         assert(v.responded && !v.error && s.remoteIntent[0].busy);playRelease(s,rx);
     }
-    assert(s.apr.play.done && s.apr.play.complete && s.apr.play.consumed && !s.apr.play.owned && s.apr.play.accepted==0x3fff);
+    assert(s.apr.play.done && s.apr.play.complete && s.apr.play.consumed && !s.apr.play.owned && s.apr.play.accepted==0x7fff);
     assert(s.apr.play.pins.restored && !s.apr.play.pins.dirty && s.apr.pcm.complete && s.apr.pcm.retained);
     for(unsigned i=0;i<4;++i)assert(pinRam[i][0]==0x2800 && pinRam[i][1]==1);
     // Reject explicit failure at every command; still close acquired resources.
-    for(unsigned phase=0;phase<14;++phase) {
+    for(unsigned phase=0;phase<PicassoPlayDone;++phase) {
         rx=playAt(s,phase);playAck(s,2);playRelease(s,rx);playCleanup(s,rx);
-        assert(!s.apr.play.complete && (phase<9?s.apr.play.firstError:s.apr.play.cleanupError)==-5);
-        unsigned expected=phase==9?PicassoPlayStream:phase==10?PicassoPlayCopp:phase==11?PicassoPlayMap:phase==12?PicassoPlayPort:phase==13?PicassoPlayClock:0;
+        assert(!s.apr.play.complete && (phase<PicassoPlayClose?s.apr.play.firstError:s.apr.play.cleanupError)==-5);
+        unsigned expected=phase==PicassoPlayClose?PicassoPlayStream:phase==PicassoPlayCloseCopp?PicassoPlayCopp:phase==PicassoPlayUnmap?PicassoPlayMap:phase==PicassoPlayStop?(PicassoPlayPort|PicassoPlayClock):phase==PicassoPlayClockOff?PicassoPlayClock:0;
         assert(s.apr.play.owned==expected);
     }
     // All response timeouts preserve unresolved ownership and skip null IDs.
-    for(unsigned phase=0;phase<14;++phase) {
+    for(unsigned phase=0;phase<PicassoPlayDone;++phase) {
         rx=playAt(s,phase);for(unsigned i=0;i<102;++i){step(s);drain(s);}
         playRelease(s,rx);playCleanup(s,rx);assert(!s.apr.play.complete);
-        unsigned expected=phase==4?PicassoPlayMap:phase==5?PicassoPlayCopp:phase==9?PicassoPlayStream:phase==10?PicassoPlayCopp:phase==11?PicassoPlayMap:phase==12?PicassoPlayPort:phase==13?PicassoPlayClock:0;
+        unsigned expected=phase==PicassoPlayMapBuffer?PicassoPlayMap:phase==PicassoPlayOpenCopp?PicassoPlayCopp:phase==PicassoPlayClose?PicassoPlayStream:phase==PicassoPlayCloseCopp?PicassoPlayCopp:phase==PicassoPlayUnmap?PicassoPlayMap:phase==PicassoPlayStop?(PicassoPlayPort|PicassoPlayClock):phase==PicassoPlayClockOff?PicassoPlayClock:0;
         assert(s.apr.play.owned==expected);
     }
+    // START errors are not proof of an idle port, including stock status9.
+    const unsigned startErrors[]={1,2,3,9,10};
+    for(unsigned error:startErrors) {
+        rx=playAt(s,PicassoPlayStart);playAck(s,error);playRelease(s,rx);
+        assert(s.apr.play.phase==PicassoPlayStop && s.apr.play.pending && s.apr.play.owned==3);
+        assert(s.apr.play.statuses[PicassoPlayStart]==error && !s.apr.play.consumed);
+        playAck(s);playRelease(s,rx);assert(s.apr.play.phase==PicassoPlayClockOff);
+        playCleanup(s,rx);assert(!s.apr.play.owned && !s.apr.play.complete);
+    }
+    // No clock drop after an unconfirmed STOP; a late START ACK cannot free it.
+    rx=playAt(s,PicassoPlayStart);uint32_t lateStart[12];unsigned lateBytes=playResponse(s,lateStart);
+    playAck(s,9);playRelease(s,rx);playAck(s,9);playRelease(s,rx);
+    assert(s.apr.play.done && s.apr.play.owned==3 && !(s.apr.play.accepted&(1U<<PicassoPlayClockOff)));
+    picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(lateStart),lateBytes);
+    assert(s.apr.play.owned==3 && s.apr.play.firstError==-5 && s.apr.play.cleanupError==-5);
+    // Previous SET acknowledgement cannot satisfy this new configuration lease.
+    rx=playAt(s,PicassoPlayConfigure);uint32_t stale[12];unsigned staleBytes=playResponse(s,stale);stale[3]=0x20520002;
+    picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(stale),staleBytes);
+    assert(s.apr.play.pending && !s.apr.play.accepted);playAck(s,2);playRelease(s,rx);playCleanup(s,rx);
+    assert(!(s.apr.play.accepted&(1U<<PicassoPlayClockOn)) && !s.apr.play.owned);
     // WRITE timeout plus CLOSE failure must not send UNMAP for an owned buffer.
-    rx=playAt(s,8);for(unsigned i=0;i<102;++i){step(s);drain(s);}playRelease(s,rx);
-    assert(s.apr.play.phase==9 && s.apr.play.pending);playAck(s,2);playRelease(s,rx);playCleanup(s,rx);
-    assert(s.apr.play.owned==(PicassoPlayStream|PicassoPlayBuffer|PicassoPlayMap) && !(s.apr.play.accepted&(1U<<11)));
-    for(unsigned phase=0;phase<9;++phase) {
+    rx=playAt(s,PicassoPlayWrite);for(unsigned i=0;i<102;++i){step(s);drain(s);}playRelease(s,rx);
+    assert(s.apr.play.phase==PicassoPlayClose && s.apr.play.pending);playAck(s,2);playRelease(s,rx);playCleanup(s,rx);
+    assert(s.apr.play.owned==(PicassoPlayStream|PicassoPlayBuffer|PicassoPlayMap) && !(s.apr.play.accepted&(1U<<PicassoPlayUnmap)));
+    for(unsigned phase=0;phase<PicassoPlayClose;++phase) {
         rx=playAt(s,phase);s.qrtr.qmi.domains[0].state=0;playRelease(s,rx);playCleanup(s,rx);
         assert(!s.apr.play.complete && s.apr.play.firstError==-104);
     }
-    for(unsigned phase=0;phase<14;++phase) {
+    for(unsigned phase=0;phase<PicassoPlayDone;++phase) {
         rx=playAt(s,phase);unsigned owned=s.apr.play.owned;picasso_glink_stop(&s);
         assert(s.apr.play.done && !s.apr.play.complete && s.apr.play.owned==owned && !s.apr.play.pins.dirty);
     }
     // Each actual packet write fault, with ownership retained after ambiguous TX.
-    for(unsigned phase=0;phase<14;++phase) {
+    for(unsigned phase=0;phase<PicassoPlayDone;++phase) {
         auto before=[&](){rx=playReady(s);for(unsigned i=0;i<phase;++i){step(s);drain(s);assert(s.apr.play.pending);playAck(s);message(s,rx,14,7,91);step(s);drain(s);}};
         before();writes=0;step(s);unsigned total=writes;assert(total);bool kick;
         for(unsigned i=1;i<=total;++i) {before();writes=0;failWrite=i;
@@ -1626,13 +1671,13 @@ __attribute__((noinline)) static void playTests() {
     rx=playReady(s);s.apr.fw.services[2][1]=0;step(s);assert(s.apr.play.done && s.apr.play.error==-95);
     rx=playReady(s);s.apr.tfa.digitalDirty=1;step(s);assert(!s.apr.play.attempted);
     rx=playReady(s);s.qrtr.qmi.domains[0].state=0;step(s);assert(!s.apr.play.attempted);
-    rx=playAt(s,3);pcmFault=-5;playAck(s);playRelease(s,rx);playCleanup(s,rx);assert(s.apr.play.dmaError==-5 && !(s.apr.play.accepted&(1U<<4)));
-    rx=playAt(s,7);s.apr.pcm.silence=nullptr;playAck(s);playRelease(s,rx);playCleanup(s,rx);assert(!s.apr.play.consumed && s.apr.play.dmaError==-22);
-    rx=playAt(s,8);pcmFault=-5;playAck(s);playRelease(s,rx);playCleanup(s,rx);assert(!s.apr.play.consumed && !s.apr.play.complete);
-    rx=playReady(s);pinFailRead=pinReads+1;step(s);drain(s);playAck(s);playRelease(s,rx);playCleanup(s,rx);
-    assert(!(s.apr.play.accepted&(1U<<1)) && !s.apr.play.owned);
+    rx=playAt(s,PicassoPlayFormat);pcmFault=-5;playAck(s);playRelease(s,rx);playCleanup(s,rx);assert(s.apr.play.dmaError==-5 && !(s.apr.play.accepted&(1U<<PicassoPlayMapBuffer)));
+    rx=playAt(s,PicassoPlayRun);s.apr.pcm.silence=nullptr;playAck(s);playRelease(s,rx);playCleanup(s,rx);assert(!s.apr.play.consumed && s.apr.play.dmaError==-22);
+    rx=playAt(s,PicassoPlayWrite);pcmFault=-5;playAck(s);playRelease(s,rx);playCleanup(s,rx);assert(!s.apr.play.consumed && !s.apr.play.complete);
+    rx=playAt(s,PicassoPlayClockOn);pinFailRead=pinReads+1;playAck(s);playRelease(s,rx);playCleanup(s,rx);
+    assert(!(s.apr.play.accepted&(1U<<PicassoPlayStart)) && !s.apr.play.owned);
     rx=playReady(s);s.remoteIntent[0].size=20;step(s);drain(s);message(s,rx,8,7,0);step(s);drain(s);step(s);assert(s.apr.play.done && s.apr.play.firstError==-28 && !s.apr.play.owned);
     rx=playReady(s);p32(s.desc.offset,(s.txHead+8)%s.tx.size);for(unsigned i=0;i<253;++i)step(s);
     assert(s.apr.play.done && s.apr.play.firstError==-60 && !s.apr.play.owned);
-    puts("PASS 14-stage silent ADM/ASM data route, exact WRITE_DONE, COPP zero, every timeout/error/TX fault, ownership and pin rollback");
+    puts("PASS 15-stage silent ADM/ASM data route, exact WRITE_DONE, COPP zero, every timeout/error/TX fault, ownership and pin rollback");
 }
