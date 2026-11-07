@@ -16,6 +16,8 @@ static pthread_mutex_t gRouteLock=PTHREAD_MUTEX_INITIALIZER;
 static PicassoAudioClientNote gRouteNotes[128];
 static unsigned gRouteCount,gRouteFlushed;
 static uintptr_t gRouteBase;
+static uint64_t (*gRouteProduct)(void);
+static atomic_bool gRouteSampleProduct;
 static OSStatus (*gRouteGet)(AudioObjectID,const AudioObjectPropertyAddress *,UInt32,const void *,UInt32 *,void *);
 static OSStatus (*gRouteSize)(AudioObjectID,const AudioObjectPropertyAddress *,UInt32,const void *,UInt32 *);
 static Boolean (*gRouteHas)(AudioObjectID,const AudioObjectPropertyAddress *);
@@ -32,6 +34,12 @@ static void routeNote(unsigned kind,OSStatus result,unsigned selector,unsigned o
     pthread_mutex_unlock(&gRouteLock);
 }
 static void flushRouteNotes(void){
+    // Read the original MobileGestalt result on the non-realtime watch thread,
+    // outside HAL locks. This also covers VA caching it before hook installation.
+    if(atomic_exchange_explicit(&gRouteSampleProduct,false,memory_order_acquire)){
+        uint64_t product=gRouteProduct();
+        routeNote(14,0,3,(unsigned)product,(unsigned)(product>>32),0,5);
+    }
     pthread_mutex_lock(&gLock);
     if(gConnect){
         for(unsigned i=0;i<16;++i){
@@ -65,12 +73,12 @@ static OSStatus routeSet(AudioObjectID o,const AudioObjectPropertyAddress *a,UIn
 }
 static void routeThrow(void *thrown,void *type,void (*destroy)(void *)){
     uintptr_t at=(uintptr_t)__builtin_return_address(0);
-    // Only CAException starts with an OSStatus. A standard exception starts
-    // with a vtable pointer, which is neither an error code nor useful telemetry.
+    // The verified arm64 20H392 CAException is 16 bytes: vtable at 0,
+    // OSStatus at 8. Other exception layouts are not interpreted.
     const char *name=type?((const char *const *)type)[1]:NULL;
     unsigned category=name&&!strcmp(name,"11CAException")?1:name&&!strcmp(name,"St11logic_error")?2:
         name&&!strcmp(name,"St13runtime_error")?3:name&&!strcmp(name,"St16invalid_argument")?4:0;
-    UInt32 first=0;if(thrown&&category==1)memcpy(&first,thrown,sizeof first);
+    UInt32 first=0;if(thrown&&category==1)memcpy(&first,(const uint8_t *)thrown+8,sizeof first);
     routeNote(13,(OSStatus)first,at>=gRouteBase && at-gRouteBase<0x60c000?(unsigned)(at-gRouteBase):0,category,0,0,4);
     __attribute__((musttail)) return gRouteThrow(thrown,type,destroy);
 }
@@ -111,6 +119,7 @@ static void routeImageAdded(const struct mach_header *header,intptr_t slide){
         resolved[i]=dlsym(RTLD_DEFAULT,names[i]);
         if(!resolved[i] || *(void **)((uintptr_t)h+offsets[i])!=resolved[i]){routeNote(14,-2,i,0,0,0,0);return;}
     }
+    gRouteProduct=(void *)dlsym(RTLD_DEFAULT,"MGGetProductType");
     gRouteGet=(void *)resolved[0];gRouteSize=(void *)resolved[1];gRouteHas=(void *)resolved[2];
     gRouteSet=(void *)resolved[3];gRouteThrow=(void *)resolved[4];gRouteBase=(uintptr_t)h;
     long pagesize=getpagesize();if(pagesize!=4096 && pagesize!=16384){routeNote(14,-3,0,0,0,0,0);return;}
@@ -128,6 +137,7 @@ static void routeImageAdded(const struct mach_header *header,intptr_t slide){
     for(unsigned i=0;i<5;++i)__atomic_store_n((void **)((uintptr_t)h+offsets[i]),hooks[i],__ATOMIC_RELEASE);
     rc=vm_protect(mach_task_self(),page,(vm_size_t)pagesize,false,regionInfo.protection);
     routeNote(14,rc,2,5,0,0,0);
+    if(gRouteProduct)atomic_store_explicit(&gRouteSampleProduct,true,memory_order_release);
 }
 #if !__has_feature(ptrauth_calls)
 __attribute__((constructor)) static void watchRouteImage(void){_dyld_register_func_for_add_image(routeImageAdded);}

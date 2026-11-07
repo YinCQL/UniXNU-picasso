@@ -66,9 +66,10 @@ typedef struct {int protection;} vm_region_basic_info_data_64_t;
 #define VM_PROT_COPY 16
 typedef struct {const char *dli_fname;} Dl_info;
 #define RTLD_DEFAULT NULL
+static uint64_t fakeProduct(void){return UINT64_C(0x669eebc5);}
 static int protectError,protectCalls,regionError,resolvedWrong;static void *resolves[5];
 static int dladdr(const void *p,Dl_info *i){(void)p;i->dli_fname="/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio";return 1;}
-static void *dlsym(void *h,const char *s){(void)h;const char *n[]={"AudioObjectGetPropertyData","AudioObjectGetPropertyDataSize","AudioObjectHasProperty","AudioObjectSetPropertyData","__cxa_throw"};for(int i=0;i<5;i++)if(!strcmp(s,n[i]))return resolvedWrong?NULL:resolves[i];return NULL;}
+static void *dlsym(void *h,const char *s){(void)h;if(!strcmp(s,"MGGetProductType"))return (void *)fakeProduct;const char *n[]={"AudioObjectGetPropertyData","AudioObjectGetPropertyDataSize","AudioObjectHasProperty","AudioObjectSetPropertyData","__cxa_throw"};for(int i=0;i<5;i++)if(!strcmp(s,n[i]))return resolvedWrong?NULL:resolves[i];return NULL;}
 static int vm_region_64(unsigned t,vm_address_t *a,vm_size_t *s,int f,vm_region_info_t i,unsigned *n,unsigned *o){(void)t;(void)a;(void)f;(void)n;*s=4096;*i=VM_PROT_READ;*o=0;return regionError;}
 static int vm_protect(unsigned t,vm_address_t a,vm_size_t n,bool b,int p){(void)t;(void)a;(void)n;(void)b;(void)p;++protectCalls;return protectError;}
 static void mach_port_deallocate(unsigned t,unsigned o){(void)t;(void)o;}
@@ -108,6 +109,29 @@ static void properties(void){
     a.mSelector=kAudioLevelControlPropertyScalarValue;float volume=0.25f;
     assert(!SetPropertyData(NULL,kVolume,0,&a,0,NULL,4,&volume)&&gVolume==0.25f);
     volume=NAN;assert(SetPropertyData(NULL,kVolume,0,&a,0,NULL,4,&volume)==(OSStatus)kAudioHardwareIllegalOperationError);
+    // Device aliases and control objects must share one real output state.
+    a=(AudioObjectPropertyAddress){kAudioObjectPropertyControlList,kAudioObjectPropertyScopeGlobal,0};UInt32 controls[3]={0};
+    assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,sizeof controls,&n,controls)&&n==8&&controls[0]==kVolume&&controls[1]==kMute);
+    a=(AudioObjectPropertyAddress){kDeviceVolumeScalar,kAudioObjectPropertyScopeOutput,0};
+    assert(!IsPropertySettable(NULL,kDevice,0,&a,&set)&&set);volume=0.75f;
+    assert(!SetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&volume)&&gVolume==0.75f);
+    float got=0;assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&n,&got)&&got==volume);
+    a.mSelector=kDeviceVolumeDecibels;volume=-9.0f;
+    assert(!SetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&volume)&&fabsf(toDb(gVolume)+9)<0.001f);
+    a.mSelector=kDeviceMute;v=1;
+    assert(!SetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&v)&&gMuted&&gain()==0);
+    assert(picasso_mix_peek(&gMix,10,1,output)==1&&output[0]==0);
+    assert(!DoIOOperation(NULL,kDevice,kOutStream,0,kAudioServerPlugInIOOperationWriteMix,1,&info,pcm,NULL));
+    assert(!picasso_mix_peek(&gMix,10,1,output)&&output[0]==0&&output[1]==0);
+    assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&n,&v)&&v==1);
+    assert(SetPropertyData(NULL,kDevice,0,&a,0,NULL,1,&v)==(OSStatus)kAudioHardwareBadPropertySizeError);
+    a.mScope=kAudioObjectPropertyScopeInput;assert(!HasProperty(NULL,kDevice,0,&a));
+    assert(SetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&v)==(OSStatus)kAudioHardwareUnknownPropertyError);
+    a.mScope=kAudioObjectPropertyScopeOutput;a.mElement=1;assert(!HasProperty(NULL,kDevice,0,&a));
+    a=(AudioObjectPropertyAddress){kAudioBooleanControlPropertyValue,kAudioObjectPropertyScopeGlobal,0};v=0;
+    assert(!SetPropertyData(NULL,kMute,0,&a,0,NULL,4,&v)&&!gMuted&&gain()>0);
+    assert(!DoIOOperation(NULL,kDevice,kOutStream,0,kAudioServerPlugInIOOperationWriteMix,1,&info,pcm,NULL));
+    assert(!picasso_mix_peek(&gMix,10,1,output)&&output[0]>0&&output[1]<0);
     for(unsigned i=0;i<200;++i){a.mSelector=0xf0000000+i;(void)HasProperty(NULL,kDevice,0,&a);}assert(gPropertyNotes==128);
 }
 static void routing(void){
@@ -132,13 +156,15 @@ static void routing(void){
     assert(routeGet(33,&a,12,(void *)42,&n,&v)==-100&&v==17&&n==4);
     assert(routeSize(33,&a,0,NULL,&n)==-101&&n==12);assert(!routeHas(33,&a));
     assert(routeSet(33,&a,0,NULL,4,&v)==-102);
-    const char *caType[2]={NULL,"11CAException"};routeThrow(&v,caType,NULL);assert(routeCalls==5);
+    struct {uint64_t vtable;int32_t status;uint32_t pad;} ca={UINT64_C(0x1234567887654321),17,0};
+    const char *caType[2]={NULL,"11CAException"};routeThrow(&ca,caType,NULL);assert(routeCalls==5);
     assert(gRouteNotes[gRouteCount-1].result==17&&gRouteNotes[gRouteCount-1].value==1);
     const char *stdType[2]={NULL,"St13runtime_error"};routeThrow(&v,stdType,NULL);
     assert(gRouteNotes[gRouteCount-1].result==0&&gRouteNotes[gRouteCount-1].value==3);
     unsigned before=gRouteCount;assert(routeSet(33,&a,0,NULL,4,&v)==-102&&gRouteCount==before);
     // Route logs stay queued until a connection exists, then drain separately.
-    gConnect=0;flushRouteNotes();assert(!gRouteFlushed);gConnect=1;flushRouteNotes();assert(gRouteFlushed==gRouteCount);
+    gConnect=0;flushRouteNotes();assert(!gRouteFlushed);
+    assert(gRouteNotes[gRouteCount-1].selector==3&&gRouteNotes[gRouteCount-1].value==0x669eebc5);gConnect=1;flushRouteNotes();assert(gRouteFlushed==gRouteCount);
     for(unsigned i=0;i<200;++i)routeNote(9,-1,i,0,0,0,0);assert(gRouteCount==128);
     free(image);
 }

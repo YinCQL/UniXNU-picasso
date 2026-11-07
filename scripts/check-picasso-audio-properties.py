@@ -28,6 +28,13 @@ def main():
     c=out/'sdk-constants.c';c.write_text('#include <CoreAudio/AudioServerPlugIn.h>\n#include <IOKit/IOKitLib.h>\n'+''.join('const unsigned long long value_'+n+' = '+n+';\n' for n in names))
     sdk=os.environ.get('PICASSO_AUDIO_SDK','/home/y/toolchains/audio-sdks/iPhoneOS16.5.sdk')
     headers=os.environ.get('PICASSO_AUDIO_HEADERS','/home/y/toolchains/audio-hal-headers')
+    legacy_header=Path(headers)/'CoreAudio/AudioHardware.h'
+    legacy=legacy_header.read_text()
+    for local,official in [('VolumeScalar','VolumeScalar'),('VolumeDecibels','VolumeDecibels'),('VolumeRangeDecibels','VolumeRangeDecibels'),('Mute','Mute')]:
+        sdk_value=re.search(r'\bkAudioDeviceProperty'+official+r"\s*=\s*'([^']+)'",legacy)
+        local_value=re.search(r'\bkDevice'+local+r"\s*=\s*'([^']+)'",source)
+        assert sdk_value and local_value and sdk_value[1]==local_value[1],local
+    runs.append(dict(name='device-alias-sdk-values',passed=True))
     cc=os.environ.get('PICASSO_AUDIO_CC','/usr/bin/clang-18')
     ir=out/'sdk-constants.ll'
     run('sdk-constants',[cc,'-target','arm64-apple-ios16.0','-isysroot',sdk,'-I',headers,'-S','-emit-llvm',str(c),'-o',str(ir)])
@@ -41,5 +48,5 @@ def main():
         run('compile'+suffix,[cc,'-std=c11','-D_DEFAULT_SOURCE','-O1','-Wall','-Wextra','-Werror','-Wno-unused-function',*flags,'-I',str(out),'-I',str(ROOT/'package'),'-I',str(ROOT/'hal'),str(ROOT/'scripts/tests/picasso-audio-properties-host.c'),'-pthread','-lm','-o',str(exe)])
         run('properties'+suffix,[str(exe)]+([str(a.reference)] if a.reference else []))
     paths=['hal/PicassoAudioPlugIn.c','hal/PicassoAudioRouteTrace.h','hal/PicassoAudioMix.h','package/PicassoAudioAbi.h','scripts/check-picasso-audio-properties.py','scripts/tests/picasso-audio-properties-host.c']
-    (out/'results.json').write_text(json.dumps(dict(passed=True,hardware_tested=False,runs=runs,reference_sha256=hashlib.sha256(a.reference.read_bytes()).hexdigest() if a.reference else None,inputs={n:hashlib.sha256((ROOT/n).read_bytes()).hexdigest() for n in paths}),indent=2)+'\n')
+    (out/'results.json').write_text(json.dumps(dict(passed=True,hardware_tested=False,runs=runs,legacy_header=dict(path=str(legacy_header),sha256=hashlib.sha256(legacy_header.read_bytes()).hexdigest()),reference_sha256=hashlib.sha256(a.reference.read_bytes()).hexdigest() if a.reference else None,inputs={n:hashlib.sha256((ROOT/n).read_bytes()).hexdigest() for n in paths}),indent=2)+'\n')
 if __name__=='__main__':main()
