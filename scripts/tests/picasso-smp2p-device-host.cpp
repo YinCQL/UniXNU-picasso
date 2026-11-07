@@ -7,7 +7,7 @@
 #include "PicassoSmp2p.h"
 #include "PicassoAdspBoot.h"
 extern "C" void picasso_adsp_boot(const PicassoAdspEvents *e);
-static uint32_t ram[WLAN_SMEM_SIZE/4], mutexRam[1024], ipccRam[1024], audioRam[4][1024];
+static uint32_t ram[WLAN_SMEM_SIZE/4], mutexRam[1024], ipccRam[1024], audioRam[4][1024], tfaRam[7][4096];
 static unsigned allocations,mappings,releases,unmaps,lines,sleeps,preempt,plans,kicks;
 static unsigned failAlloc,failMap,zeroMap;
 static bool peer,transport;
@@ -27,15 +27,20 @@ public:
         unsigned at=base==WLAN_SMEM_BASE?0:base==0x01f43000?1:2;
         if(at==2 && base!=0x00408000) {
             const uint64_t pa[]={0xf546000,0xf547000,0xf548000,0xf54a000};
-            unsigned i=0;for(;i<4 && base!=pa[i];++i){}assert(i<4);at=3+i;
+            unsigned i=0;for(;i<4 && base!=pa[i];++i){}
+            if(i<4)at=3+i;
+            else {
+                const uint64_t tfa[]={0x988000,0x118000,0x123000,0x152000,0xf531000,0xf532000,0xf53a000};
+                unsigned j=0;for(;j<7 && base!=tfa[j];++j){}assert(j<7);at=7+j;
+            }
         }
-        assert(bytes==(at?4096:WLAN_SMEM_SIZE));
-        static IODeviceMemory memory[7];memory[at].slot=at;
+        assert(bytes==(at==7?0x4000:at?4096:WLAN_SMEM_SIZE));
+        static IODeviceMemory memory[14];memory[at].slot=at;
         return ++allocations==failAlloc?nullptr:&memory[at];
     }
     IOMemoryMap *map(unsigned flags) {
-        assert(flags==3);static IOMemoryMap maps[7];++mappings;
-        maps[slot].address=mappings==zeroMap?0:reinterpret_cast<uintptr_t>(slot==0?ram:slot==1?mutexRam:slot==2?ipccRam:audioRam[slot-3]);
+        assert(flags==3);static IOMemoryMap maps[14];++mappings;
+        maps[slot].address=mappings==zeroMap?0:reinterpret_cast<uintptr_t>(slot==0?ram:slot==1?mutexRam:slot==2?ipccRam:slot<7?audioRam[slot-3]:tfaRam[slot-7]);
         return mappings==failMap?nullptr:&maps[slot];
     }
     void release(){++releases;}
@@ -79,7 +84,9 @@ static void IOSleep(unsigned ms) {
     if(peer && sleeps>2)ram[inbound/4+9]^=1; // Exercise the bounded event log.
     if(sleeps==1602)ram[(part+48+36)/4]=1; // External mutation stops service.
 }
+static void IODelay(unsigned) {}
 #include "PicassoSmp2pDevice-body.inc"
+extern "C" { volatile uint32_t native_novatek_touch_stage=0; }
 extern "C" void picasso_rpc_device_prepare(PicassoFastrpc *) { assert(false && "unexpected RPC DMA without an open channel"); }
 // Exercise the real SMEM/MMIO adapter separately from the coordinator tests,
 // which prove that this callback is gated by PAS authentication and fresh ready.
@@ -192,7 +199,27 @@ int main(int argc,char **argv) {
     picasso_audio_pins_restore(pins);assert(pins.restored && !pins.dirty);
     for(unsigned i=0;i<4;++i)assert(audioRam[i][0]==0x2800 && audioRam[i][1]==2);
     puts("PASS four exact audio GPIO mappings, invalid offsets, allocation/map/zero-VA errors and device adapter restoration");
+    PicassoTfa tfa={};unsigned tfaAlloc=allocations;
+    tfaProbe(tfa);assert(tfa.error==-16 && allocations==tfaAlloc);
+    native_novatek_touch_stage=2;
+    for(unsigned failure=0;failure<3;++failure)for(unsigned i=1;i<=7;++i) {
+        tfa={};if(failure==0)failAlloc=allocations+i;
+        if(failure==1)failMap=mappings+i;
+        if(failure==2)zeroMap=mappings+i;
+        tfaProbe(tfa);assert(tfa.error==-12 && !tfa.complete && !tfa.commands);
+        failAlloc=failMap=zeroMap=0;
+    }
+    tfa={};tfaProbe(tfa);assert(tfa.error==-16 && tfa.stage==1 && !tfa.commands && tfa.restored);
+    TfaMaps tm={};for(unsigned i=0;i<7;++i)tm.address[i]=reinterpret_cast<uintptr_t>(tfaRam[i]);
+    assert(tfaRead(&tm,7,0,&value)==-22 && tfaRead(&tm,1,4096,&value)==-22);
+    assert(tfaRead(&tm,0,0,nullptr)==-22 && tfaWrite(&tm,0,3,1)==-22);
+    assert(!tfaWrite(&tm,0,0x270,2) && !tfaRead(&tm,0,0x270,&value) && value==2);
+    puts("PASS SE8 maps, touch-owner gate, every allocation/map/zero-VA failure and MMIO boundaries");
     checkShortLogs=true;
+    tfa.stage=tfa.events=tfa.fw=tfa.ifDisable=tfa.hw[0]=tfa.hw[1]=0xffffffff;
+    tfa.clockCfg=tfa.clockLevel=tfa.irq=tfa.rxStatus=tfa.ios=tfa.commands=tfa.reg=tfa.abortStatus=0xffffffff;
+    tfa.error=tfa.cleanupError=-2147483647;tfa.identified=true;tfa.revision=0xffff;
+    for(auto &v:tfa.values)v=0xffff;for(auto &v:tfa.pinBefore)v=0xffffffff;for(auto &v:tfa.pinAfter)v=0xffffffff;logTfa(tfa);
     pins.attempted=pins.active=pins.restored=true;pins.dirty=0xffffffff;
     pins.error=pins.restoreError=-2147483647;for(auto &v:pins.observed)v=0xffffffff;logAudioPins(pins);
     PicassoRpcDomain record={};record.pd=record.requests=record.lastHandle=record.lastScalar=0xffffffffU;

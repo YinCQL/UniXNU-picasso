@@ -44,6 +44,7 @@ static void afeConfigureTests();
 static void afeClockTests();
 static void audioPinTests();
 static void afePortTests();
+static void tfaPortTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -129,7 +130,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    audioPinTests();afePortTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
+    audioPinTests();afePortTests();tfaPortTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -768,6 +769,27 @@ __attribute__((noinline)) static void afePortTests() {
         }
     }
     puts("PASS real GLINK START/STOP wire, clock hold, strict ACKs, deadlines, PD loss, close and every TX write fault");
+}
+static PicassoGlink *tfaOwner;
+static unsigned tfaCalls;static bool tfaFailure;
+static void fakeTfa(PicassoTfa &t) {
+    assert(tfaOwner->apr.pins.active && tfaOwner->apr.port.startAccepted && !tfaOwner->apr.port.phase);
+    assert(tfaOwner->apr.clock.enableAccepted && !tfaOwner->apr.clock.phase);
+    t.attempted=true;t.error=tfaFailure?-107:0;t.complete=!tfaFailure;++tfaCalls;++t.events;
+}
+__attribute__((noinline)) static void tfaPortTests() {
+    PicassoGlink s={};tfaOwner=&s;
+    for(unsigned mode=0;mode<4;++mode) {
+        unsigned rx=portStarted(s);tfaCalls=0;tfaFailure=mode==1;s.apr.tfa.probe=fakeTfa;
+        portAck(s,0,mode==2?1:0);if(mode==3)picasso_qmi_lost(&s.qrtr.qmi);
+        message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+        assert(tfaCalls==(mode<2?1U:0U) && s.apr.port.pending && s.apr.port.phase==1);
+        portAck(s,1);message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+        assert(s.apr.clock.phase==1 && s.apr.pins.restored && !s.apr.port.uncertain);
+        assert(s.apr.port.completed==(mode<2));
+        for(unsigned n=0;n<3;++n){step(s);drain(s);}assert(tfaCalls==(mode<2?1U:0U));
+    }
+    puts("PASS TFA called once only under accepted START and held MI2S resources, failure still STOPs and releases clock");
 }
 __attribute__((noinline)) static void afeClockTests() {
     // Fixed-zero readback is specific to the observed build/API and otherwise

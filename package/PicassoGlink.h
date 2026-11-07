@@ -6,6 +6,7 @@
 #include "PicassoQrtr.h"
 #include "PicassoFastrpc.h"
 #include "PicassoAudioPins.h"
+#include "PicassoTfa.h"
 enum { PicassoGlinkChannels = 16, PicassoGlinkRemoteIntents = 64,
        PicassoGlinkLocalIntents = 20, PicassoGlinkPacket = 512 };
 struct PicassoGlinkChannel {
@@ -56,6 +57,7 @@ struct PicassoAprProbe {
         int error,startError;
     } port;
     PicassoAudioPins pins;
+    PicassoTfa tfa;
 };
 struct PicassoGlink {
     // Contains pointers into its own static storage: prepare in final location,

@@ -70,6 +70,48 @@ int audioPinAccess(unsigned index,unsigned reg,uint32_t *value,bool write) {
 }
 int audioPinRead(void *,unsigned i,unsigned reg,uint32_t *v) { return audioPinAccess(i,reg,v,false); }
 int audioPinWrite(void *,unsigned i,unsigned reg,uint32_t v) { return audioPinAccess(i,reg,&v,true); }
+// Touch publishes stage >= 2 only after its one-time QUP vote update.
+// Its worker never changes that vote again. Gate on this before sharing GCC.
+extern "C" volatile uint32_t native_novatek_touch_stage __attribute__((weak_import));
+struct TfaMaps { uintptr_t address[7]; };
+int tfaRead(void *ctx,unsigned bank,unsigned reg,uint32_t *v) {
+    auto *m=static_cast<TfaMaps *>(ctx);
+    if(bank>=7 || reg&3 || reg>=(bank?0x1000U:0x4000U) || !m->address[bank] || !v)return -22;
+    *v=*reinterpret_cast<volatile uint32_t *>(m->address[bank]+reg);smemBarrier(nullptr);return 0;
+}
+int tfaWrite(void *ctx,unsigned bank,unsigned reg,uint32_t v) {
+    auto *m=static_cast<TfaMaps *>(ctx);
+    if(bank>=7 || reg&3 || reg>=(bank?0x1000U:0x4000U) || !m->address[bank])return -22;
+    *reinterpret_cast<volatile uint32_t *>(m->address[bank]+reg)=v;smemBarrier(nullptr);return 0;
+}
+void tfaDelay(void *,unsigned us) { if(us>=1000)IOSleep((us+999)/1000);else IODelay(us); }
+void tfaProbe(PicassoTfa &out) {
+    if(!&native_novatek_touch_stage || native_novatek_touch_stage<2) {
+        out.attempted=true;out.error=-16;out.stage=0;++out.events;return;
+    }
+    IOLog("PICASSO_ADSP tfa stage=map se=988000 address=34 reset=58 id_reg=3 pcm=0\n");
+    IOMemoryMap *maps[7]={};TfaMaps context={};
+    bool ok=true;
+    for(unsigned i=0;i<7 && ok;++i) {
+        maps[i]=smemMap(picasso_tfa_base(i),i?0x1000:0x4000);
+        context.address[i]=maps[i]?uintptr_t(maps[i]->getVirtualAddress()):0;
+        ok=!!context.address[i];
+    }
+    if(ok) {
+        PicassoTfaIo io={&context,tfaRead,tfaWrite,tfaDelay};picasso_tfa_run(io,out);
+    } else { out.attempted=true;out.error=-12;++out.events; }
+    for(auto *m:maps)if(m)m->release();
+}
+void logTfa(const PicassoTfa &t) {
+    IOLog("PICASSO_ADSP tfa stage=%u error=%d cleanup_error=%d id=%x identified=%u reads=%u complete=%u restored=%u dirty=%x uncertain=%u pcm=0\n",
+        t.stage,t.error,t.cleanupError,t.revision,t.identified,t.reads,t.complete,t.restored,t.dirty,t.uncertain);
+    IOLog("PICASSO_ADSP tfa-bus fw=%x if=%x hw=%x/%x level=%u cfg=%x irq=%x rx=%x ios=%x commands=%u reg=%x abort=%x\n",
+        t.fw,t.ifDisable,t.hw[0],t.hw[1],t.clockLevel,t.clockCfg,t.irq,t.rxStatus,t.ios,t.commands,t.reg,t.abortStatus);
+    IOLog("PICASSO_ADSP tfa-pins before=%x/%x/%x active=%x/%x/%x reset_high_ms=10 reset_low_ms=10\n",
+        t.pinBefore[0],t.pinBefore[1],t.pinBefore[2],t.pinAfter[0],t.pinAfter[1],t.pinAfter[2]);
+    if(t.complete)IOLog("PICASSO_ADSP tfa-config regs=00/01/02/04/20/21/22/23/26 values=%x/%x/%x/%x/%x/%x/%x/%x/%x applied=0 amplifier_write=0 pcm=0\n",
+        t.values[0],t.values[1],t.values[2],t.values[3],t.values[4],t.values[5],t.values[6],t.values[7],t.values[8]);
+}
 int prepare(SmemDevice *d, const PicassoSmemIo *io, PicassoSmp2p *s, PicassoGlink *glink) {
     s->audit.phase = "lock";
     if (__atomic_exchange_n(&allocatorGate, 1U, __ATOMIC_ACQ_REL)) return -16;
@@ -112,7 +154,7 @@ struct BootEvents {
     uint32_t qmiEvents = 0, qmiLogs = 0;
     uint32_t locatorEvents = 0, locatorLogs = 0, fwEvents = 0, afeEvents = 0;
     uint32_t tftpEvents = 0, tftpLogs = 0;
-    uint32_t clockEvents = 0, portEvents = 0, pinEvents = 0;
+    uint32_t clockEvents = 0, portEvents = 0, pinEvents = 0, tfaEvents = 0;
 };
 void logAudioPins(const PicassoAudioPins &p) {
 IOLog("PICASSO_ADSP afe-pins attempted=%u active=%u restored=%u dirty=%x error=%d restore_error=%d ctl=%x/%x/%x/%x amplifier=0 pcm=0\n",
@@ -287,6 +329,7 @@ void bootService(void *context) {
             const auto &p=a.pins;b->pinEvents=p.events;
             logAudioPins(p);
         }
+        if(a.tfa.events!=b->tfaEvents) { b->tfaEvents=a.tfa.events;logTfa(a.tfa); }
         if(q.locator.events!=b->locatorEvents && b->locatorLogs<32) {
             logLocator(q.locator);b->locatorEvents=q.locator.events;++b->locatorLogs;
         }
@@ -376,7 +419,7 @@ extern "C" void picasso_smp2p_start(void) {
         error, s.created, s.partition.offset, s.partition.size, s.out.offset, s.out.size, lockRead(&d));
     logAudit(s);
     if (error) return;
-    glink.apr.pins.read=audioPinRead;glink.apr.pins.write=audioPinWrite;
+    glink.apr.pins.read=audioPinRead;glink.apr.pins.write=audioPinWrite;glink.apr.tfa.probe=tfaProbe;
     smpKick(&d);
     IOLog("PICASSO_ADSP glink stage=prepared descriptor=%x/%x tx=%x/%x remote_pid=2\n",
         glink.desc.offset,glink.desc.size,glink.tx.offset,glink.tx.size);

@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#include "PicassoTfa.h"
+static uint32_t mem[7][4096],original[7][4096];
+static unsigned reads,writes,failRead,failWrite,dropWrite,delays,op,currentReg,commands,injectCommand;
+static unsigned nack,arb,timeout,shortRead,overflow,badId,unstable,abortFail,stopFail;
+static bool heldBus,active,irqAsserted;
+static int rd(void *,unsigned bank,unsigned reg,uint32_t *v) {
+    assert(bank<7 && !(reg&3));
+    if(++reads==failRead)return -5;
+    *v=mem[bank][reg/4];return 0;
+}
+static int wr(void *,unsigned bank,unsigned reg,uint32_t v) {
+    assert(bank<7 && !(reg&3));++writes;
+    if(writes==dropWrite)return 0;
+    mem[bank][reg/4]=v;
+    if(bank==3 && reg==8) { mem[1][0x26c/4]=(v&(1U<<24))?0:0x80000000;assert((v&0x3c0000)==0x3c0000); }
+    if(bank==0 && reg==0xe1c && v)irqAsserted=true;
+    if(bank==0 && reg==0x618)mem[0][0x610/4]&=~v;
+    if(bank==0 && reg==0x604 && v==2) {
+        mem[0][0x610/4]=abortFail?0:1U<<5;mem[0][0x40/4]=abortFail?1:0;active=!!abortFail;
+    }
+    if(bank==0 && reg==0x600) {
+        op=v>>27;assert((v&0xfe00)==0x6800);assert(op==1 || op==2 || op==7);
+        assert(mem[0][0x260/4]==0x7f8fe && mem[0][0x264/4]==0xffefe);
+        assert(mem[0][0x284/4]==0x7f8fe && mem[0][0x288/4]==0xffefe);
+        assert(mem[0][0x48/4]==0x71 && mem[0][0x278/4]==((10U<<20)|(11U<<10)|26));
+        ++commands;active=true;mem[0][0x40/4]=1;
+        if(commands==injectCommand && (nack || arb)) {
+            mem[0][0x610/4]=8|(nack?1U<<10:1U<<13);return 0;
+        }
+        if((commands==injectCommand && timeout) || (op==7 && stopFail)){mem[0][0x610/4]=0;return 0;}
+        if(op==1) {
+            assert((v&4) && mem[0][0x26c/4]==1);mem[0][0x610/4]=1U<<30;
+        } else if(op==2) {
+            assert(heldBus && !(v&4) && mem[0][0x270/4]==2);
+            uint16_t val=currentReg==3?(badId?0x1234:unstable && commands==4?0x2a74:0x1a74):uint16_t(0x1200|currentReg);
+            mem[0][0x780/4]=(val>>8)|((val&255)<<8);
+            mem[0][0x804/4]=((commands==injectCommand && overflow)?2U:1U)|0x80000000|((commands==injectCommand && shortRead)?0x10000000:0x20000000);
+            mem[0][0x610/4]=(1U<<27)|1;mem[0][0x40/4]=0;heldBus=active=false;
+        } else {mem[0][0x610/4]=1;mem[0][0x40/4]=0;heldBus=active=false;}
+    }
+    if(bank==0 && reg==0x700) {
+        assert(op==1 && v<=255);currentReg=v;heldBus=true;active=false;
+        mem[0][0x40/4]=0;mem[0][0x610/4]=1;
+    }
+    return writes==failWrite?-5:0; // fail after the write reached hardware
+}
+static int readIo(void *c,unsigned b,unsigned reg,uint32_t *v) {
+    int e=rd(c,b,reg,v);if(!e && b==0 && reg==0x780)mem[0][0x804/4]=0;return e;
+}
+static void delay(void *,unsigned us) {assert(us==10 || us==10000);delays+=us;}
+static PicassoTfaIo io={nullptr,readIo,wr,delay};
+static void setup() {
+    memset(mem,0,sizeof mem);reads=writes=failRead=failWrite=dropWrite=delays=op=currentReg=commands=injectCommand=0;
+    nack=arb=timeout=shortRead=overflow=badId=unstable=abortFail=stopFail=0;heldBus=active=irqAsserted=false;
+    mem[3][2]=0xbc0000;mem[1][0x26c/4]=0x80000000;
+    mem[0][0x68/4]=0x301;mem[0][0xe24/4]=0x20100000;mem[0][0xe28/4]=0x20100000;
+    mem[0][0x908/4]=3;mem[1][0x284/4]=1;mem[1][0x28c/4]=1;
+    for(unsigned i=4;i<7;++i) { mem[i][0]=0x2800;mem[i][1]=1; }
+    memcpy(original,mem,sizeof mem);
+}
+static void checkRestored(const PicassoTfa &o) {
+    assert(o.restored && !o.dirty && !o.uncertain);
+    assert(mem[3][2]==original[3][2]);
+    for(unsigned i=4;i<7;++i)assert(mem[i][0]==original[i][0] && (mem[i][1]&2)==(original[i][1]&2));
+    for(unsigned i=0;i<20;++i)assert(mem[0][picasso_tfa_se_reg(i)/4]==original[0][picasso_tfa_se_reg(i)/4]);
+}
+int main() {
+    assert(picasso_tfa_base(0)==0x988000 && picasso_tfa_base(6)==0xf53a000);
+    setup();PicassoTfa o={};picasso_tfa_run(io,o);
+    assert(o.complete && o.identified && o.revision==0x1a74 && o.reads==11 && o.commands==22 && !o.error && !o.cleanupError);
+    assert(!irqAsserted && !heldBus && !active && delays>=20000 && delays<21000);checkRestored(o);
+    unsigned totalReads=reads,totalWrites=writes;
+    for(unsigned i=0;i<9;++i)assert(o.values[i]==(0x1200|picasso_tfa_register(i)));
+    unsigned before=writes;picasso_tfa_run(io,o);assert(writes==before);
+    // No transfer on malformed engine, busy DMA/peer, wrong GPIO or missing XO.
+    for(unsigned mode=0;mode<9;++mode) {
+        setup();o={};
+        if(mode==0)mem[0][0x68/4]=0x101;
+        if(mode==1)mem[0][0x64/4]=1;
+        if(mode==2)mem[0][0x40/4]=1;
+        if(mode==3)mem[0][0xe18/4]=1;
+        if(mode==4)mem[0][0x258/4]=1;
+        if(mode==5)mem[4][0]=4;
+        if(mode==6)for(unsigned i=0;i<8;++i)mem[1][(0x28c+4*i)/4]=0x601;
+        if(mode==7)mem[0][0xe24/4]=0;
+        if(mode==8)mem[0][0x804/4]=1;
+        memcpy(original,mem,sizeof mem);picasso_tfa_run(io,o);assert(o.error && !o.complete && !commands);checkRestored(o);
+    }
+    setup();o={};mem[3][2]|=1U<<24;mem[1][0x26c/4]=0;memcpy(original,mem,sizeof mem);
+    picasso_tfa_run(io,o);assert(o.complete);checkRestored(o);
+    setup();o={};mem[1][0x284/4]=0;mem[1][0x274/4]=1;picasso_tfa_run(io,o);assert(o.complete);
+    for(unsigned mode=0;mode<5;++mode) {
+        setup();o={};injectCommand=2;
+        if(mode==0)nack=1;else if(mode==1)arb=1;else if(mode==2)timeout=1;else if(mode==3)shortRead=1;else overflow=1;
+        picasso_tfa_run(io,o);assert(o.error && !o.complete && !o.identified);checkRestored(o);
+        assert(delays<=50000 && !heldBus && !active);
+    }
+    setup();o={};badId=1;picasso_tfa_run(io,o);assert(o.error==-19 && !o.identified && o.reads==2);checkRestored(o);
+    setup();o={};unstable=1;picasso_tfa_run(io,o);assert(o.error==-19 && !o.identified);checkRestored(o);
+    // Every I/O failure is explicit, including partial snapshots and cleanup.
+    for(unsigned n=1;n<=totalReads;++n) {
+        setup();o={};failRead=n;picasso_tfa_run(io,o);assert(o.error || o.cleanupError);
+        assert(!o.complete || o.cleanupError);assert(o.restored || o.dirty || o.uncertain);
+    }
+    for(unsigned n=1;n<=totalWrites;++n) {
+        setup();o={};failWrite=n;picasso_tfa_run(io,o);assert(o.error || o.cleanupError);
+        assert(!o.complete || o.cleanupError);assert(o.restored || o.dirty || o.uncertain);
+    }
+    // A failed restore must keep the IRQ route disconnected and clock owned.
+    setup();o={};mem[0][0xe1c/4]=15;failWrite=totalWrites-3;picasso_tfa_run(io,o);
+    assert(o.cleanupError && !o.restored && (o.dirty&6)==6 && !irqAsserted && mem[0][0xe1c/4]==0);
+    setup();o={};dropWrite=1;picasso_tfa_run(io,o);assert(o.error==-5 && !commands);
+    setup();o={};injectCommand=2;timeout=abortFail=1;picasso_tfa_run(io,o);
+    assert(o.error==-60 && o.cleanupError==-60 && o.uncertain && !o.restored && (mem[3][2]&(1U<<24)));
+    setup();o={};injectCommand=2;timeout=stopFail=1;picasso_tfa_run(io,o);
+    assert(o.error==-60 && o.cleanupError==-60 && o.uncertain && !o.restored);
+    puts("PASS TFA9874 SE8 FIFO reads, repeated START, endian/count/ID checks, inherited votes, IRQ isolation, failures and bounded cleanup");
+}

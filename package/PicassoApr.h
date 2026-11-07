@@ -115,6 +115,11 @@ inline void picasso_port_tick(PicassoAprProbe *p,const PicassoQmi &q) {
     }
     if(!v.pending && (v.responded || v.error)) {
         if(!v.phase && v.sent) {
+            // A successful port supplies the physical MI2S clock while the
+            // bounded board probe identifies the amplifier. Always STOP even
+            // if the optional I2C probe fails; it cannot forge an AFE ACK.
+            if(v.startAccepted && !v.error && p->tfa.probe && !p->tfa.attempted)
+                p->tfa.probe(p->tfa);
             // START can have taken effect even when its ACK was lost. Always
             // issue STOP before releasing the clock, retaining uncertainty.
             v.startError=v.error;v.phase=1;v.sent=v.responded=false;
