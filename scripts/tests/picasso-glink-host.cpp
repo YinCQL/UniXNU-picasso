@@ -37,6 +37,7 @@ static void build185Tests();
 static void build186Tests();
 static void local187Tests();
 static void fastrpcTests();
+static void tftpTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -122,7 +123,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
+    tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -405,6 +406,7 @@ __attribute__((noinline)) static void build185Tests() {
     unsigned local=s.qrtrLocal[0].id;step(s);drain(s);
     assert(s.localReuse==2 && s.localIntent[0].id==1 && s.qrtrLocal[0].id==local);
     assert(s.qrtr.locator.announced);message(s,rx,14,2,0);step(s);drain(s);
+    step(s);drain(s);assert(s.qrtr.tftp.announced);message(s,rx,14,2,0);step(s);drain(s);
     uint32_t server[]={1,4,2,0xfffffffe,0,20,1,0xfffffffe,4,0x40,0x101,2,73};
     qrtrPacket(s,rx,local,server,52);step(s);drain(s);assert(s.qrtr.services[0].used);
     step(s);drain(s);uint32_t data[]={1,1,2,73,1,20,1,99,0,0,0,0,0};
@@ -471,6 +473,7 @@ static unsigned discoveredQmi(PicassoGlink &s) {
     uint32_t hello[]={1,2,5,0xfffffffe,0,20,1,0xfffffffe,2,0,0,0,0};
     qrtrPacket(s,rx,s.qrtrLocal[0].id,hello,52);message(s,rx,14,2,0);step(s);drain(s);step(s);drain(s);
     assert(s.qrtr.locator.announced);message(s,rx,14,2,0);step(s);drain(s);
+    step(s);drain(s);assert(s.qrtr.tftp.announced);message(s,rx,14,2,0);step(s);drain(s);
     uint32_t server[]={1,4,5,0xfffffffe,0,20,1,0xfffffffe,4,0x42,0x4a01,5,3};
     qrtrPacket(s,rx,s.qrtrLocal[0].id,server,52);step(s);drain(s);return rx;
 }
@@ -537,6 +540,7 @@ __attribute__((noinline)) static void local187Tests() {
         assert(!memcmp(ram+s.tx.offset+n+16,expected,sizeof expected));found=true;
     }
     assert(found);message(s,rx,14,2,0);step(s);drain(s);
+    step(s);drain(s);assert(s.qrtr.tftp.announced);message(s,rx,14,2,0);step(s);drain(s);
     uint32_t request[14]={1,1,5,88,1,19,1,0x187};
     const uint8_t qmi[]={0,9,0,0x21,0,12,0,1,9,0,'a','v','s','/','a','u','d','i','o'};
     memcpy(request+8,qmi,sizeof qmi);
@@ -574,6 +578,7 @@ __attribute__((noinline)) static void build186Tests() {
     uint32_t hello[]={1,2,5,0xfffffffe,0,20,0xffffffff,0xfffffffe,2,0,0,0,0};
     qrtrPacket(s,rx,s.qrtrLocal[0].id,hello,52);message(s,rx,14,2,0);step(s);drain(s);step(s);drain(s);
     assert(s.qrtr.locator.announced);message(s,rx,14,2,0);step(s);drain(s);
+    step(s);drain(s);assert(s.qrtr.tftp.announced);message(s,rx,14,2,0);step(s);drain(s);
     uint32_t server[]={1,4,5,0xfffffffe,0,20,1,0xfffffffe,4,0x42,0x4a01,5,3};
     qrtrPacket(s,rx,s.qrtrLocal[0].id,server,52);step(s);drain(s);assert(s.qrtr.qmi.bound);
     unsigned tx=s.txHead;p32(s.desc.offset,(tx+8)%s.tx.size);for(unsigned n=0;n<5;++n)step(s);
@@ -777,4 +782,68 @@ __attribute__((noinline)) static void fastrpcTests() {
     for(unsigned n=0;n<502;++n){drain(s);step(s);}
     assert(s.channel[1].closing && s.fastrpc.error==-60 && !s.qrtr.error && s.apr.ready && !s.failed);
     puts("PASS FastRPC stock OPEN and 64x100 RX buffers, passive transport, fragments, reuse, pressure, isolation, invalid frames, I/O failures and shutdown");
+}
+
+static unsigned tftpReady(PicassoGlink &s) {
+    unsigned rx=locatorAnnounceReady(s);step(s);drain(s);assert(s.qrtr.locator.announced);
+    message(s,rx,14,2,0);step(s);drain(s);assert(!s.qrtr.tftp.announced);return rx;
+}
+__attribute__((noinline)) static void tftpTests() {
+    PicassoGlink s={};unsigned rx=tftpReady(s);bool kick;
+    writes=0;step(s);unsigned count=writes;assert(s.qrtr.tftp.announced);
+    for(unsigned i=1;i<=count;++i) {
+        rx=tftpReady(s);writes=0;failWrite=i;
+        assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && !s.qrtr.tftp.announced);
+    }
+    rx=tftpReady(s);p32(s.desc.offset,(s.txHead+8)%s.tx.size);
+    for(unsigned i=0;i<10;++i)step(s);
+    assert(!s.qrtr.tftp.announced && !s.qrtrRemote[0].busy);drain(s);
+    unsigned at=s.txHead;step(s);drain(s);assert(s.qrtr.tftp.announced);
+    bool found=false;
+    for(unsigned i=at;i+68<=s.txHead;i+=8)if(r32(s.tx.offset+i)==0x20009) {
+        const uint32_t expected[]={1,4,1,0xfffffffe,0,20,5,0xfffffffe,4,0x1000,2,1,0x188};
+        assert(!memcmp(ram+s.tx.offset+i+16,expected,sizeof expected));found=true;
+    }
+    assert(found);message(s,rx,14,2,0);step(s);drain(s);
+    const uint8_t wrq[]={0,2,'/','r','e','a','d','w','r','i','t','e','/','c','h','e','c','k',0,'o','c','t','e','t',0};
+    uint32_t request[137]={1,1,5,73,1,sizeof wrq,1,0x188};memcpy(request+8,wrq,sizeof wrq);
+    unsigned iid=s.qrtrLocal[0].id;s.qrtr.count=7;
+    for(unsigned i=0;i<7;++i) { s.qrtr.queueBytes[i]=52;s.qrtr.queue[i][1]=7; }
+    // Full queue + unavailable remote intent must retain the RX buffer once.
+    s.qrtrRemote[0].size=0;
+    qrtrPacket(s,rx,iid,request,32+((sizeof wrq+3)&~3U));step(s);drain(s);
+    assert(!s.qrtr.tftp.requests && s.qrtrLocal[0].done && !s.qrtrLocal[0].delivered);
+    s.qrtr.count=0;s.qrtrRemote[0].size=548;step(s);drain(s);
+    assert(s.qrtr.tftp.requests==1 && s.qrtr.resumes==1 && s.qrtr.count==1);
+    message(s,rx,14,2,0);step(s);drain(s);step(s);drain(s);
+    assert(s.qrtr.tftp.replies==1 && !s.qrtr.count && !s.qrtr.locator.replies);
+    unsigned port=s.qrtr.tftp.transfers[0].port;
+    message(s,rx,14,2,0);step(s);drain(s);
+    // Timeout resends exact ACK0 from the same temporary port.
+    for(unsigned i=0;i<55 && s.qrtr.tftp.replies<2;++i) { step(s);drain(s); }
+    assert(s.qrtr.tftp.retries==1 && s.qrtr.tftp.replies==2);
+    message(s,rx,14,2,0);step(s);drain(s);
+    request[4]=0;request[5]=516;request[7]=port;
+    auto *body=reinterpret_cast<uint8_t *>(request+8);body[0]=0;body[1]=3;body[2]=0;body[3]=1;
+    for(unsigned i=0;i<512;++i)body[4+i]=uint8_t(i);
+    qrtrPacket(s,rx,iid,request,548);step(s);drain(s);step(s);drain(s);
+    assert(!s.qrtr.tftp.writes && s.qrtr.tftp.replies==3);
+    message(s,rx,14,2,0);step(s);drain(s);
+    request[5]=4;body[3]=2;qrtrPacket(s,rx,iid,request,36);step(s);drain(s);step(s);drain(s);
+    assert(s.qrtr.tftp.writes==1 && s.qrtr.tftp.files[0].size==512);
+    message(s,rx,14,2,0);step(s);drain(s);
+    request[5]=sizeof wrq;request[7]=0x188;memcpy(body,wrq,sizeof wrq);body[1]=1;
+    qrtrPacket(s,rx,iid,request,32+((sizeof wrq+3)&~3U));step(s);drain(s);
+    // 516-byte TFTP DATA + 32-byte QRTR header + GLINK alignment = 568.
+    unsigned replies=s.qrtr.tftp.replies;s.qrtrRemote[0].size=544;
+    step(s);drain(s);assert(s.qrtr.count==1 && s.qrtr.tftp.replies==replies && !s.qrtrRemote[0].busy);
+    s.qrtrRemote[0].size=548;at=s.txHead;step(s);drain(s);
+    assert(s.qrtr.tftp.replies==replies+1 && s.qrtrRemote[0].busy);
+    found=false;for(unsigned i=at;i+568<=s.txHead;i+=8)if(r32(s.tx.offset+i)==0x20009) {
+        assert(r32(s.tx.offset+i+8)==548 && r32(s.tx.offset+i+36)==516);
+        for(unsigned j=0;j<512;++j)assert(ram[s.tx.offset+i+52+j]==uint8_t(j));
+        assert(!r32(s.tx.offset+i+564));found=true;
+    }
+    assert(found);picasso_glink_stop(&s);assert(!s.qrtr.tftp.announced && !s.qrtr.tftp.files[0].used);
+    puts("PASS stock instance2 TFTP announcement, fault injection, RX hold, timeout retry and max DATA through production GLINK");
 }

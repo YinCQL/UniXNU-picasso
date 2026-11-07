@@ -127,6 +127,14 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     auto &a = s->apr;
     int qmiDue=c.local==2 ? picasso_qmi_due(&s->qrtr.qmi):-1;
     if (c.local==1) ++a.ticks;
+    // Worker cadence is 20 ms. Hold expiry while responses are backpressured.
+    if(c.local==2 && !s->qrtr.count && s->qrtr.tftp.announced) {
+        auto &q=s->qrtr;int retry=picasso_tftp_tick(&q.tftp);
+        if(retry>=0) {
+            auto &x=q.tftp.transfers[retry];
+            picasso_qrtr_reply(&q,x.port,x.node,x.peer,x.reply,x.replyBytes);
+        }
+    }
     if(c.local==1 && a.fw.pending && ++a.fw.wait>100) {
         a.fw.pending=false;a.fw.error=-60;++a.fw.events;
     }
@@ -163,14 +171,19 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     if (c.local==2) {
         auto &q=s->qrtr;
         bool announce=q.helloSent && q.helloReceived && !q.locator.announced && !q.count;
-        if (q.error || (q.helloSent && !q.count && qmiDue<0 && !announce)) return 0;
-        uint32_t words[140]={9U | (uint32_t(c.local)<<16),0,52,0};
-        bool query=q.helloSent && !q.count && !announce && qmiDue>=0;
+        bool tftpAnnounce=q.helloSent && q.helloReceived && q.locator.announced && !q.tftp.announced && !q.count;
+        if (q.error || (q.helloSent && !q.count && qmiDue<0 && !announce && !tftpAnnounce)) return 0;
+        uint32_t words[4+((PicassoQrtrWords+1)&~1U)]={9U | (uint32_t(c.local)<<16),0,52,0};
+        bool query=q.helloSent && !q.count && !announce && !tftpAnnounce && qmiDue>=0;
         if (!q.helloSent) picasso_qrtr_control(words+4,2,1,PicassoQrtrControl,
             q.helloReceived?q.peer:0xffffffffU,PicassoQrtrControl);
         else if(announce) {
             picasso_qrtr_control(words+4,4,1,PicassoQrtrControl,q.peer,PicassoQrtrControl,0x40,0x101);
             words[15]=1;words[16]=PicassoServlocPort;
+        }
+        else if(tftpAnnounce) {
+            picasso_qrtr_control(words+4,4,1,PicassoQrtrControl,q.peer,PicassoQrtrControl,0x1000,2); // stock sensor TFTP address (b21365c8)
+            words[15]=1;words[16]=PicassoTftpPort;
         }
         else if(query) words[2]=picasso_qmi_query(&q.qmi,unsigned(qmiDue),reinterpret_cast<uint8_t *>(words+4));
         else {
@@ -193,12 +206,14 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
         slot->busy=true; q.intentGranted=false;
         if (!q.helloSent) q.helloSent=true;
         else if(announce) { q.locator.announced=true;++q.locator.events; }
+        else if(tftpAnnounce) { q.tftp.announced=true;++q.tftp.events; }
         else if(query) {
             auto &d=q.qmi.domains[qmiDue];d.sent=true;d.pending=true;d.ticks=0;++q.qmi.events;
         }
         else {
             if(q.queue[q.head][1]==7)++q.resumes;
-            else { ++q.locator.replies;++q.locator.events; }
+            else if(q.queue[q.head][3]==PicassoServlocPort) { ++q.locator.replies;++q.locator.events; }
+            else { ++q.tftp.replies;++q.tftp.events; }
             q.head=(q.head+1)%PicassoQrtrQueue; --q.count;
         }
         ++q.events; return 0;

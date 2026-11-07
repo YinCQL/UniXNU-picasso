@@ -5,20 +5,22 @@
 #include <stdint.h>
 #include "PicassoQmi.h"
 #include "PicassoServloc.h"
-enum { PicassoQrtrServices = 64, PicassoQrtrQueue = 8 };
+#include "PicassoTftp.h"
+enum { PicassoQrtrServices = 64, PicassoQrtrQueue = 8, PicassoQrtrWords = (32+PicassoTftpBytes+3)/4 };
 static constexpr uint32_t PicassoQrtrControl = 0xfffffffeU;
 struct PicassoQrtrService { uint32_t service, instance, node, port; bool used; };
 struct PicassoQrtr {
     PicassoQrtrService services[PicassoQrtrServices];
-    uint32_t queue[PicassoQrtrQueue][136];
+    uint32_t queue[PicassoQrtrQueue][PicassoQrtrWords];
     uint32_t queueBytes[PicassoQrtrQueue];
-    uint8_t replyScratch[PicassoServlocBytes];
+    uint8_t replyScratch[PicassoTftpBytes];
     uint32_t head, count, peer, received, malformed, ignored, events, overflow;
     uint32_t lastType, lastService, lastInstance, lastNode, lastPort, data, resumes;
     uint32_t wireVersion, wireBytes, sourceNode, sourcePort, destNode, destPort, payloadBytes;
     uint32_t payloadWords[4];
     PicassoQmi qmi;
     PicassoServloc locator;
+    PicassoTftp tftp;
     bool helloSent, helloReceived, intentAsked, intentGranted;
     int error;
 };
@@ -31,10 +33,20 @@ inline void picasso_qrtr_control(uint32_t *w, uint32_t type, uint32_t sn, uint32
     w[0]=1; w[1]=type; w[2]=sn; w[3]=sp; w[4]=0; w[5]=20; w[6]=dn; w[7]=dp;
     w[8]=type; w[9]=a; w[10]=b; w[11]=0; w[12]=0;
 }
+inline void picasso_qrtr_reply(PicassoQrtr *q,uint32_t from,uint32_t node,uint32_t port,
+                               const uint8_t *data,unsigned size) {
+    unsigned index=(q->head+q->count)%PicassoQrtrQueue;auto *w=q->queue[index];
+    unsigned bytes=32+((size+3)&~3U);q->queueBytes[index]=bytes;
+    for(unsigned n=0;n<bytes/4;++n)w[n]=0;
+    w[0]=1;w[1]=1;w[2]=1;w[3]=from;w[5]=size;w[6]=node;w[7]=port;
+    auto *body=reinterpret_cast<uint8_t *>(w+8);
+    for(unsigned n=0;n<size;++n)body[n]=data[n];
+    ++q->count;
+}
 inline void picasso_qrtr_invalidate(PicassoQrtr *q, int error) {
     picasso_qmi_lost(&q->qmi);
     q->helloReceived=false; q->helloSent=false; q->count=0; q->error=error;
-    q->locator.announced=false;
+    q->locator.announced=false;picasso_tftp_invalidate(&q->tftp);
     for (auto &s:q->services) s.used=false;
 }
 // -11 retains the complete GLINK receive buffer for retry, without consuming
@@ -68,15 +80,19 @@ inline int picasso_qrtr_receive(PicassoQrtr *q, const uint8_t *p, uint32_t n) {
     PicassoServlocRequest request={};unsigned answer=0;
     bool locator=type==1 && dp==PicassoServlocPort && dn==1 && q->helloReceived &&
         q->locator.announced && sn==q->peer && sp!=PicassoQrtrControl && sp!=0xffffffffU;
+    bool tftp=type==1 && dn==1 && q->helloReceived && q->tftp.announced && sn==q->peer &&
+        sp!=PicassoQrtrControl && sp!=0xffffffffU && dp>=PicassoTftpPort &&
+        dp<=PicassoTftpPort+q->tftp.nextPort;
     if(locator) answer=picasso_servloc_answer(p+header,size,q->replyScratch,&request);
     // Reserve all replies atomically before consuming the packet or changing
     // counters. A full queue leaves its GLINK intent owned by the receiver.
-    if (type==1 && q->count+unsigned(confirm)+unsigned(answer!=0)>PicassoQrtrQueue) return -11;
+    if (type==1 && q->count+unsigned(confirm)+unsigned(answer!=0 || tftp)>PicassoQrtrQueue) return -11;
     ++q->received; q->lastType=type;
     const uint8_t *payload=p+header;
     if (type==2) {
         if(q->helloReceived && q->peer!=sn) {
             q->count=0;for(auto &s:q->services)s.used=false;
+            picasso_tftp_invalidate(&q->tftp);
         }
         if(q->qmi.bound && q->qmi.node!=sn) picasso_qmi_lost(&q->qmi);
         q->locator.announced=false;
@@ -110,7 +126,7 @@ inline int picasso_qrtr_receive(PicassoQrtr *q, const uint8_t *p, uint32_t n) {
         uint32_t node=type==3 ? sn : picasso_qrtr_u32(payload+8);
         for (auto &s:q->services) if (s.used && s.node==node) s.used=false;
         if(q->qmi.bound && q->qmi.node==node) picasso_qmi_lost(&q->qmi);
-        if (node==q->peer) { q->helloReceived=false;q->locator.announced=false;q->count=0; }
+        if (node==q->peer) { q->helloReceived=false;q->locator.announced=false;q->count=0;picasso_tftp_invalidate(&q->tftp); }
         ++q->events;
     } else if (type==1) {
         ++q->data;
@@ -135,6 +151,10 @@ inline int picasso_qrtr_receive(PicassoQrtr *q, const uint8_t *p, uint32_t n) {
                 for(unsigned n=0;n<answer;++n)body[n]=q->replyScratch[n];
                 ++q->count;
             }
+        } else if(tftp) {
+            uint32_t from=dp;
+            answer=picasso_tftp_receive(&q->tftp,sn,sp,dp,payload,size,q->replyScratch,&from);
+            if(answer) picasso_qrtr_reply(q,from,sn,sp,q->replyScratch,answer);
         } else if(!picasso_qmi_receive(&q->qmi,sn,sp,dp,payload,size)) ++q->ignored;
     } else ++q->ignored;
     // HELLO and announcements may be interleaved by the transport. Bind only
