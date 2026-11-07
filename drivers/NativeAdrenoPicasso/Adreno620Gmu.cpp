@@ -20,6 +20,7 @@
 #include "AdrenoFirmware.h"
 #include "AdrenoHfi.h"
 #include "AdrenoHfiStartup.h"
+#include "AdrenoHfiVotes.h"
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -165,6 +166,9 @@ struct CmdDb {
     uint32_t mxAddress, cxAddress, xoAddress, vrmAddress;
     /* RPMh BCM resources used by the GMU bandwidth table (kgsl msm-bus paths for grp3d/cnoc). */
     uint32_t sh0Address, mc0Address, acvAddress, cn0Address;
+    /* The trio's command-DB aux (struct bcm_db: unit/width/vcd). The per-level votes need the device's own
+     * unit and width, the same values the crypto path votes with. */
+    struct BcmAux { uint32_t unit; uint16_t width; uint8_t vcd; bool valid; } mc0, sh0, acv;
 };
 
 struct GmuState {
@@ -180,6 +184,11 @@ struct GmuState {
     CmdDb cmdDb;
     uint32_t speedBin;
     uint32_t votesAvailable;
+    /* sheng-gpu-bw-table=1: per-level RPMh votes from the DTS grp3d table; bwIndex is the DT
+     * qcom,bus-freq of each HFI performance level, sent in the GX vote instead of INVALID_DCVS_IDX. */
+    bool bandwidthTable;
+    unsigned bandwidthLevels;
+    uint8_t bwIndex[16];
 };
 
 GmuState *gState;
@@ -334,6 +343,40 @@ bool cmdDbAux(const volatile uint8_t *data, size_t dataBytes, const char *id,
     return false;
 }
 
+/* Raw aux bytes of one command-DB entry (cmd_db_read_aux_data). The word reader above stops at the first zero
+ * word after a value, which is right for the ARC rail tables but wrong for a BCM's packed aux
+ * (struct bcm_db {u32 unit; u16 width; u8 vcd; u8 reserved}), whose fields can legitimately hold zeros. */
+bool cmdDbBcmData(const volatile uint8_t *data, size_t dataBytes,
+    const uint16_t hdr[8][8], const char *id, uint8_t out[8])
+{
+    uint8_t query[8] = {};
+    for (size_t i = 0; i < 8 && id[i]; ++i) query[i] = static_cast<uint8_t>(id[i]);
+    for (unsigned resource = 0; resource < 8; ++resource) {
+        const uint16_t *header = hdr[resource];
+        const uint16_t slave = header[0];
+        if (!slave) break;
+        const size_t headerOffset = header[1];
+        const size_t dataOffset = header[2];
+        const size_t entries = header[3];
+        for (size_t index = 0; index < entries; ++index) {
+            const size_t at = headerOffset + index * 24;
+            if (at + 24 > dataBytes) return false;
+            bool match = true;
+            for (size_t byte = 0; byte < 8; ++byte)
+                if (data[at + byte] != query[byte]) { match = false; break; }
+            if (!match) continue;
+            const uint16_t length = uint16_t(data[at + 20] | (data[at + 21] << 8));
+            const uint16_t offset = uint16_t(data[at + 22] | (data[at + 23] << 8));
+            if (length < 8) return false;
+            const size_t aux = dataOffset + offset;
+            if (aux + 8 > dataBytes) return false;
+            for (unsigned byte = 0; byte < 8; ++byte) out[byte] = data[aux + byte];
+            return true;
+        }
+    }
+    return false;
+}
+
 bool readCmdDb(CmdDb &cmd)
 {
     cmd = {};
@@ -395,6 +438,28 @@ bool readCmdDb(CmdDb &cmd)
             const bool found = cmdDbAux(db, dbBytes, names[index],
                 (const uint16_t (*)[8])header, nullptr, 0, &scratch, targets[index]);
             printf(" %s=%s%x", names[index], found ? "" : "?", *targets[index]);
+        }
+        printf("\n");
+    }
+    /* The bandwidth votes scale each level's KB/s by the BCM's own unit/width (a6xx_gmu_rpmh_bw_votes_init),
+     * so the same aux the crypto path uses is read here once; sheng-gpu-bw-table=1 needs it. */
+    {
+        const char *auxNames[3] = {"MC0", "SH0", "ACV"};
+        CmdDb::BcmAux *auxTargets[3] = {&cmd.mc0, &cmd.sh0, &cmd.acv};
+        uint8_t bytes[8] = {};
+        printf("PICASSO_GPU gmu: cmd-db bcm aux");
+        for (unsigned index = 0; index < 3; ++index) {
+            AdrenoHfiBcm decoded = {};
+            if (cmdDbBcmData(db, dbBytes, (const uint16_t (*)[8])header, auxNames[index], bytes) &&
+                AdrenoHfiBcmAux(&decoded, bytes, sizeof bytes) == AdrenoHfiStartupSuccess) {
+                auxTargets[index]->unit = decoded.unit;
+                auxTargets[index]->width = decoded.width;
+                auxTargets[index]->vcd = decoded.vcd;
+                auxTargets[index]->valid = true;
+            }
+            printf(" %s=%s%u/%u/%u", auxNames[index], auxTargets[index]->valid ? "" : "?",
+                auxTargets[index]->unit, unsigned(auxTargets[index]->width),
+                unsigned(auxTargets[index]->vcd));
         }
         printf("\n");
     }
@@ -1333,7 +1398,13 @@ int gxPowerOn(unsigned perfIndex)
      * (rscAndPdc) or the firmware fails it inside GmuPwrGxBwVote. */
     coreWrite(kGmuGmu2HostIntrClr, 0xFFFFFFFFu);
     barrier();
-    const uint32_t vote[3] = {1, perfIndex, 0xFF};
+    /* With the per-level table the GX vote names this level's own bus vote (DT qcom,bus-freq); otherwise
+     * INVALID_DCVS_IDX lets the firmware derive it from the single zero-vote entry. */
+    uint32_t bwVote = 0xFF;
+    if (s.bandwidthTable && perfIndex < sizeof s.bwIndex &&
+        s.bwIndex[perfIndex] < s.bandwidthLevels)
+        bwVote = s.bwIndex[perfIndex];
+    const uint32_t vote[3] = {1, perfIndex, bwVote};
     AdrenoHfiStatus voteStatus = AdrenoHfiUnexpected;
     {
         uint32_t output[16] = {};
@@ -1576,6 +1647,9 @@ extern "C" int native_adreno620_hfi_handshake(void)
     s.votesAvailable = 0;
     for (size_t index = 0; index < bin->count; ++index) {
         const uint64_t hz = bin->levels[bin->count - 1 - index].frequency_hz;
+        /* The DT's qcom,bus-freq index of this very level; the GX vote sends it when the per-level
+         * bandwidth table is in use (sheng-gpu-bw-table=1). */
+        s.bwIndex[index] = uint8_t(bin->levels[bin->count - 1 - index].bus_index);
         const uint16_t vlvl = vlvlForFrequency(hz);
         uint32_t vote = 0;
         if (s.cmdDb.valid && arcVote(s.cmdDb, s.cmdDb.gfx, s.cmdDb.gfxCount,
@@ -1602,18 +1676,83 @@ extern "C" int native_adreno620_hfi_handshake(void)
      * level), so a table without the target's CN0 makes the first vote fail (wf37 measured the addresses;
      * q2msm's a650 port hit the same class of bug: "XR2 has CN0 at 0x50074, not 0x500a4"). Use the a650
      * firmware's own table shape with this device's CN0. */
-    config.bandwidth_count = 1;
-    config.cnoc_count = 1;
-    config.ddr_count = 3;
-    config.cnoc_wait_mask = 0x01;
-    config.ddr_wait_mask = 0x01;
-    config.cnoc_addresses[0] = s.cmdDb.cn0Address;
-    config.ddr_addresses[0] = s.cmdDb.mc0Address;
-    config.ddr_addresses[1] = s.cmdDb.sh0Address;
-    config.ddr_addresses[2] = s.cmdDb.acvAddress;
-    config.cnoc_data[0][0] = 0x40000000u;
-    config.cnoc_data[1][0] = 0x60000001u;
-    for (unsigned index = 0; index < 3; ++index) config.ddr_data[0][index] = 0x40000000u;
+    /* Two shapes are possible here. First the one this port booted with: a single level whose DDR and CNOC
+     * commands carry commit and valid=0, i.e. no bandwidth request at all (bw = INVALID_DCVS_IDX then
+     * "derives" that one level). Second, sheng-gpu-bw-table=1: the DTS grp3d 13 levels with the kernel's own
+     * arithmetic (AdrenoHfiBuildBandwidth: vote = kbps*width/buswidth*1000/unit, clamped to 14 bits), so the
+     * GPU asks RPMh for the bus levels the board table already defines, and the GX vote sends each
+     * performance level's own qcom,bus-freq index instead of INVALID_DCVS_IDX. Off by default: a wrong GX
+     * power vote takes the whole GPU down with it, so it stays an explicit experiment until a boot verifies. */
+    unsigned bwTableArg = 0;
+    const bool bwTableRequested = PE_parse_boot_argn("sheng-gpu-bw-table", &bwTableArg,
+        sizeof bwTableArg) && bwTableArg == 1;
+    bool bwTableBuilt = false;
+    const size_t busLevels = adreno620::gpuBusLevelCount();
+    if (bwTableRequested) {
+        const bool auxReady = s.cmdDb.valid && s.cmdDb.mc0.valid && s.cmdDb.sh0.valid &&
+            s.cmdDb.acv.valid && s.cmdDb.mc0Address && s.cmdDb.sh0Address && s.cmdDb.acvAddress &&
+            s.cmdDb.cn0Address;
+        if (auxReady && busLevels >= 2 && busLevels <= 16) {
+            /* buswidth/fixed/perfmode are catalog policy, not command-DB data: a623 (same GEN3 GMU family)
+             * names SH0 buswidth 16, MC0 buswidth 4 and a fixed ACV voting perfmode BIT(3). The order is the
+             * one this port's working startup table uses (MC0, SH0, ACV); their VCDs are all distinct, so
+             * each command carries its group's commit. */
+            AdrenoHfiBcm bcms[3] = {};
+            bcms[0].address = s.cmdDb.mc0Address;
+            bcms[0].unit = s.cmdDb.mc0.unit;
+            bcms[0].width = s.cmdDb.mc0.width;
+            bcms[0].buswidth = 4;
+            bcms[0].vcd = s.cmdDb.mc0.vcd;
+            bcms[1].address = s.cmdDb.sh0Address;
+            bcms[1].unit = s.cmdDb.sh0.unit;
+            bcms[1].width = s.cmdDb.sh0.width;
+            bcms[1].buswidth = 16;
+            bcms[1].vcd = s.cmdDb.sh0.vcd;
+            bcms[2].address = s.cmdDb.acvAddress;
+            bcms[2].vcd = s.cmdDb.acv.vcd;
+            bcms[2].fixed = 1;
+            bcms[2].perfmode = 8;
+            /* a6xx_gmu_rpmh_bw_votes_init votes ACV's perfmode on every valid bandwidth level for A6xx
+             * (the A7xx threshold form is "(perfmode_bw && bw >= perfmode_bw)"); the builder only applies
+             * perfmode at/above perfmode_kbps, so the threshold is 1 and level 0 keeps commit-only. */
+            bcms[2].perfmode_kbps = 1;
+            uint32_t kbps[16] = {};
+            for (size_t i = 0; i < busLevels; ++i) kbps[i] = adreno620::gpuBusKbps(uint32_t(i));
+            AdrenoHfiStartupConfig previous = config;
+            if (AdrenoHfiBuildBandwidth(kbps, busLevels, bcms, 3, s.cmdDb.cn0Address, &config) ==
+                    AdrenoHfiStartupSuccess) {
+                bwTableBuilt = true;
+                printf("PICASSO_GPU hfi: bw table levels=%u top votes mc0=%x sh0=%x acv=%x "
+                    "cnoc=%x/%x\n", unsigned(busLevels),
+                    config.ddr_data[busLevels - 1][0], config.ddr_data[busLevels - 1][1],
+                    config.ddr_data[busLevels - 1][2], config.cnoc_data[0][0], config.cnoc_data[1][0]);
+            } else {
+                config = previous;
+                printf("PICASSO_GPU hfi: bw table refused by the encoder; keeping the zero-vote level\n");
+            }
+        } else {
+            printf("PICASSO_GPU hfi: bw table requested but cmd-db aux=%d addresses=%d levels=%u\n",
+                int(s.cmdDb.mc0.valid && s.cmdDb.sh0.valid && s.cmdDb.acv.valid),
+                int(s.cmdDb.mc0Address && s.cmdDb.sh0Address && s.cmdDb.acvAddress && s.cmdDb.cn0Address),
+                unsigned(busLevels));
+        }
+    }
+    s.bandwidthTable = bwTableBuilt;
+    s.bandwidthLevels = bwTableBuilt ? unsigned(busLevels) : 0;
+    if (!bwTableBuilt) {
+        config.bandwidth_count = 1;
+        config.cnoc_count = 1;
+        config.ddr_count = 3;
+        config.cnoc_wait_mask = 0x01;
+        config.ddr_wait_mask = 0x01;
+        config.cnoc_addresses[0] = s.cmdDb.cn0Address;
+        config.ddr_addresses[0] = s.cmdDb.mc0Address;
+        config.ddr_addresses[1] = s.cmdDb.sh0Address;
+        config.ddr_addresses[2] = s.cmdDb.acvAddress;
+        config.cnoc_data[0][0] = 0x40000000u;
+        config.cnoc_data[1][0] = 0x60000001u;
+        for (unsigned index = 0; index < 3; ++index) config.ddr_data[0][index] = 0x40000000u;
+    }
     config.enable_ifpc = 0;
 
     /* kgsl_gmu.c only sends the ACD table and feature when the AOP mailbox exists: gmu_aop_mailbox_init sets

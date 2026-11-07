@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoVm.h"
+#include "NativeAdrenoProfile.h"
 #include "NativeAdrenoVmAlias.h"
 extern "C" volatile uint32_t native_adreno_trace_stage;
 extern "C" {int (*native_adreno_dram_read32)(uint64_t,uint32_t *);int (*native_adreno_cached_read32)(uint64_t,uint32_t *);
@@ -35,6 +36,35 @@ ArmSmmu4KLiveRegion NativeAdrenoVm::region(unsigned upper,const ArmSmmu4KRange *
 /* Board hook and per-phase time of the two table transactions, for the log: [0] map, [1] unmap; each row is count, the phases in order, the slowest call
  * and the bytes mapped (int-134: BoMap averaged 135 ms and the desktop crawled). */
 extern "C" {uint64_t (*native_adreno_vm_now_us)(void)=nullptr;volatile uint64_t native_adreno_vm_phase_us[2][8];}
+extern "C" {uint32_t native_adreno_profile_enabled;
+volatile uint64_t native_adreno_profile_phases[NativeProfilePhaseCount][3];
+volatile uint64_t native_adreno_profile_counters[NativeProfileCounterCount];}
+extern "C" volatile uint64_t native_adreno_maint_phase[8][2] __attribute__((weak_import));
+extern "C" void native_adreno_profile_report(void)
+{
+    if(!native_adreno_profile_enabled)return;
+    static const char *const names[]={"call","lock","dispatch","body","validate","retire","audit","publish","switch","drain","ring","acquire","ibpeek"};
+    for(unsigned i=0;i<NativeProfilePhaseCount;++i) {
+        uint64_t row[3];
+        for(unsigned j=0;j<3;++j)row[j]=__atomic_load_n(&native_adreno_profile_phases[i][j],__ATOMIC_RELAXED);
+        printf("PICASSO_GPU prof %s n=%llu us=%llu max=%llu\n",names[i],
+            (unsigned long long)row[0],(unsigned long long)row[1],(unsigned long long)row[2]);
+    }
+    uint64_t values[NativeProfileCounterCount];
+    for(unsigned i=0;i<NativeProfileCounterCount;++i)values[i]=__atomic_load_n(&native_adreno_profile_counters[i],__ATOMIC_RELAXED);
+    printf("PICASSO_GPU profscan pub=%llu/%llu/%llu/%llu acq=%llu/%llu/%llu/%llu\n",
+        (unsigned long long)values[0],(unsigned long long)values[1],(unsigned long long)values[2],(unsigned long long)values[3],
+        (unsigned long long)values[4],(unsigned long long)values[5],(unsigned long long)values[6],(unsigned long long)values[7]);
+    if(&native_adreno_maint_phase) {
+        uint64_t pub[2],acq[2];
+        for(unsigned i=0;i<2;++i) {
+            pub[i]=__atomic_load_n(&native_adreno_maint_phase[NativeAdrenoPhaseSubmit][i],__ATOMIC_RELAXED);
+            acq[i]=__atomic_load_n(&native_adreno_maint_phase[NativeAdrenoPhaseComplete][i],__ATOMIC_RELAXED);
+        }
+        printf("PICASSO_GPU profmaint pub=%llu/%lluK acq=%llu/%lluK\n",
+            (unsigned long long)pub[0],(unsigned long long)pub[1],(unsigned long long)acq[0],(unsigned long long)acq[1]);
+    }
+}
 /* {count, us, spans} per kind: 0 map of driver memory, 1 import map without the alias pass, 2 import map with it, 3 unmap dropping its
  * pages from the TLB one by one, 4 unmap invalidating the ASID. */
 extern "C" {volatile uint64_t native_adreno_vm_kind_us[5][3];}
@@ -441,23 +471,34 @@ IOReturn NativeAdrenoVm::invalidateTlb()
 IOReturn NativeAdrenoVm::publishMapped()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
+    uint64_t visited=0,skipped=0,candidates=0,bytes=0;
     for(size_t i=0;i<high_;++i) {
         const Mapping &m=mappings_[i];
         if(!m.memory)continue;
-        if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
+        if(native_adreno_profile_enabled)++visited;
+        if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;if(native_adreno_profile_enabled)++skipped;continue;}
+        if(native_adreno_profile_enabled) {++candidates;bytes+=m.memory->bytes();}
         if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_,NativeAdrenoPhaseSubmit))return fail(ArmSmmu4KIoError);
     }
+    nativeAdrenoProfileAdd(NativeProfilePublishVisited,visited);nativeAdrenoProfileAdd(NativeProfilePublishSkipped,skipped);
+    nativeAdrenoProfileAdd(NativeProfilePublishCandidates,candidates);nativeAdrenoProfileAdd(NativeProfilePublishBytes,bytes);
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoVm::acquireImported()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
+    NativeAdrenoProfileTimer timer(NativeProfileAcquire);
+    uint64_t visited=0,skipped=0,candidates=0,bytes=0;
     for(size_t i=0;i<high_;++i) {
         const Mapping &m=mappings_[i];
         if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite))continue;
-        if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
+        if(native_adreno_profile_enabled)++visited;
+        if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;if(native_adreno_profile_enabled)++skipped;continue;}
+        if(native_adreno_profile_enabled) {++candidates;bytes+=m.memory->bytes();}
         if(m.memory->acquireDeviceWrites(0,m.memory->bytes(),NativeAdrenoPhaseComplete))return fail(ArmSmmu4KIoError);
     }
+    nativeAdrenoProfileAdd(NativeProfileAcquireVisited,visited);nativeAdrenoProfileAdd(NativeProfileAcquireSkipped,skipped);
+    nativeAdrenoProfileAdd(NativeProfileAcquireCandidates,candidates);nativeAdrenoProfileAdd(NativeProfileAcquireBytes,bytes);
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoVm::sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dram) const
@@ -538,7 +579,7 @@ static bool dramWord(const NativeAdrenoMemory &memory,size_t offset,uint32_t *va
     }
     return false;
 }
-IOReturn NativeAdrenoVm::peekWords(uint64_t iova,uint32_t *out,size_t count) const
+IOReturn NativeAdrenoVm::peekWords(uint64_t iova,uint32_t *out,size_t count,bool batch) const
 {
     if(!out || !attached_ || poisoned_)return kIOReturnBadArgument;
     for(size_t k=0;k<count;++k)out[k]=0;
@@ -547,6 +588,32 @@ IOReturn NativeAdrenoVm::peekWords(uint64_t iova,uint32_t *out,size_t count) con
         if(!m.memory || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
         const size_t offset=(size_t)(iova-m.iova);
         if(!m.memory->mapping()) {
+            /* ngb=1: the submit diagnostic keeps the same uncached snapshot, but maps a physical page once rather than once per
+             * dword. Never read beyond this BO, a physical span, or the board hook's single-page aperture. No mapping is retained. */
+            if(batch && native_adreno_dram_read_words && !(offset&3)) {
+                const size_t available=(m.memory->bytes()-offset)/4;
+                const size_t limit=count<available?count:available;
+                for(size_t done=0;done<limit;) {
+                    const size_t at=offset+4*done;
+                    const NativeAdrenoPhysicalSpan *found=nullptr;
+                    for(size_t j=0;j<m.memory->spanCount();++j) {
+                        const auto &span=m.memory->spans()[j];
+                        if(at>=span.offset && at-span.offset<span.bytes) {found=&span;break;}
+                    }
+                    if(!found)return kIOReturnUnsupported;
+                    const size_t in_span=at-found->offset;
+                    const uint64_t physical=found->physical+in_span;
+                    size_t run=(found->bytes-in_span)/4;
+                    const size_t in_page=(4096-size_t(physical&4095))/4;
+                    if(run>in_page)run=in_page;
+                    if(run>limit-done)run=limit-done;
+                    if(!run)return kIOReturnUnsupported;
+                    const int got=native_adreno_dram_read_words(physical,out+done,run);
+                    if(got<=0 || size_t(got)>run)return kIOReturnUnsupported;
+                    done+=size_t(got);
+                }
+                return kIOReturnSuccess;
+            }
             for(size_t k=0;k<count && offset+4*k+4<=m.memory->bytes();++k)
                 if(!dramWord(*m.memory,offset+4*k,&out[k]))return kIOReturnUnsupported;
             return kIOReturnSuccess;

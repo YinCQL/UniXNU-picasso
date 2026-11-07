@@ -29,6 +29,8 @@ struct NativeAdrenoVmResult {
  * validation/protection, genuine IRQ fences and reset are implemented. */
 /* Board hook for sampleWord(): reads one aligned word of physical memory through a fresh uncached mapping; 0 on success. */
 extern "C" int (*native_adreno_dram_read32)(uint64_t physical,uint32_t *value);
+/* Same uncached reader, at most one physical page per call; returns the words read. */
+extern "C" int (*native_adreno_dram_read_words)(uint64_t physical,uint32_t *out,size_t count);
 /* The board's reader through the kernel's cacheable physical aperture (null on the host: the BO's own mapping is read). */
 extern "C" int (*native_adreno_cached_read32)(uint64_t physical,uint32_t *value);
 /* Board hook for auditRange(): [physical, physical+bytes), whole 64-byte lines inside one page, as the cacheable physical aperture and
@@ -141,7 +143,7 @@ public:
     /* Read-only description of a live mapping; never pins or extends it. */
     IOReturn describe(uint64_t handle,uint64_t *iova,size_t *bytes,unsigned *permissions) const;
     /* Up to `count` dwords of a mapped kernel-owned BO at a GPU address (through the kernel's own mapping), for the board log. */
-    IOReturn peekWords(uint64_t iova,uint32_t *out,size_t count) const;
+    IOReturn peekWords(uint64_t iova,uint32_t *out,size_t count,bool batch=false) const;
     /* The same after cleaning and invalidating the CPU cache lines over the words: a BO zeroed through the kernel's cacheable mapping keeps
      * clean lines of those zeros there, which a plain read returns instead of what the client wrote through its own mapping since. */
     IOReturn peekWordsUncached(uint64_t iova,uint32_t *out,size_t count) const;
