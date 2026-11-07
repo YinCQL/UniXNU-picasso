@@ -36,7 +36,7 @@ static void initialization() {
         sent(n,0);reply(n,0);picasso_rpc_tick(&f);
         assert(f.domain[n].initialized && f.domain[n].stage==3 && f.domain[n].call[1].queued);
         assert(f.domain[n].call[1].sc==0x04020200);
-        assert(rpc32(output(n,1,0)+4)==0xffffffffU && rpc32(output(n,1,0)+12)==4096);
+        assert(rpc32(output(n,1,0)+4)==0xffffffffU && rpc32(output(n,1,0)+12)==PicassoRpcBlob);
         sent(n,1); // blocks independently of control open/register
         assert(f.domain[n].call[0].sc==0x20200);
         assert(!strcmp(reinterpret_cast<char *>(output(n,0,1)),"adsp_default_listener"));
@@ -63,15 +63,31 @@ static void reverseCalls() {
     assert(d.call[1].queued && rpc32(output(n,1,0))==0x123);
     assert(rpc32(output(n,1,1))==8 && rpc32(output(n,1,1)+8)==0x100);
     sent(n,1);
-    const char path[]="/vendor/etc/sensors/sns_reg_config";
+    const char path[]="/vendor/etc/sensors/absent_reg_config";
     p=output(n,1,3);rpcPut32(prim,31);rpcPut32(prim+4,sizeof(path));
     len=input(p,0,prim,8);len=input(p,len,path,sizeof(path));rpcPut32(p+len,96);len+=4;
     meta=output(n,1,2);rpcPut32(meta,0x124);rpcPut32(meta+4,0x100);rpcPut32(meta+8,0x1f020100);rpcPut32(meta+12,len);
     reply(n,1);picasso_rpc_tick(&f);
     assert(d.previousResult==2 && d.replyBytes==0 && !strcmp(d.name,path));
     assert(rpc32(output(n,1,0))==0x124 && rpc32(output(n,1,0)+4)==2 && !rpc32(output(n,1,0)+8));
-    sent(n,1);meta=output(n,1,2);rpcPut32(meta,0x125);rpcPut32(meta+12,4097);
+    sent(n,1);meta=output(n,1,2);rpcPut32(meta,0x125);rpcPut32(meta+12,PicassoRpcBlob+1);
     reply(n,1);picasso_rpc_tick(&f);assert(d.previousResult==77 && !d.replyBytes);
+}
+static void fileListener() {
+    picasso_rpc_fs_reset();initialization();auto &d=f.domain[1];d.stdOpen=true;d.opens=1;
+    auto *p=output(1,1,3);uint8_t prim[16];const char key[]="ADSP_LIBRARY_PATH",delim[]=";",path[]="/vendor/etc/sensors/sns_reg_config",mode[]="r";
+    unsigned lens[]={sizeof(key),sizeof(delim),sizeof(path),sizeof(mode)};
+    for(unsigned i=0;i<4;++i)rpcPut32(prim+4*i,lens[i]);
+    unsigned len=input(p,0,prim,16);len=input(p,len,key,sizeof(key));len=input(p,len,delim,sizeof(delim));
+    len=input(p,len,path,sizeof(path));len=input(p,len,mode,sizeof(mode));rpcPut32(p+len,4);len+=4;
+    auto *meta=output(1,1,2);rpcPut32(meta,0x991);rpcPut32(meta+4,0x100);rpcPut32(meta+8,0x13050100);rpcPut32(meta+12,len);
+    reply(1,1);picasso_rpc_tick(&f);assert(!d.previousResult && !d.decodeResult && !strcmp(d.name,path));
+    unsigned h=rpc32(output(1,1,1)+8);assert(h);sent(1,1);
+    p=output(1,1,3);rpcPut32(prim,h);rpcPut32(prim+4,4096);len=input(p,0,prim,8);rpcPut32(p+len,8);rpcPut32(p+len+4,4096);len+=8;
+    meta=output(1,1,2);rpcPut32(meta,0x992);rpcPut32(meta+4,0x100);rpcPut32(meta+8,0x04010200);rpcPut32(meta+12,len);
+    reply(1,1);picasso_rpc_tick(&f);assert(!d.previousResult && d.replyBytes==4120 && rpc32(output(1,1,1)+8)==553);
+    assert(!memcmp(output(1,1,1)+24,"version=1\n",10));
+    puts("PASS dual-slot next2 packs a real stock file read larger than the former 4KiB envelope");
 }
 static void errors() {
     reset();picasso_rpc_tick(&f);sent(0,0);
@@ -89,11 +105,11 @@ static void errors() {
     assert(f.stopped && f.unclaimed==1 && !f.completed && !f.domain[0].initialized);
     reset();healthError=-5;picasso_rpc_tick(&f);assert(f.stopped && !f.sent);
     reset();syncError=-5;picasso_rpc_tick(&f);assert(f.domain[0].error==-5 && !f.domain[0].call[0].queued);
-    reset();uint8_t b=1;const uint8_t *in[1]={&b};uint32_t len=4097;
+    reset();uint8_t b=1;const uint8_t *in[1]={&b};uint32_t len=PicassoRpcBlob+1;
     assert(rpcBuild(&f,0,0,1,0x10000,in,&len)==-22 && !f.domain[0].call[0].queued);
     assert(picasso_rpc_bind(&f,{nullptr,sync,healthy},ram[0],ram[1])==-22);
     // deterministic malformed packet corpus under ASan/UBSan
-    uint32_t rng=0x12345678;uint8_t p[100],out[4096];PicassoRpcArg a[8];unsigned olen;
+    uint32_t rng=0x12345678;uint8_t p[100],out[PicassoRpcBlob];PicassoRpcArg a[8];unsigned olen;
     for(unsigned i=0;i<10000;++i) { for(auto &x:p) { rng=rng*1664525+1013904223;x=uint8_t(rng>>24); }
         picasso_rpc_receive(&f,p,i%101);(void)rpcUnpack(p,i%101,rng,out,a,&olen); }
 }
@@ -197,4 +213,4 @@ static void inheritedDma() {
     assert(!writes);
     puts("PASS skip-init bank allocation, preserved ACTLR, ASID aliases, lease races and precise readback diagnostics");
 }
-int main() { initialization();reverseCalls();errors();dma();inheritedDma();assert(published && acquired); }
+int main() { initialization();reverseCalls();fileListener();errors();dma();inheritedDma();assert(published && acquired); }

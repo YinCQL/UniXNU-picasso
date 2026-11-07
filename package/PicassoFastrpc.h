@@ -4,7 +4,8 @@
 #ifndef PICASSO_FASTRPC_H
 #define PICASSO_FASTRPC_H
 #include <stdint.h>
-enum { PicassoRpcSlotBytes=16384, PicassoRpcDomainBytes=32768, PicassoRpcBlob=4096 };
+#include "PicassoRpcFs.h"
+enum { PicassoRpcSlotBytes=16384, PicassoRpcDomainBytes=32768, PicassoRpcBlob=6144 };
 struct PicassoRpcIo {
     void *context;
     int (*sync)(void *,unsigned,unsigned,bool); // whole owned slot: publish / acquire
@@ -19,7 +20,7 @@ struct PicassoRpcDomain {
     uint8_t *memory;
     uint64_t address;
     uint32_t pd,pid,stage,defaultHandle,sequence,requests,lastHandle,lastScalar;
-    uint32_t previousCtx,previousResult,replyBytes,opens;
+    uint32_t previousCtx,previousResult,replyBytes,opens,decodeResult,wireBytes;
     int error;
     bool registered,initialized,stdOpen;
     char name[128];
@@ -109,7 +110,7 @@ struct PicassoRpcArg { uint8_t *data;uint32_t bytes; };
 static inline int rpcUnpack(uint8_t *in,unsigned bytes,uint32_t sc,uint8_t *out,
     PicassoRpcArg *args,unsigned *outBytes) {
     unsigned ni=(sc>>16)&255,no=(sc>>8)&255,cursor=0,w=0;
-    *outBytes=0;
+    *outBytes=0;rpcZero(out,PicassoRpcBlob);
     if((sc&255) || ni+no>8)return 14;
     for(unsigned i=0;i<ni+no;++i) {
         if(cursor>bytes || bytes-cursor<4)return 14;
@@ -142,23 +143,7 @@ static inline int rpcReverse(PicassoRpcDomain &d,PicassoRpcArg *a,uint32_t sc,ui
         --d.opens;d.stdOpen=d.opens!=0;rpcPut32(a[1].data,0);return 0;
     }
     if(handle!=0x100 || !d.stdOpen)return 44;
-    if(sc==0x1f020100) { // apps_std_stat extension method 31
-        if(a[0].bytes<8 || rpc32(a[0].data)!=31 || a[2].bytes<96 ||
-            !rpcString(a[1],rpc32(a[0].data+4),d.name))return 14;
-        return 2; // ENOENT: no vendor filesystem mounted here, never fake stat
-    }
-    if(sc==0x00030100) { // fopen
-        char mode[128];
-        if(a[0].bytes<8 || a[3].bytes<4 || !rpcString(a[1],rpc32(a[0].data),d.name) ||
-            !rpcString(a[2],rpc32(a[0].data+4),mode))return 14;
-        return rpcName(mode,"r") || rpcName(mode,"rb")?2:13;
-    }
-    if(sc==0x10020200) { // getenv: the host intentionally has no Android environment
-        if(a[0].bytes<8 || a[2].bytes<4 || rpc32(a[0].data+4)>a[3].bytes ||
-            !rpcString(a[1],rpc32(a[0].data),d.name))return 14;
-        return 99;
-    }
-    return 20; // AEE_EUNSUPPORTED, no fake filesystem/heap success
+    return picasso_rpc_fs_invoke(d.pd,sc,a,d.name);
 }
 static inline int rpcNext(PicassoFastrpc *f,unsigned n) {
     auto &d=f->domain[n];uint8_t prim[16];rpcPut32(prim,d.previousCtx);rpcPut32(prim+4,d.previousResult);
@@ -188,10 +173,11 @@ static inline void picasso_rpc_tick(PicassoFastrpc *f) {
                 ++d.stage;
             } else {
                 auto *prim=p+c.offset[2];d.previousCtx=rpc32(prim);d.lastHandle=rpc32(prim+4);d.lastScalar=rpc32(prim+8);
-                unsigned len=rpc32(prim+12);++d.requests;
+                unsigned len=rpc32(prim+12);d.wireBytes=len;++d.requests;d.name[0]=0;
                 if(!d.previousCtx) { d.error=-71;++f->events;break; }
                 PicassoRpcArg args[8]={};d.replyBytes=0;
                 d.previousResult=len>PicassoRpcBlob?77:rpcUnpack(p+c.offset[3],len,d.lastScalar,d.reply,args,&d.replyBytes);
+                d.decodeResult=d.previousResult;
                 if(!d.previousResult)d.previousResult=rpcReverse(d,args,d.lastScalar,d.lastHandle);
                 if(d.previousResult)d.replyBytes=0;
                 ++f->events;

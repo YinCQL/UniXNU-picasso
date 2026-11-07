@@ -92,6 +92,7 @@ struct BootEvents {
     int aprError = 0;
     uint32_t qrtrEvents = 0, qrtrReceived = 0, qrtrLogs = 0;
     int qrtrError = 0;
+    uint32_t rpcRequests[2]={},rpcRequestLogs=0;
     uint32_t fastrpcReceived = 0, fastrpcLogs = 0, fastrpcEvents = 0;
     int fastrpcError = 0;
     uint32_t reuseLogs = 0, remoteReuse = 0, localReuse = 0;
@@ -203,6 +204,14 @@ void bootService(void *context) {
             b->fastrpcEvents=g->fastrpc.events;
             b->fastrpcError=g->fastrpc.error;++b->fastrpcLogs;
         }
+        for(unsigned n=0;n<2;++n) {
+            const auto &d=g->fastrpc.domain[n];
+            if(d.requests!=b->rpcRequests[n] && b->rpcRequestLogs<256) {
+                b->rpcRequests[n]=d.requests;++b->rpcRequestLogs;
+                IOLog("PICASSO_ADSP rpc-request pd=%u count=%u handle=%x sc=%x bytes=%u decode=%u result=%u path=%.127s volatile=1\n",
+                    d.pd,d.requests,d.lastHandle,d.lastScalar,d.wireBytes,d.decodeResult,d.previousResult,d.name);
+            }
+        }
         auto &q=g->qrtr;
         if(q.tftp.events!=b->tftpEvents && b->tftpLogs<48) {
             logTftp(q.tftp);b->tftpEvents=q.tftp.events;++b->tftpLogs;
@@ -298,6 +307,9 @@ extern "C" void picasso_smp2p_start(void) {
     smpKick(&d);
     IOLog("PICASSO_ADSP glink stage=prepared descriptor=%x/%x tx=%x/%x remote_pid=2\n",
         glink.desc.offset,glink.desc.size,glink.tx.offset,glink.tx.size);
+    uint32_t soc[6]={};int socError=picasso_rpc_fs_socinfo(&io.reader,soc);
+    IOLog("PICASSO_ADSP rpc-socinfo error=%d format=%u id=%u revision=%x platform=%u version=%u subtype=%u files=%u\n",
+        socError,soc[0],soc[1],soc[2],soc[3],soc[4],soc[5],socError?0:6);
     BootEvents boot={&d,&io,&s,&glink,false,false,false};
     PicassoAdspEvents events={&boot,bootPoll,bootSnapshot,bootService};
     picasso_adsp_boot(&events);
