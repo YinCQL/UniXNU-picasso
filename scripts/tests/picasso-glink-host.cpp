@@ -38,6 +38,7 @@ static void build186Tests();
 static void local187Tests();
 static void fastrpcTests();
 static void tftpTests();
+static void afeTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -123,7 +124,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
+    afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -488,6 +489,81 @@ static unsigned locatorAnnounceReady(PicassoGlink &s) {
     const uint32_t hello[]={1,2,5,0xfffffffe,0,20,1,0xfffffffe,2,0,0,0,0};
     qrtrPacket(s,rx,s.qrtrLocal[0].id,hello,52);message(s,rx,14,2,0);step(s);drain(s);
     assert(!s.qrtr.locator.announced);return rx;
+}
+static unsigned afeReady(PicassoGlink &s) {
+    unsigned rx=frameworkReady(s);step(s);drain(s);
+    uint32_t fw[]={0x00340150,0x403,0x503,0x18710001,0x1292d,2,9,0,0,1,4,7,0};
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(fw),sizeof fw);message(s,rx,14,7,91);
+    step(s);drain(s);assert(s.apr.fw.valid && !s.apr.afe.sent);return rx;
+}
+__attribute__((noinline)) static void afeTests() {
+    // Stock q6afe v2 in-band wire, no mapped payload or SET/START command.
+    const uint32_t expected[]={0x00380250,0x504,0x404,0x20520001,0x100f0,0x00201002,0,0,0,0x1020c,0x1020d,0x1020c,0x1020d,20};
+    uint32_t command[14];picasso_afe_query(command);assert(!memcmp(command,expected,sizeof command));
+    PicassoAprProbe a={};assert(!picasso_afe_due(&a) && !a.afe.error);
+    a.ready=true;assert(!picasso_afe_due(&a) && !a.afe.error);
+    a.fw.valid=true;assert(!picasso_afe_due(&a) && a.afe.error==-2);
+    a.afe={};a.fw.count=1;a.fw.services[0][0]=4;
+    assert(!picasso_afe_due(&a) && a.afe.error==-95);
+    a.afe={};a.fw.services[0][1]=7;assert(picasso_afe_due(&a) && a.afe.api==7);
+    // Both v0 and the observed v1 extended APR header locate the payload.
+    uint32_t response[]={0x00440081,0x404,0x504,0x20520001,0x10106,0xaaa,0xbbb,0xccc,0,0x1020c,0x1020d,20,1,0x00010010,0x00010001,48000,0};
+    auto receive=[&](const void *p,unsigned bytes){picasso_apr_receive(&a,static_cast<const uint8_t *>(p),bytes);};
+    auto pending=[&](){a={};a.ready=true;a.afe.sent=a.afe.pending=true;a.afe.token=0x20520001;};
+    pending();for(unsigned bytes=0;bytes<sizeof response;++bytes)receive(response,bytes);
+    assert(a.afe.pending && !a.afe.responded);
+    const unsigned indices[]={1,2,3,4,9,10,11,12,16};
+    for(auto i:indices) {auto saved=response[i];response[i]^=i==16?0x10000:1;receive(response,sizeof response);response[i]=saved;assert(a.afe.pending && !a.afe.responded);}
+    const uint32_t headers[]={0x00440082,0x00440041,0x00450081,0x00440281,0x00440381};
+    for(auto h:headers) {response[0]=h;receive(response,sizeof response);assert(a.afe.pending && !a.afe.responded);}
+    response[0]=0x00440081;
+    uint32_t basic[]={0x001c0150,0x404,0x504,0x20520001,0x110e8,0x100f0,0};
+    receive(basic,sizeof basic);assert(a.afe.pending && !a.afe.valid && !a.afe.responded);
+    receive(response,sizeof response);assert(a.afe.valid && a.afe.responded && !a.afe.pending && a.afe.config[3]==48000 && a.ready);
+    unsigned events=a.afe.events;receive(response,sizeof response);assert(a.afe.events==events);
+    pending();basic[6]=3;receive(basic,sizeof basic);assert(a.afe.error==-5 && a.afe.status==3 && a.afe.responded && !a.afe.valid && a.ready);
+    uint32_t v0[14]={0x00380150,0x404,0x504,0x20520001,0x10106};memcpy(v0+5,response+8,36);
+    pending();receive(v0,sizeof v0);assert(a.afe.valid && a.afe.config[3]==48000);
+    const unsigned payloads[]={4,16,36};for(unsigned payload:payloads) {
+        pending();v0[0]=((20+payload)<<16)|0x150;v0[5]=7;receive(v0,20+payload);
+        assert(a.afe.responded && !a.afe.pending && !a.afe.valid && a.afe.status==7 && a.afe.error==-5);
+    }
+    PicassoGlink s={};unsigned rx=afeReady(s),at=s.txHead;step(s);drain(s);
+    assert(s.apr.afe.pending && s.apr.afe.sent && s.apr.afe.api==7 && s.remoteIntent[0].busy);
+    bool found=false;for(unsigned n=at;n+72<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x10009) {
+        assert(r32(s.tx.offset+n+8)==56 && !memcmp(ram+s.tx.offset+n+16,expected,sizeof expected));found=true;
+    }assert(found);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(response),29,39);step(s);drain(s);assert(!s.apr.afe.responded);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(response)+29,39,0,true);step(s);drain(s);
+    assert(s.apr.afe.valid && s.apr.ready && !s.failed);
+    picasso_glink_stop(&s);assert(!s.apr.afe.valid && !s.apr.afe.pending && s.apr.afe.error==-104);
+    // Too-small intents request the actual packet size. Denial stays local to
+    // this optional probe; the CORE/framework and file transport stay usable.
+    rx=afeReady(s);s.remoteIntent[0].size=20;at=s.txHead;step(s);drain(s);
+    assert(!s.apr.afe.sent && s.apr.intentAsked);found=false;
+    for(unsigned n=at;n+8<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x10007) {assert(r32(s.tx.offset+n+4)==56);found=true;}
+    assert(found);message(s,rx,8,7,0);step(s);drain(s);
+    assert(s.apr.afe.error==-28 && !s.apr.error && s.apr.ready && s.apr.fw.valid && !s.failed);
+    rx=afeReady(s);s.remoteIntent[0].size=20;step(s);drain(s);message(s,rx,8,7,1);step(s);drain(s);
+    for(unsigned n=0;n<251;++n){step(s);drain(s);}assert(s.apr.afe.error==-60 && !s.apr.afe.sent && !s.failed);
+    // Advertisements can arrive before ACK; a late denial cannot invalidate
+    // a probe already transmitted in a real buffer.
+    rx=afeReady(s);s.remoteIntent[0].size=20;step(s);drain(s);s.remoteIntent[0].size=512;
+    step(s);drain(s);message(s,rx,8,7,0);step(s);drain(s);assert(s.apr.afe.pending && !s.apr.afe.error && !s.apr.error);
+    rx=afeReady(s);p32(s.desc.offset,(s.txHead+8)%s.tx.size);
+    for(unsigned n=0;n<10;++n)step(s);assert(!s.apr.afe.sent && !s.remoteIntent[0].busy);
+    drain(s);step(s);drain(s);assert(s.apr.afe.pending);
+    p32(s.desc.offset,(s.txHead+8)%s.tx.size);for(unsigned n=0;n<102;++n)step(s);
+    assert(s.apr.afe.error==-60 && !s.apr.afe.pending && s.remoteIntent[0].busy && s.apr.ready && !s.failed);
+    picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(response),sizeof response);assert(!s.apr.afe.valid);
+    rx=afeReady(s);writes=0;step(s);unsigned total=writes;bool kick;
+    for(unsigned n=1;n<=total;++n) {
+        rx=afeReady(s);writes=0;failWrite=n;
+        assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && !s.apr.afe.pending && !s.apr.afe.valid);
+    }
+    rx=afeReady(s);step(s);drain(s);message(s,rx,3,7,0);step(s);
+    assert(!s.apr.afe.pending && !s.apr.afe.valid && s.apr.afe.error==-104);
+    puts("PASS AFE in-band GET wire, service gate, response validation, fragmentation, timeout, pressure, intent denial and invalidation");
 }
 __attribute__((noinline)) static void local187Tests() {
     PicassoGlink s={};unsigned rx=frameworkReady(s);unsigned at=s.txHead;step(s);drain(s);

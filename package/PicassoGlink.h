@@ -36,6 +36,11 @@ struct PicassoAprProbe {
         bool sent, pending, valid;
         int error;
     } fw;
+    struct {
+        uint32_t token,wait,status,opcode,events,api,config[5];
+        bool sent,pending,responded,valid;
+        int error;
+    } afe;
 };
 struct PicassoGlink {
     // Contains pointers into its own static storage: prepare in final location,

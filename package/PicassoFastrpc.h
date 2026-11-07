@@ -33,6 +33,13 @@ struct PicassoRpcTrace {
     bool valid;
     char name[128],target[128];
 };
+struct PicassoRpcIdle { uint32_t requests,ticks; };
+// One snapshot after two seconds without a new reverse request. The listener
+// normally remains pending: inactivity does not establish sensor init success.
+static inline bool picasso_rpc_idle(PicassoRpcIdle &t,uint32_t requests) {
+    if(t.requests!=requests) { t.requests=requests;t.ticks=0;return false; }
+    return requests && t.ticks<100 && ++t.ticks==100;
+}
 // Preserve later operations during long registry scans. Consecutive identical
 // requests are sampled, with bounded transition logs and periodic progress.
 static inline bool picasso_rpc_trace(PicassoRpcTrace &t,const PicassoRpcDomain &d) {

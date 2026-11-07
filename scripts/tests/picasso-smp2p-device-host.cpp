@@ -11,6 +11,7 @@ static uint32_t ram[WLAN_SMEM_SIZE/4], mutexRam[1024], ipccRam[1024];
 static unsigned allocations,mappings,releases,unmaps,lines,sleeps,preempt,plans,kicks;
 static unsigned failAlloc,failMap,zeroMap;
 static bool peer,transport;
+static bool checkShortLogs;
 static constexpr unsigned part=0x1cf000, toc=WLAN_SMEM_SIZE-4096;
 enum {kIOMapAnywhere=1,kIOMapInhibitCache=2,OSNoRetain=0};
 class IOMemoryMap {
@@ -45,7 +46,12 @@ public:
 };
 static void IOLog(const char *fmt,...) {
     assert(!preempt);
-    va_list a;va_start(a,fmt);vprintf(fmt,a);va_end(a);++lines;
+    va_list a;va_start(a,fmt);
+    if(checkShortLogs) {
+        char text[1024];int n=vsnprintf(text,sizeof text,fmt,a);
+        assert(n>0 && n<256 && text[n-1]=='\n');
+    } else {vprintf(fmt,a);++lines;}
+    va_end(a);
 }
 static void disable_preemption(){assert(!preempt);++preempt;}
 static void enable_preemption(){assert(preempt==1);--preempt;}
@@ -164,4 +170,21 @@ int main(int argc,char **argv) {
         if(strcmp(mode,"gate"))assert(!allocatorGate);
     }
     puts("PASS SMP2P device mappings, local/remote ownership, one-shot gate, persistent poll/negotiation and bounded logging");
+    checkShortLogs=true;
+    PicassoRpcDomain record={};record.pd=record.requests=record.lastHandle=record.lastScalar=0xffffffffU;
+    record.wireBytes=record.decodeResult=record.previousResult=0xffffffffU;
+    memset(record.name,'n',127);memset(record.fs.target,'t',127);
+    record.fs.nodes=record.fs.nodeLimit=record.fs.tombstones=record.fs.bytes=0xffffffffU;
+    record.fs.blocks=record.fs.blockLimit=record.fs.exhaustion=0xffffffffU;
+    logRpcRequest(record,0xffffffffU);
+    PicassoAprProbe apr={};apr.afe.valid=true;
+    apr.afe.token=apr.afe.opcode=apr.afe.api=apr.afe.status=0xffffffffU;apr.afe.error=-2147483647;
+    for(auto &v:apr.afe.config)v=0xffffffffU;logAfe(apr);
+    PicassoRpcIdle idle={};for(unsigned n=0;n<1000;++n)assert(!picasso_rpc_idle(idle,0));
+    assert(!picasso_rpc_idle(idle,1287));for(unsigned n=0;n<99;++n)assert(!picasso_rpc_idle(idle,1287));
+    assert(picasso_rpc_idle(idle,1287));for(unsigned n=0;n<1000;++n)assert(!picasso_rpc_idle(idle,1287));
+    assert(!picasso_rpc_idle(idle,1288));for(unsigned n=0;n<50;++n)assert(!picasso_rpc_idle(idle,1288));
+    assert(!picasso_rpc_idle(idle,1289));for(unsigned n=0;n<99;++n)assert(!picasso_rpc_idle(idle,1289));
+    assert(picasso_rpc_idle(idle,1289));
+    puts("PASS RPC idle transitions and worst-case short request/path/target/capacity/AFE log records");
 }

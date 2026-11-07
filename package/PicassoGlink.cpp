@@ -7,6 +7,7 @@ int fail(PicassoGlink *s, int error) {
     s->failed = true; s->error = error; s->ready = false;
     s->apr.ready = false; s->apr.pending = false;
     s->apr.fw.pending=false;s->apr.fw.valid=false;s->apr.fw.error=error;
+    s->apr.afe.pending=false;s->apr.afe.valid=false;s->apr.afe.error=error;++s->apr.afe.events;
     if (!s->apr.error) s->apr.error = error;
     picasso_qrtr_invalidate(&s->qrtr, error);
     picasso_rpc_stop(&s->fastrpc,error);
@@ -86,6 +87,7 @@ void clearChannel(PicassoGlink *s, PicassoGlinkChannel &c) {
     if (c.local==1) {
         s->apr.ready=false; s->apr.pending=false; s->apr.error=-104;
         s->apr.fw.pending=false;s->apr.fw.valid=false;s->apr.fw.error=-104;
+        s->apr.afe.pending=false;s->apr.afe.valid=false;s->apr.afe.error=-104;++s->apr.afe.events;
     }
     else if(c.local==2) picasso_qrtr_invalidate(&s->qrtr,-104);
     else picasso_rpc_stop(&s->fastrpc,-104);
@@ -137,6 +139,9 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     }
     if(c.local==1 && a.fw.pending && ++a.fw.wait>100) {
         a.fw.pending=false;a.fw.error=-60;++a.fw.events;
+    }
+    if(c.local==1 && (a.afe.pending || picasso_afe_due(&a)) && ++a.afe.wait>(a.afe.pending?100U:250U)) {
+        a.afe.pending=false;a.afe.error=-60;++a.afe.events;
     }
     // Count service calls even under TX backpressure. A timeout does not free
     // any remote intent; its ownership lasts until RX_DONE or disconnect.
@@ -239,25 +244,28 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     // Stock q6core queries FWK_VERSION only after real CORE readiness. This
     // discovers AFE/ASM/ADM APIs without starting audio or assuming versions.
     bool version=a.ready && !a.fw.sent && !a.fw.error;
-    if ((a.ready && !version) || a.error) return 0;
-    if (!version && (a.pending || a.ticks < a.next)) return 0;
+    bool afe=picasso_afe_due(&a);
+    if ((a.ready && !version && !afe) || a.error) return 0;
+    if (!version && !afe && (a.pending || a.ticks < a.next)) return 0;
+    unsigned requestBytes=afe?56:20;
     PicassoGlinkRemoteIntent *slot = nullptr;
-    for (auto &i : s->remoteIntent) if (i.used && !i.busy && i.size >= 20) { slot = &i; break; }
+    for (auto &i : s->remoteIntent) if (i.used && !i.busy && i.size >= requestBytes) { slot = &i; break; }
     if (!slot) {
         if (!a.intentAsked && !a.intentGranted) {
-            const uint32_t words[2] = {7U | (uint32_t(c.local) << 16), 20};
+            const uint32_t words[2] = {7U | (uint32_t(c.local) << 16), requestBytes};
             if ((error = transmit(io, s, words, sizeof(words), kick))) return error;
             a.intentAsked = true;
         }
         return 0;
     }
-    uint32_t words[10] = {9U | (uint32_t(c.local) << 16), slot->id, 20, 0};
+    uint32_t words[18] = {9U | (uint32_t(c.local) << 16), slot->id, requestBytes, 0};
     uint32_t query[5]; picasso_apr_query(version?0x18710001:a.token + 1, query);
-    if(version)query[4]=0x1292c;
-    for (unsigned i = 0; i < 5; ++i) words[4 + i] = query[i];
-    if ((error = transmit(io, s, words, sizeof(words), kick))) return error;
+    if(afe) { uint32_t request[14];picasso_afe_query(request);for(unsigned i=0;i<14;++i)words[4+i]=request[i]; }
+    else { if(version)query[4]=0x1292c;for (unsigned i = 0; i < 5; ++i) words[4 + i] = query[i]; }
+    if ((error = transmit(io, s, words,16+((requestBytes+7)&~7U), kick))) return error;
     slot->busy = true;
-    if(version) {
+    if(afe) { a.afe.sent=a.afe.pending=true;a.afe.token=words[7];a.afe.wait=0;++a.afe.events; }
+    else if(version) {
         a.fw.sent=a.fw.pending=true;a.fw.token=query[3];a.fw.wait=0;++a.fw.events;
     } else { ++a.token; ++a.attempts; a.wait = 0; a.pending = true; }
     a.intentGranted = false;
@@ -410,7 +418,14 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
         if (!c->up || !asked || data > 1) return fail(s, -71);
         granted=data!=0 && (c->local!=1 || !s->apr.pending); asked=false;
         if (!data) {
-            if (c->local==1 && !s->apr.pending) s->apr.error=-28;
+            if (c->local==1 && !s->apr.pending) {
+                auto &a=s->apr;
+                if(a.ready && a.fw.valid) {
+                    if(!a.afe.sent && !a.afe.error) { a.afe.error=-28;++a.afe.events; }
+                } else if(a.ready) {
+                    if(!a.fw.sent && !a.fw.error) { a.fw.error=-28;++a.fw.events; }
+                } else a.error=-28;
+            }
             if (c->local==2) s->qrtr.error=-28;
         }
         return 0;

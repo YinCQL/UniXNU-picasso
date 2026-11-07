@@ -93,13 +93,30 @@ struct BootEvents {
     uint32_t qrtrEvents = 0, qrtrReceived = 0, qrtrLogs = 0;
     int qrtrError = 0;
     PicassoRpcTrace rpcTrace[2]={};
+    PicassoRpcIdle rpcIdle[2]={};
     uint32_t fastrpcReceived = 0, fastrpcLogs = 0, fastrpcEvents = 0;
     int fastrpcError = 0;
     uint32_t reuseLogs = 0, remoteReuse = 0, localReuse = 0;
     uint32_t qmiEvents = 0, qmiLogs = 0;
-    uint32_t locatorEvents = 0, locatorLogs = 0, fwEvents = 0;
+    uint32_t locatorEvents = 0, locatorLogs = 0, fwEvents = 0, afeEvents = 0;
     uint32_t tftpEvents = 0, tftpLogs = 0;
 };
+void logAfe(const PicassoAprProbe &a) {
+    const auto &v=a.afe;
+    IOLog("PICASSO_ADSP afe sent=%u pending=%u responded=%u valid=%u api=%u token=%x opcode=%x status=%u error=%d port=1002 pcm=0\n",
+        v.sent,v.pending,v.responded,v.valid,v.api,v.token,v.opcode,v.status,v.error);
+    if(v.valid)IOLog("PICASSO_ADSP afe-config port=1002 minor=%u bits=%u channel=%u mono_stereo=%u ws=%u rate=%u format=%u pcm=0\n",
+        v.config[0],v.config[1]&65535,v.config[1]>>16,v.config[2]&65535,v.config[2]>>16,v.config[3],v.config[4]&65535);
+}
+void logRpcRequest(const PicassoRpcDomain &d,uint32_t repeated) {
+    // Serial IOLog truncates long records; correlate short lines by PD/count.
+    IOLog("PICASSO_ADSP rpc-request pd=%u count=%u handle=%x sc=%x bytes=%u decode=%u result=%u repeat=%u\n",
+        d.pd,d.requests,d.lastHandle,d.lastScalar,d.wireBytes,d.decodeResult,d.previousResult,repeated);
+    IOLog("PICASSO_ADSP rpc-path pd=%u count=%u path=%.127s\n",d.pd,d.requests,d.name);
+    if(d.fs.target[0])IOLog("PICASSO_ADSP rpc-target pd=%u count=%u target=%.127s\n",d.pd,d.requests,d.fs.target);
+    IOLog("PICASSO_ADSP rpc-fs pd=%u count=%u nodes=%u/%u tombstones=%u data=%u blocks=%u/%u exhausted=%u volatile=1\n",
+        d.pd,d.requests,d.fs.nodes,d.fs.nodeLimit,d.fs.tombstones,d.fs.bytes,d.fs.blocks,d.fs.blockLimit,d.fs.exhaustion);
+}
 void logFramework(const PicassoAprProbe &a) {
     const auto &v=a.fw;
     IOLog("PICASSO_ADSP avcs sent=%u pending=%u valid=%u token=%x status=%u error=%d build=%u.%u.%u.%u services=%u pcm=0\n",
@@ -206,10 +223,15 @@ void bootService(void *context) {
         }
         for(unsigned n=0;n<2;++n) {
             const auto &d=g->fastrpc.domain[n];
-            if(picasso_rpc_trace(b->rpcTrace[n],d)) {
-                IOLog("PICASSO_ADSP rpc-request pd=%u count=%u handle=%x sc=%x bytes=%u decode=%u result=%u path=%.127s target=%.127s repeat=%u nodes=%u/%u tombstones=%u data=%u blocks=%u/%u exhausted=%u volatile=1\n",
-                    d.pd,d.requests,d.lastHandle,d.lastScalar,d.wireBytes,d.decodeResult,d.previousResult,d.name,d.fs.target,
-                    b->rpcTrace[n].repeated,d.fs.nodes,d.fs.nodeLimit,d.fs.tombstones,d.fs.bytes,d.fs.blocks,d.fs.blockLimit,d.fs.exhaustion);
+            bool trace=picasso_rpc_trace(b->rpcTrace[n],d);
+            bool idle=picasso_rpc_idle(b->rpcIdle[n],d.requests);
+            if(trace || idle)logRpcRequest(d,b->rpcTrace[n].repeated);
+            if(idle) {
+                IOLog("PICASSO_ADSP rpc-idle pd=%u count=%u ticks=100 stage=%u queued=%u/%u pending=%u/%u complete=%u/%u error=%d sensor_init=unknown\n",
+                    d.pd,d.requests,d.stage,d.call[0].queued,d.call[1].queued,d.call[0].pending,d.call[1].pending,
+                    d.call[0].complete,d.call[1].complete,d.error);
+                IOLog("PICASSO_ADSP rpc-idle-transport pd=%u count=%u received=%u sent=%u completed=%u malformed=%u stopped=%u error=%d\n",
+                    d.pd,d.requests,g->fastrpc.received,g->fastrpc.sent,g->fastrpc.completed,g->fastrpc.malformed,g->fastrpc.stopped,g->fastrpc.error);
             }
         }
         auto &q=g->qrtr;
@@ -217,6 +239,7 @@ void bootService(void *context) {
             logTftp(q.tftp);b->tftpEvents=q.tftp.events;++b->tftpLogs;
         }
         if(a.fw.events!=b->fwEvents) { logFramework(a);b->fwEvents=a.fw.events; }
+        if(a.afe.events!=b->afeEvents) { logAfe(a);b->afeEvents=a.afe.events; }
         if(q.locator.events!=b->locatorEvents && b->locatorLogs<32) {
             logLocator(q.locator);b->locatorEvents=q.locator.events;++b->locatorLogs;
         }
