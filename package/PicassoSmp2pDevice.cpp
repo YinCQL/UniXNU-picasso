@@ -92,7 +92,7 @@ struct BootEvents {
     int aprError = 0;
     uint32_t qrtrEvents = 0, qrtrReceived = 0, qrtrLogs = 0;
     int qrtrError = 0;
-    uint32_t rpcRequests[2]={},rpcRequestLogs=0;
+    PicassoRpcTrace rpcTrace[2]={};
     uint32_t fastrpcReceived = 0, fastrpcLogs = 0, fastrpcEvents = 0;
     int fastrpcError = 0;
     uint32_t reuseLogs = 0, remoteReuse = 0, localReuse = 0;
@@ -206,10 +206,9 @@ void bootService(void *context) {
         }
         for(unsigned n=0;n<2;++n) {
             const auto &d=g->fastrpc.domain[n];
-            if(d.requests!=b->rpcRequests[n] && b->rpcRequestLogs<256) {
-                b->rpcRequests[n]=d.requests;++b->rpcRequestLogs;
-                IOLog("PICASSO_ADSP rpc-request pd=%u count=%u handle=%x sc=%x bytes=%u decode=%u result=%u path=%.127s volatile=1\n",
-                    d.pd,d.requests,d.lastHandle,d.lastScalar,d.wireBytes,d.decodeResult,d.previousResult,d.name);
+            if(picasso_rpc_trace(b->rpcTrace[n],d)) {
+                IOLog("PICASSO_ADSP rpc-request pd=%u count=%u handle=%x sc=%x bytes=%u decode=%u result=%u path=%.127s repeat=%u volatile=1\n",
+                    d.pd,d.requests,d.lastHandle,d.lastScalar,d.wireBytes,d.decodeResult,d.previousResult,d.name,b->rpcTrace[n].repeated);
             }
         }
         auto &q=g->qrtr;

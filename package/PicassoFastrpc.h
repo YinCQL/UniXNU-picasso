@@ -27,6 +27,29 @@ struct PicassoRpcDomain {
     uint8_t reply[PicassoRpcBlob];
     PicassoRpcCall call[2];
 };
+struct PicassoRpcTrace {
+    uint32_t requests,handle,scalar,result,decode,repeated,emitted,checkpoint;
+    bool valid;
+    char name[128];
+};
+// Preserve later operations during long registry scans. Consecutive identical
+// requests are sampled, with bounded transition logs and periodic progress.
+static inline bool picasso_rpc_trace(PicassoRpcTrace &t,const PicassoRpcDomain &d) {
+    if(t.requests==d.requests)return false;
+    bool same=t.valid && t.handle==d.lastHandle && t.scalar==d.lastScalar &&
+        t.result==d.previousResult && t.decode==d.decodeResult;
+    for(unsigned i=0;same && i<128;++i) { if(t.name[i]!=d.name[i])same=false;if(!d.name[i])break; }
+    t.requests=d.requests;
+    if(same) { if(t.repeated!=0xffffffffU)++t.repeated; }
+    else {
+        t.valid=true;t.handle=d.lastHandle;t.scalar=d.lastScalar;t.result=d.previousResult;t.decode=d.decodeResult;t.repeated=1;
+        for(unsigned i=0;i<128;++i)t.name[i]=d.name[i];
+    }
+    bool progress=(d.requests>>8)!=t.checkpoint;t.checkpoint=d.requests>>8;
+    bool sample=t.repeated<=2 || !(t.repeated&(t.repeated-1));
+    if((sample && t.emitted<512) || progress) { ++t.emitted;return true; }
+    return false;
+}
 struct PicassoFastrpc {
     uint32_t received,bytes,words[6],unclaimed,malformed,completed,sent,events;
     int error;

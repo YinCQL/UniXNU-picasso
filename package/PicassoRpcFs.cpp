@@ -22,18 +22,38 @@ static bool string(const PicassoRpcArg &a,unsigned n,char *out,unsigned cap=256)
 }
 static void record(char *name,const char *s) { unsigned n=length(s);if(n>127)n=127;copy(name,s,n);name[n]=0; }
 static bool canonical(const char *in,char *out) {
-    const char *replacement=nullptr;unsigned skip=0;
-    if(prefix(in,"/persist/")) { replacement="/mnt/vendor/persist/";skip=9; }
-    else if(prefix(in,"/vendor/persist/")) { replacement="/mnt/vendor/persist/";skip=16; }
-    unsigned n=0;if(replacement)while(*replacement)out[n++]=*replacement++;
-    in+=skip;if(!n && *in!='/')return false;
-    while(*in) { if(n>=255)return false;out[n++]=*in++; }out[n]=0;
-    while(n>1 && out[n-1]=='/')out[--n]=0;
-    for(unsigned i=0;i<n;++i) {
-        if(out[i]=='\\')return false;
-        if(out[i]=='/' && (out[i+1]=='/' || (out[i+1]=='.' && (!out[i+2] || out[i+2]=='/' ||
-            (out[i+2]=='.' && (!out[i+3] || out[i+3]=='/'))))))return false;
-    }return true;
+    // Firmware builds registry/../temp.json and ./ paths. Normalize within
+    // our symlink-free namespace before lookup or write authorization.
+    if(*in!='/')return false;
+    unsigned n=1;out[0]='/';
+    while(*in) {
+        if(*in=='/') { ++in;continue; }
+        const char *start=in;unsigned len=0;
+        while(*in && *in!='/') { if(*in=='\\' || ++len>255)return false;++in; }
+        if(len==1 && start[0]=='.')continue;
+        if(len==2 && start[0]=='.' && start[1]=='.') {
+            if(n==1)return false;
+            while(n>1 && out[n-1]!='/')--n;
+            if(n>1)--n;
+            continue;
+        }
+        unsigned separator=n>1;
+        if(n+separator+len>255)return false;
+        if(separator)out[n++]='/';copy(out+n,start,len);n+=len;
+    }
+    out[n]=0;
+    // Alias only after normalization so leading dots/slashes cannot bypass
+    // the canonical permission boundary.
+    unsigned skip=0;
+    if(equal(out,"/persist") || prefix(out,"/persist/"))skip=8;
+    else if(equal(out,"/vendor/persist") || prefix(out,"/vendor/persist/"))skip=15;
+    if(skip) {
+        const char *base="/mnt/vendor/persist";unsigned baseLen=length(base),tail=n-skip;
+        if(baseLen+tail>255)return false;
+        for(unsigned i=tail+1;i;--i)out[baseLen+i-1]=out[skip+i-1];
+        copy(out,base,baseLen);
+    }
+    return true;
 }
 static bool writable(const char *p) { return prefix(p,"/mnt/vendor/persist/sensors/"); }
 static bool isDir(uint32_t m) { return (m&0170000)==0040000; }
@@ -108,7 +128,8 @@ static int resolve(const char *name,char *out) {
     // Relative library lookup uses the same bounded, stock-backed namespace.
     const char *dirs[]={"/vendor/lib/rfsa/adsp/","/vendor/dsp/","/vendor/dsp/adsp/","/dsp/"};
     for(auto d:dirs) { unsigned n=length(d),l=length(name);if(n+l>=256)return 36;copy(out,d,n);copy(out+n,name,l+1);
-        char normalized[256];if(!canonical(out,normalized))return 22;if(lookup(out)>=0)return 0; }
+        char normalized[256];if(!canonical(out,normalized))return 22;
+        copy(out,normalized,length(normalized)+1);if(lookup(out)>=0)return 0; }
     return 2;
 }
 }
@@ -182,12 +203,17 @@ int picasso_rpc_fs_invoke(unsigned pd,uint32_t sc,PicassoRpcArg *a,char *name) {
             !string(a[2],rpc32(a[0].data+8),raw) || !canonical(raw,dest))return 14;
         int i=lookup(p);if(i<0)return 2;if(!writable(p) || !writable(dest))return 13;
         if(isDir(mode(i)))return 21;if(equal(p,dest))return 0;if(!parentExists(dest))return 2;
-        // This bounded store refuses rename of open files and replacement of
-        // existing entries; it must not lose descriptors or silently truncate.
-        if(lookup(dest)>=0)return 17;
-        for(auto &session:sessions)for(auto &h:session.handles)if(h.used && equal(path(h.node),p))return 16;
+        // Registry commits a temporary file with rename(). Replace a closed
+        // regular target as one service operation; no partial replacement on
+        // capacity failure. Open-file rename remains unsupported.
+        int existing=lookup(dest);if(existing>=0 && isDir(mode(existing)))return 21;
+        for(auto &session:sessions)for(auto &h:session.handles)
+            if(h.used && (equal(path(h.node),p) || equal(path(h.node),dest)))return 16;
+        unsigned needed=(i<int(StockCount))+(existing<int(StockCount)),available=0;
+        for(auto &node:nodes)if(!node.used || (node.removed && (equal(node.path,p) || equal(node.path,dest))))++available;
+        if(available<needed)return 28;
         int source=mutableNode(p,i,false);if(source<0)return -source;
-        int target=mutableNode(dest,-1,true);if(target<0)return -target;
+        int target=mutableNode(dest,existing,true);if(target<0)return -target;
         auto &from=nodes[source-StockCount];auto &to=nodes[target-StockCount];
         to.mode=from.mode;to.size=from.size;copy(to.data,from.data,from.size);from.removed=true;return 0;
     }

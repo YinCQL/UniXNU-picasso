@@ -48,7 +48,7 @@ static void stock() {
     assert(!memcmp(out+24,"version=1\n",10));
     assert(!fileOp(h,0x03010000));assert(fileOp(h,0x08010100)==9);
     openFile(config,"w",2,13);openFile("/vendor/etc/sensors/nope","r",2,2,true);
-    openFile("/vendor/etc/sensors/../sns_reg_config","r",2,22);
+    openFile("/vendor/etc/sensors/../sns_reg_config","r",2,2);
     h=openFile("/vendor/etc/sensors/config/sns_ccd.json","rb");unsigned total=0;
     for(;;) { assert(!fileOp(h,0x04010200,2,1024,0,1024));unsigned n=rpc32(out+8);total+=n;if(rpc32(out+12))break; }
     assert(total==6205);assert(!fileOp(h,0x03010000));
@@ -114,4 +114,69 @@ static void malformed() {
     rpcPut32(prim,sizeof(path));p[1]=path;o[0]=1;assert(invoke(2,0x30100,p,l,o)==14);
     puts("PASS malformed packed filesystem requests and string/output bounds under sanitizers");
 }
-int main() { stock();writes();socinfo();malformed(); }
+static int renameFile(const char *src,const char *dst) {
+    const void *p[]={prim,src,dst};unsigned l[]={12,unsigned(strlen(src)+1),unsigned(strlen(dst)+1)};
+    rpcPut32(prim,33);rpcPut32(prim+4,l[1]);rpcPut32(prim+8,l[2]);return invoke(2,0x1f030000,p,l,nullptr);
+}
+static void registryPaths() {
+    picasso_rpc_fs_reset();
+    // Paths captured from the 3352708 device, with stock bytes as the oracle.
+    const char *version="/mnt/vendor/persist/sensors/registry/registry/../sns_reg_version";
+    assert(!pathOp(version,0x1f020100) && rpc64(out+48)==11);
+    auto h=openFile(version,"r",2,0,true);assert(!fileOp(h,0x04010200,2,16,0,16));
+    uint8_t expected[11];memcpy(expected,out+24,11);assert(!fileOp(h,0x03010000));
+    h=openFile("//persist//sensors/./registry/registry/../sns_reg_version","r");
+    assert(!fileOp(h,0x04010200,2,16,0,16) && !memcmp(expected,out+24,11));assert(!fileOp(h,0x03010000));
+    h=openFile("/vendor//persist/./sensors/registry/sns_reg_version","r");assert(!fileOp(h,0x03010000));
+    openFile(".//lowi//lowi_lp.conf","r",0,2,true); // normalized but not supplied
+    openFile("/../persist/sensors/temp.json","w",2,22);
+    openFile("/persist/sensors/../../vendor/etc/sensors/sns_reg_config","w",2,13);
+    openFile("/mnt/vendor/persist/sensors/../../outside","w",2,13);
+    openFile("/mnt/vendor/persist/sensors/../sensors_evil/test","w",2,13);
+    openFile("/persist/sensors/registry/..\\temp.json","w",2,22);
+    char longPath[256];memset(longPath,'a',255);memcpy(longPath,"/persist/",9);longPath[255]=0;
+    openFile(longPath,"w",2,22); // alias expansion must fit, too
+
+    const char *temp="/mnt/vendor/persist/sensors/registry/registry/../temp.json";
+    const char *target="/mnt/vendor/persist/sensors/registry/registry/sensors_registry";
+    for(unsigned round=0;round<200;++round) {
+        h=openFile(temp,"w+",2,0,true);memcpy(buffer,expected,11);buffer[0]=uint8_t(round);
+        assert(!fileOp(h,0x05020100,2,11));assert(!fileOp(h,0x02010000));
+        assert(renameFile(temp,target)==16); // source remains open
+        assert(!fileOp(h,0x03010000));
+        auto reader=openFile(target,"r",0);assert(renameFile(temp,target)==16);assert(!fileOp(reader,0x03010000,0));
+        assert(!renameFile(temp,target));assert(pathOp(temp,0x1f020100)==2);
+        h=openFile(target,"r");assert(!fileOp(h,0x04010200,2,20,0,20));
+        assert(rpc32(out+8)==11 && out[24]==uint8_t(round) && !memcmp(out+25,expected+1,10));assert(!fileOp(h,0x03010000));
+        assert(!renameFile(target,"/persist/sensors/registry/registry/./sensors_registry"));
+    }
+    h=openFile(temp,"w");assert(!fileOp(h,0x03010000));
+    assert(renameFile(temp,"/persist/sensors/registry/registry")==21);
+    assert(renameFile(temp,"/vendor/etc/sensors/sns_reg_config")==13);
+    assert(renameFile(temp,"/persist/sensors/missing/file")==2);
+    puts("PASS captured registry ../ paths, aliases, permission boundaries and 200 atomic temporary-file replacements");
+}
+static void renameCapacity() {
+    picasso_rpc_fs_reset();
+    // Exhaust every RAM node. A failed replacement must preserve both stock
+    // source and destination; no temporary truncation or tombstone is allowed.
+    for(unsigned i=0;i<128;++i) { char p[96];snprintf(p,sizeof p,"/persist/sensors/capacity%u",i);
+        auto h=openFile(p,"w");assert(!fileOp(h,0x03010000)); }
+    const char *src="/persist/sensors/registry/sns_reg_version",*dst="/persist/sensors/registry/sns_reg_config";
+    assert(renameFile(src,dst)==28);
+    assert(!pathOp(src,0x1f020100) && rpc64(out+48)==11);
+    assert(!pathOp(dst,0x1f020100) && rpc64(out+48)==553);
+    puts("PASS full-store rename refuses without changing original files");
+}
+static void tracing() {
+    PicassoRpcDomain d={};PicassoRpcTrace trace={};unsigned emitted=0;
+    strcpy(d.name,"/persist/sensors/registry/temp.json");d.lastScalar=0x13050100;d.previousResult=22;
+    for(unsigned i=1;i<=6000;++i) { d.requests=i;emitted+=picasso_rpc_trace(trace,d);assert(!picasso_rpc_trace(trace,d)); }
+    assert(emitted<40 && trace.repeated==6000);
+    d.requests++;d.previousResult=0;assert(picasso_rpc_trace(trace,d) && trace.repeated==1);
+    trace={};emitted=0;
+    for(unsigned i=1;i<=6000;++i) { d.requests=i;d.lastScalar=i;emitted+=picasso_rpc_trace(trace,d); }
+    assert(emitted<540 && emitted>=512 && trace.requests==6000);
+    puts("PASS repeated request sampling and progress after transition log budget");
+}
+int main() { stock();writes();socinfo();malformed();registryPaths();renameCapacity();tracing(); }
