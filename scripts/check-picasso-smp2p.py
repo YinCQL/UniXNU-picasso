@@ -36,7 +36,7 @@ def main():
     for sanitized in (False, True):
         suffix = '-asan' if sanitized else ''
         flags = (['-fsanitize=address' if os.name=='nt' else '-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if sanitized else [])
-        for name in ('smp2p','smp2p-device','glink','qrtr','qmi'):
+        for name in ('smp2p','smp2p-device','glink','qrtr','qmi','servloc'):
             exe = out/(name+suffix+('.exe' if os.name=='nt' else ''))
             run(name+'-compile'+suffix, [a.cxx,'-std=c++17','-O1','-Wall','-Wextra','-Werror',*flags,*includes,
                 str(ROOT/f'scripts/tests/picasso-{name}-host.cpp'),str(core),str(ROOT/'package/PicassoGlink.cpp'),'-o',str(exe)])
@@ -54,7 +54,7 @@ def main():
             '-fno-exceptions','-fno-rtti','-fno-threadsafe-statics','-mgeneral-regs-only','-Wall','-Wextra','-Werror',
             '-Wframe-larger-than=2048',
             *includes,'-c',str(source),'-o',str(out/(name+'.o'))])
-    inputs = ['package/PicassoSmp2p.h','package/PicassoSmp2p.cpp','package/PicassoSmp2pDevice.cpp',
+    inputs = ['package/PicassoServloc.h','scripts/tests/picasso-servloc-host.cpp','package/PicassoSmp2p.h','package/PicassoSmp2p.cpp','package/PicassoSmp2pDevice.cpp',
         'package/PicassoGlink.h','package/PicassoGlink.cpp','package/PicassoApr.h','package/PicassoQrtr.h','package/PicassoQmi.h','scripts/tests/picasso-glink-host.cpp','scripts/tests/picasso-qrtr-host.cpp','scripts/tests/picasso-qmi-host.cpp',
         'package/PicassoSmemLock.h','package/PicassoAdspBoot.h','package/PicassoAdsp.h','drivers/NativeWlan/WlanSmem.h','drivers/NativeAdrenoPicasso/PicassoRpmh.h',
         'scripts/check-picasso-smp2p.py','scripts/tests/picasso-smp2p-host.cpp','scripts/tests/picasso-smp2p-device-host.cpp',

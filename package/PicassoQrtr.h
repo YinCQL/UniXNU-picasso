@@ -4,17 +4,21 @@
 #define PICASSO_QRTR_H
 #include <stdint.h>
 #include "PicassoQmi.h"
+#include "PicassoServloc.h"
 enum { PicassoQrtrServices = 64, PicassoQrtrQueue = 8 };
 static constexpr uint32_t PicassoQrtrControl = 0xfffffffeU;
 struct PicassoQrtrService { uint32_t service, instance, node, port; bool used; };
 struct PicassoQrtr {
     PicassoQrtrService services[PicassoQrtrServices];
-    uint32_t queue[PicassoQrtrQueue][13];
+    uint32_t queue[PicassoQrtrQueue][136];
+    uint32_t queueBytes[PicassoQrtrQueue];
+    uint8_t replyScratch[PicassoServlocBytes];
     uint32_t head, count, peer, received, malformed, ignored, events, overflow;
     uint32_t lastType, lastService, lastInstance, lastNode, lastPort, data, resumes;
     uint32_t wireVersion, wireBytes, sourceNode, sourcePort, destNode, destPort, payloadBytes;
     uint32_t payloadWords[4];
     PicassoQmi qmi;
+    PicassoServloc locator;
     bool helloSent, helloReceived, intentAsked, intentGranted;
     int error;
 };
@@ -30,6 +34,7 @@ inline void picasso_qrtr_control(uint32_t *w, uint32_t type, uint32_t sn, uint32
 inline void picasso_qrtr_invalidate(PicassoQrtr *q, int error) {
     picasso_qmi_lost(&q->qmi);
     q->helloReceived=false; q->helloSent=false; q->count=0; q->error=error;
+    q->locator.announced=false;
     for (auto &s:q->services) s.used=false;
 }
 // -11 retains the complete GLINK receive buffer for retry, without consuming
@@ -60,11 +65,21 @@ inline int picasso_qrtr_receive(PicassoQrtr *q, const uint8_t *p, uint32_t n) {
     if (dn!=1 && dn!=0xffffffffU && !(p[0]==3 && dn==0xffff)) {
         ++q->received; ++q->ignored; return 0; // no forwarding route is installed
     }
-    if (type==1 && confirm && q->count==PicassoQrtrQueue) return -11;
+    PicassoServlocRequest request={};unsigned answer=0;
+    bool locator=type==1 && dp==PicassoServlocPort && dn==1 && q->helloReceived &&
+        q->locator.announced && sn==q->peer && sp!=PicassoQrtrControl && sp!=0xffffffffU;
+    if(locator) answer=picasso_servloc_answer(p+header,size,q->replyScratch,&request);
+    // Reserve all replies atomically before consuming the packet or changing
+    // counters. A full queue leaves its GLINK intent owned by the receiver.
+    if (type==1 && q->count+unsigned(confirm)+unsigned(answer!=0)>PicassoQrtrQueue) return -11;
     ++q->received; q->lastType=type;
     const uint8_t *payload=p+header;
     if (type==2) {
+        if(q->helloReceived && q->peer!=sn) {
+            q->count=0;for(auto &s:q->services)s.used=false;
+        }
         if(q->qmi.bound && q->qmi.node!=sn) picasso_qmi_lost(&q->qmi);
+        q->locator.announced=false;
         q->peer=sn; q->helloReceived=true; ++q->events;
     } else if (type==4 || type==5) {
         uint32_t service=picasso_qrtr_u32(payload+4), instance=picasso_qrtr_u32(payload+8);
@@ -95,15 +110,32 @@ inline int picasso_qrtr_receive(PicassoQrtr *q, const uint8_t *p, uint32_t n) {
         uint32_t node=type==3 ? sn : picasso_qrtr_u32(payload+8);
         for (auto &s:q->services) if (s.used && s.node==node) s.used=false;
         if(q->qmi.bound && q->qmi.node==node) picasso_qmi_lost(&q->qmi);
-        if (node==q->peer) q->helloReceived=false;
+        if (node==q->peer) { q->helloReceived=false;q->locator.announced=false;q->count=0; }
         ++q->events;
     } else if (type==1) {
         ++q->data;
-        if(!picasso_qmi_receive(&q->qmi,sn,sp,dp,payload,size)) ++q->ignored;
         if (confirm) {
-            auto *w=q->queue[(q->head+q->count)%PicassoQrtrQueue];
-            picasso_qrtr_control(w,7,dn,dp,sn,sp,dn,dp); ++q->count;
+            unsigned index=(q->head+q->count)%PicassoQrtrQueue;auto *w=q->queue[index];
+            picasso_qrtr_control(w,7,dn,dp,sn,sp,dn,dp);q->queueBytes[index]=52;++q->count;
         }
+        if(locator) {
+            auto &l=q->locator;++l.requests;++l.events;
+            l.lastNode=sn;l.lastPort=sp;l.lastMessage=request.message;l.lastTransaction=request.transaction;
+            l.lastOffset=request.offset;l.lastTotal=request.total;l.lastError=request.error;
+            for(unsigned n=0;n<65;++n)l.lastName[n]=request.name[n];
+            if(!answer || request.error==1)++l.malformed;
+            else if(request.error)++l.unsupported;
+            if(request.registration)++l.registrations;
+            if(answer) {
+                unsigned index=(q->head+q->count)%PicassoQrtrQueue;auto *w=q->queue[index];
+                unsigned bytes=32+((answer+3)&~3U);q->queueBytes[index]=bytes;
+                for(unsigned n=0;n<bytes/4;++n)w[n]=0;
+                w[0]=1;w[1]=1;w[2]=1;w[3]=PicassoServlocPort;w[5]=answer;w[6]=sn;w[7]=sp;
+                auto *body=reinterpret_cast<uint8_t *>(w+8);
+                for(unsigned n=0;n<answer;++n)body[n]=q->replyScratch[n];
+                ++q->count;
+            }
+        } else if(!picasso_qmi_receive(&q->qmi,sn,sp,dp,payload,size)) ++q->ignored;
     } else ++q->ignored;
     // HELLO and announcements may be interleaved by the transport. Bind only
     // a real matching announcement on the peer learned from HELLO.

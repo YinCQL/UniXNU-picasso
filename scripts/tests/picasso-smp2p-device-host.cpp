@@ -153,7 +153,7 @@ int main(int argc,char **argv) {
     assert(allocations==3 && releases==3-!!failAlloc && mappings==releases && unmaps==mappings-!!failMap && !preempt);
     if(!strcmp(mode,"normal") || peer || transport) {
         assert(plans==1 && sleeps==1602 && kicks==(peer?2U:1U));
-    assert(lines==(peer?70U:transport?20U:8U));
+    assert(lines==(peer?70U:transport?21U:8U));
         assert(ram[(part+12)/4]==(peer?17200U:transport?33240U:16840U));
         if(transport)assert(!ipccRam[3]); // stopped observer never transmits GLINK
         assert(!allocatorGate && !mutexRam[0]);

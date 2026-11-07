@@ -30,6 +30,11 @@ struct PicassoAprProbe {
     uint32_t received, ignored, malformed;
     bool pending, responded, ready, intentAsked, intentGranted;
     int error;
+    struct {
+        uint32_t token, wait, status, build[4], count, services[25][3], events;
+        bool sent, pending, valid;
+        int error;
+    } fw;
 };
 struct PicassoGlink {
     // Contains pointers into its own static storage: prepare in final location,

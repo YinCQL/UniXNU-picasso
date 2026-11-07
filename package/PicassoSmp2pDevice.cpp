@@ -93,7 +93,20 @@ struct BootEvents {
     int qrtrError = 0;
     uint32_t reuseLogs = 0, remoteReuse = 0, localReuse = 0;
     uint32_t qmiEvents = 0, qmiLogs = 0;
+    uint32_t locatorEvents = 0, locatorLogs = 0, fwEvents = 0;
 };
+void logFramework(const PicassoAprProbe &a) {
+    const auto &v=a.fw;
+    IOLog("PICASSO_ADSP avcs sent=%u pending=%u valid=%u token=%x status=%u error=%d build=%u.%u.%u.%u services=%u pcm=0\n",
+        v.sent,v.pending,v.valid,v.token,v.status,v.error,v.build[0],v.build[1],v.build[2],v.build[3],v.count);
+    if(v.valid)for(unsigned n=0;n<v.count;++n)
+        IOLog("PICASSO_ADSP avcs service=%x api=%u branch=%u\n",v.services[n][0],v.services[n][1],v.services[n][2]);
+}
+void logLocator(const PicassoServloc &l) {
+    IOLog("PICASSO_ADSP servloc announced=%u requests=%u replies=%u malformed=%u unsupported=%u registrations=%u source=%u/%x msg=%x txn=%x name=%.64s offset=%u total=%u error=%u\n",
+        l.announced,l.requests,l.replies,l.malformed,l.unsupported,l.registrations,l.lastNode,l.lastPort,
+        l.lastMessage,l.lastTransaction,l.lastName,l.lastOffset,l.lastTotal,l.lastError);
+}
 int bootPoll(void *context, PicassoSmp2pEvent *event) {
     auto *b=static_cast<BootEvents *>(context);
     int error=picasso_smp2p_service(b->io,b->state,event);
@@ -157,6 +170,10 @@ void bootService(void *context) {
             b->aprAttempts=a.attempts; b->aprReceived=a.received; b->aprError=a.error;
         }
         auto &q=g->qrtr;
+        if(a.fw.events!=b->fwEvents) { logFramework(a);b->fwEvents=a.fw.events; }
+        if(q.locator.events!=b->locatorEvents && b->locatorLogs<32) {
+            logLocator(q.locator);b->locatorEvents=q.locator.events;++b->locatorLogs;
+        }
         if ((b->qrtrLogs<48 && (q.events!=b->qrtrEvents || q.received!=b->qrtrReceived)) || q.error!=b->qrtrError) {
             unsigned services=0,cached=0,busy=0;
             for (const auto &v:q.services) services+=v.used;
@@ -192,6 +209,7 @@ int bootSnapshot(void *context) {
     IOLog("PICASSO_ADSP glink completions snapshot done=%u remote_reuse=%u local_reuse=%u last_channel=%u last_id=%x fault_bytes=%u\n",
         g.remoteDone,g.remoteReuse,g.localReuse,g.lastDoneChannel,g.lastDoneId,g.faultBytes);
     const auto &q=g.qrtr;
+    logFramework(g.apr);logLocator(q.locator);
     IOLog("PICASSO_ADSP qrtr snapshot hello=%u/%u peer=%u received=%u malformed=%u ignored=%u overflow=%u data=%u resumes=%u queued=%u error=%d qmi_query=1 pcm=0\n",
         q.helloSent,q.helloReceived,q.peer,q.received,q.malformed,q.ignored,q.overflow,q.data,q.resumes,q.count,q.error);
     for (const auto &v:q.services) if (v.used)

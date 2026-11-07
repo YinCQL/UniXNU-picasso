@@ -27,11 +27,27 @@ inline void picasso_apr_receive(PicassoAprProbe *p, const uint8_t *data, uint32_
         ++p->malformed; return;
     }
     uint32_t type=(header>>8)&3;
-    if (!p->pending || p->receivedToken != p->token || type>1 ||
+    bool version=p->fw.pending && p->receivedToken==p->fw.token;
+    if ((!version && (!p->pending || p->receivedToken != p->token)) || type>1 ||
         wlan_sm32(data + 4) != 0x403 || wlan_sm32(data + 8) != 0x503) {
         ++p->ignored; return;
     }
-    if (p->opcode == 0x1290d && size == headerBytes + 4) {
+    if(version) {
+        auto &v=p->fw;const uint8_t *payload=data+headerBytes;unsigned bytes=size-headerBytes;
+        if(p->opcode==0x1292d) {
+            if(bytes<20) { ++p->malformed;return; }
+            unsigned count=wlan_sm32(payload+16);
+            if(count>25 || bytes!=20+count*12) { ++p->malformed;return; }
+            for(unsigned n=0;n<count;++n) for(unsigned j=0;j<n;++j)
+                if(wlan_sm32(payload+20+n*12)==wlan_sm32(payload+20+j*12)) { ++p->malformed;return; }
+            for(unsigned n=0;n<4;++n)v.build[n]=wlan_sm32(payload+n*4);
+            for(unsigned n=0;n<count;++n)for(unsigned j=0;j<3;++j)v.services[n][j]=wlan_sm32(payload+20+n*12+j*4);
+            v.count=count;v.pending=false;v.valid=true;++v.events;
+        } else if(type==1 && p->opcode==0x110e8 && bytes==8 && wlan_sm32(payload)==0x1292c) {
+            v.status=wlan_sm32(payload+4);
+            if(v.status) { v.error=-5;v.pending=false;++v.events; }else ++p->ignored;
+        } else ++p->ignored;
+    } else if (p->opcode == 0x1290d && size == headerBytes + 4) {
         p->state = wlan_sm32(data + headerBytes); p->responded = true;
         p->ready = p->state != 0; p->pending = false; p->next = p->ticks + 5;
     } else if (type==1 && p->opcode == 0x110e8 && size == headerBytes + 8 &&

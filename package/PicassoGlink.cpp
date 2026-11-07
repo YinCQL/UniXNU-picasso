@@ -6,6 +6,7 @@ namespace {
 int fail(PicassoGlink *s, int error) {
     s->failed = true; s->error = error; s->ready = false;
     s->apr.ready = false; s->apr.pending = false;
+    s->apr.fw.pending=false;s->apr.fw.valid=false;s->apr.fw.error=error;
     if (!s->apr.error) s->apr.error = error;
     picasso_qrtr_invalidate(&s->qrtr, error);
     for (auto &c : s->channel) c.up = false;
@@ -81,7 +82,10 @@ PicassoGlinkRemoteIntent *remotes(PicassoGlink *s, const PicassoGlinkChannel &c)
     return c.local==1 ? s->remoteIntent : s->qrtrRemote;
 }
 void clearChannel(PicassoGlink *s, PicassoGlinkChannel &c) {
-    if (c.local==1) { s->apr.ready=false; s->apr.pending=false; s->apr.error=-104; }
+    if (c.local==1) {
+        s->apr.ready=false; s->apr.pending=false; s->apr.error=-104;
+        s->apr.fw.pending=false;s->apr.fw.valid=false;s->apr.fw.error=-104;
+    }
     else picasso_qrtr_invalidate(&s->qrtr,-104);
     for (unsigned n=0;n<localCount(c);++n) resetIntent(locals(s,c)[n]);
     for (unsigned n=0;n<PicassoGlinkRemoteIntents;++n) remotes(s,c)[n]={};
@@ -119,6 +123,9 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     auto &a = s->apr;
     int qmiDue=c.local==2 ? picasso_qmi_due(&s->qrtr.qmi):-1;
     if (c.local==1) ++a.ticks;
+    if(c.local==1 && a.fw.pending && ++a.fw.wait>100) {
+        a.fw.pending=false;a.fw.error=-60;++a.fw.events;
+    }
     // Count service calls even under TX backpressure. A timeout does not free
     // any remote intent; its ownership lasts until RX_DONE or disconnect.
     if (c.local==1 && !a.ready && !a.error) {
@@ -151,13 +158,21 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     }
     if (c.local==2) {
         auto &q=s->qrtr;
-        if (q.error || (q.helloSent && !q.count && qmiDue<0)) return 0;
-        uint32_t words[28]={9U | (uint32_t(c.local)<<16),0,52,0};
-        bool query=q.helloSent && !q.count && qmiDue>=0;
+        bool announce=q.helloSent && q.helloReceived && !q.locator.announced && !q.count;
+        if (q.error || (q.helloSent && !q.count && qmiDue<0 && !announce)) return 0;
+        uint32_t words[140]={9U | (uint32_t(c.local)<<16),0,52,0};
+        bool query=q.helloSent && !q.count && !announce && qmiDue>=0;
         if (!q.helloSent) picasso_qrtr_control(words+4,2,1,PicassoQrtrControl,
             q.helloReceived?q.peer:0xffffffffU,PicassoQrtrControl);
+        else if(announce) {
+            picasso_qrtr_control(words+4,4,1,PicassoQrtrControl,q.peer,PicassoQrtrControl,0x40,0x101);
+            words[15]=1;words[16]=PicassoServlocPort;
+        }
         else if(query) words[2]=picasso_qmi_query(&q.qmi,unsigned(qmiDue),reinterpret_cast<uint8_t *>(words+4));
-        else for (unsigned n=0;n<13;++n) words[4+n]=q.queue[q.head][n];
+        else {
+            words[2]=q.queueBytes[q.head];
+            for(unsigned n=0;n<words[2]/4;++n)words[4+n]=q.queue[q.head][n];
+        }
         PicassoGlinkRemoteIntent *slot=nullptr;
         for (unsigned n=0;n<PicassoGlinkRemoteIntents;++n)
             if (remote[n].used && !remote[n].busy && remote[n].size>=words[2]) { slot=&remote[n]; break; }
@@ -173,14 +188,22 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
         if ((error=transmit(io,s,words,16+((words[2]+7)&~7U),kick))) return error;
         slot->busy=true; q.intentGranted=false;
         if (!q.helloSent) q.helloSent=true;
+        else if(announce) { q.locator.announced=true;++q.locator.events; }
         else if(query) {
             auto &d=q.qmi.domains[qmiDue];d.sent=true;d.pending=true;d.ticks=0;++q.qmi.events;
         }
-        else { q.head=(q.head+1)%PicassoQrtrQueue; --q.count; ++q.resumes; }
+        else {
+            if(q.queue[q.head][1]==7)++q.resumes;
+            else { ++q.locator.replies;++q.locator.events; }
+            q.head=(q.head+1)%PicassoQrtrQueue; --q.count;
+        }
         ++q.events; return 0;
     }
-    if (a.ready || a.error) return 0;
-    if (a.pending || a.ticks < a.next) return 0;
+    // Stock q6core queries FWK_VERSION only after real CORE readiness. This
+    // discovers AFE/ASM/ADM APIs without starting audio or assuming versions.
+    bool version=a.ready && !a.fw.sent && !a.fw.error;
+    if ((a.ready && !version) || a.error) return 0;
+    if (!version && (a.pending || a.ticks < a.next)) return 0;
     PicassoGlinkRemoteIntent *slot = nullptr;
     for (auto &i : s->remoteIntent) if (i.used && !i.busy && i.size >= 20) { slot = &i; break; }
     if (!slot) {
@@ -192,10 +215,14 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
         return 0;
     }
     uint32_t words[10] = {9U | (uint32_t(c.local) << 16), slot->id, 20, 0};
-    uint32_t query[5]; picasso_apr_query(a.token + 1, query);
+    uint32_t query[5]; picasso_apr_query(version?0x18710001:a.token + 1, query);
+    if(version)query[4]=0x1292c;
     for (unsigned i = 0; i < 5; ++i) words[4 + i] = query[i];
     if ((error = transmit(io, s, words, sizeof(words), kick))) return error;
-    slot->busy = true; ++a.token; ++a.attempts; a.wait = 0; a.pending = true;
+    slot->busy = true;
+    if(version) {
+        a.fw.sent=a.fw.pending=true;a.fw.token=query[3];a.fw.wait=0;++a.fw.events;
+    } else { ++a.token; ++a.attempts; a.wait = 0; a.pending = true; }
     a.intentGranted = false;
     return 0;
 }

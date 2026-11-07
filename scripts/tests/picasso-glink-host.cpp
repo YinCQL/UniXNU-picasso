@@ -5,6 +5,7 @@
 #include <string.h>
 #include "PicassoGlink.h"
 #include "PicassoAdsp.h"
+#include "PicassoApr.h"
 static uint8_t ram[WLAN_SMEM_SIZE], before[WLAN_SMEM_SIZE];
 static constexpr uint32_t part=0x1cf000, bytes=0x30000, toc=WLAN_SMEM_SIZE-4096;
 static bool held;static unsigned writes,reads,failWrite,failRead,barriers;
@@ -34,6 +35,7 @@ static void build184Tests();
 static void qrtrTests();
 static void build185Tests();
 static void build186Tests();
+static void local187Tests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -119,7 +121,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
+    local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -401,6 +403,7 @@ __attribute__((noinline)) static void build185Tests() {
     assert(s.apr.ready && s.qrtr.helloReceived && s.apr.header==0x00180150 && s.qrtr.sourceNode==2);
     unsigned local=s.qrtrLocal[0].id;step(s);drain(s);
     assert(s.localReuse==2 && s.localIntent[0].id==1 && s.qrtrLocal[0].id==local);
+    assert(s.qrtr.locator.announced);message(s,rx,14,2,0);step(s);drain(s);
     uint32_t server[]={1,4,2,0xfffffffe,0,20,1,0xfffffffe,4,0x40,0x101,2,73};
     qrtrPacket(s,rx,local,server,52);step(s);drain(s);assert(s.qrtr.services[0].used);
     step(s);drain(s);uint32_t data[]={1,1,2,73,1,20,1,99,0,0,0,0,0};
@@ -466,8 +469,85 @@ static unsigned discoveredQmi(PicassoGlink &s) {
     const uint32_t grant[]={0x20005,1,128,0};frame(s,rx,grant,16);step(s);drain(s);step(s);drain(s);
     uint32_t hello[]={1,2,5,0xfffffffe,0,20,1,0xfffffffe,2,0,0,0,0};
     qrtrPacket(s,rx,s.qrtrLocal[0].id,hello,52);message(s,rx,14,2,0);step(s);drain(s);step(s);drain(s);
+    assert(s.qrtr.locator.announced);message(s,rx,14,2,0);step(s);drain(s);
     uint32_t server[]={1,4,5,0xfffffffe,0,20,1,0xfffffffe,4,0x42,0x4a01,5,3};
     qrtrPacket(s,rx,s.qrtrLocal[0].id,server,52);step(s);drain(s);return rx;
+}
+static unsigned frameworkReady(PicassoGlink &s) {
+    unsigned rx=query(s);const uint32_t state[]={0x00240081,0x403,0x503,s.apr.token,0x1290d,0,0,0,1};
+    packet(s,rx,1,reinterpret_cast<const uint8_t *>(state),36);message(s,rx,14,7,91);
+    step(s);drain(s);assert(s.apr.ready && !s.apr.fw.sent);return rx;
+}
+static unsigned locatorAnnounceReady(PicassoGlink &s) {
+    unsigned rx=connectQrtr(s);s.apr.error=-60;
+    const uint32_t grant[]={0x20005,1,512,0};frame(s,rx,grant,16);step(s);drain(s);step(s);drain(s);
+    const uint32_t hello[]={1,2,5,0xfffffffe,0,20,1,0xfffffffe,2,0,0,0,0};
+    qrtrPacket(s,rx,s.qrtrLocal[0].id,hello,52);message(s,rx,14,2,0);step(s);drain(s);
+    assert(!s.qrtr.locator.announced);return rx;
+}
+__attribute__((noinline)) static void local187Tests() {
+    PicassoGlink s={};unsigned rx=frameworkReady(s);unsigned at=s.txHead;step(s);drain(s);
+    assert(s.apr.fw.sent && s.apr.fw.pending && s.remoteIntent[0].busy);
+    // Completion, local intent advertisement, then the real FWK command.
+    bool found=false;
+    for(unsigned n=at;n+36<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x10009) {
+        assert(r32(s.tx.offset+n+28)==0x18710001 && r32(s.tx.offset+n+32)==0x1292c);found=true;
+    }
+    assert(found);
+    uint32_t reply[]={0x00580081,0x403,0x503,0x18710001,0x1292d,0,0,0,5,6,1,9,3,4,3,0,7,2,1,8,4,2};
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(reply),31,57);step(s);drain(s);
+    assert(!s.apr.fw.valid);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(reply)+31,57,0,true);step(s);drain(s);
+    assert(s.apr.fw.valid && !s.apr.fw.pending && s.apr.fw.count==3 && s.apr.fw.services[2][0]==8);
+    assert(s.apr.fw.build[3]==9 && s.apr.ready);
+    picasso_glink_stop(&s);assert(!s.apr.fw.valid && !s.apr.fw.pending);
+    // Pure decoder rejects all truncations, excess/duplicate service records,
+    // wrong token/address/type and basic success without changing the version.
+    PicassoAprProbe a={};a.ready=true;a.fw.pending=true;a.fw.token=0x18710001;
+    for(unsigned n=0;n<sizeof reply;++n)picasso_apr_receive(&a,reinterpret_cast<uint8_t *>(reply),n);
+    assert(a.fw.pending && !a.fw.valid);
+    reply[12]=26;picasso_apr_receive(&a,reinterpret_cast<uint8_t *>(reply),sizeof reply);assert(!a.fw.valid);reply[12]=3;
+    reply[19]=4;picasso_apr_receive(&a,reinterpret_cast<uint8_t *>(reply),sizeof reply);assert(!a.fw.valid);reply[19]=8;
+    reply[3]++;picasso_apr_receive(&a,reinterpret_cast<uint8_t *>(reply),sizeof reply);assert(!a.fw.valid);reply[3]--;
+    uint32_t basic[]={0x001c0150,0x403,0x503,0x18710001,0x110e8,0x1292c,0};
+    picasso_apr_receive(&a,reinterpret_cast<uint8_t *>(basic),sizeof basic);assert(a.fw.pending && !a.fw.valid);
+    basic[6]=3;picasso_apr_receive(&a,reinterpret_cast<uint8_t *>(basic),sizeof basic);
+    assert(a.fw.error==-5 && a.fw.status==3 && !a.fw.pending && a.ready);
+    rx=frameworkReady(s);step(s);drain(s);p32(s.desc.offset,(s.txHead+8)%s.tx.size);
+    for(unsigned n=0;n<102;++n)step(s);
+    assert(s.apr.fw.error==-60 && !s.apr.fw.pending && s.remoteIntent[0].busy && s.apr.ready);
+    rx=frameworkReady(s);writes=0;step(s);unsigned total=writes;bool kick;
+    for(unsigned n=1;n<=total;++n) {
+        rx=frameworkReady(s);writes=0;failWrite=n;
+        assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && !s.apr.fw.pending && !s.apr.fw.valid);
+    }
+    // Real GLINK HELLO -> APSS announcement -> confirmed domain-list query.
+    rx=locatorAnnounceReady(s);writes=0;step(s);unsigned announceWrites=writes;
+    for(unsigned n=1;n<=announceWrites;++n) {
+        rx=locatorAnnounceReady(s);writes=0;failWrite=n;
+        assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && !s.qrtr.locator.announced);
+    }
+    rx=locatorAnnounceReady(s);p32(s.desc.offset,(s.txHead+8)%s.tx.size);
+    for(unsigned n=0;n<10;++n)step(s);
+    assert(!s.qrtr.locator.announced && !s.qrtrRemote[0].busy);drain(s);
+    at=s.txHead;step(s);drain(s);assert(s.qrtr.locator.announced);
+    found=false;for(unsigned n=at;n+68<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x20009) {
+        const uint32_t expected[]={1,4,1,0xfffffffe,0,20,5,0xfffffffe,4,0x40,0x101,1,0x187};
+        assert(!memcmp(ram+s.tx.offset+n+16,expected,sizeof expected));found=true;
+    }
+    assert(found);message(s,rx,14,2,0);step(s);drain(s);
+    uint32_t request[14]={1,1,5,88,1,19,1,0x187};
+    const uint8_t qmi[]={0,9,0,0x21,0,12,0,1,9,0,'a','v','s','/','a','u','d','i','o'};
+    memcpy(request+8,qmi,sizeof qmi);
+    qrtrPacket(s,rx,s.qrtrLocal[0].id,request,52);step(s);drain(s);
+    assert(s.qrtr.locator.requests==1 && s.qrtr.count==2);
+    step(s);drain(s);assert(s.qrtr.resumes==1 && !s.qrtr.locator.replies);
+    message(s,rx,14,2,0);step(s);drain(s);s.qrtrRemote[0].size=64;
+    step(s);drain(s);assert(!s.qrtr.locator.replies && s.qrtr.count==1 && !s.qrtrRemote[0].busy);
+    s.qrtrRemote[0].size=512;step(s);drain(s);
+    assert(s.qrtr.locator.replies==1 && !s.qrtr.count && s.qrtrRemote[0].busy);
+    picasso_glink_stop(&s);assert(!s.qrtr.locator.announced && !s.qrtr.count);
+    puts("PASS local187 real locator announcement/replies and AVCS version wire, fragmentation, validation, timeout, TX failures and invalidation");
 }
 __attribute__((noinline)) static void build186Tests() {
     PicassoGlink s={};unsigned rx=query(s);bool kick;
@@ -492,6 +572,7 @@ __attribute__((noinline)) static void build186Tests() {
     rx=connectQrtr(s);s.apr.error=-60;const uint32_t grant[]={0x20005,1,128,0};frame(s,rx,grant,16);step(s);drain(s);step(s);drain(s);
     uint32_t hello[]={1,2,5,0xfffffffe,0,20,0xffffffff,0xfffffffe,2,0,0,0,0};
     qrtrPacket(s,rx,s.qrtrLocal[0].id,hello,52);message(s,rx,14,2,0);step(s);drain(s);step(s);drain(s);
+    assert(s.qrtr.locator.announced);message(s,rx,14,2,0);step(s);drain(s);
     uint32_t server[]={1,4,5,0xfffffffe,0,20,1,0xfffffffe,4,0x42,0x4a01,5,3};
     qrtrPacket(s,rx,s.qrtrLocal[0].id,server,52);step(s);drain(s);assert(s.qrtr.qmi.bound);
     unsigned tx=s.txHead;p32(s.desc.offset,(tx+8)%s.tx.size);for(unsigned n=0;n<5;++n)step(s);
