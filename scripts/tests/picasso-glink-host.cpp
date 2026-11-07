@@ -36,6 +36,7 @@ static void qrtrTests();
 static void build185Tests();
 static void build186Tests();
 static void local187Tests();
+static void fastrpcTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -121,7 +122,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
+    fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -609,14 +610,14 @@ __attribute__((noinline)) static void build184Tests(){
     // payloads: zero-ID/512 bytes below is a protocol regression, not a dump.
     openPeer(s,rx,1,"fastrpcglink-apps-dsp");openPeer(s,rx,2,"IPCRTR");
     openPeer(s,rx,3,"LOOPBACK_CTL_LPASS");openPeer(s,rx,4,"apr_audio_svc");
-    step(s);assert(s.rxTail==120 && s.deferredOpens==2);drain(s);step(s);
-    assert(s.txHead==72 && s.channel[0].ackSent);drain(s);
+    step(s);assert(s.rxTail==120 && s.deferredOpens==1);drain(s);step(s);
+    assert(s.txHead==112 && s.channel[0].ackSent && s.channel[1].local==3 && s.channel[1].ackSent);drain(s);
     message(s,rx,4,1,0);uint32_t zero[4]={0x40005,1,512,0};frame(s,rx,zero,16);step(s);
     assert(!s.failed && s.channel[0].up && s.rxTail==144);
     assert(s.remoteIntent[0].used && s.remoteIntent[0].id==0 && s.intentOffers==1);
     step(s);assert(s.apr.pending && s.remoteIntent[0].busy);
     const uint32_t expected[]={0x10009,0,20,0,0x00140250,0x503,0x403,0x18300001,0x1290c,0};
-    assert(!memcmp(ram+s.tx.offset+88,expected,sizeof expected));drain(s);
+    assert(!memcmp(ram+s.tx.offset+128,expected,sizeof expected));drain(s);
     uint32_t answer[10]={0x40009,1,24,0,0x00180150,0x403,0x503,s.apr.token,0x1290d,5};
     frame(s,rx,answer,sizeof answer);step(s);assert(s.apr.ready && s.apr.state==5);drain(s);
     message(s,rx,6,4,0);step(s);assert(!s.remoteIntent[0].used);
@@ -689,4 +690,91 @@ __attribute__((noinline)) static void build184Tests(){
         else {failRead=0;for(unsigned j=0;j<8;++j)step(s);assert(s.intentOffers==116 && s.intentFrames==1);}
     }
     puts("PASS build184 remote intent zero, 116 offers, bounded batches, large grants, busy ownership and diagnostics");
+}
+
+// Stock FastRPC binds a transport without sending a startup invocation. These
+// fixtures prove real backing storage/ownership and isolation, not RPC success.
+static unsigned connectFastrpc(PicassoGlink &s) {
+    unsigned rx=connect(s);s.apr.ready=true;s.apr.fw.sent=true;
+    openPeer(s,rx,9,"fastrpcglink-apps-dsp");step(s);drain(s);
+    unsigned at=s.txHead;step(s);
+    assert(!s.deferredOpens && s.channel[1].local==3 && !s.channel[1].up);
+    assert(r32(s.tx.offset+at+16)==0x30002 && r32(s.tx.offset+at+20)==22);
+    assert(!memcmp(ram+s.tx.offset+at+24,"fastrpcglink-apps-dsp",22));
+    assert(r32(s.tx.offset+at+48)==0x90004);drain(s);
+    message(s,rx,4,3,0);step(s);assert(s.channel[1].up);drain(s);
+    for(unsigned n=0;n<64;++n) { step(s);drain(s); }
+    for(unsigned n=0;n<64;++n) {
+        auto &i=s.fastrpcLocal[n];assert(i.advertised && i.id && i.capacity==100);
+        assert(i.data==s.fastrpcStorage[n] && !i.done && !i.active);
+        for(unsigned k=0;k<n;++k)assert(i.id!=s.fastrpcLocal[k].id);
+        for(auto &a:s.localIntent)assert(i.id!=a.id);
+    }
+    at=s.txHead;step(s);assert(at==s.txHead); // passive, no fabricated RPC
+    return rx;
+}
+static void fastrpcPacket(PicassoGlink &s,unsigned rx,unsigned iid,const uint8_t *p,unsigned size,unsigned left=0,bool cont=false) {
+    uint32_t words[30]={unsigned(cont?12:9)|(9U<<16),iid,size,left};
+    assert(size<=104);memcpy(words+4,p,size);frame(s,rx,words,16+((size+7)&~7U));
+}
+__attribute__((noinline)) static void fastrpcTests() {
+    PicassoGlink s={};unsigned rx=connectFastrpc(s);bool kick;
+    // Reassembly across arbitrary byte boundaries records raw data once. The
+    // RPC context remains opaque even if it resembles a successful response.
+    uint8_t payload[104];for(unsigned n=0;n<sizeof payload;++n)payload[n]=uint8_t(n+1);
+    unsigned iid=s.fastrpcLocal[0].id;
+    fastrpcPacket(s,rx,iid,payload,7,17);step(s);drain(s);
+    assert(s.fastrpcLocal[0].active && !s.fastrpc.received);
+    fastrpcPacket(s,rx,iid,payload+7,17,0,true);step(s);drain(s);
+    assert(s.fastrpc.received==1 && s.fastrpc.bytes==24 && s.fastrpc.words[0]==0x04030201);
+    assert(s.fastrpc.words[5]==0x18171615 && s.fastrpcLocal[0].done && !s.qrtr.received && !s.apr.received);
+    unsigned at=s.txHead;step(s);assert(r32(s.tx.offset+at)==0x3000e && r32(s.tx.offset+at+4)==iid);
+    assert(s.fastrpcLocal[0].advertised && s.fastrpc.received==1);drain(s);
+    // Backpressure retains ownership; neither dispatch nor RX_DONE duplicates.
+    fastrpcPacket(s,rx,iid,payload,100);step(s);drain(s);at=s.txHead;
+    p32(s.desc.offset,(at+16)%s.tx.size);step(s);
+    assert(s.fastrpcLocal[0].done && !s.fastrpcLocal[0].advertised && s.fastrpc.received==2);
+    unsigned count=writes;step(s);assert(writes==count && s.fastrpc.received==2);
+    drain(s);step(s);assert(s.fastrpcLocal[0].advertised);drain(s);
+    fastrpcPacket(s,rx,iid,payload,1);step(s);drain(s);step(s);drain(s);
+    assert(s.fastrpc.bytes==1 && s.fastrpc.words[0]==1 && !s.fastrpc.words[1]);
+    // Stock capacity request succeeds; larger buffers are explicitly denied.
+    at=s.txHead;message(s,rx,7,9,100);step(s);
+    assert(r32(s.tx.offset+at)==0x30008 && r32(s.tx.offset+at+4)==1);drain(s);
+    at=s.txHead;message(s,rx,7,9,101);step(s);
+    assert(r32(s.tx.offset+at)==0x30008 && !r32(s.tx.offset+at+4));drain(s);
+    // Equal remote IDs on independent channels never alias another pool.
+    s.remoteIntent[0]={0,512,true,true};s.qrtrRemote[0]={0,512,true,true};
+    const uint32_t offerFast[4]={0x90005,1,100,0};frame(s,rx,offerFast,16);step(s);drain(s);
+    assert(s.fastrpcRemote[0].used && !s.fastrpcRemote[0].busy && s.remoteIntent[0].busy && s.qrtrRemote[0].busy);
+    s.qrtr.helloSent=true;s.qrtr.helloReceived=true;s.qrtr.locator.announced=true;
+    message(s,rx,3,9,0);step(s);
+    assert(s.fastrpc.error==-104 && s.channel[1].closing && !s.channel[1].up);
+    assert(s.apr.ready && s.qrtr.locator.announced && s.remoteIntent[0].busy && s.qrtrRemote[0].busy);
+    for(auto &i:s.fastrpcLocal)assert(!i.id && !i.advertised && !i.active);
+    for(auto &i:s.fastrpcRemote)assert(!i.used);
+    message(s,rx,11,3,0);step(s);assert(s.channel[1].closeAck);
+    // Oversize/foreign intent and impossible unsolicited ACK fail explicitly.
+    rx=connectFastrpc(s);fastrpcPacket(s,rx,s.fastrpcLocal[0].id,payload,101);
+    assert(picasso_glink_service(&io,&s,&kick)==-90 && !s.fastrpc.received && !s.channel[1].up);
+    rx=connectFastrpc(s);fastrpcPacket(s,rx,s.localIntent[0].id,payload,12);
+    assert(picasso_glink_service(&io,&s,&kick)==-71 && !s.apr.received);
+    rx=connectFastrpc(s);s.qrtr.intentAsked=true;message(s,rx,8,9,1);
+    assert(picasso_glink_service(&io,&s,&kick)==-71 && !s.qrtr.intentGranted);
+    rx=connectFastrpc(s);message(s,rx,14,9,0);
+    assert(picasso_glink_service(&io,&s,&kick)==-71); // no invoke owns this ID
+    // Every payload/head write failure during reuse is terminal, never retried.
+    for(unsigned n=1;n<=3;++n) {
+        rx=connectFastrpc(s);fastrpcPacket(s,rx,s.fastrpcLocal[0].id,payload,24);step(s);drain(s);
+        writes=0;failWrite=n;assert(picasso_glink_service(&io,&s,&kick)==-5);
+        count=writes;assert(picasso_glink_service(&io,&s,&kick)==-5 && writes==count && !s.channel[1].up);
+    }
+    rx=connectFastrpc(s);memcpy(before,ram,sizeof ram);picasso_glink_stop(&s);
+    assert(s.failed && s.fastrpc.error==-104 && !memcmp(before,ram,sizeof ram));
+    for(auto &i:s.fastrpcLocal)assert(!i.id && !i.advertised);
+    // Missing OPEN_ACK times out only this channel, leaving APR/QRTR intact.
+    rx=connect(s);s.apr.ready=true;s.apr.fw.sent=true;openPeer(s,rx,9,"fastrpcglink-apps-dsp");step(s);
+    for(unsigned n=0;n<502;++n){drain(s);step(s);}
+    assert(s.channel[1].closing && s.fastrpc.error==-60 && !s.qrtr.error && s.apr.ready && !s.failed);
+    puts("PASS FastRPC stock OPEN and 64x100 RX buffers, passive transport, fragments, reuse, pressure, isolation, invalid frames, I/O failures and shutdown");
 }

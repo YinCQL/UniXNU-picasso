@@ -9,6 +9,7 @@ int fail(PicassoGlink *s, int error) {
     s->apr.fw.pending=false;s->apr.fw.valid=false;s->apr.fw.error=error;
     if (!s->apr.error) s->apr.error = error;
     picasso_qrtr_invalidate(&s->qrtr, error);
+    s->fastrpc.error = error;
     for (auto &c : s->channel) c.up = false;
     return error;
 }
@@ -75,18 +76,19 @@ void resetIntent(PicassoGlinkLocalIntent &i) {
     i.id=0; i.fill=0; i.left=0; i.advertised=false; i.active=false; i.done=false; i.delivered=false;
 }
 PicassoGlinkLocalIntent *locals(PicassoGlink *s, const PicassoGlinkChannel &c) {
-    return c.local==1 ? s->localIntent : s->qrtrLocal;
+    return c.local==1 ? s->localIntent : c.local==2 ? s->qrtrLocal : s->fastrpcLocal;
 }
-unsigned localCount(const PicassoGlinkChannel &c) { return c.local==1 ? PicassoGlinkLocalIntents : 10; }
+unsigned localCount(const PicassoGlinkChannel &c) { return c.local==1 ? PicassoGlinkLocalIntents : c.local==2 ? 10 : 64; }
 PicassoGlinkRemoteIntent *remotes(PicassoGlink *s, const PicassoGlinkChannel &c) {
-    return c.local==1 ? s->remoteIntent : s->qrtrRemote;
+    return c.local==1 ? s->remoteIntent : c.local==2 ? s->qrtrRemote : s->fastrpcRemote;
 }
 void clearChannel(PicassoGlink *s, PicassoGlinkChannel &c) {
     if (c.local==1) {
         s->apr.ready=false; s->apr.pending=false; s->apr.error=-104;
         s->apr.fw.pending=false;s->apr.fw.valid=false;s->apr.fw.error=-104;
     }
-    else picasso_qrtr_invalidate(&s->qrtr,-104);
+    else if(c.local==2) picasso_qrtr_invalidate(&s->qrtr,-104);
+    else s->fastrpc.error=-104;
     for (unsigned n=0;n<localCount(c);++n) resetIntent(locals(s,c)[n]);
     for (unsigned n=0;n<PicassoGlinkRemoteIntents;++n) remotes(s,c)[n]={};
 }
@@ -99,7 +101,9 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     if (c.closing) return 0;
     int error;
     if (!c.up && ++c.steps > 500) {
-        if (c.local==1) s->apr.error = -60; else s->qrtr.error = -60;
+        if (c.local==1) s->apr.error = -60;
+        else if(c.local==2) s->qrtr.error = -60;
+        else s->fastrpc.error = -60;
         if (c.openSent) {
             const uint32_t words[2] = {3U | (uint32_t(c.local) << 16), 0};
             if ((error = transmit(io, s, words, sizeof(words), kick))) return error;
@@ -199,6 +203,10 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
         }
         ++q.events; return 0;
     }
+    // Stock adsprpc rpmsg_probe only binds the channel. It sends no startup
+    // invocation. Keep the real RX buffers available, but never fabricate an
+    // invoke, process attachment or completion before those consumers exist.
+    if(c.local==3) return 0;
     // Stock q6core queries FWK_VERSION only after real CORE readiness. This
     // discovers AFE/ASM/ADM APIs without starting audio or assuming versions.
     bool version=a.ready && !a.fw.sent && !a.fw.error;
@@ -270,6 +278,7 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
             *c = {}; c->used = true;
             for (unsigned i = 0; i < nameBytes; ++i) c->name[i] = name[i];
             if (sameName(name,"IPCRTR")) { c->supported=true; c->local=2; }
+            else if(sameName(name,"fastrpcglink-apps-dsp")) { c->supported=true; c->local=3; }
             else ++s->deferredOpens;
         }
         c->remote = uint16_t(id); c->priority = uint16_t(data >> 16); ++s->channelEvents;
@@ -367,6 +376,9 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
         return 0;
     }
     if (command == 8) {
+        // This passive transport never requests remote capacity. Do not let an
+        // unsolicited FastRPC ACK modify the independent QRTR request state.
+        if(c->local==3) return fail(s,-71);
         auto &asked=c->local==1 ? s->apr.intentAsked : s->qrtr.intentAsked;
         auto &granted=c->local==1 ? s->apr.intentGranted : s->qrtr.intentGranted;
         if (!c->up || !asked || data > 1) return fail(s, -71);
@@ -414,7 +426,14 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
         slot->fill += chunk; slot->left = left; slot->active = left != 0;
         if (!left) {
             if (c->local==1) { picasso_apr_receive(&s->apr,slot->data,slot->fill); slot->delivered=true; }
-            else slot->delivered=picasso_qrtr_receive(&s->qrtr,slot->data,slot->fill)!=-11;
+            else if(c->local==2) slot->delivered=picasso_qrtr_receive(&s->qrtr,slot->data,slot->fill)!=-11;
+            else {
+                auto &f=s->fastrpc;++f.received;f.bytes=slot->fill;
+                for(unsigned n=0;n<6;++n) f.words[n]=0;
+                for(unsigned n=0;n<slot->fill && n<24;++n)
+                    f.words[n/4]|=uint32_t(slot->data[n])<<((n&3)*8);
+                slot->delivered=true;
+            }
             slot->done = true; slot->advertised = false; ++s->dataPackets;
         }
         return 0;
@@ -441,6 +460,9 @@ int picasso_glink_prepare(const PicassoSmemIo *io, PicassoGlink *s, PicassoSmemA
     for (unsigned n=0;n<10;++n) {
         auto &i=s->qrtrLocal[n]; i.capacity=n<5 ? 0x800 : n<8 ? 0x2000 : 0x4400;
         i.data=s->qrtrStorage+offset; offset+=i.capacity;
+    }
+    for(unsigned n=0;n<64;++n) {
+        s->fastrpcLocal[n].data=s->fastrpcStorage[n];s->fastrpcLocal[n].capacity=100;
     }
     s->nextIntent = 1; s->apr.token = 0x18300000;
     s->prepared = true; return 0;

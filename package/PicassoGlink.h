@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// lito GLINK SMEM, bounded APR CORE and QRTR discovery. No PCM endpoint.
+// lito GLINK SMEM, APR/QRTR and FastRPC transport. No RPC invocation or PCM endpoint.
 #ifndef PICASSO_GLINK_H
 #define PICASSO_GLINK_H
 #include "PicassoSmp2p.h"
@@ -36,6 +36,12 @@ struct PicassoAprProbe {
         int error;
     } fw;
 };
+struct PicassoFastrpc {
+    // No invocation contexts exist yet. Record unsolicited wire data without
+    // interpreting it as a completed RPC, exposing shared memory or replying.
+    uint32_t received, bytes, words[6];
+    int error;
+};
 struct PicassoGlink {
     // Contains pointers into its own static storage: prepare in final location,
     // never copy a prepared session or place it on a kernel stack.
@@ -61,6 +67,11 @@ struct PicassoGlink {
     uint8_t aprStorage[PicassoGlinkLocalIntents][PicassoGlinkPacket];
     // lito.dtsi: IPCRTR 5*0x800, 3*0x2000, 2*0x4400. Static worker storage.
     uint8_t qrtrStorage[5*0x800 + 3*0x2000 + 2*0x4400];
+    // Stock lito.dtsi: fastrpcglink-apps-dsp, 64 receive intents of 0x64 bytes.
+    PicassoGlinkLocalIntent fastrpcLocal[64];
+    PicassoGlinkRemoteIntent fastrpcRemote[PicassoGlinkRemoteIntents];
+    uint8_t fastrpcStorage[64][100];
+    PicassoFastrpc fastrpc;
     PicassoAprProbe apr;
     PicassoQrtr qrtr;
 };

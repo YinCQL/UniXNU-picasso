@@ -91,6 +91,8 @@ struct BootEvents {
     int aprError = 0;
     uint32_t qrtrEvents = 0, qrtrReceived = 0, qrtrLogs = 0;
     int qrtrError = 0;
+    uint32_t fastrpcReceived = 0, fastrpcLogs = 0;
+    int fastrpcError = 0;
     uint32_t reuseLogs = 0, remoteReuse = 0, localReuse = 0;
     uint32_t qmiEvents = 0, qmiLogs = 0;
     uint32_t locatorEvents = 0, locatorLogs = 0, fwEvents = 0;
@@ -101,6 +103,15 @@ void logFramework(const PicassoAprProbe &a) {
         v.sent,v.pending,v.valid,v.token,v.status,v.error,v.build[0],v.build[1],v.build[2],v.build[3],v.count);
     if(v.valid)for(unsigned n=0;n<v.count;++n)
         IOLog("PICASSO_ADSP avcs service=%x api=%u branch=%u\n",v.services[n][0],v.services[n][1],v.services[n][2]);
+}
+void logFastrpc(const PicassoGlink &g) {
+    bool up=false;unsigned advertised=0,active=0,done=0;
+    for(const auto &c:g.channel) if(c.used && c.local==3) up=c.up;
+    for(const auto &i:g.fastrpcLocal) { advertised+=i.advertised;active+=i.active;done+=i.done; }
+    const auto &f=g.fastrpc;
+    IOLog("PICASSO_ADSP fastrpc up=%u buffers=%u/%u/%u received=%u unclaimed=%u bytes=%u words=%08x/%08x/%08x/%08x/%08x/%08x error=%d rpc=0 pcm=0\n",
+        up,advertised,active,done,f.received,f.received,f.bytes,f.words[0],f.words[1],f.words[2],
+        f.words[3],f.words[4],f.words[5],f.error);
 }
 void logLocator(const PicassoServloc &l) {
     IOLog("PICASSO_ADSP servloc announced=%u requests=%u replies=%u malformed=%u unsupported=%u registrations=%u source=%u/%x msg=%x txn=%x name=%.64s offset=%u total=%u error=%u\n",
@@ -169,6 +180,10 @@ void bootService(void *context) {
             }
             b->aprAttempts=a.attempts; b->aprReceived=a.received; b->aprError=a.error;
         }
+        if((g->fastrpc.received!=b->fastrpcReceived && b->fastrpcLogs<16) || g->fastrpc.error!=b->fastrpcError) {
+            logFastrpc(*g);b->fastrpcReceived=g->fastrpc.received;
+            b->fastrpcError=g->fastrpc.error;++b->fastrpcLogs;
+        }
         auto &q=g->qrtr;
         if(a.fw.events!=b->fwEvents) { logFramework(a);b->fwEvents=a.fw.events; }
         if(q.locator.events!=b->locatorEvents && b->locatorLogs<32) {
@@ -209,7 +224,7 @@ int bootSnapshot(void *context) {
     IOLog("PICASSO_ADSP glink completions snapshot done=%u remote_reuse=%u local_reuse=%u last_channel=%u last_id=%x fault_bytes=%u\n",
         g.remoteDone,g.remoteReuse,g.localReuse,g.lastDoneChannel,g.lastDoneId,g.faultBytes);
     const auto &q=g.qrtr;
-    logFramework(g.apr);logLocator(q.locator);
+    logFramework(g.apr);logLocator(q.locator);logFastrpc(g);
     IOLog("PICASSO_ADSP qrtr snapshot hello=%u/%u peer=%u received=%u malformed=%u ignored=%u overflow=%u data=%u resumes=%u queued=%u error=%d qmi_query=1 pcm=0\n",
         q.helloSent,q.helloReceived,q.peer,q.received,q.malformed,q.ignored,q.overflow,q.data,q.resumes,q.count,q.error);
     for (const auto &v:q.services) if (v.used)
