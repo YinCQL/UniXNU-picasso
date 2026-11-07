@@ -11,6 +11,8 @@ struct PicassoQrtr {
     uint32_t queue[PicassoQrtrQueue][13];
     uint32_t head, count, peer, received, malformed, ignored, events, overflow;
     uint32_t lastType, lastService, lastInstance, lastNode, lastPort, data, resumes;
+    uint32_t wireVersion, wireBytes, sourceNode, sourcePort, destNode, destPort, payloadBytes;
+    uint32_t payloadWords[4];
     bool helloSent, helloReceived, intentAsked, intentGranted;
     int error;
 };
@@ -44,6 +46,10 @@ inline int picasso_qrtr_receive(PicassoQrtr *q, const uint8_t *p, uint32_t n) {
         if (dp==0xfffe) dp=PicassoQrtrControl;
     } else valid=false;
     if (dp==0xffff) dp=PicassoQrtrControl;
+    q->wireVersion=n?p[0]:0; q->wireBytes=n; q->sourceNode=sn; q->sourcePort=sp;
+    q->destNode=dn; q->destPort=dp; q->payloadBytes=size;
+    for (unsigned i=0;i<4;++i) q->payloadWords[i]=
+        header && header<=n && i*4+4<=n-header && i*4+4<=size ? picasso_qrtr_u32(p+header+i*4):0;
     valid=valid && header<=n && size && size<=n-header && ((size+3)&~3U)==n-header &&
         (type==1 || type==7 || dp==PicassoQrtrControl);
     if (valid && type!=1) valid=size>=20 && picasso_qrtr_u32(p+header)==type;

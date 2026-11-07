@@ -26,6 +26,7 @@ struct PicassoGlinkRemoteIntent {
 };
 struct PicassoAprProbe {
     uint32_t token, attempts, ticks, wait, next, state, status, opcode, receivedToken;
+    uint32_t header, source, destination, bytes;
     uint32_t received, ignored, malformed;
     bool pending, responded, ready, intentAsked, intentGranted;
     int error;
@@ -43,6 +44,9 @@ struct PicassoGlink {
     uint32_t intentFrames, intentOffers, intentSkipped, intentReplaced;
     uint32_t intentProgress, intentCount, intentTail, intentChannel;
     uint32_t lastIntentId, lastIntentSize, intentFault;
+    uint32_t remoteDone, remoteReuse, localReuse, lastDoneId, lastDoneChannel;
+    // Preserve bounded wire evidence for the next unhandled or invalid frame.
+    uint32_t faultBytes, faultWords[8];
     bool readNotify;
     PicassoGlinkChannel channel[PicassoGlinkChannels];
     PicassoGlinkLocalIntent localIntent[PicassoGlinkLocalIntents];

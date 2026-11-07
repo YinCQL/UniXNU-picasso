@@ -32,6 +32,7 @@ static void message(PicassoGlink &s,unsigned rx,unsigned cmd,unsigned a,unsigned
 static void channelTests();
 static void build184Tests();
 static void qrtrTests();
+static void build185Tests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -117,7 +118,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    build184Tests();channelTests();qrtrTests();
+    build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -174,7 +175,7 @@ static void channelTests(){
     assert(r32(s.tx.offset+16376)==0x10002 && r32(s.tx.offset+16380)==14);
     assert(!memcmp(ram+s.tx.offset,"apr_audio_svc",14));
     uint32_t name[4]={};memcpy(name,"apr_audio_svc",14);frame(s,rx,name,16);step(s);assert(s.rxTail==16);
-    // Unknown duplicate IDs/names, bad names, overflow counts and unnegotiated reuse fail closed.
+    // Unknown duplicate IDs/names, bad names, overflow counts and invalid completion fail closed.
     rx=handshake(s);openPeer(s,rx,2,"one");openPeer(s,rx,2,"two");bool kick;
     assert(picasso_glink_service(&io,&s,&kick)==-17 && s.failed);
     rx=handshake(s);openPeer(s,rx,2,"same");openPeer(s,rx,3,"same");assert(picasso_glink_service(&io,&s,&kick)==-17);
@@ -182,21 +183,21 @@ static void channelTests(){
     rx=handshake(s);uint32_t badName[4]={0x70002,4,0x64636261,0};frame(s,rx,badName,16);
     assert(picasso_glink_service(&io,&s,&kick)==-22);
     rx=connect(s);message(s,rx,5,7,0x20000000);assert(picasso_glink_service(&io,&s,&kick)==-90);
-    rx=connect(s);message(s,rx,14,7,1);assert(picasso_glink_service(&io,&s,&kick)==-95);
+    rx=connect(s);message(s,rx,14,7,1);assert(picasso_glink_service(&io,&s,&kick)==-71);
     rx=connect(s);uint32_t dup[6]={0x70005,2,512,91,256,91};frame(s,rx,dup,24);
     assert(picasso_glink_service(&io,&s,&kick)==-17 && !s.apr.pending);
     // A late intent-request ACK remains valid after the granted intent was used.
     rx=connect(s);offer(s,rx);step(s);drain(s);step(s);assert(s.apr.pending && s.apr.intentAsked);
     message(s,rx,8,7,1);step(s);assert(!s.failed && !s.apr.intentAsked);
-    // Full APR request/response, reassembly and non-reuse buffer ownership.
+    // Full APR request/response, reassembly and reusable local buffer ownership.
     rx=query(s);uint32_t response[6]={0x00180150,0x403,0x503,s.apr.token,0x1290d,5};
     unsigned iid=s.localIntent[0].id;
     packet(s,rx,iid,reinterpret_cast<uint8_t *>(response),11,13);step(s);
     assert(s.localIntent[0].active && s.localIntent[0].fill==11 && !s.apr.ready);drain(s);
     packet(s,rx,iid,reinterpret_cast<uint8_t *>(response)+11,13,0,true);step(s);
     assert(s.apr.ready && s.apr.responded && s.apr.state==5 && s.localIntent[0].done);drain(s);
-    unsigned at=s.txHead;step(s);assert(r32(s.tx.offset+at)==0x10006 && r32(s.tx.offset+at+4)==iid);
-    assert(s.localIntent[0].id!=iid && s.remoteIntent[0].busy);
+    unsigned at=s.txHead;step(s);assert(r32(s.tx.offset+at)==0x1000e && r32(s.tx.offset+at+4)==iid);
+    assert(s.localIntent[0].id==iid && s.localIntent[0].advertised && s.remoteIntent[0].busy);
     message(s,rx,6,7,91);step(s);assert(!s.remoteIntent[0].used);
     drain(s);message(s,rx,3,7,0);step(s);
     assert(!s.apr.ready && !s.channel[0].up && s.channel[0].closing && !s.localIntent[0].id);
@@ -227,10 +228,13 @@ static void channelTests(){
     rx=connect(s);unsigned head=s.txHead;message(s,rx,7,7,513);step(s);
     assert(r32(s.tx.offset+head+16)==0x10008 && !r32(s.tx.offset+head+20));
     rx=connect(s);for(unsigned n=0;n<20;++n){drain(s);step(s);}drain(s);
-    head=s.txHead;message(s,rx,7,7,512);step(s);assert(r32(s.tx.offset+head)==0x10008 && !r32(s.tx.offset+head+4));
-    // Supported request advertises real storage and ACK atomically.
+    head=s.txHead;message(s,rx,7,7,512);step(s);assert(r32(s.tx.offset+head)==0x10008 && r32(s.tx.offset+head+4)==1);
+    // A full idle pool grants its existing storage; a fully busy pool cannot.
+    for(auto &i:s.localIntent)i.active=true;drain(s);head=s.txHead;message(s,rx,7,7,512);step(s);
+    assert(r32(s.tx.offset+head)==0x10008 && !r32(s.tx.offset+head+4));
+    // Existing reusable storage grants without a duplicate advertisement.
     rx=connect(s);head=s.txHead;message(s,rx,7,7,512);step(s);
-    assert(r32(s.tx.offset+head+16)==0x10005 && r32(s.tx.offset+head+32)==0x10008 && r32(s.tx.offset+head+36)==1);
+    assert(r32(s.tx.offset+head+16)==0x10008 && r32(s.tx.offset+head+20)==1);
     // Close with only reserve space sends one READ_NOTIF, preserves RX, then commits once.
     rx=connect(s);s.apr.error=-60;for(auto &i:s.localIntent)if(!i.id)i.id=99;
     p32(s.desc.offset,(s.txHead+24)%s.tx.size);message(s,rx,3,7,0);unsigned tail=s.rxTail;head=s.txHead;
@@ -323,7 +327,7 @@ __attribute__((noinline)) static void qrtrTests() {
     uint32_t hello[]={1,2,2,0xfffffffe,0,20,1,0xfffffffe,2,0,0,0,0};
     qrtrPacket(s,rx,s.qrtrLocal[0].id,hello,52);step(s);drain(s);
     assert(s.qrtr.helloReceived && s.qrtr.peer==2 && s.qrtrLocal[0].done);
-    unsigned iid=s.qrtrLocal[0].id;step(s);drain(s);assert(s.qrtrLocal[0].id!=iid);
+    unsigned iid=s.qrtrLocal[0].id;step(s);drain(s);assert(s.qrtrLocal[0].id==iid && s.qrtrLocal[0].advertised);
     // The sizes are advertised from the matching physical storage, and
     // fragmented payloads >APR's 512 bytes stay within their channel pool.
     for(unsigned n=0;n<12;++n){step(s);drain(s);}
@@ -376,6 +380,85 @@ __attribute__((noinline)) static void qrtrTests() {
     rx=connectQrtr(s);frame(s,rx,grant,16);step(s);drain(s);step(s);drain(s);
     message(s,rx,3,7,0);step(s);assert(s.channel[1].up && s.qrtr.helloSent && s.qrtrRemote[0].busy);
     puts("PASS GLINK APR/IPCRTR isolation, shared ID0, stock buffer tiers, large fragments, HELLO/RESUME backpressure and selective close");
+}
+__attribute__((noinline)) static void build185Tests() {
+    PicassoGlink s={};unsigned rx=connectQrtr(s);bool kick;
+    // 185's stopping command is RX_DONE_W_REUSE/rcid4/iid0. Here APR is
+    // already connected as rcid7: exercise the same completion on both peers.
+    s.channel[0].remote=4;
+    const uint32_t aprOffer[]={0x40005,1,128,0},qrtrOffer[]={0x20005,1,8320,0};
+    frame(s,rx,aprOffer,16);frame(s,rx,qrtrOffer,16);step(s);drain(s);step(s);drain(s);
+    assert(s.apr.pending && s.qrtr.helloSent && s.remoteIntent[0].busy && s.qrtrRemote[0].busy);
+    unsigned tail=s.rxTail;message(s,rx,14,4,0);message(s,rx,14,2,0);step(s);drain(s);
+    assert(s.rxTail==tail+16 && s.ready && !s.failed && s.remoteReuse==2 && !s.remoteDone);
+    assert(s.remoteIntent[0].used && s.qrtrRemote[0].used && !s.remoteIntent[0].busy && !s.qrtrRemote[0].busy);
+    assert(!s.apr.ready && s.apr.pending && !s.qrtr.helloReceived); // completion is not application success
+    uint32_t reply[]={0x40009,1,24,0,0x00180150,0x403,0x503,s.apr.token,0x1290d,5};
+    frame(s,rx,reply,sizeof reply);
+    uint32_t hello[]={1,2,2,0xfffffffe,0,20,1,0xfffffffe,2,0,0,0,0};
+    qrtrPacket(s,rx,s.qrtrLocal[0].id,hello,52);step(s);drain(s);
+    assert(s.apr.ready && s.qrtr.helloReceived && s.apr.header==0x00180150 && s.qrtr.sourceNode==2);
+    unsigned local=s.qrtrLocal[0].id;step(s);drain(s);
+    assert(s.localReuse==2 && s.localIntent[0].id==1 && s.qrtrLocal[0].id==local);
+    uint32_t server[]={1,4,2,0xfffffffe,0,20,1,0xfffffffe,4,0x40,0x101,2,73};
+    qrtrPacket(s,rx,local,server,52);step(s);drain(s);assert(s.qrtr.services[0].used);
+    step(s);drain(s);uint32_t data[]={1,1,2,73,1,20,1,99,0,0,0,0,0};
+    qrtrPacket(s,rx,local,data,52);step(s);drain(s);step(s);drain(s);
+    assert(s.qrtr.resumes==1 && s.qrtrRemote[0].busy);
+    message(s,rx,14,2,0);step(s);drain(s);assert(!s.qrtrRemote[0].busy);
+    qrtrPacket(s,rx,local,data,52);step(s);drain(s);step(s);drain(s);
+    assert(s.qrtr.resumes==2 && s.qrtrRemote[0].busy && s.qrtrLocal[0].id==local);
+    message(s,rx,6,2,0);step(s);drain(s);assert(!s.qrtrRemote[0].used && s.remoteDone==1);
+    // Enough repeated complete packets to exhaust non-reuse buffers if they
+    // were not safely returned; no new ID or advertisement is needed.
+    for(unsigned n=0;n<20;++n){step(s);drain(s);}unsigned next=s.nextIntent;
+    for(unsigned n=0;n<100;++n) {
+        qrtrPacket(s,rx,local,hello,52);step(s);drain(s);step(s);drain(s);
+        assert(s.qrtrLocal[0].id==local && s.qrtrLocal[0].advertised && !s.qrtrLocal[0].fill);
+    }
+    assert(s.nextIntent==next && s.apr.ready && s.qrtr.helloReceived);
+    // Duplicate/stale/not-busy completions must never create capacity.
+    const unsigned completions[]={6,14};
+    for(unsigned command: completions) {
+        rx=connect(s);offer(s,rx,0);step(s);drain(s);step(s);drain(s);
+        message(s,rx,command,7,0);step(s);drain(s);s.apr.error=-60;
+        message(s,rx,14,7,0);assert(picasso_glink_service(&io,&s,&kick)==-71);
+        assert(s.faultBytes==8 && s.faultWords[0]==0x7000e && !s.faultWords[1]);
+    }
+    rx=connect(s);offer(s,rx,0xffffffff);step(s);drain(s);step(s);drain(s);
+    s.rxTail=16376;p32(s.desc.offset+8,16376);p32(s.desc.offset+12,16376);
+    message(s,rx,14,7,0xffffffff);step(s);assert(s.rxTail==0 && s.remoteIntent[0].used && !s.remoteIntent[0].busy);
+    // APR can retry using the same returned intent, but a late response from
+    // its previous token still cannot complete the new query.
+    for(unsigned n=0;n<57;++n){drain(s);step(s);}
+    assert(s.apr.attempts==2 && s.remoteIntent[0].busy && s.remoteIntent[0].id==0xffffffff);
+    uint32_t late[]={0x00180150,0x403,0x503,s.apr.token-1,0x1290d,5};
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(late),24);step(s);drain(s);step(s);drain(s);
+    assert(s.apr.ignored==1 && s.apr.pending && !s.apr.ready);
+    message(s,rx,6,7,0xffffffff);step(s);drain(s);assert(!s.remoteIntent[0].used);
+    late[3]=s.apr.token;packet(s,rx,1,reinterpret_cast<uint8_t *>(late),24);step(s);
+    assert(s.apr.ready && s.localIntent[0].done);
+    // Failure to publish the RX tail after a completion terminates the
+    // session; it cannot transmit using that just-returned slot on retry.
+    rx=query(s);s.apr.error=-60;for(unsigned n=0;n<20;++n){step(s);drain(s);}
+    message(s,rx,14,7,91);unsigned oldTail=s.rxTail;writes=0;failWrite=1;
+    assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && s.rxTail==oldTail);
+    unsigned countWrites=writes;assert(picasso_glink_service(&io,&s,&kick)==-5 && writes==countWrites);
+    // A pending local completion stays unavailable while TX is full. A new
+    // packet using the same ID is legal only after completion is published.
+    rx=query(s);uint32_t response[]={0x00180150,0x403,0x503,s.apr.token,0x1290d,5};
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(response),24);step(s);drain(s);
+    p32(s.desc.offset,(s.txHead+8)%s.tx.size);unsigned localReuse=s.localReuse;
+    for(unsigned n=0;n<12;++n)step(s);
+    assert(s.localIntent[0].done && !s.localIntent[0].advertised && s.localReuse==localReuse);
+    drain(s);step(s);drain(s);assert(s.localIntent[0].advertised && s.localIntent[0].id==1);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(response),24);step(s);assert(s.apr.received==2 && s.apr.ignored==1);
+    // Fault evidence wraps and stops at peer head, leaving unknown data intact.
+    rx=connect(s);s.rxTail=16376;p32(s.desc.offset+8,16376);p32(s.desc.offset+12,16376);
+    const uint32_t unknown[]={0x70063,0xabc,0x11223344,0x55667788};frame(s,rx,unknown,sizeof unknown);
+    assert(picasso_glink_service(&io,&s,&kick)==-95 && s.rxTail==16376 && s.faultBytes==16);
+    assert(!memcmp(s.faultWords,unknown,sizeof unknown));
+    puts("PASS build185 reuse completion with features0, APR/QRTR responses, stable local pool, repeated send, stale completion, wrap and pressure");
 }
 // Keep this independent scenario out of main: Clang 18 Windows machine-sink
 // crashes after inlining both large fixture bodies. Production flags unchanged.

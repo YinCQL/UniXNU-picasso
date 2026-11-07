@@ -86,7 +86,7 @@ extern "C" void picasso_adsp_boot(const PicassoAdspEvents *e) {
     assert(ipccRam[3]==0x30000);ipccRam[3]=0;
     unsigned at=part+ram[(part+12)/4],rx=at+16;
     ram[at/4]=0xa5a5|(480U<<16);ram[at/4+1]=16384;
-    ram[rx/4]=0x10000;ram[rx/4+1]=1; // peer offers intent reuse
+    ram[rx/4]=0x10000;ram[rx/4+1]=1; // peer offers an optional feature
     ram[rx/4+2]=0x10001;ram[rx/4+3]=0; // agrees to features 0
     ram[(part+12)/4]+=16400;ram[(g->desc.offset+12)/4]=16;
     e->service(e->context);
@@ -116,10 +116,13 @@ extern "C" void picasso_adsp_boot(const PicassoAdspEvents *e) {
     ram[g->desc.offset/4]=g->txHead;ipccRam[3]=0;unsigned tx=g->txHead;
     e->service(e->context);assert(g->apr.pending && g->remoteIntent[0].busy && ipccRam[3]==0x30000);
     assert(ram[(g->tx.offset+tx+16)/4]==0x10009 && !ram[(g->tx.offset+tx+20)/4]);
+    const uint32_t reuse[2]={0x4000e,0};append(reuse,sizeof reuse);e->service(e->context);
+    assert(g->remoteIntent[0].used && !g->remoteIntent[0].busy && g->apr.pending && g->remoteReuse==1);
     const uint32_t reply[10]={0x40009,1,24,0,0x00180150,0x403,0x503,g->apr.token,0x1290d,5};
     append(reply,sizeof reply);e->service(e->context);assert(g->apr.ready && g->apr.state==5);
-    const uint32_t done[2]={0x40006,0};append(done,sizeof done);e->service(e->context);
-    assert(!g->remoteIntent[0].used);ipccRam[3]=0;
+    ram[g->desc.offset/4]=g->txHead;tx=g->txHead;e->service(e->context);
+    assert(ram[(g->tx.offset+tx)/4]==0x1000e && ram[(g->tx.offset+tx+4)/4]==1);
+    assert(g->localReuse==1 && g->localIntent[0].id==1 && g->localIntent[0].advertised);ipccRam[3]=0;
 }
 extern "C" int picasso_rpmh_adsp_plan(){assert(!preempt && !allocations);++plans;return 0;}
 int main(int argc,char **argv) {
@@ -150,7 +153,7 @@ int main(int argc,char **argv) {
     assert(allocations==3 && releases==3-!!failAlloc && mappings==releases && unmaps==mappings-!!failMap && !preempt);
     if(!strcmp(mode,"normal") || peer || transport) {
         assert(plans==1 && sleeps==1602 && kicks==(peer?2U:1U));
-        assert(lines==(peer?70U:transport?16U:8U));
+    assert(lines==(peer?70U:transport?20U:8U));
         assert(ram[(part+12)/4]==(peer?17200U:transport?33240U:16840U));
         if(transport)assert(!ipccRam[3]); // stopped observer never transmits GLINK
         assert(!allocatorGate && !mutexRam[0]);

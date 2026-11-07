@@ -126,8 +126,8 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
             a.pending = false; a.error = -60;
         }
     }
-    // Send at most one completion and one advertisement per call. An intent
-    // remains occupied until RX_DONE is published; non-reuse IDs never repeat.
+    // Stock lito uses reusable base intents without a negotiated feature bit.
+    // Keep each real buffer unavailable until RX_DONE_W_REUSE is published.
     auto *local=locals(s,c); auto *remote=remotes(s,c);
     for (unsigned n=0;n<localCount(c);++n) {
         auto &i=local[n];
@@ -136,9 +136,10 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
             if (c.local==2 && picasso_qrtr_receive(&s->qrtr,i.data,i.fill)==-11) break;
             i.delivered=true;
         }
-        const uint32_t words[2] = {6U | (uint32_t(c.local) << 16), i.id};
+        const uint32_t words[2] = {14U | (uint32_t(c.local) << 16), i.id};
         if ((error = transmit(io, s, words, sizeof(words), kick))) return error;
-        resetIntent(i); break;
+        uint32_t id=i.id; resetIntent(i); i.id=id; i.advertised=true;
+        ++s->localReuse; break;
     }
     for (unsigned n=0;n<localCount(c);++n) {
         auto &i=local[n]; if (i.id) continue;
@@ -311,6 +312,16 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
     if (command == 7) {
         if (!c->up || !data) return fail(s, -71);
         PicassoGlinkLocalIntent *slot = nullptr;
+        // A reusable advertised buffer already belongs to this endpoint. A
+        // request may refer to that pool; do not require another free slot or
+        // re-advertise its ID. Busy/undelivered buffers cannot grant capacity.
+        for (unsigned n=0;n<localCount(*c);++n) {
+            const auto &i=locals(s,*c)[n];
+            if (i.advertised && !i.active && !i.done && i.capacity>=data) {
+                const uint32_t ack[2]={8U | (uint32_t(c->local)<<16),1};
+                return transmit(io,s,ack,sizeof(ack),kick);
+            }
+        }
         for (unsigned n=0;n<localCount(*c);++n) {
             auto &i=locals(s,*c)[n]; if (!i.id && i.capacity>=data) { slot=&i; break; }
         }
@@ -332,11 +343,17 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
         }
         return 0;
     }
-    if (command == 6) {
+    if (command == 6 || command == 14) {
         if (!c->up) return fail(s, -71);
         for (unsigned n=0;n<PicassoGlinkRemoteIntents;++n) {
             auto &i=remotes(s,*c)[n];
-            if (i.used && i.id == data && i.busy) { i = {}; return 0; }
+            if (i.used && i.id == data && i.busy) {
+                // RX_DONE retires the ID; RX_DONE_W_REUSE releases only its
+                // in-flight ownership. Stock v1 handles both with features=0.
+                if (command==14) { i.busy=false; ++s->remoteReuse; }
+                else { i={}; ++s->remoteDone; }
+                s->lastDoneId=data; s->lastDoneChannel=id; return 0;
+            }
         }
         return fail(s, -71);
     }
@@ -369,7 +386,6 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
         return 0;
     }
     // Unknown commands cannot be skipped without knowing their framing.
-    // In particular reuse (14) was not negotiated.
     return fail(s, -95);
 }
 }
@@ -403,7 +419,7 @@ int picasso_glink_service(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) 
     int error = 0;
     if (!s->sent) {
         if ((error = send(io, s, 0, kick))) return error;
-        s->sent = true; // version 1, features 0: no unimplemented intent reuse
+        s->sent = true; // stock version 1, features 0; explicit intents required
     }
     error = receivePipe(io, s);
     if (error == -2 || error == -11) return 0;
@@ -441,7 +457,17 @@ int picasso_glink_service(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) 
             s->pendingChannel = uint16_t(version); s->pendingData = words[1];
             error = receive(io, s, command, version, words[1], avail, &length, &intentBudget, kick);
             if (error == -11) return 0; // incomplete frame or TX pressure; retry without consuming
-            if (error) return error;
+            if (error) {
+                // Read only the currently owned FIFO span, without turning a
+                // failed diagnostic read into another protocol operation.
+                s->faultBytes=0;
+                for (unsigned at=0;at<32 && at+4<=avail;at+=4) {
+                    uint8_t raw[4];
+                    if (wlan_smread(&io->reader,s->rx.offset+(tail+at)%s->rx.size,raw,4)) break;
+                    s->faultWords[at/4]=wlan_sm32(raw); s->faultBytes+=4;
+                }
+                return error;
+            }
         }
         uint32_t next = (tail + length) % s->rx.size;
         fence(io);

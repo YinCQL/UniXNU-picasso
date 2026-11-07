@@ -91,6 +91,7 @@ struct BootEvents {
     int aprError = 0;
     uint32_t qrtrEvents = 0, qrtrReceived = 0, qrtrLogs = 0;
     int qrtrError = 0;
+    uint32_t reuseLogs = 0, remoteReuse = 0, localReuse = 0;
 };
 int bootPoll(void *context, PicassoSmp2pEvent *event) {
     auto *b=static_cast<BootEvents *>(context);
@@ -122,6 +123,9 @@ void bootService(void *context) {
             b->failedLogged=true;
             IOLog("PICASSO_ADSP glink stage=stopped error=%d tx=%u rx=%u commands=%u last_command=%u channel=%u data=%x channel_open=0 pcm=0\n",
                 transport,g->txHead,g->rxTail,g->commands,g->pendingCommand,g->pendingChannel,g->pendingData);
+            IOLog("PICASSO_ADSP glink fault bytes=%u words=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x\n",
+                g->faultBytes,g->faultWords[0],g->faultWords[1],g->faultWords[2],g->faultWords[3],
+                g->faultWords[4],g->faultWords[5],g->faultWords[6],g->faultWords[7]);
         }
         if (g->channelEvents != b->channelEvents && b->channelLogs < 32) {
             b->channelEvents = g->channelEvents; ++b->channelLogs;
@@ -130,6 +134,11 @@ void bootService(void *context) {
                     c.name,c.local,c.remote,c.priority,c.supported,c.openSent,c.openAck,c.ackSent,c.up,c.closing,c.closeAck);
         }
         auto &a = g->apr;
+        if (b->reuseLogs<16 && (g->remoteReuse!=b->remoteReuse || g->localReuse!=b->localReuse)) {
+            IOLog("PICASSO_ADSP glink completions done=%u remote_reuse=%u local_reuse=%u last_channel=%u last_id=%x\n",
+                g->remoteDone,g->remoteReuse,g->localReuse,g->lastDoneChannel,g->lastDoneId);
+            b->remoteReuse=g->remoteReuse; b->localReuse=g->localReuse; ++b->reuseLogs;
+        }
         if ((g->intentOffers != b->intentOffers && b->intentLogs < 16) || g->intentFault != b->intentFault) {
             unsigned cached = 0, busy = 0;
             for (const auto &i : g->remoteIntent) { cached += i.used; busy += i.used && i.busy; }
@@ -139,9 +148,11 @@ void bootService(void *context) {
             ++b->intentLogs; b->intentOffers=g->intentOffers; b->intentFault=g->intentFault;
         }
         if (a.attempts != b->aprAttempts || a.received != b->aprReceived || a.error != b->aprError) {
-            if (a.received <= 32 || a.error != b->aprError)
+            if (a.received <= 32 || a.error != b->aprError) {
                 IOLog("PICASSO_ADSP apr query=1290c attempts=%u token=%x pending=%u received=%u opcode=%x response_token=%x state=%x status=%x ready=%u ignored=%u malformed=%u error=%d pcm=0\n",
                     a.attempts,a.token,a.pending,a.received,a.opcode,a.receivedToken,a.state,a.status,a.ready,a.ignored,a.malformed,a.error);
+                IOLog("PICASSO_ADSP apr wire bytes=%u header=%x source=%x destination=%x\n",a.bytes,a.header,a.source,a.destination);
+            }
             b->aprAttempts=a.attempts; b->aprReceived=a.received; b->aprError=a.error;
         }
         auto &q=g->qrtr;
@@ -152,6 +163,9 @@ void bootService(void *context) {
             IOLog("PICASSO_ADSP qrtr hello=%u/%u peer=%u received=%u type=%u services=%u last=%x/%x/%u/%x overflow=%u malformed=%u ignored=%u data=%u resumes=%u queued=%u intents=%u/%u error=%d qmi=0 pcm=0\n",
                 q.helloSent,q.helloReceived,q.peer,q.received,q.lastType,services,q.lastService,q.lastInstance,q.lastNode,q.lastPort,
                 q.overflow,q.malformed,q.ignored,q.data,q.resumes,q.count,cached,busy,q.error);
+            if (q.received) IOLog("PICASSO_ADSP qrtr wire version=%u bytes=%u source=%u/%x destination=%u/%x payload=%u words=%08x/%08x/%08x/%08x\n",
+                q.wireVersion,q.wireBytes,q.sourceNode,q.sourcePort,q.destNode,q.destPort,q.payloadBytes,
+                q.payloadWords[0],q.payloadWords[1],q.payloadWords[2],q.payloadWords[3]);
             b->qrtrEvents=q.events; b->qrtrReceived=q.received; b->qrtrError=q.error; ++b->qrtrLogs;
         }
     }
@@ -166,6 +180,8 @@ int bootSnapshot(void *context) {
         g.ready,g.failed,g.error,g.commands,g.txHead,g.rxTail,g.pendingCommand,g.pendingChannel,g.pendingData,
         g.deferredOpens,g.channel[0].up,g.apr.ready,g.apr.error,g.intentOffers,g.intentSkipped,
         g.lastIntentId,g.lastIntentSize,g.intentFault);
+    IOLog("PICASSO_ADSP glink completions snapshot done=%u remote_reuse=%u local_reuse=%u last_channel=%u last_id=%x fault_bytes=%u\n",
+        g.remoteDone,g.remoteReuse,g.localReuse,g.lastDoneChannel,g.lastDoneId,g.faultBytes);
     const auto &q=g.qrtr;
     IOLog("PICASSO_ADSP qrtr snapshot hello=%u/%u peer=%u received=%u malformed=%u ignored=%u overflow=%u data=%u resumes=%u queued=%u error=%d qmi=0 pcm=0\n",
         q.helloSent,q.helloReceived,q.peer,q.received,q.malformed,q.ignored,q.overflow,q.data,q.resumes,q.count,q.error);

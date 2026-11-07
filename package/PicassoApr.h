@@ -13,6 +13,10 @@ inline void picasso_apr_query(uint32_t token, uint32_t (&words)[5]) {
 }
 inline void picasso_apr_receive(PicassoAprProbe *p, const uint8_t *data, uint32_t size) {
     ++p->received;
+    p->bytes=size;
+    p->header=size>=4?wlan_sm32(data):0;
+    p->source=size>=8?wlan_sm32(data+4):0;
+    p->destination=size>=12?wlan_sm32(data+8):0;
     if (size < 20) { ++p->malformed; return; }
     uint32_t header = wlan_sm32(data);
     uint32_t headerBytes = ((header >> 4) & 15) * 4;

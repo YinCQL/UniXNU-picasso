@@ -40,6 +40,7 @@ int main() {
     unsigned received=q.received;assert(picasso_qrtr_receive(&q,p,52)==-11 && q.received==received);
     const uint32_t expected[]={1,7,1,0xdef,0,20,2,0xabc,7,1,0xdef,0,0};
     assert(!memcmp(q.queue[0],expected,sizeof expected));
+    assert(q.sourceNode==2 && q.sourcePort==0xabc && q.destNode==1 && q.destPort==0xdef && q.payloadBytes==20);
     q.head=1;--q.count;assert(!picasso_qrtr_receive(&q,p,52) && q.received==received+1);
     assert(!memcmp(q.queue[0],expected,sizeof expected));
     put(p+24,99);received=q.received;assert(!picasso_qrtr_receive(&q,p,52) && q.received==received+1);
