@@ -117,6 +117,7 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     updateChannel(s, &c);
     if (!c.up) return 0;
     auto &a = s->apr;
+    int qmiDue=c.local==2 ? picasso_qmi_due(&s->qrtr.qmi):-1;
     if (c.local==1) ++a.ticks;
     // Count service calls even under TX backpressure. A timeout does not free
     // any remote intent; its ownership lasts until RX_DONE or disconnect.
@@ -150,25 +151,31 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     }
     if (c.local==2) {
         auto &q=s->qrtr;
-        if (q.error || (q.helloSent && !q.count)) return 0;
+        if (q.error || (q.helloSent && !q.count && qmiDue<0)) return 0;
+        uint32_t words[28]={9U | (uint32_t(c.local)<<16),0,52,0};
+        bool query=q.helloSent && !q.count && qmiDue>=0;
+        if (!q.helloSent) picasso_qrtr_control(words+4,2,1,PicassoQrtrControl,
+            q.helloReceived?q.peer:0xffffffffU,PicassoQrtrControl);
+        else if(query) words[2]=picasso_qmi_query(&q.qmi,unsigned(qmiDue),reinterpret_cast<uint8_t *>(words+4));
+        else for (unsigned n=0;n<13;++n) words[4+n]=q.queue[q.head][n];
         PicassoGlinkRemoteIntent *slot=nullptr;
         for (unsigned n=0;n<PicassoGlinkRemoteIntents;++n)
-            if (remote[n].used && !remote[n].busy && remote[n].size>=52) { slot=&remote[n]; break; }
+            if (remote[n].used && !remote[n].busy && remote[n].size>=words[2]) { slot=&remote[n]; break; }
         if (!slot) {
             if (!q.intentAsked && !q.intentGranted) {
-                const uint32_t words[2]={7U | (uint32_t(c.local)<<16),52};
-                if ((error=transmit(io,s,words,sizeof(words),kick))) return error;
+                const uint32_t request[2]={7U | (uint32_t(c.local)<<16),words[2]};
+                if ((error=transmit(io,s,request,sizeof(request),kick))) return error;
                 q.intentAsked=true;
             }
             return 0;
         }
-        uint32_t words[18]={9U | (uint32_t(c.local)<<16),slot->id,52,0};
-        if (!q.helloSent) picasso_qrtr_control(words+4,2,1,PicassoQrtrControl,
-            q.helloReceived?q.peer:0xffffffffU,PicassoQrtrControl);
-        else for (unsigned n=0;n<13;++n) words[4+n]=q.queue[q.head][n];
-        if ((error=transmit(io,s,words,sizeof(words),kick))) return error;
+        words[1]=slot->id;
+        if ((error=transmit(io,s,words,16+((words[2]+7)&~7U),kick))) return error;
         slot->busy=true; q.intentGranted=false;
         if (!q.helloSent) q.helloSent=true;
+        else if(query) {
+            auto &d=q.qmi.domains[qmiDue];d.sent=true;d.pending=true;d.ticks=0;++q.qmi.events;
+        }
         else { q.head=(q.head+1)%PicassoQrtrQueue; --q.count; ++q.resumes; }
         ++q.events; return 0;
     }

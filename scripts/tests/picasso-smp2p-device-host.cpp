@@ -118,7 +118,7 @@ extern "C" void picasso_adsp_boot(const PicassoAdspEvents *e) {
     assert(ram[(g->tx.offset+tx+16)/4]==0x10009 && !ram[(g->tx.offset+tx+20)/4]);
     const uint32_t reuse[2]={0x4000e,0};append(reuse,sizeof reuse);e->service(e->context);
     assert(g->remoteIntent[0].used && !g->remoteIntent[0].busy && g->apr.pending && g->remoteReuse==1);
-    const uint32_t reply[10]={0x40009,1,24,0,0x00180150,0x403,0x503,g->apr.token,0x1290d,5};
+    const uint32_t reply[14]={0x40009,1,36,0,0x00240081,0x403,0x503,g->apr.token,0x1290d,0xaaaa,0xbbbb,0xcccc,5,0};
     append(reply,sizeof reply);e->service(e->context);assert(g->apr.ready && g->apr.state==5);
     ram[g->desc.offset/4]=g->txHead;tx=g->txHead;e->service(e->context);
     assert(ram[(g->tx.offset+tx)/4]==0x1000e && ram[(g->tx.offset+tx+4)/4]==1);

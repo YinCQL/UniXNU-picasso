@@ -33,6 +33,7 @@ static void channelTests();
 static void build184Tests();
 static void qrtrTests();
 static void build185Tests();
+static void build186Tests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -118,7 +119,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    build185Tests();build184Tests();channelTests();qrtrTests();
+    build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -459,6 +460,65 @@ __attribute__((noinline)) static void build185Tests() {
     assert(picasso_glink_service(&io,&s,&kick)==-95 && s.rxTail==16376 && s.faultBytes==16);
     assert(!memcmp(s.faultWords,unknown,sizeof unknown));
     puts("PASS build185 reuse completion with features0, APR/QRTR responses, stable local pool, repeated send, stale completion, wrap and pressure");
+}
+static unsigned discoveredQmi(PicassoGlink &s) {
+    unsigned rx=connectQrtr(s);s.apr.error=-60;
+    const uint32_t grant[]={0x20005,1,128,0};frame(s,rx,grant,16);step(s);drain(s);step(s);drain(s);
+    uint32_t hello[]={1,2,5,0xfffffffe,0,20,1,0xfffffffe,2,0,0,0,0};
+    qrtrPacket(s,rx,s.qrtrLocal[0].id,hello,52);message(s,rx,14,2,0);step(s);drain(s);step(s);drain(s);
+    uint32_t server[]={1,4,5,0xfffffffe,0,20,1,0xfffffffe,4,0x42,0x4a01,5,3};
+    qrtrPacket(s,rx,s.qrtrLocal[0].id,server,52);step(s);drain(s);return rx;
+}
+__attribute__((noinline)) static void build186Tests() {
+    PicassoGlink s={};unsigned rx=query(s);bool kick;
+    // 186 logs prove the first five words and size/header, but do not include
+    // extension/payload bytes. Distinct synthetic extension/state values test
+    // offsets without pretending the actual DSP state was captured.
+    uint32_t response[]={0x00240081,0x403,0x503,s.apr.token,0x1290d,0xaaaa,0xbbbb,0xcccc,5};
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(response),36);step(s);drain(s);
+    assert(s.apr.ready && s.apr.responded && s.apr.state==5 && !s.apr.malformed);
+    rx=query(s);response[8]=0;packet(s,rx,1,reinterpret_cast<uint8_t *>(response),36);step(s);drain(s);
+    assert(s.apr.responded && !s.apr.ready && !s.apr.pending);
+    rx=query(s);response[8]=5;response[3]=s.apr.token+1;packet(s,rx,1,reinterpret_cast<uint8_t *>(response),36);step(s);
+    assert(s.apr.ignored==1 && !s.apr.ready);
+    response[3]=s.apr.token;
+    const uint32_t badHeaders[]={0x00240082,0x00240041,0x002400a1,0x00280081};
+    for(auto h:badHeaders) {rx=query(s);response[0]=h;packet(s,rx,1,reinterpret_cast<uint8_t *>(response),36);step(s);assert(s.apr.malformed==1 && !s.apr.ready);}
+    rx=query(s);response[0]=0x00240281;packet(s,rx,1,reinterpret_cast<uint8_t *>(response),36);step(s);assert(s.apr.ignored==1);
+    rx=query(s);response[0]=0x00240081;packet(s,rx,1,reinterpret_cast<uint8_t *>(response),13,23);step(s);drain(s);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(response)+13,23,0,true);step(s);assert(s.apr.ready);
+    // Actual186 discovery tuple. Sending starts only after HELLO and service
+    // publication, without hardcoding the observed node5/port3 into transport.
+    rx=connectQrtr(s);s.apr.error=-60;const uint32_t grant[]={0x20005,1,128,0};frame(s,rx,grant,16);step(s);drain(s);step(s);drain(s);
+    uint32_t hello[]={1,2,5,0xfffffffe,0,20,0xffffffff,0xfffffffe,2,0,0,0,0};
+    qrtrPacket(s,rx,s.qrtrLocal[0].id,hello,52);message(s,rx,14,2,0);step(s);drain(s);step(s);drain(s);
+    uint32_t server[]={1,4,5,0xfffffffe,0,20,1,0xfffffffe,4,0x42,0x4a01,5,3};
+    qrtrPacket(s,rx,s.qrtrLocal[0].id,server,52);step(s);drain(s);assert(s.qrtr.qmi.bound);
+    unsigned tx=s.txHead;p32(s.desc.offset,(tx+8)%s.tx.size);for(unsigned n=0;n<5;++n)step(s);
+    assert(!s.qrtr.qmi.domains[0].sent);drain(s);step(s);drain(s);
+    assert(s.qrtr.qmi.domains[0].pending && s.qrtrRemote[0].busy);
+    const uint8_t answer[]={2,1,0,0x21,0,14,0,2,4,0,0,0,0,0,0x10,4,0,0xff,0xff,0xff,0x1f};
+    uint32_t data[14]={1,1,5,3,1,21,1,0x186};memcpy(data+8,answer,sizeof answer);
+    qrtrPacket(s,rx,s.qrtrLocal[0].id,data,56);message(s,rx,14,2,0);step(s);drain(s);
+    assert(s.qrtr.qmi.domains[0].stateValid && s.qrtr.qmi.domains[0].state==0x1fffffff && s.qrtr.count==1);
+    step(s);drain(s);assert(s.qrtr.resumes==1 && !s.qrtr.qmi.domains[1].sent);
+    message(s,rx,14,2,0);step(s);drain(s);step(s);drain(s);assert(s.qrtr.qmi.domains[1].pending);
+    // A disappearing remote service invalidates pending transactions/states.
+    server[1]=5;server[8]=5;qrtrPacket(s,rx,s.qrtrLocal[0].id,server,52);step(s);
+    assert(!s.qrtr.qmi.bound && s.qrtr.qmi.lost && !s.qrtr.qmi.domains[0].stateValid && !s.qrtr.qmi.domains[1].pending);
+    assert(!s.failed);picasso_glink_stop(&s);assert(picasso_glink_service(&io,&s,&kick)==-104);
+    rx=discoveredQmi(s);writes=0;step(s);unsigned queryWrites=writes;
+    for(unsigned n=1;n<=queryWrites;++n) {
+        rx=discoveredQmi(s);writes=0;failWrite=n;
+        assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && !s.qrtr.qmi.bound && !s.qrtr.qmi.domains[0].pending);
+        unsigned count=writes;assert(picasso_glink_service(&io,&s,&kick)==-5 && writes==count);
+    }
+    // A missing QMI response expires even with permanent FIFO pressure, and
+    // cannot free the remote intent or block APR/transport service forever.
+    rx=discoveredQmi(s);step(s);drain(s);p32(s.desc.offset,(s.txHead+8)%s.tx.size);
+    for(unsigned n=0;n<102;++n)step(s);
+    assert(s.qrtr.qmi.domains[0].error==-60 && !s.qrtr.qmi.domains[0].pending && s.qrtrRemote[0].busy && !s.failed);
+    puts("PASS build186 APR v1 extended EVENT replies and discovered QMI query, pressure, confirmed response and service loss");
 }
 // Keep this independent scenario out of main: Clang 18 Windows machine-sink
 // crashes after inlining both large fixture bodies. Production flags unchanged.

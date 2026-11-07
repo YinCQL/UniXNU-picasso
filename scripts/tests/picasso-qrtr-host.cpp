@@ -46,5 +46,11 @@ int main() {
     put(p+24,99);received=q.received;assert(!picasso_qrtr_receive(&q,p,52) && q.received==received+1);
     assert(q.count==PicassoQrtrQueue); // off-node DATA cannot solicit a reply
     picasso_qrtr_invalidate(&q,-104);assert(!q.count && !q.helloReceived && q.error==-104);
+    q={};control(p,4,0x42,0x4a01);picasso_qrtr_receive(&q,p,52);assert(!q.qmi.bound);
+    control(p,2);picasso_qrtr_receive(&q,p,52);assert(q.qmi.bound && q.qmi.node==2 && q.qmi.port==73);
+    control(p,4,0x42,0x4a01,2,74);picasso_qrtr_receive(&q,p,52);assert(q.qmi.lost && !q.qmi.bound);
+    q={};control(p,2);picasso_qrtr_receive(&q,p,52);control(p,4,0x42,0x4a02);picasso_qrtr_receive(&q,p,52);assert(!q.qmi.bound);
+    control(p,4,0x42,0x4a01);picasso_qrtr_receive(&q,p,52);assert(q.qmi.bound);
+    control(p,13,0,2);picasso_qrtr_receive(&q,p,52);assert(q.qmi.lost);
     puts("PASS QRTR v1/v3 discovery, service lifecycle, bounds, confirmed DATA queue and exact RESUME endpoints; no QMI consumer");
 }

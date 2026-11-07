@@ -92,6 +92,7 @@ struct BootEvents {
     uint32_t qrtrEvents = 0, qrtrReceived = 0, qrtrLogs = 0;
     int qrtrError = 0;
     uint32_t reuseLogs = 0, remoteReuse = 0, localReuse = 0;
+    uint32_t qmiEvents = 0, qmiLogs = 0;
 };
 int bootPoll(void *context, PicassoSmp2pEvent *event) {
     auto *b=static_cast<BootEvents *>(context);
@@ -160,13 +161,21 @@ void bootService(void *context) {
             unsigned services=0,cached=0,busy=0;
             for (const auto &v:q.services) services+=v.used;
             for (const auto &v:g->qrtrRemote) { cached+=v.used; busy+=v.used && v.busy; }
-            IOLog("PICASSO_ADSP qrtr hello=%u/%u peer=%u received=%u type=%u services=%u last=%x/%x/%u/%x overflow=%u malformed=%u ignored=%u data=%u resumes=%u queued=%u intents=%u/%u error=%d qmi=0 pcm=0\n",
+            IOLog("PICASSO_ADSP qrtr hello=%u/%u peer=%u received=%u type=%u services=%u last=%x/%x/%u/%x overflow=%u malformed=%u ignored=%u data=%u resumes=%u queued=%u intents=%u/%u error=%d qmi_query=1 pcm=0\n",
                 q.helloSent,q.helloReceived,q.peer,q.received,q.lastType,services,q.lastService,q.lastInstance,q.lastNode,q.lastPort,
                 q.overflow,q.malformed,q.ignored,q.data,q.resumes,q.count,cached,busy,q.error);
             if (q.received) IOLog("PICASSO_ADSP qrtr wire version=%u bytes=%u source=%u/%x destination=%u/%x payload=%u words=%08x/%08x/%08x/%08x\n",
                 q.wireVersion,q.wireBytes,q.sourceNode,q.sourcePort,q.destNode,q.destPort,q.payloadBytes,
                 q.payloadWords[0],q.payloadWords[1],q.payloadWords[2],q.payloadWords[3]);
             b->qrtrEvents=q.events; b->qrtrReceived=q.received; b->qrtrError=q.error; ++b->qrtrLogs;
+        }
+        if(q.qmi.events!=b->qmiEvents && b->qmiLogs<16) {
+            b->qmiEvents=q.qmi.events;++b->qmiLogs;
+            for(unsigned n=0;n<PicassoQmiDomains;++n) {
+                const auto &d=q.qmi.domains[n];
+                IOLog("PICASSO_ADSP qmi domain=%s server=%u/%x bound=%u txn=%u sent=%u pending=%u complete=%u state_valid=%u state=%x result=%u remote_error=%u error=%d\n",
+                    picasso_qmi_domain(n),q.qmi.node,q.qmi.port,q.qmi.bound,n+1,d.sent,d.pending,d.completed,d.stateValid,d.state,d.result,d.remoteError,d.error);
+            }
         }
     }
 }
@@ -183,10 +192,17 @@ int bootSnapshot(void *context) {
     IOLog("PICASSO_ADSP glink completions snapshot done=%u remote_reuse=%u local_reuse=%u last_channel=%u last_id=%x fault_bytes=%u\n",
         g.remoteDone,g.remoteReuse,g.localReuse,g.lastDoneChannel,g.lastDoneId,g.faultBytes);
     const auto &q=g.qrtr;
-    IOLog("PICASSO_ADSP qrtr snapshot hello=%u/%u peer=%u received=%u malformed=%u ignored=%u overflow=%u data=%u resumes=%u queued=%u error=%d qmi=0 pcm=0\n",
+    IOLog("PICASSO_ADSP qrtr snapshot hello=%u/%u peer=%u received=%u malformed=%u ignored=%u overflow=%u data=%u resumes=%u queued=%u error=%d qmi_query=1 pcm=0\n",
         q.helloSent,q.helloReceived,q.peer,q.received,q.malformed,q.ignored,q.overflow,q.data,q.resumes,q.count,q.error);
     for (const auto &v:q.services) if (v.used)
         IOLog("PICASSO_ADSP qrtr service=%x instance=%x node=%u port=%x\n",v.service,v.instance,v.node,v.port);
+    IOLog("PICASSO_ADSP qmi snapshot bound=%u lost=%u received=%u malformed=%u ignored=%u\n",
+        q.qmi.bound,q.qmi.lost,q.qmi.received,q.qmi.malformed,q.qmi.ignored);
+    if(q.qmi.bound || q.qmi.lost) for(unsigned n=0;n<PicassoQmiDomains;++n) {
+        const auto &d=q.qmi.domains[n];
+        IOLog("PICASSO_ADSP qmi snapshot domain=%s sent=%u pending=%u complete=%u state_valid=%u state=%x result=%u remote_error=%u error=%d\n",
+            picasso_qmi_domain(n),d.sent,d.pending,d.completed,d.stateValid,d.state,d.result,d.remoteError,d.error);
+    }
     return s.glink_error;
 }
 void logAudit(const PicassoSmp2p &s) {

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Picasso stock net/qrtr/qrtr.c wire format. Bounded discovery, no QMI services.
+// Picasso stock net/qrtr/qrtr.c wire format. Discovery and read-only QMI probe.
 #ifndef PICASSO_QRTR_H
 #define PICASSO_QRTR_H
 #include <stdint.h>
+#include "PicassoQmi.h"
 enum { PicassoQrtrServices = 64, PicassoQrtrQueue = 8 };
 static constexpr uint32_t PicassoQrtrControl = 0xfffffffeU;
 struct PicassoQrtrService { uint32_t service, instance, node, port; bool used; };
@@ -13,6 +14,7 @@ struct PicassoQrtr {
     uint32_t lastType, lastService, lastInstance, lastNode, lastPort, data, resumes;
     uint32_t wireVersion, wireBytes, sourceNode, sourcePort, destNode, destPort, payloadBytes;
     uint32_t payloadWords[4];
+    PicassoQmi qmi;
     bool helloSent, helloReceived, intentAsked, intentGranted;
     int error;
 };
@@ -26,6 +28,7 @@ inline void picasso_qrtr_control(uint32_t *w, uint32_t type, uint32_t sn, uint32
     w[8]=type; w[9]=a; w[10]=b; w[11]=0; w[12]=0;
 }
 inline void picasso_qrtr_invalidate(PicassoQrtr *q, int error) {
+    picasso_qmi_lost(&q->qmi);
     q->helloReceived=false; q->helloSent=false; q->count=0; q->error=error;
     for (auto &s:q->services) s.used=false;
 }
@@ -61,6 +64,7 @@ inline int picasso_qrtr_receive(PicassoQrtr *q, const uint8_t *p, uint32_t n) {
     ++q->received; q->lastType=type;
     const uint8_t *payload=p+header;
     if (type==2) {
+        if(q->qmi.bound && q->qmi.node!=sn) picasso_qmi_lost(&q->qmi);
         q->peer=sn; q->helloReceived=true; ++q->events;
     } else if (type==4 || type==5) {
         uint32_t service=picasso_qrtr_u32(payload+4), instance=picasso_qrtr_u32(payload+8);
@@ -72,24 +76,41 @@ inline int picasso_qrtr_receive(PicassoQrtr *q, const uint8_t *p, uint32_t n) {
             if (!s.used && !slot) slot=&s;
         }
         if (type==4) {
+            if(q->qmi.bound && ((node==q->qmi.node && port==q->qmi.port && (service!=0x42 || instance!=0x4a01)) ||
+                (service==0x42 && instance==0x4a01 && (node!=q->qmi.node || port!=q->qmi.port))))
+                picasso_qmi_lost(&q->qmi);
             if (slot) *slot={service,instance,node,port,true}; else ++q->overflow;
+            if (service==0x42 && instance==0x4a01 && q->helloReceived && node==q->peer &&
+                !q->qmi.bound && !q->qmi.lost) {
+                q->qmi.node=node;q->qmi.port=port;q->qmi.bound=true;++q->qmi.events;
+            }
         } else {
             for (auto &s:q->services) if (s.used && s.node==node && s.port==port &&
                 s.service==service && s.instance==instance) s.used=false;
+            if(service==0x42 && instance==0x4a01 && q->qmi.bound && node==q->qmi.node && port==q->qmi.port)
+                picasso_qmi_lost(&q->qmi);
         }
         ++q->events;
     } else if (type==3 || type==13) {
         uint32_t node=type==3 ? sn : picasso_qrtr_u32(payload+8);
         for (auto &s:q->services) if (s.used && s.node==node) s.used=false;
+        if(q->qmi.bound && q->qmi.node==node) picasso_qmi_lost(&q->qmi);
         if (node==q->peer) q->helloReceived=false;
         ++q->events;
     } else if (type==1) {
-        ++q->data; ++q->ignored; // no local QMI consumer registered yet
+        ++q->data;
+        if(!picasso_qmi_receive(&q->qmi,sn,sp,dp,payload,size)) ++q->ignored;
         if (confirm) {
             auto *w=q->queue[(q->head+q->count)%PicassoQrtrQueue];
             picasso_qrtr_control(w,7,dn,dp,sn,sp,dn,dp); ++q->count;
         }
     } else ++q->ignored;
+    // HELLO and announcements may be interleaved by the transport. Bind only
+    // a real matching announcement on the peer learned from HELLO.
+    if(q->helloReceived && !q->qmi.bound && !q->qmi.lost) for(const auto &s:q->services)
+        if(s.used && s.service==0x42 && s.instance==0x4a01 && s.node==q->peer) {
+            q->qmi.node=s.node;q->qmi.port=s.port;q->qmi.bound=true;++q->qmi.events;break;
+        }
     return 0;
 }
 #endif
