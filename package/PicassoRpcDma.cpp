@@ -25,21 +25,31 @@ void cache(uint8_t *p,unsigned bytes,bool publish) {
         else __asm__ volatile("dc ivac, %0" :: "r"(a) : "memory");
     }barrier();
 }
-int healthy(void *) {
-    if(read(0)&1)return -16;
-    for(unsigned n=0;n<2;++n) {
-        const auto &p=memory.plan;unsigned cb=(p.pages+p.bank[n])*4096;
-        uint32_t fsr=read(cb+0x58);
-        if(fsr&0xc00001feU) {
-            IOLog("PICASSO_ADSP rpc-dma fault pd=%u fsr=%x far=%08x%08x syndrome=%x\n",
-                n?2:0,fsr,read(cb+0x64),read(cb+0x60),read(cb+0x68));return -5;
+void diagnose(int error,unsigned n) {
+    const auto &p=memory.plan;const auto &d=p.diagnostic;
+    IOLog("PICASSO_ADSP rpc-dma check error=%d pd=%u phase=%s reg=%x actual=%x expected=%x mask=%x\n",
+        error,n?2:0,d.phase?d.phase:"none",d.offset,d.actual,d.expected,d.mask);
+    if(n<2 && p.bank[n]<p.banks) {
+        unsigned cb=(p.pages+p.bank[n])*4096;
+        IOLog("PICASSO_ADSP rpc-dma context pd=%u bank=%u sctlr=%x actlr=%x inherited=%x/%x cbar=%x cba2r=%x fsr=%x far=%08x%08x syndrome=%x\n",
+            n?2:0,p.bank[n],read(cb),read(cb+4),p.sctlr[n],p.actlr[n],read(0x1000+4*p.bank[n]),
+            read(0x1800+4*p.bank[n]),read(cb+0x58),read(cb+0x64),read(cb+0x60),read(cb+0x68));
+    }
+    if(d.phase && (d.offset>=0x800 && d.offset<0xa00)) {
+        unsigned slot=(d.offset-0x800)/4;uint32_t s2cr=read(0xc00+4*slot);
+        IOLog("PICASSO_ADSP rpc-dma stream slot=%u smr=%x s2cr=%x\n",slot,read(d.offset),s2cr);
+        unsigned bank=s2cr&255;
+        if(((s2cr>>16)&3)==0 && bank<p.banks) {
+            unsigned cb=(p.pages+bank)*4096;
+            IOLog("PICASSO_ADSP rpc-dma owner bank=%u sctlr=%x actlr=%x cbar=%x cba2r=%x\n",
+                bank,read(cb),read(cb+4),read(0x1000+4*bank),read(0x1800+4*bank));
         }
-        uint64_t ttbr=(uint64_t(p.asid[n])<<48)|(memory.physical[n]+32768);
-        if(read(0x800+4*p.slot[n])!=0x80001403U+n || read(0xc00+4*p.slot[n])!=p.bank[n] ||
-            read(0x1800+4*p.bank[n])!=1 || read(0x1000+4*p.bank[n])!=0x1f300 ||
-            (read(cb+0x10)&~0x60U)!=0x38011 || read(cb+0x30)!=0x80802020 || read(cb+4) ||
-            (read(cb)&~0x1000U)!=0x127 || read(cb+0x20)!=uint32_t(ttbr) || read(cb+0x24)!=uint32_t(ttbr>>32) ||
-            read(cb+0x28) || read(cb+0x2c)!=(p.asid[n]<<16) || read(cb+0x38)!=0xff44 || read(cb+0x3c))return -16;
+    }
+}
+int healthy(void *) {
+    for(unsigned n=0;n<2;++n) {
+        int error=picasso_rpc_dma_check(memory.plan,n,memory.physical[n],true,true,read);
+        if(error) { diagnose(error,n);return error; }
     }barrier();return 0;
 }
 int sync(void *,unsigned n,unsigned slot,bool publish) {
@@ -68,12 +78,17 @@ extern "C" void picasso_rpc_device_prepare(PicassoFastrpc *f) {
         if(error)break;cache(memory.data[n],PicassoRpcAllocation,true);
     }
     if(!error)for(unsigned n=0;n<2;++n) {
-        error=picasso_rpc_dma_program(memory.plan,n,memory.physical[n],read,write,write64);if(error)break;
+        error=picasso_rpc_dma_program(memory.plan,n,memory.physical[n],read,write,write64);if(error) { diagnose(error,n);break; }
     }
     if(!error)error=healthy(nullptr);
     if(!error)error=picasso_rpc_bind(f,{nullptr,sync,healthy},memory.data[0],memory.data[1]);
     if(error)picasso_rpc_stop(f,error);
     const auto &p=memory.plan;
+    if(p.error)diagnose(p.error,0);
+    IOLog("PICASSO_ADSP rpc-dma survey streams=%u banks=%u pages=%u used=%u enabled=%u idle=%u nonzero_actlr=%u phase=%s\n",
+        p.count,p.banks,p.pages,p.usedBanks,p.enabledBanks,p.idleBanks,p.nonzeroActlr,p.diagnostic.phase);
+    if(!error)for(unsigned n=0;n<2;++n)
+        IOLog("PICASSO_ADSP rpc-dma inherited pd=%u bank=%u sctlr=%x actlr=%x preserved=1\n",n?2:0,p.bank[n],p.sctlr[n],p.actlr[n]);
     IOLog("PICASSO_ADSP rpc-dma prepared=%u error=%d id=%x/%x/%x slots=%u/%u banks=%u/%u asids=%u/%u sid=1403/1404 iova=80000000 bytes=32768 retained=1\n",
         !error,error,p.id[0],p.id[1],p.id[2],p.slot[0],p.slot[1],p.bank[0],p.bank[1],p.asid[0],p.asid[1]);
     // One boot, bounded 88KiB. Retain allocations/mappings even on failures:

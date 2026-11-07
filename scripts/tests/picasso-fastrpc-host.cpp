@@ -99,8 +99,9 @@ static void errors() {
 }
 static uint32_t regs[0x100000/4];
 static unsigned writes;static bool stuck,drop;
+static unsigned touched[512],touchCount;
 static uint32_t rd(unsigned at) { assert(at<sizeof regs && !(at&3));return regs[at/4]; }
-static void wr(unsigned at,uint32_t v) { ++writes;if(drop)return;if((at&4095)==0x58 && at>=0x80000)v=0;
+static void wr(unsigned at,uint32_t v) { ++writes;if(touchCount<512)touched[touchCount++]=at;if(drop)return;if((at&4095)==0x58 && at>=0x80000)v=0;
     if((at&4095)==0x7f0 && at>=0x80000)regs[(at+4)/4]=stuck?1:0;regs[at/4]=v; }
 static void wr64(unsigned at,uint64_t v) { assert(!(at&7));wr(at,uint32_t(v));wr(at+4,uint32_t(v>>32)); }
 static void dma() {
@@ -112,6 +113,7 @@ static void dma() {
     alignas(8) uint64_t t[1536];assert(!picasso_rpc_dma_tables(t,0x123450000ULL));
     assert(t[2]==0x123459003ULL && t[512]==0x12345a003ULL);
     for(unsigned i=0;i<1536;++i)if(i!=2 && i!=512 && (i<1024 || i>=1032))assert(!t[i]);
+    assert((t[1024]&(1U<<11)) && (t[1031]&(1U<<11))); // non-global in both PDs
     assert((t[1024]&~0xfffULL)==(0x123450000ULL|(3ULL<<53)) && !(t[1024]&(1ULL<<7)));
     assert(!picasso_rpc_dma_program(p,0,0x123450000ULL,rd,wr,wr64));
     assert(!picasso_rpc_dma_program(p,1,0x123470000ULL,rd,wr,wr64));
@@ -127,4 +129,72 @@ static void dma() {
     assert(picasso_rpc_dma_tables(t,0xfffff8000ULL)==-22);
     puts("PASS bounded RPC lifecycle, reverse registry request, malformed wire, isolated SMMU tables and refusal paths");
 }
-int main() { initialization();reverseCalls();errors();dma();assert(published && acquired); }
+// Replay the observed Picasso geometry with a skip-init register image.
+// Control/ACTLR values below are adversarial fixtures, not claimed device reads.
+static void inheritedImage() {
+    memset(regs,0,sizeof regs);writes=touchCount=0;stuck=drop=false;
+    regs[8]=0x4c017e51;regs[9]=0x6000003e;regs[10]=0x5111;
+    for(unsigned i=0;i<62;++i) {
+        regs[((128+i)*4096)/4]=0x166; // M=0, inherited fault controls
+        regs[((128+i)*4096+4)/4]=0x32b;
+    }
+    // A disabled bank can still be owned: UFS and another boot mapping.
+    regs[(0x800+4*80)/4]=0x80000060;regs[(0xc00+4*80)/4]=60;
+    regs[(0x800+4*79)/4]=0x800000a1;regs[(0xc00+4*79)/4]=61;
+    regs[(188*4096)/4]=0;regs[(189*4096)/4]=0;
+}
+static void inheritedDma() {
+    inheritedImage();auto p=picasso_rpc_dma_plan(rd);
+    assert(!p.error && p.bank[0]==59 && p.bank[1]==58 && p.usedBanks==2 && p.idleBanks==60);
+    assert(p.sctlr[0]==0x166 && p.actlr[0]==0x32b && p.nonzeroActlr==62);
+    // 8-bit, 16-bit and AArch32 inherited ASIDs must all exclude aliases.
+    regs[(128*4096+0x24)/4]=0x00880000;
+    regs[(129*4096+0x2c)/4]=0x01890000;
+    regs[(130*4096+0x34)/4]=0x8a;
+    p=picasso_rpc_dma_plan(rd);assert(!p.error && p.asid[0]==0x18b && p.asid[1]==0x18c);
+    assert(!picasso_rpc_dma_program(p,0,0x123450000ULL,rd,wr,wr64));
+    assert(!picasso_rpc_dma_program(p,1,0x123470000ULL,rd,wr,wr64));
+    assert(!picasso_rpc_dma_check(p,0,0x123450000ULL,true,true,rd));
+    assert(rd(187*4096+4)==0x32b && rd(186*4096+4)==0x32b);
+    for(unsigned i=0;i<touchCount;++i) {
+        unsigned at=touched[i];
+        assert(at!=0 && at!=0x800+4*80 && at!=0xc00+4*80 && at!=0x800+4*79 && at!=0xc00+4*79);
+        assert(at<188*4096 || at>=190*4096);
+        assert(at<0x80000 || (at&4095)!=4); // never change ACTLR
+    }
+    regs[(187*4096+4)/4]^=1;
+    assert(picasso_rpc_dma_check(p,0,0x123450000ULL,true,true,rd)==-5);
+    assert(!strcmp(p.diagnostic.phase,"actlr-drift"));
+    regs[(187*4096+4)/4]^=1;regs[(187*4096+0x58)/4]=2;
+    assert(picasso_rpc_dma_check(p,0,0x123450000ULL,true,true,rd)==-5);
+    assert(!strcmp(p.diagnostic.phase,"context-fault"));
+    // Drop SCTLR normalization: no translation address or stream is published.
+    inheritedImage();p=picasso_rpc_dma_plan(rd);drop=true;
+    assert(picasso_rpc_dma_program(p,0,0x123450000ULL,rd,wr,wr64)==-5 && writes==1);
+    assert(!strcmp(p.diagnostic.phase,"disable-readback") && !rd(0x800));
+    drop=false;
+    // A newly enabled bank, ACTLR change, route, slot or ASID loses the lease
+    // before any writes. No automatic retries against a changing owner.
+    for(unsigned which=0;which<6;++which) {
+        inheritedImage();p=picasso_rpc_dma_plan(rd);
+        unsigned cb=(p.pages+p.bank[0])*4096;
+        if(which==0)regs[cb/4]|=1;
+        if(which==1)regs[(cb+4)/4]^=1;
+        if(which==2) { regs[(0x800+4*20)/4]=0x80000555;regs[(0xc00+4*20)/4]=p.bank[0]; }
+        if(which==3)regs[0x800/4]=0x80000999;
+        if(which==4)regs[(128*4096+0x24)/4]=0x1880000;
+        if(which==5)regs[0]=1;
+        assert(picasso_rpc_dma_program(p,0,0x123450000ULL,rd,wr,wr64)==-16 && !writes);
+    }
+    inheritedImage();regs[0x804/4]=0x80001403;p=picasso_rpc_dma_plan(rd);
+    assert(p.error==-16 && !strcmp(p.diagnostic.phase,"stream-conflict") && p.diagnostic.offset==0x804);
+    inheritedImage();regs[0x804/4]=0x9fff1400;p=picasso_rpc_dma_plan(rd);
+    assert(p.error==-16 && !strcmp(p.diagnostic.phase,"stream-conflict"));
+    inheritedImage();for(unsigned i=0;i<62;++i)regs[((128+i)*4096)/4]|=1;
+    p=picasso_rpc_dma_plan(rd);assert(p.error==-16 && !strcmp(p.diagnostic.phase,"no-idle-banks") && p.enabledBanks==62);
+    inheritedImage();regs[0]=1;p=picasso_rpc_dma_plan(rd);
+    assert(p.error==-16 && !strcmp(p.diagnostic.phase,"client-disabled"));
+    assert(!writes);
+    puts("PASS skip-init bank allocation, preserved ACTLR, ASID aliases, lease races and precise readback diagnostics");
+}
+int main() { initialization();reverseCalls();errors();dma();inheritedDma();assert(published && acquired); }
