@@ -77,7 +77,13 @@ static void *watchService(void *arg){
         pthread_mutex_lock(&gLock);bool before=gConnect!=0;
         if(!gStop&&!gConnect)(void)connectService();bool changed=!before&&gConnect;
         pthread_mutex_unlock(&gLock);
-        if(changed&&gHost){AudioObjectPropertyAddress a={kAudioDevicePropertyDeviceIsAlive,kAudioObjectPropertyScopeGlobal,kAudioObjectPropertyElementMaster};gHost->PropertiesChanged(gHost,kDevice,1,&a);}
+        if(changed&&gHost){
+            // Do not enumerate a dead device at plugin initialization. Publish
+            // its list when the real kernel connection becomes available.
+            AudioObjectPropertyAddress a={kAudioPlugInPropertyDeviceList,kAudioObjectPropertyScopeGlobal,kAudioObjectPropertyElementMaster};
+            gHost->PropertiesChanged(gHost,kPlugIn,1,&a);
+            a.mSelector=kAudioObjectPropertyOwnedObjects;gHost->PropertiesChanged(gHost,kPlugIn,1,&a);
+        }
         usleep(1000000);
     }return NULL;
 }
@@ -121,12 +127,12 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kAudioObjectPropertyManufacturer: REPLY_STR("UniXNU");
         case kAudioObjectPropertyOwnedObjects:
         case kAudioPlugInPropertyDeviceList: {
-            if (inDataSize < sizeof(AudioObjectID)) {*outDataSize = 0; return 0;}
+            if (!gConnect || inDataSize < sizeof(AudioObjectID)) {*outDataSize = 0; return 0;}
             ((AudioObjectID *)outData)[0] = kDevice; *outDataSize = sizeof(AudioObjectID); return 0;
         }
         case kAudioPlugInPropertyTranslateUIDToDevice: {
             CFStringRef uid = q && qs >= sizeof(CFStringRef) ? *(const CFStringRef *)q : NULL;
-            REPLY(AudioObjectID, uid && CFStringCompare(uid, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo ? kDevice : kAudioObjectUnknown);
+            REPLY(AudioObjectID, gConnect && uid && CFStringCompare(uid, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo ? kDevice : kAudioObjectUnknown);
         }
         case kAudioPlugInPropertyResourceBundle: REPLY_STR("");
         default: return kAudioHardwareUnknownPropertyError;
@@ -156,13 +162,13 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kAudioDevicePropertyDeviceCanBeDefaultDevice: REPLY(UInt32, a->mScope != kAudioObjectPropertyScopeInput);
         case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: REPLY(UInt32, a->mScope != kAudioObjectPropertyScopeInput);
         case kAudioDevicePropertyLatency: REPLY(UInt32, latencyFrames());
-                case kAudioDevicePropertySafetyOffset: REPLY(UInt32, latencyFrames() + 4096);
+        case kAudioDevicePropertySafetyOffset: REPLY(UInt32, latencyFrames() + 4096);
         case kAudioDevicePropertyNominalSampleRate: REPLY(Float64, kRate);
         case kAudioDevicePropertyAvailableNominalSampleRates: REPLY(AudioValueRange, ((AudioValueRange){kRate, kRate}));
         case kAudioDevicePropertyIsHidden: REPLY(UInt32, 0);
         case kAudioDevicePropertyZeroTimeStampPeriod: REPLY(UInt32, kZeroPeriod);
         case kAudioDevicePropertyClockIsStable: REPLY(UInt32, 0);
-            case kAudioDevicePropertyClockAlgorithm: REPLY(UInt32, kAudioDeviceClockAlgorithmRaw);
+        case kAudioDevicePropertyClockAlgorithm: REPLY(UInt32, kAudioDeviceClockAlgorithmRaw);
         case kAudioDevicePropertyPreferredChannelsForStereo: {
             if (inDataSize < 2 * sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
             ((UInt32 *)outData)[0] = 1; ((UInt32 *)outData)[1] = a->mScope == kAudioObjectPropertyScopeInput ? 0 : 2;
@@ -247,10 +253,10 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
 static OSStatus GetPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 n,UInt32 *z,void *v){
     (void)d;(void)pid;if(!a||!z||(!v&&n))return kAudioHardwareIllegalOperationError;
     pthread_mutex_lock(&gLock);OSStatus rc=propertyData(o,a,qs,q,n,z,v);
-    if(rc==kAudioHardwareUnknownPropertyError && gUnknown<32){++gUnknown;note(5,rc,a->mSelector,o);}pthread_mutex_unlock(&gLock);return rc;
+    if(rc==kAudioHardwareUnknownPropertyError && gConnect && gUnknown<32){++gUnknown;note(5,rc,a->mSelector,o);}pthread_mutex_unlock(&gLock);return rc;
 }
 static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 *z){
-    union {uint64_t align;uint8_t b[1024];} v;return GetPropertyData(d,o,pid,a,qs,q,sizeof v,z,&v);
+    union {uint64_t align;uint8_t b[1024];} v={0};return GetPropertyData(d,o,pid,a,qs,q,sizeof v,z,&v);
 }
 static Boolean HasProperty(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a){UInt32 n;return !GetPropertyDataSize(d,o,pid,a,0,NULL,&n);}
 static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,Boolean *set){
@@ -295,6 +301,21 @@ static void *worker(void *unused){
     }
     return NULL;
 }
+// A stop requests asynchronous DSP cleanup. Keep the service connection and
+// device identity alive, but wait for the actual idle state before a new Begin.
+// This runs on StartIO's control thread, never on the realtime mix callback.
+static kern_return_t waitIdle(void){
+    for(unsigned retry=0;retry<200;++retry){
+        PicassoAudioStatus status;size_t size=sizeof status;
+        kern_return_t rc=method(PicassoAudioGetStatus,NULL,0,&status,&size);
+        if(rc)return rc;
+        if(size!=sizeof status || status.version!=1)return kIOReturnBadArgument;
+        if(status.state==PicassoAudioIdle)return 0;
+        if(status.state==PicassoAudioFailed)return kIOReturnNotReady;
+        usleep(10000);
+    }
+    return kIOReturnBusy;
+}
 static OSStatus StartIO(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 client){
     (void)d;if(o!=kDevice||client==UINT32_MAX)return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gLock);unsigned slot=32;
@@ -302,7 +323,8 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 clie
     if(slot==32||gStop||(gIoUsers&&gFault)){pthread_mutex_unlock(&gLock);return kAudioHardwareIllegalOperationError;}
     if(!gIoUsers){
         if(connectService()){pthread_mutex_unlock(&gLock);return kAudioHardwareNotRunningError;}
-        kern_return_t rc=method(PicassoAudioBegin,&gFormat,sizeof gFormat,NULL,NULL);
+        kern_return_t rc=waitIdle();
+        if(!rc)rc=method(PicassoAudioBegin,&gFormat,sizeof gFormat,NULL,NULL);
         if(rc){note(2,(int)rc,1,0);pthread_mutex_unlock(&gLock);return kAudioHardwareNotRunningError;}
         memset(&gMix,0,sizeof gMix);gSent=gMissing=gReservedEnd=gCalls=0;gFault=0;gOrigin=mach_absolute_time();++gSeed;
         int e=pthread_create(&gThread,NULL,worker,NULL);if(e){(void)method(PicassoAudioCancel,NULL,0,NULL,NULL);pthread_mutex_unlock(&gLock);return kAudioHardwareUnspecifiedError;}
@@ -317,8 +339,9 @@ static OSStatus StopIO(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 clien
     if(gIoUsers){pthread_mutex_unlock(&gLock);return 0;}
     gStop=true;bool join=gThreadLive;pthread_mutex_unlock(&gLock);if(join)pthread_join(gThread,NULL);
     pthread_mutex_lock(&gLock);gThreadLive=false;(void)method(PicassoAudioCancel,NULL,0,NULL,NULL);note(2,0,4,0);
-    // Closing the last connection also gives the kernel a client-death cancel.
-    IOServiceClose(gConnect);gConnect=0;gStop=false;pthread_mutex_unlock(&gLock);return 0;
+    // The device still exists after StopIO. Keep this exclusive connection;
+    // closing it here would report DeviceIsAlive=0 between previews.
+    gStop=false;pthread_mutex_unlock(&gLock);return 0;
 }
 static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 client,Float64 *sample,UInt64 *host,UInt64 *seed){
     (void)d;(void)client;if(o!=kDevice||!sample||!host||!seed)return kAudioHardwareIllegalOperationError;

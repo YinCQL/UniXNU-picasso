@@ -1,0 +1,107 @@
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4650,6 +4650,25 @@
+ 		at += length + (at[length] == ',' ? 1 : 0);
+ 	}
+ 	return false;
++}
++
++/* Picasso's output-only HAL is hosted by the signed iOS audio server. The
++ * stock profile cannot name this board's new user-client class. Scope this
++ * compatibility rule to that identity, exact provider/client and type zero;
++ * never use the mutable registry process-name grant for audio. */
++static bool
++picasso_audio_open_grant(IOService *service, IOUserClient *client, task_t owner, uint32_t type)
++{
++    if (!service || !client || type || owner != current_task() ||
++        strcmp(service->getMetaClass()->getClassName(), "PicassoAudio") ||
++        strcmp(client->getMetaClass()->getClassName(), "PicassoAudioUserClient") ||
++        client->getProvider() != service) return false;
++    proc_t process = proc_self();
++    const char *identity = process ? csproc_get_identity(process) : NULL;
++    bool grant = process && proc_task(process) == owner && csproc_get_platform_binary(process) &&
++        identity && !strcmp(identity, "com.apple.mediaserverd");
++    if (process) proc_rele(process);
++    return grant;
+ }
+ 
+ kern_return_t
+@@ -4852,12 +4871,20 @@
+ 
+ 			OSSafeReleaseNULL(requiredEntitlement);
+ 
++            const bool audioGrant = picasso_audio_open_grant(service, client, owningTask, connect_type);
++            if (audioGrant) {
++                static unsigned reports;
++                if (__atomic_fetch_add(&reports, 1U, __ATOMIC_RELAXED) < 8)
++                    IOLog("PICASSO_AUDIO access signed_server=1 type=%u entitlement_denied=%u scoped=1\n",
++                        connect_type, disallowAccess);
++            }
++
+ 			if (disallowAccess) {
+ 				res = kIOReturnNotPrivileged;
+ 			}
+ #if CONFIG_MACF
+ 			/* The service's grant (native_sandbox_grant) stands in for the sandbox's verdict on the render server's open. */
+-			else if (!native_sandbox_grant(service)
++			else if (!audioGrant && !native_sandbox_grant(service)
+ 			    && 0 != mac_iokit_check_open(kauth_cred_get(), client, connect_type)) {
+ 				IOLog("IOUC %s failed MACF in process %s\n",
+ 				    client->getMetaClass()->getClassName(), creatorNameCStr);
+@@ -4866,7 +4893,7 @@
+ #endif
+ 
+ 			if ((kIOReturnSuccess == res)
+-			    && !native_sandbox_grant(service)
++			    && !audioGrant && !native_sandbox_grant(service)
+ 			    && gIOUCFilterCallbacks
+ 			    && gIOUCFilterCallbacks->io_filter_resolver) {
+ 				io_filter_policy_t filterPolicy;
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7753,6 +7753,31 @@
+ 		}
+ 	}
+ }
++/* The reference iPad's BuiltinAudioPlugin bundle is not guaranteed on this
++ * iPhone image. Verify our two required files independently; compare the lower
++ * bundle's vnode only when it existed before the union mount. */
++static void
++picasso_audio_addon_mount(proc_t p, user_addr_t scratch, volatile int *stage, volatile int *status)
++{
++    static const char lower[] = "/System/Library/Audio/Plug-Ins/HAL/BuiltinAudioPlugin.driver";
++    static const char source[] = "/private/var/ngpu/audio", point[] = "/System/Library/Audio/Plug-Ins/HAL";
++    vnode_t before = NULLVP, after = NULLVP;
++    int lower_error = vnode_lookup(lower, 0, &before, vfs_context_current());
++    native_gpu_addon_mount(p, scratch, 0xa00, source, sizeof(source), point, sizeof(point),
++        "/System/Library/Audio/Plug-Ins/HAL/PicassoAudio.driver/Info.plist",
++        "/System/Library/Audio/Plug-Ins/HAL/PicassoAudio.driver/PicassoAudio", stage, status);
++    int preserved = -1;
++    if (!lower_error) {
++        int error = vnode_lookup(lower, 0, &after, vfs_context_current());
++        preserved = !error && before == after;
++        if (!preserved && !*status) { *status = error ? error : EAUTH; *stage = 6; }
++    } else if (lower_error != ENOENT && !*status) { *status = lower_error; *stage = 6; }
++    printf("PICASSO_AUDIO addon lower_before=%d lower_preserved=%d own_stage=%d error=%d\n",
++        lower_error, preserved, *stage, *status);
++    if (after) vnode_put(after);
++    if (before) vnode_put(before);
++}
++
+ static void
+ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -7762,12 +7787,9 @@
+ 	if (enabled != 1 && audio != 1) return;
+ 	native_gpu_addon_install(p, scratch);
+ 	if (audio == 1) {
+-		static const char source[] = "/private/var/ngpu/audio", point[] = "/System/Library/Audio/Plug-Ins/HAL";
+ 		static volatile int stage, status;
+ 		if (!native_gpu_addon_failed && native_gpu_addon_files == 2) {
+-			native_gpu_addon_mount(p, scratch, 0xa00, source, sizeof(source), point, sizeof(point),
+-			    "/System/Library/Audio/Plug-Ins/HAL/BuiltinAudioPlugin.driver",
+-			    "/System/Library/Audio/Plug-Ins/HAL/PicassoAudio.driver/Info.plist", &stage, &status);
++			picasso_audio_addon_mount(p, scratch, &stage, &status);
+ 		} else { stage = -1; status = native_gpu_addon_error; }
+ 		printf("PICASSO_AUDIO addon files=%d written=%d same=%d failed=%d stage=%d error=%d\n",
+ 		    native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, stage, status);
