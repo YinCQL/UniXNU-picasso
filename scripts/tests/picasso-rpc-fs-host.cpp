@@ -67,7 +67,7 @@ static void writes() {
     assert(!fileOp(h,0x09010000,2,5));memcpy(buffer,"z",1);assert(!fileOp(h,0x05020100,2,1));
     assert(!fileOp(h,0x09010000,2,0));assert(!fileOp(h,0x04010200,2,10,0,10));assert(rpc32(out+8)==6 && !memcmp(out+24,"abc\0\0z",6));
     assert(fileOp(h,0x08010100,0)==9);assert(fileOp(h,0x17010000)==95);
-    assert(!fileOp(h,0x09010000,2,8192));assert(fileOp(h,0x05020100,2,1)==28);
+    assert(!fileOp(h,0x09010000,2,65536));assert(fileOp(h,0x05020100,2,1)==28);
     assert(!fileOp(h,0x0d010100) && rpc32(out+8)==28);
     assert(!fileOp(h,0x03010000));assert(!pathOp(p,0x18020000));assert(pathOp(base,0x1e020000)==0);
     h=openFile("/persist/sensors/registry/sns_reg_version","r+");
@@ -160,12 +160,16 @@ static void renameCapacity() {
     picasso_rpc_fs_reset();
     // Exhaust every RAM node. A failed replacement must preserve both stock
     // source and destination; no temporary truncation or tombstone is allowed.
-    for(unsigned i=0;i<128;++i) { char p[96];snprintf(p,sizeof p,"/persist/sensors/capacity%u",i);
+    for(unsigned i=0;i<512;++i) { char p[96];snprintf(p,sizeof p,"/persist/sensors/capacity%u",i);
         auto h=openFile(p,"w");assert(!fileOp(h,0x03010000)); }
     const char *src="/persist/sensors/registry/sns_reg_version",*dst="/persist/sensors/registry/sns_reg_config";
     assert(renameFile(src,dst)==28);
     assert(!pathOp(src,0x1f020100) && rpc64(out+48)==11);
     assert(!pathOp(dst,0x1f020100) && rpc64(out+48)==553);
+    assert(!renameFile("/persist/sensors/capacity0","/persist/sensors/moved-at-capacity"));
+    assert(pathOp("/persist/sensors/capacity0",0x1f020100)==2);
+    assert(!renameFile("/persist/sensors/capacity1","/persist/sensors/moved-at-capacity"));
+    auto h=openFile("/persist/sensors/recovered","w");assert(!fileOp(h,0x03010000));
     puts("PASS full-store rename refuses without changing original files");
 }
 static void tracing() {
@@ -177,6 +181,72 @@ static void tracing() {
     trace={};emitted=0;
     for(unsigned i=1;i<=6000;++i) { d.requests=i;d.lastScalar=i;emitted+=picasso_rpc_trace(trace,d); }
     assert(emitted<540 && emitted>=512 && trace.requests==6000);
+    d.requests++;d.previousResult=28;assert(picasso_rpc_trace(trace,d));
+    d.requests++;strcpy(d.fs.target,"/persist/sensors/registry/new-group");assert(picasso_rpc_trace(trace,d));
     puts("PASS repeated request sampling and progress after transition log budget");
 }
-int main() { stock();writes();socinfo();malformed();registryPaths();renameCapacity();tracing(); }
+static PicassoRpcFsStats stats() { PicassoRpcFsStats s;picasso_rpc_fs_stats(&s);return s; }
+static void registryScale() {
+    picasso_rpc_fs_reset();const char *temp="/persist/sensors/registry/registry/../temp.json";
+    // More distinct groups than the factory's 150 owner groups. Validate all
+    // files, including ones created before the former 128-node boundary.
+    for(unsigned i=0;i<300;++i) {
+        char p[100];snprintf(p,sizeof p,"/persist/sensors/registry/registry/group%u",i);
+        auto h=openFile(temp,"w+");for(unsigned j=0;j<700;++j)buffer[j]=uint8_t(i+j);
+        assert(!fileOp(h,0x05020100,2,700));assert(!fileOp(h,0x03010000));assert(!renameFile(temp,p));
+    }
+    auto s=stats();assert(s.nodes==300 && s.blocks==900 && s.bytes==210000 && !s.exhaustion);
+    for(unsigned i=0;i<300;++i) {
+        char p[100];snprintf(p,sizeof p,"/persist/sensors/registry/registry/group%u",i);auto h=openFile(p,"r",0);
+        assert(!fileOp(h,0x04010200,0,701,0,701) && rpc32(out+8)==700);
+        for(unsigned j=0;j<700;++j)assert(out[24+j]==uint8_t(i+j));assert(!fileOp(h,0x03010000,0));
+        assert(!pathOp(p,0x18020000));
+    }
+    s=stats();assert(!s.nodes && !s.blocks && !s.bytes);
+    // Unique deleted runtime names must not leave permanent tombstones.
+    for(unsigned i=0;i<1200;++i) { char p[100];snprintf(p,sizeof p,"/persist/sensors/transient%u",i);
+        auto h=openFile(p,"w");assert(!fileOp(h,0x05020100,2,1));assert(!fileOp(h,0x03010000));assert(!pathOp(p,0x18020000)); }
+    assert(!stats().nodes && !stats().blocks);
+    // Recreating a deleted factory file must select its tombstone even when
+    // a lower unused slot exists, or the old hidden entry could mask it.
+    auto h=openFile(temp,"w");assert(!fileOp(h,0x03010000));
+    const char *factory="/persist/sensors/registry/sns_reg_version";
+    assert(!pathOp(factory,0x18020000));assert(stats().tombstones==1);assert(!pathOp(temp,0x18020000));
+    h=openFile(factory,"w");memcpy(buffer,"new",3);assert(!fileOp(h,0x05020100,2,3));assert(!fileOp(h,0x03010000));
+    h=openFile(factory,"r");assert(!fileOp(h,0x04010200,2,12,0,12) && rpc32(out+8)==3 && !memcmp(out+24,"new",3));
+    assert(!fileOp(h,0x03010000));assert(stats().nodes==1 && !stats().tombstones);
+    puts("PASS 300 distinct registry outputs, 1200 deleted names and factory tombstone reuse");
+}
+static int truncateFile(unsigned h,unsigned bytes) {
+    rpcPut32(prim,32);rpcPut32(prim+4,h);rpcPut32(prim+8,bytes);
+    const void *p[]={prim};unsigned l[]={12};return invoke(2,0x1f010000,p,l,nullptr);
+}
+static void sharedPool() {
+    picasso_rpc_fs_reset();memset(buffer,0xa5,4096);
+    // Fill the shared 1 MiB pool with 16 real 64 KiB files.
+    for(unsigned i=0;i<16;++i) { char p[80];snprintf(p,sizeof p,"/persist/sensors/large%u",i);auto h=openFile(p,"w");
+        for(unsigned n=0;n<16;++n)assert(!fileOp(h,0x05020100,2,4096));
+        assert(!fileOp(h,0x03010000)); }
+    assert(stats().blocks==4096 && stats().bytes==1048576);
+    auto h=openFile("/persist/sensors/overflow","w+");assert(fileOp(h,0x05020100,2,1)==28 && stats().exhaustion==2);
+    assert(!fileOp(h,0x0a010100) && rpc64(out+8)==0);
+    assert(!pathOp("/persist/sensors/large7",0x18020000));
+    assert(!fileOp(h,0x05020100,2,4096));assert(!fileOp(h,0x03010000));
+    // Blocks released from the middle of the pool are reusable and retain no
+    // old bytes across sparse growth, shrink or subsequent extension.
+    h=openFile("/persist/sensors/sparse","w+");assert(!fileOp(h,0x09010000,2,9000));
+    buffer[0]=0x71;assert(!fileOp(h,0x05020100,2,1));assert(stats().exhaustion==0);
+    assert(!fileOp(h,0x09010000,2,8190));assert(!fileOp(h,0x04010200,2,820,0,820));
+    assert(rpc32(out+8)==811);for(unsigned i=0;i<810;++i)assert(out[24+i]==0);assert(out[834]==0x71);
+    assert(!truncateFile(h,257));assert(!truncateFile(h,1000));
+    assert(!fileOp(h,0x09010000,2,250));assert(!fileOp(h,0x04010200,2,1000,0,1000));
+    assert(rpc32(out+8)==750);for(unsigned i=0;i<750;++i)assert(!out[24+i]);
+    assert(truncateFile(h,65537)==28 && stats().exhaustion==3);
+    assert(!fileOp(h,0x0a010100) && rpc64(out+8)==1000);
+    assert(!truncateFile(h,0));assert(!fileOp(h,0x03010000));
+    assert(!pathOp("/persist/sensors/sparse",0x18020000));assert(!pathOp("/persist/sensors/overflow",0x18020000));
+    for(unsigned i=0;i<16;++i)if(i!=7) { char p[80];snprintf(p,sizeof p,"/persist/sensors/large%u",i);assert(!pathOp(p,0x18020000)); }
+    assert(!stats().blocks && !stats().nodes);
+    puts("PASS pooled 1 MiB capacity, 64 KiB files, fragmented reuse, sparse zero-fill and truncation rollback");
+}
+int main() { stock();writes();socinfo();malformed();registryPaths();renameCapacity();tracing();registryScale();sharedPool(); }

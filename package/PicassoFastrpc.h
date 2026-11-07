@@ -24,13 +24,14 @@ struct PicassoRpcDomain {
     int error;
     bool registered,initialized,stdOpen;
     char name[128];
+    PicassoRpcFsStats fs;
     uint8_t reply[PicassoRpcBlob];
     PicassoRpcCall call[2];
 };
 struct PicassoRpcTrace {
-    uint32_t requests,handle,scalar,result,decode,repeated,emitted,checkpoint;
+    uint32_t requests,handle,scalar,result,decode,repeated,emitted,checkpoint,errors;
     bool valid;
-    char name[128];
+    char name[128],target[128];
 };
 // Preserve later operations during long registry scans. Consecutive identical
 // requests are sampled, with bounded transition logs and periodic progress.
@@ -39,15 +40,17 @@ static inline bool picasso_rpc_trace(PicassoRpcTrace &t,const PicassoRpcDomain &
     bool same=t.valid && t.handle==d.lastHandle && t.scalar==d.lastScalar &&
         t.result==d.previousResult && t.decode==d.decodeResult;
     for(unsigned i=0;same && i<128;++i) { if(t.name[i]!=d.name[i])same=false;if(!d.name[i])break; }
+    for(unsigned i=0;same && i<128;++i) { if(t.target[i]!=d.fs.target[i])same=false;if(!d.fs.target[i])break; }
     t.requests=d.requests;
     if(same) { if(t.repeated!=0xffffffffU)++t.repeated; }
     else {
         t.valid=true;t.handle=d.lastHandle;t.scalar=d.lastScalar;t.result=d.previousResult;t.decode=d.decodeResult;t.repeated=1;
-        for(unsigned i=0;i<128;++i)t.name[i]=d.name[i];
+        for(unsigned i=0;i<128;++i) { t.name[i]=d.name[i];t.target[i]=d.fs.target[i]; }
     }
     bool progress=(d.requests>>8)!=t.checkpoint;t.checkpoint=d.requests>>8;
     bool sample=t.repeated<=2 || !(t.repeated&(t.repeated-1));
-    if((sample && t.emitted<512) || progress) { ++t.emitted;return true; }
+    bool failure=sample && d.previousResult && t.errors<64;
+    if((sample && t.emitted<512) || failure || progress) { ++t.emitted;if(failure)++t.errors;return true; }
     return false;
 }
 struct PicassoFastrpc {
@@ -166,7 +169,7 @@ static inline int rpcReverse(PicassoRpcDomain &d,PicassoRpcArg *a,uint32_t sc,ui
         --d.opens;d.stdOpen=d.opens!=0;rpcPut32(a[1].data,0);return 0;
     }
     if(handle!=0x100 || !d.stdOpen)return 44;
-    return picasso_rpc_fs_invoke(d.pd,sc,a,d.name);
+    int result=picasso_rpc_fs_invoke(d.pd,sc,a,d.name);picasso_rpc_fs_stats(&d.fs);return result;
 }
 static inline int rpcNext(PicassoFastrpc *f,unsigned n) {
     auto &d=f->domain[n];uint8_t prim[16];rpcPut32(prim,d.previousCtx);rpcPut32(prim+4,d.previousResult);
@@ -196,7 +199,7 @@ static inline void picasso_rpc_tick(PicassoFastrpc *f) {
                 ++d.stage;
             } else {
                 auto *prim=p+c.offset[2];d.previousCtx=rpc32(prim);d.lastHandle=rpc32(prim+4);d.lastScalar=rpc32(prim+8);
-                unsigned len=rpc32(prim+12);d.wireBytes=len;++d.requests;d.name[0]=0;
+                unsigned len=rpc32(prim+12);d.wireBytes=len;++d.requests;d.name[0]=0;d.fs={};
                 if(!d.previousCtx) { d.error=-71;++f->events;break; }
                 PicassoRpcArg args[8]={};d.replyBytes=0;
                 d.previousResult=len>PicassoRpcBlob?77:rpcUnpack(p+c.offset[3],len,d.lastScalar,d.reply,args,&d.replyBytes);

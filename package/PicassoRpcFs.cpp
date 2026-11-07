@@ -5,12 +5,18 @@
 namespace {
 struct RpcStock { const char *path;uint32_t mode,size;const uint8_t *data; };
 #include "PicassoRpcStock.inc"
-enum { StockCount=sizeof(rpcStock)/sizeof(rpcStock[0]),MutableCount=128,FileBytes=8192,HandleCount=16 };
-struct Node { char path[256];uint32_t mode,size;bool used,removed;uint8_t data[FileBytes]; };
+enum { StockCount=sizeof(rpcStock)/sizeof(rpcStock[0]),MutableCount=512,FileBytes=65536,HandleCount=16,
+       BlockBytes=256,BlockCount=4096,NoBlock=0xffff };
+struct Node { char path[256];uint32_t mode,size;bool used,removed;uint16_t first,last,blocks; };
 struct Handle { uint32_t token,node,pos;bool used,directory,read,write,append,eof;int error; };
 struct Session { Handle handles[HandleCount];uint32_t sequence; };
 static Node nodes[MutableCount];
 static Session sessions[2];
+static uint8_t blocks[BlockCount][BlockBytes];
+static uint16_t nextBlock[BlockCount],freeHead;
+static unsigned freeBlocks;
+static unsigned exhaustion;
+static char renameTarget[128];
 static bool equal(const char *a,const char *b) { while(*a && *a==*b) { ++a;++b; }return *a==*b; }
 static unsigned length(const char *s) { unsigned n=0;while(s[n])++n;return n; }
 static bool prefix(const char *s,const char *p) { while(*p)if(*s++!=*p++)return false;return true; }
@@ -60,11 +66,57 @@ static bool isDir(uint32_t m) { return (m&0170000)==0040000; }
 static const char *path(unsigned i) { return i<StockCount?rpcStock[i].path:nodes[i-StockCount].path; }
 static uint32_t mode(unsigned i) { return i<StockCount?rpcStock[i].mode:nodes[i-StockCount].mode; }
 static uint32_t size(unsigned i) { return i<StockCount?rpcStock[i].size:nodes[i-StockCount].size; }
-static const uint8_t *data(unsigned i) { return i<StockCount?rpcStock[i].data:nodes[i-StockCount].data; }
-static int lookup(const char *p) {
-    for(unsigned i=0;i<MutableCount;++i)if(nodes[i].used && equal(nodes[i].path,p))return nodes[i].removed?-1:int(StockCount+i);
+static int stockLookup(const char *p) {
     for(unsigned i=0;i<StockCount;++i)if(equal(rpcStock[i].path,p))return int(i);
     return -1;
+}
+static unsigned blocksFor(unsigned bytes) { return (bytes+BlockBytes-1)/BlockBytes; }
+static uint16_t blockAt(const Node &n,unsigned pos) {
+    auto b=n.first;for(unsigned i=pos/BlockBytes;i;--i)b=nextBlock[b];return b;
+}
+static void releaseBlocks(Node &n) {
+    if(n.blocks) { nextBlock[n.last]=freeHead;freeHead=n.first;freeBlocks+=n.blocks; }
+    n.first=n.last=NoBlock;n.blocks=0;n.size=0;
+}
+static int reserve(Node &n,unsigned bytes) {
+    if(bytes>FileBytes) { exhaustion=3;return -28; }
+    unsigned wanted=blocksFor(bytes);
+    if(wanted>n.blocks && wanted-n.blocks>freeBlocks) { exhaustion=2;return -28; }
+    while(n.blocks<wanted) {
+        auto b=freeHead;freeHead=nextBlock[b];--freeBlocks;nextBlock[b]=NoBlock;
+        rpcZero(blocks[b],BlockBytes);
+        if(n.blocks)nextBlock[n.last]=b;else n.first=b;
+        n.last=b;++n.blocks;
+    }
+    return 0;
+}
+static void writeRange(Node &n,unsigned pos,const uint8_t *src,unsigned bytes) {
+    if(!bytes)return;
+    auto b=blockAt(n,pos);
+    while(bytes) { unsigned at=pos%BlockBytes,take=BlockBytes-at;if(take>bytes)take=bytes;
+        if(src) { copy(blocks[b]+at,src,take);src+=take; }else rpcZero(blocks[b]+at,take);
+        pos+=take;bytes-=take;b=nextBlock[b]; }
+}
+static int resize(Node &n,unsigned bytes) {
+    int error=reserve(n,bytes);if(error)return error;
+    if(bytes>n.size)writeRange(n,n.size,nullptr,bytes-n.size);
+    unsigned wanted=blocksFor(bytes);
+    if(wanted<n.blocks) {
+        uint16_t tail=NoBlock,first=n.first;
+        if(wanted) { tail=blockAt(n,(wanted-1)*BlockBytes);first=nextBlock[tail];nextBlock[tail]=NoBlock; }
+        nextBlock[n.last]=freeHead;freeHead=first;freeBlocks+=n.blocks-wanted;
+        n.first=wanted?n.first:NoBlock;n.last=tail;n.blocks=wanted;
+    }
+    n.size=bytes;return 0;
+}
+static void retire(Node &n) {
+    releaseBlocks(n);
+    // Only factory entries require a tombstone to prevent reappearing.
+    if(stockLookup(n.path)>=0)n.removed=true;else n.used=false;
+}
+static int lookup(const char *p) {
+    for(unsigned i=0;i<MutableCount;++i)if(nodes[i].used && equal(nodes[i].path,p))return nodes[i].removed?-1:int(StockCount+i);
+    return stockLookup(p);
 }
 static bool virtualParent(const char *p) {
     return equal(p,"/") || equal(p,"/vendor") || equal(p,"/vendor/etc") || equal(p,"/vendor/etc/sensors") ||
@@ -77,14 +129,20 @@ static bool parentExists(const char *p) {
 }
 static int mutableNode(const char *p,int original,bool truncate) {
     if(!writable(p))return -13;
-    if(original>=int(StockCount)) { if(truncate)nodes[original-StockCount].size=0;return original; }
-    if(original>=0 && size(original)>FileBytes)return -28;
-    for(unsigned i=0;i<MutableCount;++i)if(!nodes[i].used || (nodes[i].removed && equal(nodes[i].path,p))) {
+    if(original>=int(StockCount)) { if(truncate)releaseBlocks(nodes[original-StockCount]);return original; }
+    unsigned bytes=original>=0&&!truncate?size(original):0;
+    if(bytes>FileBytes) { exhaustion=3;return -28; }
+    if(blocksFor(bytes)>freeBlocks) { exhaustion=2;return -28; }
+    unsigned selected=MutableCount;
+    for(unsigned i=0;i<MutableCount;++i)if(nodes[i].used && nodes[i].removed && equal(nodes[i].path,p)) { selected=i;break; }
+    if(selected==MutableCount)for(unsigned i=0;i<MutableCount;++i)if(!nodes[i].used) { selected=i;break; }
+    if(selected<MutableCount) {
+        unsigned i=selected;
         auto &n=nodes[i];n.used=true;n.removed=false;copy(n.path,p,length(p)+1);
-        n.mode=original>=0?mode(original):0100600;n.size=original>=0&&!truncate?size(original):0;
-        if(n.size)copy(n.data,data(original),n.size);return StockCount+i;
+        n.mode=original>=0?mode(original):0100600;n.size=0;n.first=n.last=NoBlock;n.blocks=0;
+        (void)resize(n,bytes);if(bytes)writeRange(n,0,rpcStock[original].data,bytes);return StockCount+i;
     }
-    return -28;
+    exhaustion=1;return -28;
 }
 static Handle *handle(Session &s,uint64_t token) {
     if(token>0xffffffffU)return nullptr;
@@ -104,10 +162,10 @@ static int open(Session &s,const char *p,const char *m,bool directory,uint32_t *
     if(!directory && wr && !writable(p))return 13;
     if(i<0 && !parentExists(p))return 2;
     Handle *free=nullptr;for(auto &h:s.handles)if(!h.used) { free=&h;break; }if(!free)return 24;
+    if(s.sequence>=0x00ffffff)return 24;
     if(wr) { i=mutableNode(p,i,trunc);if(i<0)return -i; }
     // Stock node identity remains stable across a later copy-on-write by another
     // open. Resolve its current path for each operation, never silently stale.
-    if(s.sequence>=0x00ffffff)return 24;
     *free={};free->used=true;free->node=i;free->directory=directory;free->read=rd;free->write=wr;free->append=append;
     free->pos=append?size(i):0;free->token=(++s.sequence<<8)|(unsigned(free-s.handles)+1)|(unsigned(&s-sessions)<<7);
     *token=free->token;return 0;
@@ -117,7 +175,11 @@ static int readFile(Handle &h,uint8_t *out,unsigned bytes,bool line,unsigned *do
     if(h.directory || !h.read)return 9;int i=current(h);if(i<0)return 2;
     unsigned limit=size(i),n=0,room=line?(bytes?bytes-1:0):bytes;
     if(line && !bytes)return 22;
-    while(n<room && h.pos<limit) { uint8_t c=data(i)[h.pos++];out[n++]=c;if(line && c=='\n')break; }
+    uint16_t b=i>=int(StockCount) && h.pos<limit?blockAt(nodes[i-StockCount],h.pos):NoBlock;
+    while(n<room && h.pos<limit) {
+        uint8_t c=i<int(StockCount)?rpcStock[i].data[h.pos]:blocks[b][h.pos%BlockBytes];++h.pos;
+        if(b!=NoBlock && !(h.pos%BlockBytes))b=nextBlock[b];out[n++]=c;if(line && c=='\n')break;
+    }
     if(line)out[n]=0;
     if(n<room && h.pos>=limit)h.eof=true;
     *done=n;return 0;
@@ -133,7 +195,16 @@ static int resolve(const char *name,char *out) {
     return 2;
 }
 }
-void picasso_rpc_fs_reset() { for(auto &n:nodes)n.used=false;for(auto &s:sessions)s={}; }
+void picasso_rpc_fs_reset() {
+    for(auto &n:nodes)n.used=false;for(auto &s:sessions)s={};
+    for(unsigned i=0;i<BlockCount;++i)nextBlock[i]=i+1<BlockCount?i+1:NoBlock;
+    freeHead=0;freeBlocks=BlockCount;exhaustion=0;renameTarget[0]=0;
+}
+void picasso_rpc_fs_stats(PicassoRpcFsStats *s) {
+    *s={};s->nodeLimit=MutableCount;s->blockLimit=BlockCount;s->blocks=BlockCount-freeBlocks;s->exhaustion=exhaustion;
+    for(auto &n:nodes)if(n.used) { ++s->nodes;s->tombstones+=n.removed;s->bytes+=n.size; }
+    copy(s->target,renameTarget,length(renameTarget)+1);
+}
 // Stock socinfo_v0_6 prefix, item 137 in the v12 global partition.
 // Keep a stable bounded snapshot; no dummy platform values on parse failures.
 int picasso_rpc_fs_socinfo(const wlan_smem_io *io,uint32_t *values) {
@@ -160,19 +231,23 @@ int picasso_rpc_fs_socinfo(const wlan_smem_io *io,uint32_t *values) {
     copy(contents[0],platformName,length(platformName)+1);copy(contents[1],subName,length(subName)+1);
     decimal(contents[2],sub);decimal(contents[3],version);decimal(contents[4],id);
     unsigned n=decimal(contents[5],revision>>16);contents[5][n++]='.';decimal(contents[5]+n,revision&65535);
-    unsigned freeCount=0;for(auto &node:nodes)freeCount+=!node.used;if(freeCount<6)return -28;
+    unsigned freeCount=0;for(auto &node:nodes)freeCount+=!node.used;
+    if(freeCount<6 || freeBlocks<6)return -28;
     for(unsigned i=0;i<6;++i) {
         char full[256]="/sys/devices/soc0/";unsigned at=length(full);copy(full+at,keys[i],length(keys[i])+1);
         if(lookup(full)>=0)return -17; // startup-only publication
     }
     for(unsigned i=0;i<6;++i)for(auto &node:nodes)if(!node.used) {
-        node.used=true;node.removed=false;node.mode=0100444;
+        node.used=true;node.removed=false;node.mode=0100444;node.first=node.last=NoBlock;node.blocks=0;node.size=0;
         const char *base="/sys/devices/soc0/";copy(node.path,base,length(base));copy(node.path+length(base),keys[i],length(keys[i])+1);
-        node.size=length(contents[i]);copy(node.data,contents[i],node.size);node.data[node.size++]='\n';break;
+        unsigned count=length(contents[i]);(void)resize(node,count+1);
+        writeRange(node,0,reinterpret_cast<const uint8_t *>(contents[i]),count);
+        const uint8_t lf='\n';writeRange(node,count,&lf,1);break;
     }
     values[0]=format;values[1]=id;values[2]=revision;values[3]=platform;values[4]=version;values[5]=sub;return 0;
 }
 int picasso_rpc_fs_invoke(unsigned pd,uint32_t sc,PicassoRpcArg *a,char *name) {
+    exhaustion=0;renameTarget[0]=0;
     if(pd!=0 && pd!=2)return 22;
     Session &s=sessions[pd==2];char p[256],raw[256],modeText[16];
     unsigned method=(sc>>24)&31;unsigned ni=(sc>>16)&255,no=(sc>>8)&255;
@@ -201,6 +276,7 @@ int picasso_rpc_fs_invoke(unsigned pd,uint32_t sc,PicassoRpcArg *a,char *name) {
     if(method==31 && ni==3 && no==0) { // extension 33: frename
         char dest[256];if(!shape(3,0,12,0) || rpc32(a[0].data)!=33 || !getPath(1,rpc32(a[0].data+4)) ||
             !string(a[2],rpc32(a[0].data+8),raw) || !canonical(raw,dest))return 14;
+        record(renameTarget,dest);
         int i=lookup(p);if(i<0)return 2;if(!writable(p) || !writable(dest))return 13;
         if(isDir(mode(i)))return 21;if(equal(p,dest))return 0;if(!parentExists(dest))return 2;
         // Registry commits a temporary file with rename(). Replace a closed
@@ -209,20 +285,28 @@ int picasso_rpc_fs_invoke(unsigned pd,uint32_t sc,PicassoRpcArg *a,char *name) {
         int existing=lookup(dest);if(existing>=0 && isDir(mode(existing)))return 21;
         for(auto &session:sessions)for(auto &h:session.handles)
             if(h.used && (equal(path(h.node),p) || equal(path(h.node),dest)))return 16;
+        // A runtime-only source can move in place without a spare node, even
+        // when replacing a factory path. No handle still refers to either name.
+        if(i>=int(StockCount) && stockLookup(p)<0) {
+            if(existing>=int(StockCount)) { auto &old=nodes[existing-StockCount];releaseBlocks(old);old.used=false; }
+            else for(auto &old:nodes)if(old.used && old.removed && equal(old.path,dest))old.used=false;
+            copy(nodes[i-StockCount].path,dest,length(dest)+1);return 0;
+        }
         unsigned needed=(i<int(StockCount))+(existing<int(StockCount)),available=0;
         for(auto &node:nodes)if(!node.used || (node.removed && (equal(node.path,p) || equal(node.path,dest))))++available;
-        if(available<needed)return 28;
+        if(available<needed) { exhaustion=1;return 28; }
+        if(i<int(StockCount) && blocksFor(size(i))>freeBlocks) { exhaustion=2;return 28; }
         int source=mutableNode(p,i,false);if(source<0)return -source;
         int target=mutableNode(dest,existing,true);if(target<0)return -target;
         auto &from=nodes[source-StockCount];auto &to=nodes[target-StockCount];
-        to.mode=from.mode;to.size=from.size;copy(to.data,from.data,from.size);from.removed=true;return 0;
+        to.mode=from.mode;to.size=from.size;to.first=from.first;to.last=from.last;to.blocks=from.blocks;
+        from.first=from.last=NoBlock;from.blocks=0;from.size=0;retire(from);return 0;
     }
     if(method==31 && ni==1 && no==0) { // extension 32: ftrunc
         if(!shape(1,0,12,0) || rpc32(a[0].data)!=32)return 14;
         auto *h=handle(s,rpc32(a[0].data+4));if(!h || !h->write || h->directory)return 9;
         int i=current(*h);if(i<int(StockCount))return 9;record(name,path(i));
-        unsigned bytes=rpc32(a[0].data+8);if(bytes>FileBytes)return 28;
-        auto &n=nodes[i-StockCount];if(bytes>n.size)rpcZero(n.data+n.size,bytes-n.size);n.size=bytes;return 0;
+        unsigned bytes=rpc32(a[0].data+8);int error=resize(nodes[i-StockCount],bytes);return -error;
     }
     if(method==31) {
         if(!shape(2,1,8,96) || rpc32(a[0].data)!=31 || !getPath(1,rpc32(a[0].data+4)))return 14;
@@ -252,7 +336,7 @@ int picasso_rpc_fs_invoke(unsigned pd,uint32_t sc,PicassoRpcArg *a,char *name) {
             if(lookup(path(j))!=int(j))continue;
             if(prefix(path(j),p) && path(j)[length(p)]=='/')return 39;
         }
-        i=mutableNode(p,i,false);if(i<0)return -i;nodes[i-StockCount].removed=true;return 0;
+        i=mutableNode(p,i,true);if(i<0)return -i;retire(nodes[i-StockCount]);return 0;
     }
     if(method==27 || method==28) {
         if(!shape(1,method==28?1:0,8,method==28?264:0))return 14;
@@ -297,9 +381,12 @@ int picasso_rpc_fs_invoke(unsigned pd,uint32_t sc,PicassoRpcArg *a,char *name) {
         }
         if(bytes>a[1].bytes)return 14;if(!h->write)return 9;
         auto &n=nodes[i-StockCount];if(h->append)h->pos=n.size;
-        if(h->pos>FileBytes || bytes>FileBytes-h->pos) { h->error=28;return 28; }
-        if(h->pos>n.size)rpcZero(n.data+n.size,h->pos-n.size);
-        copy(n.data+h->pos,a[1].data,bytes);h->pos+=bytes;if(h->pos>n.size)n.size=h->pos;
+        if(!bytes) { rpcPut32(a[2].data,0);rpcPut32(a[2].data+4,0);return 0; }
+        if(h->pos>FileBytes || bytes>FileBytes-h->pos) { exhaustion=3;h->error=28;return 28; }
+        unsigned end=h->pos+bytes;int error=reserve(n,end);
+        if(error) { h->error=-error;return -error; }
+        if(h->pos>n.size)writeRange(n,n.size,nullptr,h->pos-n.size);
+        writeRange(n,h->pos,a[1].data,bytes);h->pos=end;if(h->pos>n.size)n.size=h->pos;
         rpcPut32(a[2].data,bytes);rpcPut32(a[2].data+4,0);return 0;
     }
     return 20;
