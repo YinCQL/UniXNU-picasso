@@ -117,6 +117,12 @@ static int pcmSilence(PicassoPcm &o) {
     int e=pcmCheck(o);if(e)return e;
     rpcZero(pcmMemory.data[0],4096);cache(pcmMemory.data[0],4096,true);return pcmCheck(o);
 }
+static int pcmTone(PicassoPcm &o) {
+    if(!o.prepared || o.address!=0x180000000ULL || o.bytes!=32768 || !pcmMemory.data[0])return -22;
+    int e=pcmCheck(o);if(e)return e;
+    e=picasso_pcm_tone(pcmMemory.data[0],32768);if(e)return e;
+    cache(pcmMemory.data[0],32768,true);return pcmCheck(o);
+}
 extern "C" void picasso_pcm_device_prepare(PicassoPcm &o) {
     if(pcmMemory.attempted) { o.dmaError=-16;return; }
     pcmMemory.attempted=true;int e=-12;
@@ -146,7 +152,7 @@ extern "C" void picasso_pcm_device_prepare(PicassoPcm &o) {
     if(!e)e=pcmCheck(o);
     o.dmaError=e;o.prepared=!e;o.physical=pcmMemory.physical[0];o.sid=0x1401;
     o.slot=p.slot[0];o.bank=p.bank[0];o.asid=p.asid[0];
-    if(!e) { o.address=0x180000000ULL;o.bytes=PicassoRpcDmaBytes;o.check=pcmCheck;o.silence=pcmSilence; }
+    if(!e) { o.address=0x180000000ULL;o.bytes=PicassoRpcDmaBytes;o.check=pcmCheck;o.silence=pcmSilence;o.tone=pcmTone; }
     const auto &d=p.diagnostic;
     IOLog("PICASSO_ADSP pcm-dma prepared=%u error=%d slot=%u bank=%u asid=%u sid=1401 address=%08x%08x bytes=%u retained=%u\n",
         o.prepared,e,o.slot,o.bank,o.asid,uint32_t(o.address>>32),uint32_t(o.address),o.bytes,o.retained);

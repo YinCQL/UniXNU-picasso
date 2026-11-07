@@ -3,7 +3,8 @@
 #define PICASSO_TFA_H
 #include <stdint.h>
 // Stock lito-qupv3, gcc-lito, pinctrl-lito, i2c-qcom-geni and TFA9874.
-// Single worker, bounded FIFO transactions. No amp enable, MTP or calibration writes.
+// Single worker, bounded FIFO transactions. Probe keeps the amp off; playback
+// uses a bounded speaker lease. No OTP programming or calibration execution.
 struct PicassoTfa {
     void (*probe)(PicassoTfa &);
     uint32_t stage,events,fw,ifDisable,hw[2],clockCfg,clockLevel,irq,rxStatus,ios;
@@ -272,4 +273,166 @@ inline void picasso_tfa_run(const PicassoTfaIo &io,PicassoTfa &o) {
     if(o.complete)picasso_tfa_digital(s);
     picasso_tfa_cleanup(s);
 }
+// One playback lease owns SE8 and the TFA format until drain or any error.
+// Tables: Picasso tfa98xx.cnt SHA256 00d119e7b87a4fd2732d166f1292d43c1418d26a3328eae5a703c6f395a3e221;
+// tfa_init.c revision 0c74 V1.16 and tfaRunStartup/INIT_CF/OPERATING.
+// No OTP copy/program command, calibration execution or protection bypass.
+struct PicassoTfaPlayback {
+    uint32_t stage,registers,polls;
+    uint16_t status[4],control[3]; // 10,11,13,14 and 00,01,02
+    bool attempted,configured,clockReady,enabled,wasEnabled,stopped,resetSafe;
+    int error,stopError;
+};
+inline int picasso_tfa_field(PicassoTfaSession &s,unsigned reg,uint16_t mask,uint16_t value) {
+    uint16_t old=0;int e=picasso_tfa_read_register(s,reg,old);
+    return e?e:picasso_tfa_write_verify(s,reg,uint16_t((old&~mask)|(value&mask)));
+}
+inline int picasso_tfa_play_status(PicassoTfaSession &s,PicassoTfaPlayback &a,bool operating) {
+    const unsigned regs[]={0x10,0x11,0x13,0x14};
+    for(unsigned i=0;i<4;++i) {int e=picasso_tfa_read_register(s,regs[i],a.status[i]);if(e)return e;}
+    // Stock field names are otpOK/uvpOK/ovpOK: these bits must be ONE.
+    // NOCLK is sticky from reset; use current CLKS; reject alarm/TDM faults.
+    if((a.status[0]&0x68) || (a.status[0]&0x16)!=0x16 || (a.status[1]&0x100) || !(a.status[2]&0x100))return -5;
+    if(!(a.status[1]&0x80))return -11;
+    if(operating && (!(a.status[1]&0x4000) || !(a.status[2]&0x8000)))return -11;
+    return 0;
+}
+inline int picasso_tfa_play_prepare(PicassoTfaSession &s,PicassoTfaPlayback &a) {
+    if(a.attempted)return -16;a.attempted=true;a.stage=1;
+    auto &o=s.out;o.attempted=true;
+    int e=picasso_tfa_prepare(s);uint16_t id=0;
+    if(!e)e=picasso_tfa_read_register(s,3,o.revision);
+    if(!e)e=picasso_tfa_read_register(s,3,id);
+    if(!e && (id!=0x0c74 || o.revision!=id))e=-19;
+    for(unsigned i=0;i<9 && !e;++i)e=picasso_tfa_read_register(s,picasso_tfa_register(i),o.values[i]);
+    if(!e && (o.values[0]&0x19)!=1)e=-16;
+    if(e)return a.error=e;
+    a.stage=2;
+    // Original key sequence. These unlock volatile register/shadow access only;
+    // never write A3/A7/A8 (OTP programming) or F0/F4 calibration data.
+    uint16_t key=0;e=picasso_tfa_write_register(s,0x0f,0x5a6b);
+    if(!e)e=picasso_tfa_read_register(s,0xfb,key);
+    if(!e)e=picasso_tfa_write_register(s,0xa0,key^0x5a);
+    if(!e)e=picasso_tfa_write_register(s,0xa1,0x5a);
+    const uint16_t optimal[][2]={{2,0x22c8},{0x52,0x57dc},{0x53,0x003e},{0x56,0x0400},
+        {0x61,0x0110},{0x6f,0x00a5},{0x70,0x07f8},{0x73,0x0047},{0x74,0x5098},
+        {0x75,0x8d28},{0x80,0},{0x83,0x0799},{0x84,0x0081}};
+    for(const auto &v:optimal)if(!e) {e=picasso_tfa_write_verify(s,v[0],v[1]);if(!e)++a.registers;}
+    if(!e) {picasso_tfa_digital(s);e=o.digitalError;}
+    // Stock device list, then speaker profile up to its default boundary.
+    // F8 changes only the volatile temperature-gain shadow; reset discards it.
+    const uint16_t profile[][3]={
+        {0x21,0x000f,0x0001},
+        {0x23,0x0008,0x0008},
+        {0x23,0x0010,0x0010},
+        {0x26,0x000f,0x0000},
+        {0x26,0xf000,0x1000},
+        {0x27,0x000f,0x0000},
+        {0x68,0x0007,0x0002},
+        {0x68,0x0018,0x0008},
+        {0x68,0x0060,0x0040},
+        {0x02,0x07e0,0x01e0},
+        {0x64,0xc000,0x4000},
+        {0x74,0x0008,0x0008},
+        {0x88,0x0003,0x0002},
+        {0x74,0x3e00,0x1000},
+        {0x8f,0x0001,0x0000},
+        {0x74,0x8000,0x0000},
+        {0x70,0x0180,0x0180},
+        {0xc4,0x2000,0x0000},
+        {0x66,0x0001,0x0000},
+        {0x58,0x01f0,0x0010},
+        {0x6f,0x0380,0x0080},
+        {0x85,0x0002,0x0002},
+        {0x84,0x01e0,0x0080},
+        {0x6f,0x0020,0x0020},
+        {0x83,0x003f,0x0015},
+        {0x83,0x07c0,0x0700},
+        {0xf8,0xe000,0x6000},
+        {0x61,0x03c0,0x0100},
+        {0x61,0x003c,0x0010},
+        {0x74,0x01f0,0x0090},
+        {0x75,0x1f00,0x0d00},
+        {0x76,0x7e00,0x7e00},
+        {0x00,0x0010,0x0010},
+        {0x64,0xc000,0x4000},
+        {0x62,0xc000,0x0000},
+        {0x02,0x000f,0x0008}
+    };
+    if(!e)e=picasso_tfa_write_register(s,0x0f,0x5a6b);
+    if(!e)e=picasso_tfa_write_register(s,0xa1,0x5a);
+    if(!e)e=picasso_tfa_write_register(s,0xa0,0x5a);
+    for(const auto &v:profile)if(!e) {e=picasso_tfa_field(s,v[0],v[1],v[2]);if(!e)++a.registers;}
+    // Relock keys even if an earlier command failed; preserve the first error.
+    const unsigned locks[]={0xa1,0xa0,0x0f};
+    if(!o.uncertain)for(unsigned reg:locks) {
+        int lock=picasso_tfa_write_register(s,reg,0);if(!e)e=lock;
+    }
+    if(e)return a.error=e;
+    a.stage=3;
+    // Probus INIT_CF: I2C configured, then power up with AMPE still zero.
+    e=picasso_tfa_field(s,1,4,4);
+    if(!e)e=picasso_tfa_field(s,0,9,0);
+    for(unsigned n=0;n<50 && !e;++n) {
+        ++a.polls;int health=picasso_tfa_play_status(s,a,false);
+        if(!health) {a.clockReady=true;break;}
+        if(health!=-11) {e=health;break;}s.delay(1000);
+    }
+    if(!e && !a.clockReady)e=-60;
+    for(unsigned i=0;i<3 && !e;++i)e=picasso_tfa_read_register(s,i,a.control[i]);
+    a.configured=!e;a.error=e;return e;
+}
+inline int picasso_tfa_play_enable(PicassoTfaSession &s,PicassoTfaPlayback &a) {
+    if(!a.configured || a.enabled || a.error || a.stopped)return -22;
+    a.stage=4;int e=picasso_tfa_play_status(s,a,false);
+    if(!e)e=picasso_tfa_field(s,0,1,0);
+    if(!e)e=picasso_tfa_field(s,1,4,4);
+    // The stock no-DSP mute callback is a no-op. Track the real AMPE write.
+    if(!e) {a.wasEnabled=true;e=picasso_tfa_field(s,0,8,8);}
+    bool ready=false;
+    for(unsigned n=0;n<50 && !e;++n) {
+        ++a.polls;int health=picasso_tfa_play_status(s,a,true);
+        if(!health) {ready=true;break;}
+        if(health!=-11) {e=health;break;}s.delay(1000);
+    }
+    if(!e && !ready)e=-60;
+    if(!e)e=picasso_tfa_read_register(s,0,a.control[0]);
+    a.enabled=!e;a.error=e;return e;
+}
+inline int picasso_tfa_play_finish(PicassoTfaSession &s,PicassoTfaPlayback &a) {
+    if(!a.attempted || a.stopped)return a.stopError;
+    bool resetRequired=!!(s.pinDirty&4);picasso_tfa_release_bus(s);int e=0;
+    if(!s.out.uncertain && a.configured) {
+        e=picasso_tfa_field(s,0,0x19,1); // AMPE/DCA off, PWDN on
+        bool idle=false;
+        for(unsigned n=0;n<50 && !e;++n) {
+            uint16_t state=0;e=picasso_tfa_read_register(s,0x14,state);a.status[3]=state;
+            if(!e && ((state>>3)&15)<4) {idle=true;break;}s.delay(1000);
+        }
+        if(!e && !idle)e=-60;
+    }
+    // A hardware reset also discards profile and all volatile trim shadows.
+    // If I2C was lost, GPIO readback still proves that reset was asserted.
+    if(s.pinDirty&4) {
+        // Verify GPIO mode/OE as well as the latch: a failed prepare may have
+        // marked the pin dirty before it actually became an output.
+        uint32_t cfg=0;int reset=s.rd(6,0,cfg);
+        if(!reset)reset=s.update(6,0,0x13ff,0x201|((cfg&(1U<<11))?1U<<12:0));
+        if(!reset)reset=s.update(6,4,2,2);
+        if(!reset) {s.delay(10000);a.resetSafe=true;a.enabled=false;
+            reset=s.update(6,4,2,0);if(!reset)s.delay(10000);}
+        if(reset && !e)e=reset;
+        if(a.resetSafe)s.out.digitalDirty=0;
+    }
+    if(resetRequired && !a.resetSafe) {
+        // Do not release the reset/I2C lease after an unconfirmed shutdown.
+        s.out.dirty=(s.pinDirty?1:0)|(s.configDirty?2:0)|(s.voteDirty?4:0)|(s.out.digitalDirty?8:0);
+        s.out.restored=false;a.stopError=e?e:-5;return a.stopError;
+    }
+    picasso_tfa_cleanup(s);
+    if(s.out.cleanupError && !e)e=s.out.cleanupError;
+    a.stopped=(!resetRequired || a.resetSafe) && s.out.restored;
+    a.stopError=e?e:a.stopped?0:-5;return a.stopError;
+}
+
 #endif

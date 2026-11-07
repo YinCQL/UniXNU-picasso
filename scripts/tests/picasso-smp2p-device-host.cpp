@@ -211,6 +211,19 @@ int main(int argc,char **argv) {
         failAlloc=failMap=zeroMap=0;
     }
     tfa={};tfaProbe(tfa);assert(tfa.error==-16 && tfa.stage==1 && !tfa.commands && tfa.restored);
+    // Exercise the actual persistent playback adapter: all map failures and
+    // prepare failure must release exactly the mappings that were acquired.
+    for(unsigned failure=0;failure<3;++failure)for(unsigned i=1;i<=7;++i) {
+        PicassoPlayback v={};unsigned before=mappings,freed=unmaps;
+        if(failure==0)failAlloc=allocations+i;
+        if(failure==1)failMap=mappings+i;
+        if(failure==2)zeroMap=mappings+i;
+        assert(tfaPlayback(v,0)==-12 && !playTfaMapped);
+        assert(unmaps-freed==mappings-before-(failure==1?1:0));
+        assert(!tfaPlayback(v,2));failAlloc=failMap=zeroMap=0;
+    }
+    {PicassoPlayback v={};assert(tfaPlayback(v,0)==-16 && playTfaMapped);
+        assert(!tfaPlayback(v,2) && !playTfaMapped && v.amp.stopped);}
     TfaMaps tm={};for(unsigned i=0;i<7;++i)tm.address[i]=reinterpret_cast<uintptr_t>(tfaRam[i]);
     assert(tfaRead(&tm,7,0,&value)==-22 && tfaRead(&tm,1,4096,&value)==-22);
     assert(tfaRead(&tm,0,0,nullptr)==-22 && tfaWrite(&tm,0,3,1)==-22);
@@ -235,7 +248,12 @@ int main(int argc,char **argv) {
     play.writeAddressHigh=play.writeAddressLow=play.writeHandle=play.writeStatus=0xffffffff;
     play.replyPhase=play.replyOpcode=play.replyType=play.replyBytes=play.replySource=play.replyDestination=play.replyReject=play.rejected=0xffffffff;
     for(auto &word:play.replyRaw)word=0xffffffff;
-    play.error=play.firstError=play.cleanupError=play.dmaError=-2147483647;logPlay(stream);
+    play.error=play.firstError=play.cleanupError=play.dmaError=-2147483647;
+    play.amp.stage=play.amp.registers=play.amp.polls=0xffffffff;
+    play.amp.configured=play.amp.clockReady=play.amp.enabled=play.amp.stopped=play.amp.resetSafe=true;
+    play.amp.error=play.amp.stopError=-2147483647;
+    for(auto &v:play.amp.status)v=0xffff;for(auto &v:play.amp.control)v=0xffff;
+    logPlay(stream);
     PicassoRpcDomain record={};record.pd=record.requests=record.lastHandle=record.lastScalar=0xffffffffU;
     record.wireBytes=record.decodeResult=record.previousResult=0xffffffffU;
     memset(record.name,'n',127);memset(record.fs.target,'t',127);

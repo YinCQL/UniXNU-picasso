@@ -74,6 +74,17 @@ int main(int argc,char **argv) {
         registers[(187*4096+0x58)/4]=0x400;
         memset(storage,0xa5,8192);assert(p.silence && !p.silence(p));
         for(unsigned i=0;i<8192;++i)assert(storage[i]==(i<4096?0:0xa5));
+        uint8_t tables[4096];memcpy(tables,storage+32768,4096);assert(p.tone && !p.tone(p));
+        int peak=0;long sum=0;
+        for(unsigned frame=0;frame<8192;++frame) {
+            unsigned at=frame*4;int sample=int16_t(uint16_t(storage[at])|(uint16_t(storage[at+1])<<8));
+            assert(storage[at]==storage[at+2] && storage[at+1]==storage[at+3]);
+            assert(sample>=-64 && sample<=64);if(sample>peak)peak=sample;sum+=sample;
+            if(!frame || frame==8191)assert(!sample);
+        }
+        assert(peak==64 && sum>-2000 && sum<2000);
+        assert(!memcmp(storage+32768,tables,4096));
+        assert(picasso_pcm_tone(nullptr,32768)==-22 && picasso_pcm_tone(storage,4096)==-22);
         if(mode==14){registers[(187*4096+0x58)/4]=2;assert(p.check(p)==-5 && p.fsr==2);}
         if(mode==15){registers[(187*4096+4)/4]^=1;assert(p.check(p)==-5);}
     }

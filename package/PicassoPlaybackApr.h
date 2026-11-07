@@ -33,7 +33,9 @@ inline unsigned picasso_play_request(const PicassoAprProbe &p,uint32_t (&w)[18])
     } else if(n==PicassoPlayWrite) {
         bytes=52;w[1]=0x01010507;w[2]=0x01010407;w[4]=0x10dab;
         w[5]=uint32_t(p.pcm.address);w[6]=uint32_t(p.pcm.address>>32);w[7]=v.handle;
-        w[8]=4096;w[9]=1; // 1024 stereo S16 silence frames, no valid timestamp
+        w[8]=v.tone?32768:4096;w[9]=1; // one stereo S16 buffer, no valid timestamp
+    } else if(n==PicassoPlayDrain) {
+        w[1]=0x01010507;w[2]=0x01010407;w[4]=0x10bdb; // EOS, wait for RENDERED_EOS
     } else if(n==PicassoPlayCloseCopp) {
         w[1]=0x10020508;w[2]=(v.copp<<16)|0x408;w[4]=0x10327;
     } else return 0;
@@ -65,6 +67,10 @@ inline void picasso_play_tick(PicassoAprProbe &p,const PicassoQmi &q) {
         v.phase=v.phase<PicassoPlayClose && v.error?PicassoPlayClose:v.phase+1;
         v.sent=v.responded=false;v.error=0;v.wait=v.status=v.opcode=0;++v.events;
     }
+    if(v.phase>=PicassoPlayClose && v.amplifier && !v.ampFinished) {
+        int e=v.amplifier(v,2);v.ampFinished=true;
+        if(e && !v.cleanupError)v.cleanupError=e;++v.events;
+    }
     // Stock SET marks port+0x20 configured (b05a340c); STOP clears it
     // (b01ecdc4). Every START needs a fresh SET, as in q6afe __afe_port_start.
     // Close clients before removing their DMA mapping or physical clock.
@@ -81,7 +87,7 @@ inline void picasso_play_tick(PicassoAprProbe &p,const PicassoQmi &q) {
     // COPP zero is valid; use the accepted bit, not a truthy ID.
     if(v.phase==PicassoPlayDone) {
         picasso_audio_pins_restore(v.pins);
-        v.done=true;v.complete=v.consumed && v.accepted==((1U<<PicassoPlayDone)-1) && !v.owned &&
+        v.done=true;v.complete=v.consumed && v.drained && (!v.amplifier || v.amp.stopped) && v.accepted==((1U<<PicassoPlayDone)-1) && !v.owned &&
             !v.firstError && !v.cleanupError && !v.dmaError && v.pins.restored && !v.pins.dirty;
         ++v.events;return;
     }
@@ -94,8 +100,17 @@ inline void picasso_play_tick(PicassoAprProbe &p,const PicassoQmi &q) {
 inline bool picasso_play_due(PicassoAprProbe &p) {
     auto &v=p.play;
     if(!p.ready || !p.fw.valid || !v.attempted || v.done || v.sent || v.error)return false;
+    if(v.amplifier && v.phase==PicassoPlayOpen && !v.ampPrepared) {
+        v.ampPrepared=true;v.error=v.amplifier(v,0);++v.events;if(v.error)return false;
+    }
+    if(v.amplifier && v.phase==PicassoPlayWrite && !v.bufferReady) {
+        v.error=v.amplifier(v,1);++v.events;if(v.error)return false;v.tone=true;
+    }
+    if(v.amplifier && v.phase==PicassoPlayDrain) {
+        v.error=v.amplifier(v,3);if(v.error) {++v.events;return false;}
+    }
     if(v.phase==PicassoPlayWrite && !v.bufferReady) {
-        v.dmaError=p.pcm.silence?p.pcm.silence(p.pcm):-22;
+        v.dmaError=v.tone?(p.pcm.tone?p.pcm.tone(p.pcm):-22):(p.pcm.silence?p.pcm.silence(p.pcm):-22);
         if(v.dmaError) {v.error=v.dmaError;++v.events;return false;}
         v.bufferReady=true;
     }
@@ -133,9 +148,11 @@ inline bool picasso_play_receive(PicassoAprProbe &p,const uint8_t *b,unsigned by
         status=wlan_sm32(b+12);v.writeAddressLow=wlan_sm32(b);v.writeAddressHigh=wlan_sm32(b+4);
         v.writeHandle=wlan_sm32(b+8);v.writeStatus=status;v.owned&=~PicassoPlayBuffer;
         health=p.pcm.check?p.pcm.check(p.pcm):-22;v.consumed=!status && !health;
+    } else if(n==PicassoPlayDrain && p.opcode==0x10c1c && type==0 && bytes==0) {
+        v.drained=true;
     } else if(basic) {
         status=wlan_sm32(b+4);
-        if(!status && (n==PicassoPlayMapBuffer || n==PicassoPlayOpenCopp || n==PicassoPlayWrite))return reject(4);
+        if(!status && (n==PicassoPlayMapBuffer || n==PicassoPlayOpenCopp || n==PicassoPlayWrite || n==PicassoPlayDrain))return reject(4);
     } else return reject(2);
     v.pending=false;v.responded=true;v.status=v.statuses[n]=status;v.opcode=p.opcode;v.error=status?-5:protocol;
     // Configuration/START can leave port state behind even on failure.

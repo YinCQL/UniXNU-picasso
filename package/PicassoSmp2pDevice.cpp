@@ -102,6 +102,43 @@ void tfaProbe(PicassoTfa &out) {
     } else { out.attempted=true;out.error=-12;++out.events; }
     for(auto *m:maps)if(m)m->release();
 }
+// Single ADSP worker, one bounded playback per boot. Preserve mappings while
+// the lease owns SE8; stack-backed state would disappear between APR replies.
+static TfaMaps playTfaContext={};
+static IOMemoryMap *playTfaMaps[7]={};
+static PicassoTfa playTfa={};
+static const PicassoTfaIo playTfaIo={&playTfaContext,tfaRead,tfaWrite,tfaDelay};
+static PicassoTfaSession playTfaSession={playTfaIo,playTfa,{},{},0,0,false,false,false,false};
+static bool playTfaMapped=false;
+int tfaPlayback(PicassoPlayback &v,unsigned action) {
+    auto &a=v.amp;int e=0;
+    if(action==0) {
+        if(playTfaMapped || a.attempted)return -16;
+        if(!&native_novatek_touch_stage || native_novatek_touch_stage<2)return a.error=-16;
+        for(unsigned i=0;i<7 && !e;++i) {
+            playTfaMaps[i]=smemMap(picasso_tfa_base(i),i?0x1000:0x4000);
+            playTfaContext.address[i]=playTfaMaps[i]?uintptr_t(playTfaMaps[i]->getVirtualAddress()):0;
+            if(!playTfaContext.address[i])e=-12;
+        }
+        if(!e) {playTfaMapped=true;e=picasso_tfa_play_prepare(playTfaSession,a);}
+        else {
+            a.error=e;
+            for(auto *&m:playTfaMaps)if(m) {m->release();m=nullptr;}
+        }
+    } else if(action==1)e=playTfaMapped?picasso_tfa_play_enable(playTfaSession,a):-22;
+    else if(action==3) {e=playTfaMapped?picasso_tfa_play_status(playTfaSession,a,true):-22;if(e && !a.error)a.error=e;}
+    else if(action==2) {
+        if(playTfaMapped) {
+            e=picasso_tfa_play_finish(playTfaSession,a);
+            // Keep uncertain engine mappings/clock owned for diagnostics.
+            if(playTfa.restored) {
+                for(auto *&m:playTfaMaps)if(m) {m->release();m=nullptr;}
+                playTfaMapped=false;
+            }
+        }
+    } else e=-22;
+    return e;
+}
 void logTfa(const PicassoTfa &t) {
     IOLog("PICASSO_ADSP tfa stage=%u error=%d cleanup_error=%d id=%x identified=%u reads=%u complete=%u restored=%u dirty=%x uncertain=%u pcm=0\n",
         t.stage,t.error,t.cleanupError,t.revision,t.identified,t.reads,t.complete,t.restored,t.dirty,t.uncertain);
@@ -127,8 +164,8 @@ void logPlay(const PicassoAprProbe &a) {
     const auto &v=a.play;
     IOLog("PICASSO_ADSP play phase=%u token=%x pending=%u opcode=%x status=%u error=%d first_error=%d cleanup_error=%d dma_error=%d\n",
         v.phase,v.token,v.pending,v.opcode,v.status,v.error,v.firstError,v.cleanupError,v.dmaError);
-    IOLog("PICASSO_ADSP play-state accepted=%x owned=%x copp=%u handle=%x consumed=%u done=%u complete=%u bytes=4096 silence=1 amp_enable=0\n",
-        v.accepted,v.owned,v.copp,v.handle,v.consumed,v.done,v.complete);
+    IOLog("PICASSO_ADSP play-state accepted=%x owned=%x copp=%u handle=%x consumed=%u done=%u complete=%u bytes=%u silence=%u amp_enable=%u\n",
+        v.accepted,v.owned,v.copp,v.handle,v.consumed,v.done,v.complete,v.tone?32768:4096,!v.tone,v.amp.wasEnabled);
     IOLog("PICASSO_ADSP play-pins active=%u restored=%u dirty=%x error=%d restore_error=%d\n",
         v.pins.active,v.pins.restored,v.pins.dirty,v.pins.error,v.pins.restoreError);
     IOLog("PICASSO_ADSP play-write address=%08x%08x handle=%x status=%u fsr=%x fault=%x\n",
@@ -137,6 +174,12 @@ void logPlay(const PicassoAprProbe &a) {
         v.replyPhase,v.replyOpcode,v.replyType,v.replyBytes,v.replySource,v.replyDestination,v.replyReject,v.rejected);
     IOLog("PICASSO_ADSP play-raw words=%08x/%08x/%08x/%08x\n",
         v.replyRaw[0],v.replyRaw[1],v.replyRaw[2],v.replyRaw[3]);
+    IOLog("PICASSO_ADSP play-amp stage=%u configured=%u clks=%u enabled=%u stopped=%u reset=%u error=%d stop_error=%d regs=%u polls=%u drained=%u\n",
+        v.amp.stage,v.amp.configured,v.amp.clockReady,v.amp.enabled,v.amp.stopped,v.amp.resetSafe,v.amp.error,v.amp.stopError,v.amp.registers,v.amp.polls,v.drained);
+    if(v.amplifier)IOLog("PICASSO_ADSP play-amp-bus reg=%x irq=%x commands=%u writes=%u dirty=%x uncertain=%u cleanup_error=%d\n",
+        playTfa.reg,playTfa.irq,playTfa.commands,playTfa.registerWrites,playTfa.dirty,playTfa.uncertain,playTfa.cleanupError);
+    IOLog("PICASSO_ADSP play-amp-reg status10_11_13_14=%x/%x/%x/%x control00_01_02=%x/%x/%x tone_peak=64 frames=8192\n",
+        v.amp.status[0],v.amp.status[1],v.amp.status[2],v.amp.status[3],v.amp.control[0],v.amp.control[1],v.amp.control[2]);
 }
 void logPcm(const PicassoAprProbe &a) {
     const auto &v=a.pcm;
@@ -457,7 +500,7 @@ extern "C" void picasso_smp2p_start(void) {
         error, s.created, s.partition.offset, s.partition.size, s.out.offset, s.out.size, lockRead(&d));
     logAudit(s);
     if (error) return;
-    glink.apr.pins.read=audioPinRead;glink.apr.pins.write=audioPinWrite;glink.apr.tfa.probe=tfaProbe;glink.apr.pcm.prepare=picasso_pcm_device_prepare;glink.apr.play.enabled=true;
+    glink.apr.pins.read=audioPinRead;glink.apr.pins.write=audioPinWrite;glink.apr.tfa.probe=tfaProbe;glink.apr.pcm.prepare=picasso_pcm_device_prepare;glink.apr.play.enabled=true;glink.apr.play.amplifier=tfaPlayback;
     smpKick(&d);
     IOLog("PICASSO_ADSP glink stage=prepared descriptor=%x/%x tx=%x/%x remote_pid=2\n",
         glink.desc.offset,glink.desc.size,glink.tx.offset,glink.tx.size);
