@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// lito GLINK SMEM transport and bounded APR CORE bring-up. No PCM endpoint.
+// lito GLINK SMEM, bounded APR CORE and QRTR discovery. No PCM endpoint.
 #ifndef PICASSO_GLINK_H
 #define PICASSO_GLINK_H
 #include "PicassoSmp2p.h"
+#include "PicassoQrtr.h"
 enum { PicassoGlinkChannels = 16, PicassoGlinkRemoteIntents = 64,
        PicassoGlinkLocalIntents = 20, PicassoGlinkPacket = 512 };
 struct PicassoGlinkChannel {
@@ -14,7 +15,9 @@ struct PicassoGlinkChannel {
 struct PicassoGlinkLocalIntent {
     uint32_t id, fill, left;
     bool advertised, active, done;
-    uint8_t data[PicassoGlinkPacket];
+    bool delivered;
+    uint32_t capacity;
+    uint8_t *data;
 };
 struct PicassoGlinkRemoteIntent {
     // The peer owns the ID namespace: zero is valid; used tracks occupancy.
@@ -28,6 +31,8 @@ struct PicassoAprProbe {
     int error;
 };
 struct PicassoGlink {
+    // Contains pointers into its own static storage: prepare in final location,
+    // never copy a prepared session or place it on a kernel stack.
     wlan_smem_item desc, tx, rx;
     uint32_t txHead, rxTail, steps, commands, retries;
     uint16_t pendingCommand, pendingChannel;
@@ -42,7 +47,13 @@ struct PicassoGlink {
     PicassoGlinkChannel channel[PicassoGlinkChannels];
     PicassoGlinkLocalIntent localIntent[PicassoGlinkLocalIntents];
     PicassoGlinkRemoteIntent remoteIntent[PicassoGlinkRemoteIntents];
+    PicassoGlinkLocalIntent qrtrLocal[10];
+    PicassoGlinkRemoteIntent qrtrRemote[PicassoGlinkRemoteIntents];
+    uint8_t aprStorage[PicassoGlinkLocalIntents][PicassoGlinkPacket];
+    // lito.dtsi: IPCRTR 5*0x800, 3*0x2000, 2*0x4400. Static worker storage.
+    uint8_t qrtrStorage[5*0x800 + 3*0x2000 + 2*0x4400];
     PicassoAprProbe apr;
+    PicassoQrtr qrtr;
 };
 // Called under the same hardware allocator mutex as SMP2P, before PAS boot.
 int picasso_glink_prepare(const PicassoSmemIo *, PicassoGlink *, PicassoSmemAudit *);

@@ -31,6 +31,7 @@ static void message(PicassoGlink &s,unsigned rx,unsigned cmd,unsigned a,unsigned
 }
 static void channelTests();
 static void build184Tests();
+static void qrtrTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -116,7 +117,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    build184Tests();channelTests();
+    build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -302,6 +303,80 @@ static void channelTests(){
     offer(s,rx,100);step(s);assert(s.intentSkipped==1 && s.remoteIntent[0].id==1 && s.remoteIntent[0].busy);
     puts("PASS GLINK channel isolation, OPEN/CLOSE/intent/data, bounded APR query, fragmentation, ownership, pressure, malformed input and response matching");
 }
+static void qrtrPacket(PicassoGlink &s,unsigned rx,unsigned id,const uint32_t *p,unsigned bytes,unsigned left=0,bool cont=false) {
+    static uint32_t w[0x1104];assert(bytes<=0x4400);
+    w[0]=unsigned(cont?12:9)|(2U<<16);w[1]=id;w[2]=bytes;w[3]=left;
+    memset(w+4,0,((bytes+7)&~7U));memcpy(w+4,p,bytes);frame(s,rx,w,16+((bytes+7)&~7U));
+}
+static unsigned connectQrtr(PicassoGlink &s) {
+    unsigned rx=connect(s);openPeer(s,rx,2,"IPCRTR");step(s);drain(s);step(s);drain(s);
+    message(s,rx,4,2,0);step(s);drain(s);step(s);drain(s);return rx;
+}
+__attribute__((noinline)) static void qrtrTests() {
+    PicassoGlink s={};unsigned rx=connect(s);openPeer(s,rx,2,"IPCRTR");step(s);drain(s);step(s);drain(s);
+    assert(s.channel[1].local==2 && s.channel[1].openSent && !s.channel[1].up);
+    message(s,rx,4,2,0);step(s);drain(s);step(s);drain(s);assert(s.channel[1].up);
+    const uint32_t grant[]={0x20005,1,2048,0};frame(s,rx,grant,16);offer(s,rx,0);step(s);drain(s);
+    assert(s.qrtrRemote[0].used && s.remoteIntent[0].used);step(s);drain(s);
+    assert(s.qrtr.helloSent && s.qrtrRemote[0].busy && s.apr.pending && s.remoteIntent[0].busy);
+    message(s,rx,6,2,0);step(s);drain(s);assert(!s.qrtrRemote[0].used && s.remoteIntent[0].busy);
+    uint32_t hello[]={1,2,2,0xfffffffe,0,20,1,0xfffffffe,2,0,0,0,0};
+    qrtrPacket(s,rx,s.qrtrLocal[0].id,hello,52);step(s);drain(s);
+    assert(s.qrtr.helloReceived && s.qrtr.peer==2 && s.qrtrLocal[0].done);
+    unsigned iid=s.qrtrLocal[0].id;step(s);drain(s);assert(s.qrtrLocal[0].id!=iid);
+    // The sizes are advertised from the matching physical storage, and
+    // fragmented payloads >APR's 512 bytes stay within their channel pool.
+    for(unsigned n=0;n<12;++n){step(s);drain(s);}
+    for(unsigned n=0;n<10;++n)assert(s.qrtrLocal[n].advertised && s.qrtrLocal[n].capacity==(n<5?0x800U:n<8?0x2000U:0x4400U));
+    static uint32_t large[0x1100];memset(large,0,sizeof large);
+    large[0]=1;large[1]=1;large[2]=2;large[3]=73;large[4]=1;large[5]=sizeof large-32;large[6]=1;large[7]=99;
+    iid=s.qrtrLocal[8].id;qrtrPacket(s,rx,iid,large,8192,sizeof large-8192);step(s);drain(s);
+    assert(s.qrtrLocal[8].active && s.qrtrLocal[8].fill==8192);
+    qrtrPacket(s,rx,iid,large+2048,sizeof large-8192,0,true);step(s);drain(s);
+    assert(s.qrtr.data==1 && s.qrtr.count==1 && s.qrtrLocal[8].done);
+    // Queue pressure retains completed input without re-appending fragments.
+    for(unsigned n=0;n<8;++n){step(s);drain(s);uint32_t data[]={1,1,2,73,1,20,1,99,0,0,0,0,0};
+        qrtrPacket(s,rx,s.qrtrLocal[0].id,data,52);step(s);drain(s);}
+    assert(s.qrtr.count==8 && s.qrtrLocal[0].done && !s.qrtrLocal[0].delivered);
+    unsigned packets=s.qrtr.received;step(s);drain(s);assert(s.qrtr.received==packets);
+    frame(s,rx,grant,16);step(s);drain(s);unsigned tx=s.txHead;step(s);drain(s);
+    const uint32_t resume[]={0x20009,0,52,0,1,7,1,99,0,20,2,73,7,1,99,0,0,0};
+    assert(!memcmp(ram+s.tx.offset+tx,resume,sizeof resume) && s.qrtr.resumes==1);
+    step(s);drain(s);assert(s.qrtr.received==packets+1 && s.qrtr.count==8);
+    // Closing IPCRTR invalidates only its ownership; APR's outstanding ID0
+    // remains busy until that channel receives its own RX_DONE.
+    message(s,rx,3,2,0);step(s);drain(s);
+    assert(s.channel[0].up && s.apr.pending && s.remoteIntent[0].busy && !s.qrtrRemote[0].used && !s.qrtr.count);
+    message(s,rx,6,7,0);step(s);assert(!s.remoteIntent[0].used);
+    picasso_glink_stop(&s);assert(!s.channel[0].up && !s.qrtr.helloReceived);
+    // HELLO is never reported as sent when any TX word/publication failed.
+    // A pressure retry preserves intent ownership and emits exactly one HELLO.
+    rx=connectQrtr(s);s.apr.error=-60;frame(s,rx,grant,16);step(s);drain(s);writes=0;step(s);
+    unsigned helloWrites=writes;bool kick;
+    for(unsigned n=1;n<=helloWrites;++n) {
+        rx=connectQrtr(s);s.apr.error=-60;frame(s,rx,grant,16);step(s);drain(s);writes=0;failWrite=n;
+        assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && !s.qrtr.helloSent);
+        unsigned count=writes;assert(picasso_glink_service(&io,&s,&kick)==-5 && writes==count);
+    }
+    rx=connectQrtr(s);s.apr.error=-60;frame(s,rx,grant,16);step(s);drain(s);
+    unsigned head=s.txHead;p32(s.desc.offset,(head+32)%s.tx.size);step(s);
+    assert(!s.qrtr.helloSent && !s.qrtrRemote[0].busy);unsigned count=writes;
+    for(unsigned n=0;n<10;++n)step(s);assert(writes==count && !s.qrtr.helloSent);
+    drain(s);step(s);assert(s.qrtr.helloSent && s.qrtrRemote[0].busy);drain(s);
+    // A large grant request selects its actual backing tier. A request beyond
+    // the stock maximum is denied without advertising undersized storage.
+    rx=connectQrtr(s);message(s,rx,7,2,0x4400);step(s);drain(s);
+    assert(s.qrtrLocal[8].advertised && s.qrtrLocal[8].capacity==0x4400);
+    message(s,rx,7,2,0x4401);step(s);drain(s);assert(!s.failed && !s.qrtrLocal[9].advertised);
+    // RX ids are checked within their endpoint, even when the numeric value
+    // is a valid live intent in the other endpoint.
+    rx=connectQrtr(s);qrtrPacket(s,rx,s.localIntent[0].id,hello,52);
+    assert(picasso_glink_service(&io,&s,&kick)==-71 && !s.apr.ready);
+    // APR close leaves QRTR live, complementing the reverse close above.
+    rx=connectQrtr(s);frame(s,rx,grant,16);step(s);drain(s);step(s);drain(s);
+    message(s,rx,3,7,0);step(s);assert(s.channel[1].up && s.qrtr.helloSent && s.qrtrRemote[0].busy);
+    puts("PASS GLINK APR/IPCRTR isolation, shared ID0, stock buffer tiers, large fragments, HELLO/RESUME backpressure and selective close");
+}
 // Keep this independent scenario out of main: Clang 18 Windows machine-sink
 // crashes after inlining both large fixture bodies. Production flags unchanged.
 __attribute__((noinline)) static void build184Tests(){
@@ -310,14 +385,14 @@ __attribute__((noinline)) static void build184Tests(){
     // payloads: zero-ID/512 bytes below is a protocol regression, not a dump.
     openPeer(s,rx,1,"fastrpcglink-apps-dsp");openPeer(s,rx,2,"IPCRTR");
     openPeer(s,rx,3,"LOOPBACK_CTL_LPASS");openPeer(s,rx,4,"apr_audio_svc");
-    step(s);assert(s.rxTail==120 && s.deferredOpens==3);drain(s);step(s);
-    assert(s.txHead==48 && s.channel[0].ackSent);drain(s);
+    step(s);assert(s.rxTail==120 && s.deferredOpens==2);drain(s);step(s);
+    assert(s.txHead==72 && s.channel[0].ackSent);drain(s);
     message(s,rx,4,1,0);uint32_t zero[4]={0x40005,1,512,0};frame(s,rx,zero,16);step(s);
     assert(!s.failed && s.channel[0].up && s.rxTail==144);
     assert(s.remoteIntent[0].used && s.remoteIntent[0].id==0 && s.intentOffers==1);
     step(s);assert(s.apr.pending && s.remoteIntent[0].busy);
     const uint32_t expected[]={0x10009,0,20,0,0x00140250,0x503,0x403,0x18300001,0x1290c,0};
-    assert(!memcmp(ram+s.tx.offset+64,expected,sizeof expected));drain(s);
+    assert(!memcmp(ram+s.tx.offset+88,expected,sizeof expected));drain(s);
     uint32_t answer[10]={0x40009,1,24,0,0x00180150,0x403,0x503,s.apr.token,0x1290d,5};
     frame(s,rx,answer,sizeof answer);step(s);assert(s.apr.ready && s.apr.state==5);drain(s);
     message(s,rx,6,4,0);step(s);assert(!s.remoteIntent[0].used);

@@ -7,6 +7,7 @@ int fail(PicassoGlink *s, int error) {
     s->failed = true; s->error = error; s->ready = false;
     s->apr.ready = false; s->apr.pending = false;
     if (!s->apr.error) s->apr.error = error;
+    picasso_qrtr_invalidate(&s->qrtr, error);
     for (auto &c : s->channel) c.up = false;
     return error;
 }
@@ -69,22 +70,32 @@ PicassoGlinkChannel *localChannel(PicassoGlink *s, unsigned id) {
     for (auto &c : s->channel) if (c.used && c.local == id && id) return &c;
     return nullptr;
 }
-void clearApr(PicassoGlink *s) {
-    s->apr.ready = false; s->apr.pending = false; s->apr.error = -104;
-    for (auto &i : s->localIntent) i = {};
-    for (auto &i : s->remoteIntent) i = {};
+void resetIntent(PicassoGlinkLocalIntent &i) {
+    i.id=0; i.fill=0; i.left=0; i.advertised=false; i.active=false; i.done=false; i.delivered=false;
+}
+PicassoGlinkLocalIntent *locals(PicassoGlink *s, const PicassoGlinkChannel &c) {
+    return c.local==1 ? s->localIntent : s->qrtrLocal;
+}
+unsigned localCount(const PicassoGlinkChannel &c) { return c.local==1 ? PicassoGlinkLocalIntents : 10; }
+PicassoGlinkRemoteIntent *remotes(PicassoGlink *s, const PicassoGlinkChannel &c) {
+    return c.local==1 ? s->remoteIntent : s->qrtrRemote;
+}
+void clearChannel(PicassoGlink *s, PicassoGlinkChannel &c) {
+    if (c.local==1) { s->apr.ready=false; s->apr.pending=false; s->apr.error=-104; }
+    else picasso_qrtr_invalidate(&s->qrtr,-104);
+    for (unsigned n=0;n<localCount(c);++n) resetIntent(locals(s,c)[n]);
+    for (unsigned n=0;n<PicassoGlinkRemoteIntents;++n) remotes(s,c)[n]={};
 }
 void updateChannel(PicassoGlink *s, PicassoGlinkChannel *c) {
     bool up = c->supported && !c->closing && c->openSent && c->openAck && c->ackSent && c->remote;
     if (up != c->up) { c->up = up; ++s->channelEvents; }
 }
-int channelWork(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) {
-    if (!s->ready) return 0;
-    auto &c = s->channel[0];
+int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c, bool *kick) {
+    if (!s->ready || !c.supported) return 0;
     if (c.closing) return 0;
     int error;
     if (!c.up && ++c.steps > 500) {
-        s->apr.error = -60;
+        if (c.local==1) s->apr.error = -60; else s->qrtr.error = -60;
         if (c.openSent) {
             const uint32_t words[2] = {3U | (uint32_t(c.local) << 16), 0};
             if ((error = transmit(io, s, words, sizeof(words), kick))) return error;
@@ -92,9 +103,10 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) {
         c.closing = true; ++s->channelEvents; return 0;
     }
     if (!c.openSent) {
-        uint32_t words[6] = {2U | (uint32_t(c.local) << 16), 14};
-        for (unsigned i = 0; i < 14; ++i) words[2 + i / 4] |= uint32_t(uint8_t(c.name[i])) << ((i & 3) * 8);
-        if ((error = transmit(io, s, words, sizeof(words), kick))) return error;
+        unsigned length=1; while (c.name[length-1]) ++length;
+        uint32_t words[10] = {2U | (uint32_t(c.local) << 16), length};
+        for (unsigned i = 0; i < length; ++i) words[2 + i / 4] |= uint32_t(uint8_t(c.name[i])) << ((i & 3) * 8);
+        if ((error = transmit(io, s, words, 8+((length+7)&~7U), kick))) return error;
         c.openSent = true; ++s->channelEvents;
     }
     if (c.remote && !c.ackSent) {
@@ -105,10 +117,10 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) {
     updateChannel(s, &c);
     if (!c.up) return 0;
     auto &a = s->apr;
-    ++a.ticks;
+    if (c.local==1) ++a.ticks;
     // Count service calls even under TX backpressure. A timeout does not free
     // any remote intent; its ownership lasts until RX_DONE or disconnect.
-    if (!a.ready && !a.error) {
+    if (c.local==1 && !a.ready && !a.error) {
         if (a.pending && ++a.wait > 50) { a.pending = false; a.next = a.ticks + 5; }
         if (a.ticks > 250 || (!a.pending && a.attempts >= 3 && a.ticks >= a.next)) {
             a.pending = false; a.error = -60;
@@ -116,16 +128,48 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) {
     }
     // Send at most one completion and one advertisement per call. An intent
     // remains occupied until RX_DONE is published; non-reuse IDs never repeat.
-    for (auto &i : s->localIntent) if (i.done) {
+    auto *local=locals(s,c); auto *remote=remotes(s,c);
+    for (unsigned n=0;n<localCount(c);++n) {
+        auto &i=local[n];
+        if (!i.done) continue;
+        if (!i.delivered) {
+            if (c.local==2 && picasso_qrtr_receive(&s->qrtr,i.data,i.fill)==-11) break;
+            i.delivered=true;
+        }
         const uint32_t words[2] = {6U | (uint32_t(c.local) << 16), i.id};
         if ((error = transmit(io, s, words, sizeof(words), kick))) return error;
-        i = {}; break;
+        resetIntent(i); break;
     }
-    for (auto &i : s->localIntent) if (!i.id) {
+    for (unsigned n=0;n<localCount(c);++n) {
+        auto &i=local[n]; if (i.id) continue;
         if (!s->nextIntent) return fail(s, -75);
-        const uint32_t words[4] = {5U | (uint32_t(c.local) << 16), 1, PicassoGlinkPacket, s->nextIntent};
+        const uint32_t words[4] = {5U | (uint32_t(c.local) << 16), 1, i.capacity, s->nextIntent};
         if ((error = transmit(io, s, words, sizeof(words), kick))) return error;
         i.id = s->nextIntent++; i.advertised = true; break;
+    }
+    if (c.local==2) {
+        auto &q=s->qrtr;
+        if (q.error || (q.helloSent && !q.count)) return 0;
+        PicassoGlinkRemoteIntent *slot=nullptr;
+        for (unsigned n=0;n<PicassoGlinkRemoteIntents;++n)
+            if (remote[n].used && !remote[n].busy && remote[n].size>=52) { slot=&remote[n]; break; }
+        if (!slot) {
+            if (!q.intentAsked && !q.intentGranted) {
+                const uint32_t words[2]={7U | (uint32_t(c.local)<<16),52};
+                if ((error=transmit(io,s,words,sizeof(words),kick))) return error;
+                q.intentAsked=true;
+            }
+            return 0;
+        }
+        uint32_t words[18]={9U | (uint32_t(c.local)<<16),slot->id,52,0};
+        if (!q.helloSent) picasso_qrtr_control(words+4,2,1,PicassoQrtrControl,
+            q.helloReceived?q.peer:0xffffffffU,PicassoQrtrControl);
+        else for (unsigned n=0;n<13;++n) words[4+n]=q.queue[q.head][n];
+        if ((error=transmit(io,s,words,sizeof(words),kick))) return error;
+        slot->busy=true; q.intentGranted=false;
+        if (!q.helloSent) q.helloSent=true;
+        else { q.head=(q.head+1)%PicassoQrtrQueue; --q.count; ++q.resumes; }
+        ++q.events; return 0;
     }
     if (a.ready || a.error) return 0;
     if (a.pending || a.ticks < a.next) return 0;
@@ -190,7 +234,8 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
             if (!c) return fail(s, -28);
             *c = {}; c->used = true;
             for (unsigned i = 0; i < nameBytes; ++i) c->name[i] = name[i];
-            ++s->deferredOpens;
+            if (sameName(name,"IPCRTR")) { c->supported=true; c->local=2; }
+            else ++s->deferredOpens;
         }
         c->remote = uint16_t(id); c->priority = uint16_t(data >> 16); ++s->channelEvents;
         return 0;
@@ -204,7 +249,7 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
         if (!c || data) return fail(s, -71);
         uint32_t words[4] = {11U | (id << 16), 0, 3U | (uint32_t(c->local) << 16), 0};
         if ((error = transmit(io, s, words, c->openSent && !c->closing ? 16 : 8, kick))) return error;
-        if (c->supported) { c->closing = true; c->remote = 0; c->up = false; clearApr(s); }
+        if (c->supported) { c->closing = true; c->remote = 0; c->up = false; clearChannel(s,*c); }
         else *c = {};
         ++s->channelEvents; return 0;
     }
@@ -240,13 +285,16 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
             // stock idr_alloc(riids, ..., iid, iid+1) explicitly accepts zero.
             if (!size) { s->intentFault = 4; return fail(s, -22); }
             PicassoGlinkRemoteIntent *slot = nullptr;
-            for (auto &i : s->remoteIntent) {
+            for (unsigned n=0;n<PicassoGlinkRemoteIntents;++n) {
+                auto &i=remotes(s,*c)[n];
                 if (i.used && i.id == iid) { s->intentFault = 5; return fail(s, -17); }
                 if (!i.used && !slot) slot = &i;
             }
             if (!slot) {
-                for (auto &i : s->remoteIntent)
+                for (unsigned n=0;n<PicassoGlinkRemoteIntents;++n) {
+                    auto &i=remotes(s,*c)[n];
                     if (!i.busy && i.size < size && (!slot || i.size < slot->size)) slot = &i;
+                }
                 if (slot) ++s->intentReplaced;
             }
             // Idle descriptors are remote-owned storage, not allocations held
@@ -263,25 +311,33 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
     if (command == 7) {
         if (!c->up || !data) return fail(s, -71);
         PicassoGlinkLocalIntent *slot = nullptr;
-        if (data <= PicassoGlinkPacket)
-            for (auto &i : s->localIntent) if (!i.id) { slot = &i; break; }
+        for (unsigned n=0;n<localCount(*c);++n) {
+            auto &i=locals(s,*c)[n]; if (!i.id && i.capacity>=data) { slot=&i; break; }
+        }
         if (slot && !s->nextIntent) return fail(s, -75);
-        uint32_t words[6] = {5U | (uint32_t(c->local) << 16), 1, PicassoGlinkPacket, s->nextIntent,
+        uint32_t words[6] = {5U | (uint32_t(c->local) << 16), 1, slot ? slot->capacity : 0, s->nextIntent,
                             8U | (uint32_t(c->local) << 16), slot ? 1U : 0U};
         if ((error = transmit(io, s, slot ? words : words + 4, slot ? 24 : 8, kick))) return error;
         if (slot) { slot->id = s->nextIntent++; slot->advertised = true; }
         return 0;
     }
     if (command == 8) {
-        if (!c->up || !s->apr.intentAsked || data > 1) return fail(s, -71);
-        s->apr.intentGranted = data != 0 && !s->apr.pending;
-        s->apr.intentAsked = false;
-        if (!data && !s->apr.pending) s->apr.error = -28;
+        auto &asked=c->local==1 ? s->apr.intentAsked : s->qrtr.intentAsked;
+        auto &granted=c->local==1 ? s->apr.intentGranted : s->qrtr.intentGranted;
+        if (!c->up || !asked || data > 1) return fail(s, -71);
+        granted=data!=0 && (c->local!=1 || !s->apr.pending); asked=false;
+        if (!data) {
+            if (c->local==1 && !s->apr.pending) s->apr.error=-28;
+            if (c->local==2) s->qrtr.error=-28;
+        }
         return 0;
     }
     if (command == 6) {
         if (!c->up) return fail(s, -71);
-        for (auto &i : s->remoteIntent) if (i.used && i.id == data && i.busy) { i = {}; return 0; }
+        for (unsigned n=0;n<PicassoGlinkRemoteIntents;++n) {
+            auto &i=remotes(s,*c)[n];
+            if (i.used && i.id == data && i.busy) { i = {}; return 0; }
+        }
         return fail(s, -71);
     }
     if (command == 9 || command == 12) {
@@ -290,20 +346,24 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
         uint32_t sizes[2];
         if ((error = peek(io, s, 8, sizes, 8))) return error;
         uint32_t chunk = sizes[0], left = sizes[1];
-        if (!chunk || chunk > PicassoGlinkPacket || left > PicassoGlinkPacket - chunk) return fail(s, -90);
+        if (!chunk || chunk>0x4400 || left>0x4400-chunk) return fail(s,-90);
         *length = 16 + ((chunk + 7) & ~7U);
         if (*length > s->rx.size - 8) return fail(s, -90);
         if (avail < *length) return -11;
         PicassoGlinkLocalIntent *slot = nullptr;
-        for (auto &i : s->localIntent) if (i.id == data && data) { slot = &i; break; }
+        for (unsigned n=0;n<localCount(*c);++n) {
+            auto &i=locals(s,*c)[n]; if (i.id==data && data) { slot=&i; break; }
+        }
         if (!slot || !slot->advertised || slot->done ||
             (command == 9 ? slot->active : !slot->active)) return fail(s, -71);
-        if (slot->fill > PicassoGlinkPacket - chunk - left ||
+        if (chunk>slot->capacity || left>slot->capacity-chunk ||
+            slot->fill > slot->capacity - chunk - left ||
             (command == 12 && slot->left != chunk + left)) return fail(s, -90);
         if ((error = peek(io, s, 16, slot->data + slot->fill, chunk))) return error;
         slot->fill += chunk; slot->left = left; slot->active = left != 0;
         if (!left) {
-            picasso_apr_receive(&s->apr, slot->data, slot->fill);
+            if (c->local==1) { picasso_apr_receive(&s->apr,slot->data,slot->fill); slot->delivered=true; }
+            else slot->delivered=picasso_qrtr_receive(&s->qrtr,slot->data,slot->fill)!=-11;
             slot->done = true; slot->advertised = false; ++s->dataPackets;
         }
         return 0;
@@ -315,7 +375,7 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
 }
 int picasso_glink_prepare(const PicassoSmemIo *io, PicassoGlink *s, PicassoSmemAudit *audit) {
     if (!s) return -22;
-    // Aggregate assignment creates a >12 KiB temporary at -O0, overflowing a
+    // Aggregate assignment creates a large temporary at -O0, overflowing a
     // small kernel stack despite the caller using static storage. Zero in place.
     auto *bytes = reinterpret_cast<uint8_t *>(s);
     for (unsigned i = 0; i < sizeof(*s); ++i) bytes[i] = 0;
@@ -324,6 +384,14 @@ int picasso_glink_prepare(const PicassoSmemIo *io, PicassoGlink *s, PicassoSmemA
     auto &c = s->channel[0]; c.used = true; c.supported = true; c.local = 1;
     const char name[] = "apr_audio_svc";
     for (unsigned i = 0; i < sizeof(name); ++i) c.name[i] = name[i];
+    for (unsigned n=0;n<PicassoGlinkLocalIntents;++n) {
+        s->localIntent[n].data=s->aprStorage[n]; s->localIntent[n].capacity=PicassoGlinkPacket;
+    }
+    unsigned offset=0;
+    for (unsigned n=0;n<10;++n) {
+        auto &i=s->qrtrLocal[n]; i.capacity=n<5 ? 0x800 : n<8 ? 0x2000 : 0x4400;
+        i.data=s->qrtrStorage+offset; offset+=i.capacity;
+    }
     s->nextIntent = 1; s->apr.token = 0x18300000;
     s->prepared = true; return 0;
 }
@@ -343,8 +411,9 @@ int picasso_glink_service(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) 
     // Only work already due at entry is sent here. Newly received OPENs are
     // acknowledged on the next service tick, after the command is committed.
     // Descriptors from a partially parsed command are not eligible for TX.
-    error = s->intentProgress ? 0 : channelWork(io, s, kick);
-    if (s->failed) return error;
+    if (!s->intentProgress) for (auto &c:s->channel) if (c.used && c.supported) {
+        error=channelWork(io,s,c,kick); if (s->failed) return error;
+    }
     unsigned intentBudget = 16;
     for (unsigned budget = 0; budget < 8; ++budget) {
         uint32_t head = 0, tail = 0, words[2] = {};
@@ -385,5 +454,6 @@ int picasso_glink_service(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) 
 }
 void picasso_glink_stop(PicassoGlink *s) {
     if (!s) return;
-    fail(s, -104); clearApr(s);
+    fail(s, -104);
+    for (auto &c:s->channel) if (c.used && c.supported) clearChannel(s,c);
 }

@@ -89,6 +89,8 @@ struct BootEvents {
     uint32_t channelEvents = 0, channelLogs = 0, aprAttempts = 0, aprReceived = 0;
     uint32_t intentOffers = 0, intentLogs = 0, intentFault = 0;
     int aprError = 0;
+    uint32_t qrtrEvents = 0, qrtrReceived = 0, qrtrLogs = 0;
+    int qrtrError = 0;
 };
 int bootPoll(void *context, PicassoSmp2pEvent *event) {
     auto *b=static_cast<BootEvents *>(context);
@@ -142,6 +144,16 @@ void bootService(void *context) {
                     a.attempts,a.token,a.pending,a.received,a.opcode,a.receivedToken,a.state,a.status,a.ready,a.ignored,a.malformed,a.error);
             b->aprAttempts=a.attempts; b->aprReceived=a.received; b->aprError=a.error;
         }
+        auto &q=g->qrtr;
+        if ((b->qrtrLogs<48 && (q.events!=b->qrtrEvents || q.received!=b->qrtrReceived)) || q.error!=b->qrtrError) {
+            unsigned services=0,cached=0,busy=0;
+            for (const auto &v:q.services) services+=v.used;
+            for (const auto &v:g->qrtrRemote) { cached+=v.used; busy+=v.used && v.busy; }
+            IOLog("PICASSO_ADSP qrtr hello=%u/%u peer=%u received=%u type=%u services=%u last=%x/%x/%u/%x overflow=%u malformed=%u ignored=%u data=%u resumes=%u queued=%u intents=%u/%u error=%d qmi=0 pcm=0\n",
+                q.helloSent,q.helloReceived,q.peer,q.received,q.lastType,services,q.lastService,q.lastInstance,q.lastNode,q.lastPort,
+                q.overflow,q.malformed,q.ignored,q.data,q.resumes,q.count,cached,busy,q.error);
+            b->qrtrEvents=q.events; b->qrtrReceived=q.received; b->qrtrError=q.error; ++b->qrtrLogs;
+        }
     }
 }
 int bootSnapshot(void *context) {
@@ -154,6 +166,11 @@ int bootSnapshot(void *context) {
         g.ready,g.failed,g.error,g.commands,g.txHead,g.rxTail,g.pendingCommand,g.pendingChannel,g.pendingData,
         g.deferredOpens,g.channel[0].up,g.apr.ready,g.apr.error,g.intentOffers,g.intentSkipped,
         g.lastIntentId,g.lastIntentSize,g.intentFault);
+    const auto &q=g.qrtr;
+    IOLog("PICASSO_ADSP qrtr snapshot hello=%u/%u peer=%u received=%u malformed=%u ignored=%u overflow=%u data=%u resumes=%u queued=%u error=%d qmi=0 pcm=0\n",
+        q.helloSent,q.helloReceived,q.peer,q.received,q.malformed,q.ignored,q.overflow,q.data,q.resumes,q.count,q.error);
+    for (const auto &v:q.services) if (v.used)
+        IOLog("PICASSO_ADSP qrtr service=%x instance=%x node=%u port=%x\n",v.service,v.instance,v.node,v.port);
     return s.glink_error;
 }
 void logAudit(const PicassoSmp2p &s) {
