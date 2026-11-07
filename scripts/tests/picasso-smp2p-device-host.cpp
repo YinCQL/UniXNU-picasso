@@ -70,6 +70,7 @@ static void IOSleep(unsigned ms) {
     if(sleeps==1602)ram[(part+48+36)/4]=1; // External mutation stops service.
 }
 #include "PicassoSmp2pDevice-body.inc"
+extern "C" void picasso_rpc_device_prepare(PicassoFastrpc *) { assert(false && "unexpected RPC DMA without an open channel"); }
 // Exercise the real SMEM/MMIO adapter separately from the coordinator tests,
 // which prove that this callback is gated by PAS authentication and fresh ready.
 extern "C" void picasso_adsp_boot(const PicassoAdspEvents *e) {

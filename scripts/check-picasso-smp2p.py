@@ -36,7 +36,7 @@ def main():
     for sanitized in (False, True):
         suffix = '-asan' if sanitized else ''
         flags = (['-fsanitize=address' if os.name=='nt' else '-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if sanitized else [])
-        for name in ('smp2p','smp2p-device','glink','qrtr','qmi','servloc','tftp'):
+        for name in ('smp2p','smp2p-device','glink','qrtr','qmi','servloc','tftp','fastrpc'):
             exe = out/(name+suffix+('.exe' if os.name=='nt' else ''))
             run(name+'-compile'+suffix, [a.cxx,'-std=c++17','-O1','-Wall','-Wextra','-Werror',*flags,*includes,
                 str(ROOT/f'scripts/tests/picasso-{name}-host.cpp'),str(core),str(ROOT/'package/PicassoGlink.cpp'),'-o',str(exe)])
@@ -49,12 +49,20 @@ def main():
         'void IOLog(const char *,...) __attribute__((format(printf,1,2)));\n'
         'void IOSleep(unsigned); void _disable_preemption(); void _enable_preemption(); }\n'
         '#define disable_preemption() _disable_preemption()\n#define enable_preemption() _enable_preemption()\n'+body,encoding='utf8',newline='\n')
-    for name,source in [('smp2p',core),('smp2p-device',arm),('glink',ROOT/'package/PicassoGlink.cpp')]:
+    dma_body = re.sub(r'^#include <[^>]+>[^\n]*\n', '', (ROOT/'package/PicassoRpcDma.cpp').read_text(), flags=re.M)
+    dma = out/'rpc-dma-arm.cpp'
+    dma.write_text('#include "picasso-wlan-kernel-api.h"\n'
+        'extern "C" void IOLog(const char *,...) __attribute__((format(printf,1,2)));\n'
+        'using IOOptionBits=unsigned long long;using IOByteCount=unsigned long long;extern void *kernel_task;\n'
+        'enum { kIODirectionInOut=3,kIOMemoryPhysicallyContiguous=16,kIOMemoryMapperNone=32 };\n'
+        'class IOBufferMemoryDescriptor {public: static IOBufferMemoryDescriptor *inTaskWithOptions(void *,IOOptionBits,unsigned,unsigned);'
+        'void *getBytesNoCopy();uint64_t getPhysicalSegment(unsigned,IOByteCount *,unsigned);};\n'+dma_body,encoding='utf8',newline='\n')
+    for name,source in [('smp2p',core),('smp2p-device',arm),('glink',ROOT/'package/PicassoGlink.cpp'),('rpc-dma',dma)]:
         run(name+'-arm64',[a.cxx,'-target','arm64-apple-ios17.0','-std=c++17','-ffreestanding',
             '-fno-exceptions','-fno-rtti','-fno-threadsafe-statics','-mgeneral-regs-only','-Wall','-Wextra','-Werror',
             '-Wframe-larger-than=2048',
             *includes,'-c',str(source),'-o',str(out/(name+'.o'))])
-    inputs = ['package/PicassoTftp.h','scripts/tests/picasso-tftp-host.cpp','package/PicassoServloc.h','scripts/tests/picasso-servloc-host.cpp','package/PicassoSmp2p.h','package/PicassoSmp2p.cpp','package/PicassoSmp2pDevice.cpp',
+    inputs = ['package/PicassoFastrpc.h','package/PicassoRpcDma.h','package/PicassoRpcDma.cpp','scripts/tests/picasso-fastrpc-host.cpp','package/PicassoTftp.h','scripts/tests/picasso-tftp-host.cpp','package/PicassoServloc.h','scripts/tests/picasso-servloc-host.cpp','package/PicassoSmp2p.h','package/PicassoSmp2p.cpp','package/PicassoSmp2pDevice.cpp',
         'package/PicassoGlink.h','package/PicassoGlink.cpp','package/PicassoApr.h','package/PicassoQrtr.h','package/PicassoQmi.h','scripts/tests/picasso-glink-host.cpp','scripts/tests/picasso-qrtr-host.cpp','scripts/tests/picasso-qmi-host.cpp',
         'package/PicassoSmemLock.h','package/PicassoAdspBoot.h','package/PicassoAdsp.h','drivers/NativeWlan/WlanSmem.h','drivers/NativeAdrenoPicasso/PicassoRpmh.h',
         'scripts/check-picasso-smp2p.py','scripts/tests/picasso-smp2p-host.cpp','scripts/tests/picasso-smp2p-device-host.cpp',

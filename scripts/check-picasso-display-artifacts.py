@@ -66,7 +66,7 @@ def check(tree, work, kernelcache, output):
         'hid-original-bindings.o', 'NativeGOPPresenter.late.o', 'NativeGOPGlue.o',
         'PicassoPr13.o', 'PicassoButtons.o', 'PicassoBacklight.o', 'PicassoBrightness.late.o',
         'PicassoSpmi.o', 'PicassoAdsp.o', 'PicassoAdspFirmware.o', 'PicassoFat.o',
-        'PicassoQmp.o', 'PicassoAop.o', 'PicassoSmp2p.o', 'PicassoSmp2pDevice.o', 'PicassoAdspBoot.o', 'PicassoGlink.o'}, 'Wrong display/state/input archive members')
+        'PicassoQmp.o', 'PicassoAop.o', 'PicassoSmp2p.o', 'PicassoSmp2pDevice.o', 'PicassoAdspBoot.o', 'PicassoGlink.o', 'PicassoRpcDma.o'}, 'Wrong display/state/input archive members')
     kernel = work / 'kernel/kernel.macho'
     plan = json.loads(kernel.with_suffix('.json').read_text())
     report = builder.verify_kernel(aes, native, original, kernel.read_bytes(), plan, audit)

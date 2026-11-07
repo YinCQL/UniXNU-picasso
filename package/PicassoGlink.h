@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// lito GLINK SMEM, APR/QRTR and FastRPC transport. No RPC invocation or PCM endpoint.
+// lito GLINK SMEM, APR/QRTR and bounded FastRPC listener. No PCM endpoint.
 #ifndef PICASSO_GLINK_H
 #define PICASSO_GLINK_H
 #include "PicassoSmp2p.h"
 #include "PicassoQrtr.h"
+#include "PicassoFastrpc.h"
 enum { PicassoGlinkChannels = 16, PicassoGlinkRemoteIntents = 64,
        PicassoGlinkLocalIntents = 20, PicassoGlinkPacket = 512 };
 struct PicassoGlinkChannel {
@@ -35,12 +36,6 @@ struct PicassoAprProbe {
         bool sent, pending, valid;
         int error;
     } fw;
-};
-struct PicassoFastrpc {
-    // No invocation contexts exist yet. Record unsolicited wire data without
-    // interpreting it as a completed RPC, exposing shared memory or replying.
-    uint32_t received, bytes, words[6];
-    int error;
 };
 struct PicassoGlink {
     // Contains pointers into its own static storage: prepare in final location,

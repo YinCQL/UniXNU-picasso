@@ -9,7 +9,7 @@ int fail(PicassoGlink *s, int error) {
     s->apr.fw.pending=false;s->apr.fw.valid=false;s->apr.fw.error=error;
     if (!s->apr.error) s->apr.error = error;
     picasso_qrtr_invalidate(&s->qrtr, error);
-    s->fastrpc.error = error;
+    picasso_rpc_stop(&s->fastrpc,error);
     for (auto &c : s->channel) c.up = false;
     return error;
 }
@@ -88,7 +88,7 @@ void clearChannel(PicassoGlink *s, PicassoGlinkChannel &c) {
         s->apr.fw.pending=false;s->apr.fw.valid=false;s->apr.fw.error=-104;
     }
     else if(c.local==2) picasso_qrtr_invalidate(&s->qrtr,-104);
-    else s->fastrpc.error=-104;
+    else picasso_rpc_stop(&s->fastrpc,-104);
     for (unsigned n=0;n<localCount(c);++n) resetIntent(locals(s,c)[n]);
     for (unsigned n=0;n<PicassoGlinkRemoteIntents;++n) remotes(s,c)[n]={};
 }
@@ -218,10 +218,24 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
         }
         ++q.events; return 0;
     }
-    // Stock adsprpc rpmsg_probe only binds the channel. It sends no startup
-    // invocation. Keep the real RX buffers available, but never fabricate an
-    // invoke, process attachment or completion before those consumers exist.
-    if(c.local==3) return 0;
+    if(c.local==3) {
+        auto &f=s->fastrpc;picasso_rpc_tick(&f);
+        uint32_t words[14]={9U|(uint32_t(c.local)<<16),0,40,0};
+        int call=picasso_rpc_packet(&f,words+4);if(call<0)return 0;
+        PicassoGlinkRemoteIntent *slot=nullptr;
+        for(unsigned n=0;n<PicassoGlinkRemoteIntents;++n)
+            if(remote[n].used && !remote[n].busy && remote[n].size>=40) { slot=&remote[n];break; }
+        if(!slot) {
+            if(!f.intentAsked && !f.intentGranted) {
+                const uint32_t request[2]={7U|(uint32_t(c.local)<<16),40};
+                if((error=transmit(io,s,request,sizeof(request),kick)))return error;
+                f.intentAsked=true;
+            }return 0;
+        }
+        words[1]=slot->id;
+        if((error=transmit(io,s,words,sizeof(words),kick)))return error;
+        slot->busy=true;f.intentGranted=false;picasso_rpc_sent(&f,unsigned(call));return 0;
+    }
     // Stock q6core queries FWK_VERSION only after real CORE readiness. This
     // discovers AFE/ASM/ADM APIs without starting audio or assuming versions.
     bool version=a.ready && !a.fw.sent && !a.fw.error;
@@ -391,11 +405,8 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
         return 0;
     }
     if (command == 8) {
-        // This passive transport never requests remote capacity. Do not let an
-        // unsolicited FastRPC ACK modify the independent QRTR request state.
-        if(c->local==3) return fail(s,-71);
-        auto &asked=c->local==1 ? s->apr.intentAsked : s->qrtr.intentAsked;
-        auto &granted=c->local==1 ? s->apr.intentGranted : s->qrtr.intentGranted;
+        auto &asked=c->local==1 ? s->apr.intentAsked : c->local==2 ? s->qrtr.intentAsked : s->fastrpc.intentAsked;
+        auto &granted=c->local==1 ? s->apr.intentGranted : c->local==2 ? s->qrtr.intentGranted : s->fastrpc.intentGranted;
         if (!c->up || !asked || data > 1) return fail(s, -71);
         granted=data!=0 && (c->local!=1 || !s->apr.pending); asked=false;
         if (!data) {
@@ -443,10 +454,7 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
             if (c->local==1) { picasso_apr_receive(&s->apr,slot->data,slot->fill); slot->delivered=true; }
             else if(c->local==2) slot->delivered=picasso_qrtr_receive(&s->qrtr,slot->data,slot->fill)!=-11;
             else {
-                auto &f=s->fastrpc;++f.received;f.bytes=slot->fill;
-                for(unsigned n=0;n<6;++n) f.words[n]=0;
-                for(unsigned n=0;n<slot->fill && n<24;++n)
-                    f.words[n/4]|=uint32_t(slot->data[n])<<((n&3)*8);
+                picasso_rpc_receive(&s->fastrpc,slot->data,slot->fill);
                 slot->delivered=true;
             }
             slot->done = true; slot->advertised = false; ++s->dataPackets;

@@ -12,6 +12,7 @@
 #include "PicassoAdspBoot.h"
 #include "PicassoAdsp.h"
 #include "PicassoGlink.h"
+#include "PicassoRpcDma.h"
 
 // Display also builds without the optional Adreno archive. A missing shared
 // owner means no power plan; never create an independent RSC writer.
@@ -91,7 +92,7 @@ struct BootEvents {
     int aprError = 0;
     uint32_t qrtrEvents = 0, qrtrReceived = 0, qrtrLogs = 0;
     int qrtrError = 0;
-    uint32_t fastrpcReceived = 0, fastrpcLogs = 0;
+    uint32_t fastrpcReceived = 0, fastrpcLogs = 0, fastrpcEvents = 0;
     int fastrpcError = 0;
     uint32_t reuseLogs = 0, remoteReuse = 0, localReuse = 0;
     uint32_t qmiEvents = 0, qmiLogs = 0;
@@ -110,9 +111,15 @@ void logFastrpc(const PicassoGlink &g) {
     for(const auto &c:g.channel) if(c.used && c.local==3) up=c.up;
     for(const auto &i:g.fastrpcLocal) { advertised+=i.advertised;active+=i.active;done+=i.done; }
     const auto &f=g.fastrpc;
-    IOLog("PICASSO_ADSP fastrpc up=%u buffers=%u/%u/%u received=%u unclaimed=%u bytes=%u words=%08x/%08x/%08x/%08x/%08x/%08x error=%d rpc=0 pcm=0\n",
-        up,advertised,active,done,f.received,f.received,f.bytes,f.words[0],f.words[1],f.words[2],
+    IOLog("PICASSO_ADSP fastrpc up=%u buffers=%u/%u/%u received=%u unclaimed=%u bytes=%u words=%08x/%08x/%08x/%08x/%08x/%08x error=%d pcm=0\n",
+        up,advertised,active,done,f.received,f.unclaimed,f.bytes,f.words[0],f.words[1],f.words[2],
         f.words[3],f.words[4],f.words[5],f.error);
+    IOLog("PICASSO_ADSP rpc bound=%u stopped=%u sent=%u completed=%u malformed=%u\n",
+        f.bound,f.stopped,f.sent,f.completed,f.malformed);
+    if(f.bound)for(const auto &d:f.domain)
+        IOLog("PICASSO_ADSP rpc pd=%u stage=%u init=%u default=%u handle=%x queued=%u/%u pending=%u/%u requests=%u reverse=%x/%x result=%x name=%.127s error=%d\n",
+            d.pd,d.stage,d.initialized,d.registered,d.defaultHandle,d.call[0].queued,d.call[1].queued,
+            d.call[0].pending,d.call[1].pending,d.requests,d.lastHandle,d.lastScalar,d.previousResult,d.name,d.error);
 }
 void logTftp(const PicassoTftp &t) {
     unsigned files=0,bytes=0,active=0;
@@ -139,6 +146,8 @@ void bootService(void *context) {
     // neither a preflight sample nor the stopped observer can transmit GLINK.
     {
         bool kick=false;auto *g=b->glink;
+        for(const auto &c:g->channel)if(c.used && c.local==3 && c.up && !g->fastrpc.bound && !g->fastrpc.stopped)
+            picasso_rpc_device_prepare(&g->fastrpc);
         int transport=picasso_glink_service(b->io,g,&kick);
         if(kick) {
             smemBarrier(b->device);
@@ -189,8 +198,9 @@ void bootService(void *context) {
             }
             b->aprAttempts=a.attempts; b->aprReceived=a.received; b->aprError=a.error;
         }
-        if((g->fastrpc.received!=b->fastrpcReceived && b->fastrpcLogs<16) || g->fastrpc.error!=b->fastrpcError) {
+        if(((g->fastrpc.received!=b->fastrpcReceived || g->fastrpc.events!=b->fastrpcEvents) && b->fastrpcLogs<64) || g->fastrpc.error!=b->fastrpcError) {
             logFastrpc(*g);b->fastrpcReceived=g->fastrpc.received;
+            b->fastrpcEvents=g->fastrpc.events;
             b->fastrpcError=g->fastrpc.error;++b->fastrpcLogs;
         }
         auto &q=g->qrtr;

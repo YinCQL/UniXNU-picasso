@@ -781,6 +781,36 @@ __attribute__((noinline)) static void fastrpcTests() {
     rx=connect(s);s.apr.ready=true;s.apr.fw.sent=true;openPeer(s,rx,9,"fastrpcglink-apps-dsp");step(s);
     for(unsigned n=0;n<502;++n){drain(s);step(s);}
     assert(s.channel[1].closing && s.fastrpc.error==-60 && !s.qrtr.error && s.apr.ready && !s.failed);
+    // Real SMQ queue: RX_DONE releases transport capacity, not the RPC call.
+    alignas(4096) static uint8_t rpcMemory[2][PicassoRpcDomainBytes];
+    auto bind=[&](){
+        PicassoRpcIo rpcIo={nullptr,[](void *,unsigned,unsigned,bool){return 0;},[](void *){return 0;}};
+        assert(!picasso_rpc_bind(&s.fastrpc,rpcIo,rpcMemory[0],rpcMemory[1]));
+    };
+    rx=connectFastrpc(s);bind();at=s.txHead;step(s);drain(s);
+    assert(s.fastrpc.intentAsked && s.fastrpc.domain[0].call[0].queued && !s.fastrpc.sent);
+    assert(r32(s.tx.offset+at)==0x30007 && r32(s.tx.offset+at+4)==40);
+    message(s,rx,8,9,1);frame(s,rx,offerFast,16);step(s);drain(s);
+    at=s.txHead;step(s);drain(s);
+    assert(s.fastrpc.sent==1 && s.fastrpc.domain[0].call[0].pending && s.fastrpcRemote[0].busy);
+    assert(r32(s.tx.offset+at)==0x30009 && !r32(s.tx.offset+at+4) && r32(s.tx.offset+at+8)==40);
+    assert(r32(s.tx.offset+at+16)==0 && r32(s.tx.offset+at+32)==1 && r32(s.tx.offset+at+36)==0x10000);
+    message(s,rx,14,9,0);step(s);drain(s);
+    assert(s.fastrpc.domain[0].call[0].pending && !s.fastrpcRemote[0].busy);
+    uint8_t response[16]={};rpcPut64(response,s.fastrpc.domain[0].call[0].ctx);
+    fastrpcPacket(s,rx,s.fastrpcLocal[0].id,response,16);step(s);drain(s);step(s);drain(s);
+    assert(s.fastrpc.completed==1 && s.fastrpc.domain[0].stage==2);
+    // Full FIFO cannot publish a context or reuse its DMA slot.
+    rx=connectFastrpc(s);frame(s,rx,offerFast,16);step(s);drain(s);bind();at=s.txHead;
+    p32(s.desc.offset,(at+8)%s.tx.size);step(s);
+    assert(!s.fastrpc.sent && s.fastrpc.domain[0].call[0].queued && !s.fastrpcRemote[0].busy);
+    drain(s);step(s);assert(s.fastrpc.sent==1 && s.fastrpc.domain[0].call[0].pending);
+    // Failure at each actual TX word/head write never fabricates a send.
+    for(unsigned n=1;n<=15;++n) {
+        rx=connectFastrpc(s);frame(s,rx,offerFast,16);step(s);drain(s);bind();
+        writes=0;failWrite=n;assert(picasso_glink_service(&io,&s,&kick)==-5);
+        assert(s.fastrpc.stopped && !s.fastrpc.sent && !s.fastrpc.domain[0].call[0].pending);
+    }
     puts("PASS FastRPC stock OPEN and 64x100 RX buffers, passive transport, fragments, reuse, pressure, isolation, invalid frames, I/O failures and shutdown");
 }
 
