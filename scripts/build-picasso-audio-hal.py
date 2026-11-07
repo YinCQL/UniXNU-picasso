@@ -44,6 +44,8 @@ def main():
         if run.returncode:raise RuntimeError(run.stdout+run.stderr)
     shutil.copy2(ROOT/'hal/Info.plist',bundle/'Info.plist');identity=bundle_identity(binary.read_bytes())
     info=plistlib.loads((bundle/'Info.plist').read_bytes());assert info['CFBundleIdentifier']=='org.unixnu.picasso.audio'
+    assert info['AudioServerPlugIn_LoadingConditions']=={'IOService Matching':[{'IOProviderClass':'PicassoAudio'}]}
+    assert info['AudioServerPlugIn_IOKitUserClients']==['PicassoAudioUserClient']
     files=[('audio/PicassoAudio.driver/Info.plist',0o644,(bundle/'Info.plist').read_bytes()),('audio/PicassoAudio.driver/PicassoAudio',0o755,binary.read_bytes())]
     addon=out/'audio.addon';addon.write_bytes(pack(files))
     sources={str(p.relative_to(ROOT)):sha(p) for p in [source,ROOT/'hal/PicassoAudioMix.h',ROOT/'hal/Info.plist',ROOT/'package/PicassoAudioAbi.h',Path(__file__)]}

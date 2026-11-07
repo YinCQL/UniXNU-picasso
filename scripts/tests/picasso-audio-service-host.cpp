@@ -108,12 +108,29 @@ static void queueTests() {
     assert(!picasso_audio_begin(q,8,format));assert(!picasso_audio_end(q,8,true) && !picasso_audio_available(q));
     picasso_audio_retire(q,false,-5,false);assert(picasso_audio_begin(q,9,format)==-6);
 }
-int main() {
+int main(int argc,char **) {
     queueTests();static PicassoAprProbe p;PicassoQmi q={};q.bound=true;q.round=1;
     for(auto &d:q.domains){d.completed=d.stateValid=true;d.state=0x1fffffff;}
     p.ready=p.fw.valid=true;p.fw.count=1;p.fw.services[0][0]=8;p.fw.services[0][1]=4;
     p.pcm.prepared=p.pcm.done=p.pcm.complete=true;p.pcm.address=0x180000000ULL;p.pcm.bytes=32768;p.pcm.check=health;p.pcm.copy=copyPcm;
     p.pins.read=pinRead;p.pins.write=pinWrite;p.tfa.digitalApplied=p.tfa.digitalRestored=true;
+    if(argc>1){
+        p.play.amplifier=amplifier;
+        p.pcm.uncertain=true;picasso_audio_service_tick(p,false);assert(!published && !queueLock);p.pcm.uncertain=false;
+        p.tfa.digitalDirty=true;picasso_audio_service_tick(p,false);assert(!published && !queueLock);p.tfa.digitalDirty=false;
+        p.pcm.busyMask=1;picasso_audio_service_tick(p,false);assert(!published && !queueLock);p.pcm.busyMask=0;
+        picasso_audio_service_tick(p,false);
+        assert(published && testPhase==3 && !active && !p.play.attempted && !p.play.complete && !queue.epoch && !copies);
+        PicassoAudio provider;PicassoAudioUserClient client;
+        assert(client.initWithTask(nullptr,nullptr,0,nullptr)&&client.start(&provider));
+        static uint8_t data[4096];
+        assert(!call(client,1,&format,sizeof format));
+        for(unsigned i=0;i<4;++i)assert(!call(client,2,data,sizeof data));
+        assert(!call(client,3));
+        for(unsigned i=0;i<80;++i)cycle(p,q);
+        assert(queue.epoch==1 && queue.returned==16384 && queue.drained && p.play.complete && !active);
+        puts("PASS quiet boot: no test PCM, real first client playback/drain");return 0;
+    }
     p.play.done=p.play.complete=p.play.amp.stopped=true;p.play.amplifier=amplifier;
     for(unsigned i=0;i<300 && !published;++i)cycle(p,q);
     assert(published && registrations==1 && metaCalls==1 && testPhase==3 && !active);

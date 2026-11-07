@@ -36,5 +36,19 @@
 	</dict>
 	<key>MinimumOSVersion</key>
 	<string>16.0</string>
+	<key>AudioServerPlugIn_LoadingConditions</key>
+	<dict>
+		<key>IOService Matching</key>
+		<array>
+			<dict>
+				<key>IOProviderClass</key>
+				<string>PicassoAudio</string>
+			</dict>
+		</array>
+	</dict>
+	<key>AudioServerPlugIn_IOKitUserClients</key>
+	<array>
+		<string>PicassoAudioUserClient</string>
+	</array>
 </dict>
 </plist>

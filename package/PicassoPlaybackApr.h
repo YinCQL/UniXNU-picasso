@@ -251,8 +251,10 @@ inline bool picasso_play_receive(PicassoAprProbe &p,const uint8_t *b,unsigned by
 inline bool picasso_play_rearm(PicassoAprProbe &p) {
     auto &v=p.play;
     bool cancelled=v.firstError==-125 && !v.cleanupError && !v.dmaError;
-    if(!v.done || (!v.complete && !cancelled) || v.owned || v.inflight || p.pcm.busyMask || v.pins.dirty ||
-        (v.amplifier && !v.amp.stopped) || picasso_play_base(v)>=0x7ffe0000)return false;
+    bool fresh=!v.enabled && !v.attempted && !v.done && !v.error && !v.firstError &&
+        !v.cleanupError && !v.dmaError && !v.sent && !v.pending && !v.ampPrepared && !v.ampEnabled;
+    if((!fresh && (!v.done || (!v.complete && !cancelled))) || v.owned || v.inflight || p.pcm.busyMask || v.pins.dirty ||
+        (!fresh && v.amplifier && !v.amp.stopped) || picasso_play_base(v)>=0x7ffe0000)return false;
     auto amp=v.amplifier;auto source=v.source;auto pins=v.pins;
     unsigned base=picasso_play_base(v)+0x10000,events=v.events+1;
     // Byte clearing avoids placing a complete playback state on the kernel stack.

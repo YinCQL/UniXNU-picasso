@@ -32,7 +32,8 @@ static pthread_t gThread,gWatch;
 static bool gWatchLive;
 static PicassoAudioMix gMix;
 static uint64_t gSent,gMissing,gReservedEnd;
-static uint32_t gCalls,gUnknown;
+static uint32_t gCalls,gUnknown,gPropertyNotes;
+static uint64_t gPropertySeen;
 static int16_t gChunk[2048];
 static PicassoAudioFormat gFormat={1,48000,2,16};
 static const Float32 kMinDb=-36;
@@ -78,11 +79,14 @@ static void *watchService(void *arg){
         if(!gStop&&!gConnect)(void)connectService();bool changed=!before&&gConnect;
         pthread_mutex_unlock(&gLock);
         if(changed&&gHost){
-            // Do not enumerate a dead device at plugin initialization. Publish
-            // its list when the real kernel connection becomes available.
+            // LoadingConditions normally defers initialization until the service
+            // exists. Keep recovery notification for hosts that load early.
             AudioObjectPropertyAddress a={kAudioPlugInPropertyDeviceList,kAudioObjectPropertyScopeGlobal,kAudioObjectPropertyElementMaster};
-            gHost->PropertiesChanged(gHost,kPlugIn,1,&a);
-            a.mSelector=kAudioObjectPropertyOwnedObjects;gHost->PropertiesChanged(gHost,kPlugIn,1,&a);
+            OSStatus rc=gHost->PropertiesChanged(gHost,kPlugIn,1,&a);
+            pthread_mutex_lock(&gLock);note(8,rc,a.mSelector,kPlugIn);pthread_mutex_unlock(&gLock);
+            a.mSelector=kAudioDevicePropertyDeviceIsAlive;
+            rc=gHost->PropertiesChanged(gHost,kDevice,1,&a);
+            pthread_mutex_lock(&gLock);note(8,rc,a.mSelector,kDevice);pthread_mutex_unlock(&gLock);
         }
         usleep(1000000);
     }return NULL;
@@ -90,11 +94,12 @@ static void *watchService(void *arg){
 static OSStatus Initialize(AudioServerPlugInDriverRef d,AudioServerPlugInHostRef host){
     (void)d;gHost=host;pthread_mutex_lock(&gLock);(void)connectService();
     if(!gWatchLive){if(!pthread_create(&gWatch,NULL,watchService,NULL)){gWatchLive=true;pthread_detach(gWatch);}}
+    note(8,0,0,gConnect!=0);
     pthread_mutex_unlock(&gLock);return 0;
 }
 static OSStatus CreateDevice(AudioServerPlugInDriverRef d,CFDictionaryRef a,const AudioServerPlugInClientInfo *b,AudioObjectID *c){(void)d;(void)a;(void)b;(void)c;return kAudioHardwareUnsupportedOperationError;}
 static OSStatus DestroyDevice(AudioServerPlugInDriverRef d,AudioObjectID o){(void)d;(void)o;return kAudioHardwareUnsupportedOperationError;}
-static OSStatus AddDeviceClient(AudioServerPlugInDriverRef d,AudioObjectID o,const AudioServerPlugInClientInfo *c){(void)d;(void)c;return o==kDevice?0:kAudioHardwareBadObjectError;}
+static OSStatus AddDeviceClient(AudioServerPlugInDriverRef d,AudioObjectID o,const AudioServerPlugInClientInfo *c){(void)d;(void)c;pthread_mutex_lock(&gLock);note(8,0,1,o);pthread_mutex_unlock(&gLock);return o==kDevice?0:kAudioHardwareBadObjectError;}
 static OSStatus StopIO(AudioServerPlugInDriverRef,AudioObjectID,UInt32);
 static OSStatus RemoveDeviceClient(AudioServerPlugInDriverRef d,AudioObjectID o,const AudioServerPlugInClientInfo *c){return c?StopIO(d,o,c->mClientID):kAudioHardwareIllegalOperationError;}
 static OSStatus PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d,AudioObjectID o,UInt64 a,void *i){(void)d;(void)o;(void)a;(void)i;return kAudioHardwareUnsupportedOperationError;}
@@ -127,12 +132,12 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kAudioObjectPropertyManufacturer: REPLY_STR("UniXNU");
         case kAudioObjectPropertyOwnedObjects:
         case kAudioPlugInPropertyDeviceList: {
-            if (!gConnect || inDataSize < sizeof(AudioObjectID)) {*outDataSize = 0; return 0;}
+            if (inDataSize < sizeof(AudioObjectID)) {*outDataSize = 0; return 0;}
             ((AudioObjectID *)outData)[0] = kDevice; *outDataSize = sizeof(AudioObjectID); return 0;
         }
         case kAudioPlugInPropertyTranslateUIDToDevice: {
             CFStringRef uid = q && qs >= sizeof(CFStringRef) ? *(const CFStringRef *)q : NULL;
-            REPLY(AudioObjectID, gConnect && uid && CFStringCompare(uid, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo ? kDevice : kAudioObjectUnknown);
+            REPLY(AudioObjectID, uid && CFStringCompare(uid, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo ? kDevice : kAudioObjectUnknown);
         }
         case kAudioPlugInPropertyResourceBundle: REPLY_STR("");
         default: return kAudioHardwareUnknownPropertyError;
@@ -253,6 +258,11 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
 static OSStatus GetPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 n,UInt32 *z,void *v){
     (void)d;(void)pid;if(!a||!z||(!v&&n))return kAudioHardwareIllegalOperationError;
     pthread_mutex_lock(&gLock);OSStatus rc=propertyData(o,a,qs,q,n,z,v);
+    // Bounded first-observation diagnostics identify enumeration vs routing.
+    uint64_t bit=1ULL<<((a->mSelector^(a->mSelector>>8)^o)%64);
+    if(gConnect && gPropertyNotes<32 && !(gPropertySeen&bit)){
+        gPropertySeen|=bit;++gPropertyNotes;note(7,rc,a->mSelector,o);
+    }
     if(rc==kAudioHardwareUnknownPropertyError && gConnect && gUnknown<32){++gUnknown;note(5,rc,a->mSelector,o);}pthread_mutex_unlock(&gLock);return rc;
 }
 static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 *z){

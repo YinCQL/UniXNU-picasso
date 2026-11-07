@@ -6,6 +6,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <libkern/c++/OSSharedPtr.h>
 #include <kern/cpu_data.h>
+#include <pexpert/pexpert.h>
 #include "PicassoSmp2p.h"
 #include "PicassoSmemLock.h"
 #include "PicassoRpmh.h"
@@ -515,7 +516,7 @@ extern "C" void picasso_smp2p_start(void) {
         error, s.created, s.partition.offset, s.partition.size, s.out.offset, s.out.size, lockRead(&d));
     logAudit(s);
     if (error) return;
-    glink.apr.pins.read=audioPinRead;glink.apr.pins.write=audioPinWrite;glink.apr.tfa.probe=tfaProbe;glink.apr.pcm.prepare=picasso_pcm_device_prepare;glink.apr.play.enabled=true;glink.apr.play.amplifier=tfaPlayback;
+    glink.apr.pins.read=audioPinRead;glink.apr.pins.write=audioPinWrite;glink.apr.tfa.probe=tfaProbe;glink.apr.pcm.prepare=picasso_pcm_device_prepare;uint32_t audioTest=0;PE_parse_boot_argn("picasso-audio-test",&audioTest,sizeof audioTest);glink.apr.play.enabled=audioTest==1;glink.apr.play.amplifier=tfaPlayback;
     smpKick(&d);
     IOLog("PICASSO_ADSP glink stage=prepared descriptor=%x/%x tx=%x/%x remote_pid=2\n",
         glink.desc.offset,glink.desc.size,glink.tx.offset,glink.tx.size);

@@ -85,6 +85,7 @@ static void IOSleep(unsigned ms) {
     if(sleeps==1602)ram[(part+48+36)/4]=1; // External mutation stops service.
 }
 static void IODelay(unsigned) {}
+static bool PE_parse_boot_argn(const char *,void *,int){return false;}
 #include "PicassoSmp2pDevice-body.inc"
 extern "C" void picasso_audio_service_tick(PicassoAprProbe &,bool) {}
 extern "C" { volatile uint32_t native_novatek_touch_stage=0; }

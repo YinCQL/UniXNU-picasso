@@ -16,7 +16,7 @@ static PicassoAudioQueue queue;
 static IOLock *queueLock;
 static uint8_t scratch[16384]; // worker-only staging, never stack or user DMA
 static bool attempted,published,registered,active,registrationFailed;
-static unsigned clientNotes,clientOpens;
+static unsigned clientNotes,clientOpens,clientPropertyNotes;
 static unsigned testPhase,testFrames,testPause,lastEvents,startWait;
 
 static const PicassoAudioFormat format={1,48000,2,16};
@@ -33,11 +33,13 @@ static int audioCall(uint64_t owner,unsigned selector,const void *input,unsigned
     else if((selector==PicassoAudioEnd || selector==PicassoAudioCancel) && !bytes && !output)e=picasso_audio_end(queue,owner,selector==PicassoAudioCancel);
     else if(selector==PicassoAudioNote && input && bytes==sizeof(PicassoAudioClientNote) && !output) {
         const auto &n=*static_cast<const PicassoAudioClientNote *>(input);
-        if(n.version==1 && n.kind>=1 && n.kind<=6 && !n.reserved) {
+        if(n.version==1 && n.kind>=1 && n.kind<=8 && !n.reserved) {
             // Client-provided observations, separately labeled from DSP state.
-            if(clientNotes<64 || (n.kind==3 && !(n.sentFrames&0x3ffff))) {
+            bool property=n.kind==5 || n.kind==7;
+            unsigned &budget=property?clientPropertyNotes:clientNotes;
+            if(budget<(property?48U:64U) || (n.kind==3 && !(n.sentFrames&0x3ffff))) {
                 IOLog("PICASSO_AUDIO hal-note kind=%u result=%d selector=%x value=%u calls=%llu sent_frames=%llu missing_frames=%llu client_report=1\n",
-                    n.kind,n.result,n.selector,n.value,n.calls,n.sentFrames,n.missingFrames);++clientNotes;
+                    n.kind,n.result,n.selector,n.value,n.calls,n.sentFrames,n.missingFrames);++budget;
             }
             e=0;
         }
@@ -131,9 +133,10 @@ static int audioSource(PicassoPlayback &,PicassoPcm &pcm,unsigned slot,unsigned 
     if(!e) {queue.read=(queue.read+n)%PicassoAudioRingBytes;queue.used-=n;queue.dma+=n;*bytes=n;}
     IOLockUnlock(queueLock);return e;
 }
-// Initial 2s tone remains the hardware qualification gate. Then run 1s of
+// With picasso-audio-test=1, the initial 2s tone gates 1s of
 // externally supplied PCM through this exact producer/copy/rearm path. A second
 // short session validates start/stop and token generations before publication.
+// Normal boot publishes after the silent control/DMA checks, without test PCM.
 static void feedSelftest() {
     if(testPhase!=1 && testPhase!=2)return;
     unsigned total=testPhase==1?48000:24000;
@@ -157,11 +160,16 @@ static void feedSelftest() {
 }
 extern "C" void picasso_audio_service_tick(PicassoAprProbe &p,bool transportFailed) {
     auto &v=p.play;
-    if(!attempted && v.done) {
+    bool quietReady=!v.enabled && !v.attempted && !v.done && p.ready && p.fw.valid &&
+        p.pcm.done && p.pcm.complete && !p.pcm.uncertain && !p.pcm.busyMask &&
+        p.tfa.digitalApplied && p.tfa.digitalRestored && !p.tfa.digitalError &&
+        !p.tfa.digitalRestoreError && !p.tfa.digitalDirty;
+    if(!attempted && (v.done || quietReady)) {
         attempted=true;
-        if(!v.complete || transportFailed)return;
+        if(transportFailed || (!quietReady && !v.complete))return;
         queueLock=IOLockAlloc();if(!queueLock) {IOLog("PICASSO_AUDIO error=lock\n");return;}
-        queue.ready=true;testPhase=1;
+        queue.ready=true;testPhase=quietReady?3:1;
+        IOLog("PICASSO_AUDIO boot selftest=%u ready=1 playback_completed=%u quiet=%u\n",!quietReady,v.complete,quietReady);
     }
     if(!queueLock)return;
     if(active) {
