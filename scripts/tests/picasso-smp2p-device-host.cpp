@@ -246,6 +246,8 @@ int main(int argc,char **argv) {
     pcm.statuses[0]=pcm.statuses[1]=0xffffffff;logPcm(stream);
     auto &play=stream.play;play.phase=play.token=play.opcode=play.status=play.copp=play.handle=play.accepted=play.owned=0xffffffff;
     play.writeAddressHigh=play.writeAddressLow=play.writeHandle=play.writeStatus=0xffffffff;
+    play.writeSent=play.writeDone=play.inflight=play.bytesSent=play.bytesDone=play.streamTicks=stream.pcm.busyMask=0xffffffff;
+    for(auto &v:play.amp.serial)v=0xffff;
     play.replyPhase=play.replyOpcode=play.replyType=play.replyBytes=play.replySource=play.replyDestination=play.replyReject=play.rejected=0xffffffff;
     for(auto &word:play.replyRaw)word=0xffffffff;
     play.error=play.firstError=play.cleanupError=play.dmaError=-2147483647;

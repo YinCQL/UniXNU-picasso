@@ -6,7 +6,7 @@
 static uint32_t mem[7][4096],original[7][4096];
 static unsigned reads,writes,failRead,failWrite,dropWrite,delays,op,currentReg,commands,injectCommand;
 static unsigned nack,arb,timeout,shortRead,overflow,badId,unstable,abortFail,stopFail;
-static bool heldBus,active,irqAsserted,realRevision,playbackMode,noClocks,noOperating;
+static bool heldBus,active,irqAsserted,realRevision,playbackMode,noClocks,noOperating,autoOperating;
 static unsigned resets,statusFailure;
 static uint16_t amp[256];static unsigned ampWrites,failAmpWrite,writeControl;
 static int rd(void *,unsigned bank,unsigned reg,uint32_t *v) {
@@ -43,6 +43,7 @@ static int wr(void *,unsigned bank,unsigned reg,uint32_t v) {
         } else if(op==2) {
             assert(heldBus && !(v&4) && mem[0][0x270/4]==2);
             if(playbackMode) {
+                if(autoOperating && !(amp[0]&1) && (amp[1]&4))amp[0]|=8;
                 amp[0x10]=0x16;
                 if(statusFailure==1)amp[0x10]&=~4U;
                 if(statusFailure==2)amp[0x10]|=0x40;
@@ -81,7 +82,7 @@ static PicassoTfaIo io={nullptr,readIo,wr,delay};
 static void setup() {
     memset(mem,0,sizeof mem);reads=writes=failRead=failWrite=dropWrite=delays=op=currentReg=commands=injectCommand=0;
     nack=arb=timeout=shortRead=overflow=badId=unstable=abortFail=stopFail=0;heldBus=active=irqAsserted=realRevision=false;
-    ampWrites=failAmpWrite=writeControl=resets=statusFailure=0;playbackMode=noClocks=noOperating=false;memset(amp,0,sizeof amp);
+    ampWrites=failAmpWrite=writeControl=resets=statusFailure=0;playbackMode=noClocks=noOperating=autoOperating=false;memset(amp,0,sizeof amp);
     mem[3][2]=0xbc0000;mem[1][0x26c/4]=0x80000000;
     mem[0][0x68/4]=0x301;mem[0][0xe24/4]=0x20100000;mem[0][0xe28/4]=0x20100000;
     mem[0][0x908/4]=3;mem[1][0x284/4]=1;mem[1][0x28c/4]=1;
@@ -136,6 +137,14 @@ static void amplifierTests() {
     assert(!picasso_tfa_play_finish(session,a));
     assert(a.stopped && a.resetSafe && !a.enabled && resets==2 && amp[0]==1);checkRestored(o);
     unsigned totalReads=reads,totalWrites=writes;
+    realAmp();playbackMode=autoOperating=true;o={};a={};
+    PicassoTfaSession automatic={io,o,{},{},0,0,false,false,false,false};
+    assert(!picasso_tfa_play_prepare(automatic,a));
+    assert(a.enabled && a.wasEnabled && !a.enableRequested && (a.control[0]&8));
+    assert(!picasso_tfa_play_enable(automatic,a) && a.enableRequested && a.enabled);
+    assert(a.serial[0]==0x890 && a.serial[1]==0xc0f1 && a.serial[2]==0x43c && a.serial[3]==0x19);
+    assert(picasso_tfa_play_enable(automatic,a)==-22);
+    assert(!picasso_tfa_play_finish(automatic,a) && a.stopped && !a.enabled);
     for(unsigned mode=0;mode<4;++mode) {
         realAmp();playbackMode=true;o={};a={};
         PicassoTfaSession s={io,o,{},{},0,0,false,false,false,false};

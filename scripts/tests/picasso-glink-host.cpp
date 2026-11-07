@@ -48,6 +48,7 @@ static void tfaPortTests();
 static void streamTests();
 static void pcmTests();
 static void playTests();
+static void continuousPlayTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -133,7 +134,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    audioPinTests();afePortTests();tfaPortTests();streamTests();pcmTests();playTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
+    audioPinTests();afePortTests();tfaPortTests();streamTests();pcmTests();playTests();continuousPlayTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -1536,6 +1537,9 @@ static int ampHook(PicassoPlayback &v,unsigned action) {
 }
 
 static int playSilence(PicassoPcm &) {++silenceCalls;return pcmFault;}
+static int playTone(PicassoPcm &p,unsigned slot,unsigned sequence) {
+    assert(slot<2 && sequence<24 && !(p.busyMask&(1U<<slot)));++silenceCalls;return pcmFault;
+}
 static unsigned playReady(PicassoGlink &s) {
     unsigned rx=pcmReady(s);s.apr.pcm.prepare=nullptr;
     s.apr.pcm.attempted=s.apr.pcm.done=s.apr.pcm.complete=s.apr.pcm.prepared=s.apr.pcm.retained=true;
@@ -1553,6 +1557,12 @@ static unsigned playResponse(PicassoGlink &s,uint32_t (&reply)[12],unsigned stat
     if(!status && phase==PicassoPlayMapBuffer) {reply[0]=0x00240181;reply[4]=0x10d93;reply[8]=0x7788;bytes=36;}
     if(!status && phase==PicassoPlayOpenCopp) {reply[4]=0x10329;reply[8]=0;reply[9]=0;} // COPP zero is valid
     if(phase==PicassoPlayWrite) {reply[0]=0x00300081;reply[4]=0x10d99;reply[8]=0x80000000;reply[9]=1;reply[10]=s.apr.play.handle;reply[11]=status;bytes=48;}
+    if(phase==PicassoPlayWrite && s.apr.play.tone) {
+        auto &v=s.apr.play;unsigned slot=(v.inflight&1)?0:1;
+        if(v.inflight==3 && v.writeSequence[1]<v.writeSequence[0])slot=1;
+        assert(v.inflight&(1U<<slot));reply[3]=0x20571001+v.writeSequence[slot];
+        reply[8]=0x80000000+slot*16384;
+    }
     if(!status && phase==PicassoPlayDrain) {reply[0]=0x00200081;reply[4]=0x10c1c;bytes=32;}
     return bytes;
 }
@@ -1594,8 +1604,8 @@ __attribute__((noinline)) static void playTests() {
     // Here verify APR lifecycle ordering, once-only lease and failure cleanup.
     for(unsigned fail=0;fail<=4;++fail) {
         rx=playReady(s);memset(ampActions,0,sizeof ampActions);ampFailure=fail;
-        s.apr.play.amplifier=ampHook;s.apr.pcm.tone=playSilence;
-        for(unsigned n=0;n<40 && !s.apr.play.done;++n) {
+        s.apr.play.amplifier=ampHook;s.apr.pcm.tone=playTone;
+        for(unsigned n=0;n<80 && !s.apr.play.done;++n) {
             step(s);drain(s);
             if(s.apr.play.pending) {playAck(s);playRelease(s,rx);}
         }
@@ -1606,7 +1616,7 @@ __attribute__((noinline)) static void playTests() {
     }
     for(unsigned mode=0;mode<2;++mode) {
         rx=playReady(s);memset(ampActions,0,sizeof ampActions);ampFailure=0;
-        s.apr.play.amplifier=ampHook;s.apr.pcm.tone=playSilence;
+        s.apr.play.amplifier=ampHook;s.apr.pcm.tone=playTone;
         for(unsigned n=0;n<PicassoPlayWrite;++n) {step(s);drain(s);playAck(s);playRelease(s,rx);}
         assert(s.apr.play.phase==PicassoPlayWrite && s.apr.play.pending && ampActions[1]==1);
         if(mode) {s.qrtr.qmi.domains[0].state=0;playRelease(s,rx);playCleanup(s,rx);}
@@ -1761,4 +1771,87 @@ __attribute__((noinline)) static void playTests() {
     rx=playReady(s);p32(s.desc.offset,(s.txHead+8)%s.tx.size);for(unsigned i=0;i<253;++i)step(s);
     assert(s.apr.play.done && s.apr.play.firstError==-60 && !s.apr.play.owned);
     puts("PASS 15-stage silent ADM/ASM data route, exact WRITE_DONE, COPP zero, every timeout/error/TX fault, ownership and pin rollback");
+}
+
+// Replies use an independent stock wire layout, never the next request token.
+static void toneDone(PicassoGlink &s,unsigned sequence,unsigned status=0,unsigned corrupt=0) {
+    uint32_t reply[]={0x00300081,0x01010407,0x01010507,0x20571001+sequence,0x10d99,0,0,0,
+        0x80000000+(sequence&1)*16384,1,0x7788,status};
+    if(corrupt)reply[corrupt]^=1;
+    picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(reply),sizeof reply);
+}
+static unsigned twoToneSlots(PicassoGlink &s) {
+    unsigned rx=playReady(s);memset(ampActions,0,sizeof ampActions);ampFailure=0;
+    s.apr.play.amplifier=ampHook;s.apr.pcm.tone=playTone;
+    for(unsigned i=0;i<PicassoPlayWrite;++i) {step(s);drain(s);playAck(s);playRelease(s,rx);}
+    assert(s.apr.play.writeSent==1 && s.apr.play.inflight==1);
+    playRelease(s,rx);assert(s.apr.play.writeSent==2 && s.apr.play.inflight==3);
+    playRelease(s,rx);assert(s.apr.pcm.busyMask==3 && !s.remoteIntent[0].busy);
+    return rx;
+}
+__attribute__((noinline)) static void continuousPlayTests() {
+    static PicassoGlink s;unsigned rx=twoToneSlots(s);auto &v=s.apr.play;
+    uint32_t request[18];picasso_play_request(s.apr,request);
+    const uint32_t next[]={0x00340250,0x01010507,0x01010407,0x20571003,0x10dab,0x80000000,1,0x7788,16384,0x20571003,0,0,0};
+    assert(!memcmp(request,next,sizeof next));
+    // A success BASIC ACK, wrong endpoint/type/address/handle, stale or future
+    // token cannot retire a slot or move to EOS.
+    uint32_t ack[]={0x00280181,0x01010407,0x01010507,0x20571001,0x110e8,0,0,0,0x10dab,0};
+    picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),sizeof ack);
+    const unsigned fields[]={1,2,4,8,9,10};for(unsigned field:fields)toneDone(s,0,0,field);
+    toneDone(s,24);assert(v.writeDone==0 && v.inflight==3 && s.apr.pcm.busyMask==3);
+    toneDone(s,1);assert(v.writeDone==1 && v.inflight==1 && s.apr.pcm.busyMask==1);
+    toneDone(s,1);step(s);drain(s);assert(v.writeSent==2 && v.writeDone==1 && v.phase==PicassoPlayWrite);
+    toneDone(s,0);step(s);drain(s);assert(v.writeSent==3 && v.inflight==1);
+    toneDone(s,0);assert(v.writeDone==2 && v.inflight==1); // same address, old generation
+    playRelease(s,rx);assert(v.writeSent==4 && v.inflight==3);playRelease(s,rx);
+    for(unsigned seq=2;seq<24;seq+=2) {
+        unsigned fills=silenceCalls;
+        toneDone(s,seq+1);step(s);drain(s);
+        assert(v.writeSent==seq+2 && silenceCalls==fills);
+        toneDone(s,seq);step(s);drain(s);
+        if(seq<22) {playRelease(s,rx);playRelease(s,rx);assert(v.writeSent==seq+4 && v.inflight==3);}
+    }
+    assert(v.phase==PicassoPlayDrain && v.pending && v.consumed && !v.inflight && !s.apr.pcm.busyMask);
+    assert(v.writeSent==24 && v.writeDone==24 && v.bytesSent==384000 && v.bytesDone==384000 && silenceCalls==24);
+    assert(ampActions[0]==1 && ampActions[1]==1 && !ampActions[2]);
+    toneDone(s,23);assert(!v.drained && v.phase==PicassoPlayDrain);
+    playAck(s);playRelease(s,rx);playCleanup(s,rx);
+    assert(v.complete && v.drained && !v.owned && v.amp.stopped && ampActions[2]==1);
+    // An explicit error returns only its buffer. Failure to close the stream
+    // cannot release the other buffer or remove its mapping.
+    for(unsigned basic=0;basic<2;++basic) {
+        rx=twoToneSlots(s);
+        if(basic) {ack[9]=2;picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),sizeof ack);}
+        else toneDone(s,0,2);
+        assert(v.error==-5 && v.inflight==2 && s.apr.pcm.busyMask==2 && !v.consumed);
+        step(s);drain(s);assert(v.phase==PicassoPlayClose && v.pending);
+        toneDone(s,1);assert(v.inflight==2);playAck(s,2);playRelease(s,rx);playCleanup(s,rx);
+        assert(!v.complete && v.owned==(PicassoPlayStream|PicassoPlayBuffer|PicassoPlayMap));
+        assert(s.apr.pcm.busyMask==2 && !(v.accepted&(1U<<PicassoPlayUnmap)) && v.amp.stopped);
+    }
+    // Failure while refilling with another DSP buffer still pending must
+    // immediately schedule CLOSE, not freeze waiting for the local error.
+    rx=twoToneSlots(s);toneDone(s,0);pcmFault=-5;step(s);drain(s);
+    assert(v.error==-5 && v.inflight==2);pcmFault=0;step(s);drain(s);
+    assert(v.phase==PicassoPlayClose && v.pending);playAck(s);playRelease(s,rx);playCleanup(s,rx);
+    assert(!v.complete && !v.owned && !s.apr.pcm.busyMask && v.firstError==-5);
+    for(unsigned mode=0;mode<4;++mode) {
+        rx=twoToneSlots(s);
+        if(mode==0)for(unsigned i=0;i<102;++i) {toneDone(s,25);step(s);drain(s);}
+        if(mode==1) {v.streamTicks=500;step(s);drain(s);}
+        if(mode==2) {s.qrtr.qmi.domains[0].state=0;step(s);drain(s);}
+        if(mode==3) {picasso_glink_stop(&s);assert(v.done && v.inflight==3 && s.apr.pcm.busyMask==3 && !v.complete);continue;}
+        assert(v.phase==PicassoPlayClose && v.pending);playAck(s);playRelease(s,rx);playCleanup(s,rx);
+        assert(!v.complete && !v.owned && !s.apr.pcm.busyMask && v.firstError==(mode==2?-104:-60));
+    }
+    // Every failed MMIO in a refill publication may have reached the peer.
+    // Retain both the old slot and the ambiguous new slot on transport loss.
+    rx=twoToneSlots(s);toneDone(s,0);writes=0;step(s);unsigned total=writes;
+    for(unsigned n=1;n<=total;++n) {
+        rx=twoToneSlots(s);toneDone(s,0);writes=0;failWrite=n;bool kick=false;
+        assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && v.done && !v.complete);
+        assert((v.owned&PicassoPlayBuffer) && s.apr.pcm.busyMask==3 && v.amp.stopped);
+    }
+    puts("PASS two-slot 2s PCM: exact wire, out-of-order/stale/duplicate replies, short tail, refill, EOS, all TX faults and retained ownership");
 }

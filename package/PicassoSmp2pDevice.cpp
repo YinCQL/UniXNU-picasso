@@ -126,7 +126,11 @@ int tfaPlayback(PicassoPlayback &v,unsigned action) {
             for(auto *&m:playTfaMaps)if(m) {m->release();m=nullptr;}
         }
     } else if(action==1)e=playTfaMapped?picasso_tfa_play_enable(playTfaSession,a):-22;
-    else if(action==3) {e=playTfaMapped?picasso_tfa_play_status(playTfaSession,a,true):-22;if(e && !a.error)a.error=e;}
+    else if(action==3) {
+        e=playTfaMapped?picasso_tfa_play_status(playTfaSession,a,true):-22;
+        if(!e)e=picasso_tfa_play_serial(playTfaSession,a);
+        if(e && !a.error)a.error=e;
+    }
     else if(action==2) {
         if(playTfaMapped) {
             e=picasso_tfa_play_finish(playTfaSession,a);
@@ -165,7 +169,11 @@ void logPlay(const PicassoAprProbe &a) {
     IOLog("PICASSO_ADSP play phase=%u token=%x pending=%u opcode=%x status=%u error=%d first_error=%d cleanup_error=%d dma_error=%d\n",
         v.phase,v.token,v.pending,v.opcode,v.status,v.error,v.firstError,v.cleanupError,v.dmaError);
     IOLog("PICASSO_ADSP play-state accepted=%x owned=%x copp=%u handle=%x consumed=%u done=%u complete=%u bytes=%u silence=%u amp_enable=%u\n",
-        v.accepted,v.owned,v.copp,v.handle,v.consumed,v.done,v.complete,v.tone?32768:4096,!v.tone,v.amp.wasEnabled);
+        v.accepted,v.owned,v.copp,v.handle,v.consumed,v.done,v.complete,v.tone?v.bytesSent:4096,!v.tone,v.amp.wasEnabled);
+    IOLog("PICASSO_ADSP play-queue sent=%u returned=%u inflight=%x dma_busy=%x bytes=%u/%u ticks=%u chunks=24 slot_bytes=16384\n",
+        v.writeSent,v.writeDone,v.inflight,a.pcm.busyMask,v.bytesSent,v.bytesDone,v.streamTicks);
+    IOLog("PICASSO_ADSP play-serial regs20_21_22_23_26_6e=%x/%x/%x/%x/%x/%x enable_requested=%u\n",
+        v.amp.serial[0],v.amp.serial[1],v.amp.serial[2],v.amp.serial[3],v.amp.serial[4],v.amp.serial[5],v.amp.enableRequested);
     IOLog("PICASSO_ADSP play-pins active=%u restored=%u dirty=%x error=%d restore_error=%d\n",
         v.pins.active,v.pins.restored,v.pins.dirty,v.pins.error,v.pins.restoreError);
     IOLog("PICASSO_ADSP play-write address=%08x%08x handle=%x status=%u fsr=%x fault=%x\n",
@@ -178,7 +186,7 @@ void logPlay(const PicassoAprProbe &a) {
         v.amp.stage,v.amp.configured,v.amp.clockReady,v.amp.enabled,v.amp.stopped,v.amp.resetSafe,v.amp.error,v.amp.stopError,v.amp.registers,v.amp.polls,v.drained);
     if(v.amplifier)IOLog("PICASSO_ADSP play-amp-bus reg=%x irq=%x commands=%u writes=%u dirty=%x uncertain=%u cleanup_error=%d\n",
         playTfa.reg,playTfa.irq,playTfa.commands,playTfa.registerWrites,playTfa.dirty,playTfa.uncertain,playTfa.cleanupError);
-    IOLog("PICASSO_ADSP play-amp-reg status10_11_13_14=%x/%x/%x/%x control00_01_02=%x/%x/%x tone_peak=64 frames=8192\n",
+    IOLog("PICASSO_ADSP play-amp-reg status10_11_13_14=%x/%x/%x/%x control00_01_02=%x/%x/%x tone_peak=512 frames=96000\n",
         v.amp.status[0],v.amp.status[1],v.amp.status[2],v.amp.status[3],v.amp.control[0],v.amp.control[1],v.amp.control[2]);
 }
 void logPcm(const PicassoAprProbe &a) {

@@ -114,14 +114,18 @@ int pcmCheck(PicassoPcm &o) {
 }
 static int pcmSilence(PicassoPcm &o) {
     if(!o.prepared || o.address!=0x180000000ULL || o.bytes!=32768 || !pcmMemory.data[0])return -22;
+    if(o.busyMask)return -16;
     int e=pcmCheck(o);if(e)return e;
     rpcZero(pcmMemory.data[0],4096);cache(pcmMemory.data[0],4096,true);return pcmCheck(o);
 }
-static int pcmTone(PicassoPcm &o) {
-    if(!o.prepared || o.address!=0x180000000ULL || o.bytes!=32768 || !pcmMemory.data[0])return -22;
+static int pcmTone(PicassoPcm &o,unsigned slot,unsigned sequence) {
+    if(!o.prepared || o.address!=0x180000000ULL || o.bytes!=32768 || !pcmMemory.data[0] || slot>=2)return -22;
+    unsigned bytes=picasso_pcm_chunk_bytes(sequence);if(!bytes)return -22;
+    if(o.busyMask&(1U<<slot))return -16;
     int e=pcmCheck(o);if(e)return e;
-    e=picasso_pcm_tone(pcmMemory.data[0],32768);if(e)return e;
-    cache(pcmMemory.data[0],32768,true);return pcmCheck(o);
+    auto *data=pcmMemory.data[0]+slot*PicassoPcmSlotBytes;
+    e=picasso_pcm_tone(data,bytes,sequence*PicassoPcmChunkFrames);if(e)return e;
+    cache(data,bytes,true);return pcmCheck(o);
 }
 extern "C" void picasso_pcm_device_prepare(PicassoPcm &o) {
     if(pcmMemory.attempted) { o.dmaError=-16;return; }

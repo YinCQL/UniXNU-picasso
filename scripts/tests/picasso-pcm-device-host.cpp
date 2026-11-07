@@ -74,17 +74,31 @@ int main(int argc,char **argv) {
         registers[(187*4096+0x58)/4]=0x400;
         memset(storage,0xa5,8192);assert(p.silence && !p.silence(p));
         for(unsigned i=0;i<8192;++i)assert(storage[i]==(i<4096?0:0xa5));
-        uint8_t tables[4096];memcpy(tables,storage+32768,4096);assert(p.tone && !p.tone(p));
-        int peak=0;long sum=0;
-        for(unsigned frame=0;frame<8192;++frame) {
-            unsigned at=frame*4;int sample=int16_t(uint16_t(storage[at])|(uint16_t(storage[at+1])<<8));
-            assert(storage[at]==storage[at+2] && storage[at+1]==storage[at+3]);
-            assert(sample>=-64 && sample<=64);if(sample>peak)peak=sample;sum+=sample;
-            if(!frame || frame==8191)assert(!sample);
+        static uint8_t saved[49152];int peak=0;long sum=0;unsigned frames=0;
+        for(unsigned seq=0;seq<24;++seq) {
+            unsigned slot=seq&1,bytes=seq==23?7168:16384,offset=slot*16384;
+            memcpy(saved,storage,sizeof storage);p.busyMask=1U<<slot;
+            assert(p.tone && p.tone(p,slot,seq)==-16 && !memcmp(saved,storage,sizeof storage));
+            assert(p.silence(p)==-16);p.busyMask=1U<<(slot^1);
+            assert(!p.tone(p,slot,seq));p.busyMask=0;
+            for(unsigned i=0;i<sizeof storage;++i)if(i<offset || i>=offset+bytes)assert(saved[i]==storage[i]);
+            for(unsigned i=0;i<bytes/4;++i,++frames) {
+                unsigned at=offset+i*4;int sample=int16_t(uint16_t(storage[at])|(uint16_t(storage[at+1])<<8));
+                assert(storage[at]==storage[at+2] && storage[at+1]==storage[at+3]);
+                assert(sample>=-512 && sample<=512);if(sample>peak)peak=sample;sum+=sample;
+                if(!frames || frames==95999)assert(!sample);
+                // 48-frame continuity across the alternating slot boundary.
+                if(frames>=480 && frames<95520 && frames%48==12)assert(sample==512);
+                if(frames>=480 && frames<95520 && frames%48==36)assert(sample==-512);
+            }
         }
-        assert(peak==64 && sum>-2000 && sum<2000);
-        assert(!memcmp(storage+32768,tables,4096));
-        assert(picasso_pcm_tone(nullptr,32768)==-22 && picasso_pcm_tone(storage,4096)==-22);
+        assert(frames==96000 && peak==512 && sum>-1000 && sum<1000);
+        memcpy(saved,storage,sizeof storage);
+        assert(p.tone(p,2,0)==-22 && p.tone(p,0,24)==-22);
+        registers[(187*4096+0x58)/4]=2;assert(p.tone(p,0,0)==-5);registers[(187*4096+0x58)/4]=0x400;
+        assert(!memcmp(saved,storage,sizeof storage));
+        assert(picasso_pcm_tone(nullptr,16384,0)==-22 && picasso_pcm_tone(storage,32768,0)==-22);
+        assert(picasso_pcm_tone(storage,16384,95000)==-22 && picasso_pcm_tone(storage,3,0)==-22);
         if(mode==14){registers[(187*4096+0x58)/4]=2;assert(p.check(p)==-5 && p.fsr==2);}
         if(mode==15){registers[(187*4096+4)/4]^=1;assert(p.check(p)==-5);}
     }

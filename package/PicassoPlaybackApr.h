@@ -32,18 +32,31 @@ inline unsigned picasso_play_request(const PicassoAprProbe &p,uint32_t (&w)[18])
         bytes=32;w[1]=0x01010507;w[2]=0x01010407;w[4]=0x10daa; // immediate RUN, timestamp zero
     } else if(n==PicassoPlayWrite) {
         bytes=52;w[1]=0x01010507;w[2]=0x01010407;w[4]=0x10dab;
-        w[5]=uint32_t(p.pcm.address);w[6]=uint32_t(p.pcm.address>>32);w[7]=v.handle;
-        w[8]=v.tone?32768:4096;w[9]=1; // one stereo S16 buffer, no valid timestamp
+        uint64_t address=p.pcm.address+(v.tone?(v.writeSent&1)*PicassoPcmSlotBytes:0);
+        w[5]=uint32_t(address);w[6]=uint32_t(address>>32);w[7]=v.handle;
+        w[8]=v.tone?picasso_pcm_chunk_bytes(v.writeSent):4096;
+        w[9]=v.tone?0x20571001+v.writeSent:1; // stock seq_id after buf_size; timestamps/flags zero
     } else if(n==PicassoPlayDrain) {
         w[1]=0x01010507;w[2]=0x01010407;w[4]=0x10bdb; // EOS, wait for RENDERED_EOS
     } else if(n==PicassoPlayCloseCopp) {
         w[1]=0x10020508;w[2]=(v.copp<<16)|0x408;w[4]=0x10327;
     } else return 0;
-    w[0]=(bytes<<16)|0x250;w[3]=0x20570001+n;return bytes;
+    w[0]=(bytes<<16)|0x250;w[3]=n==PicassoPlayWrite && v.tone?0x20571001+v.writeSent:0x20570001+n;return bytes;
 }
-inline void picasso_play_sent(PicassoPlayback &v) {
+inline void picasso_play_sent(PicassoAprProbe &p) {
+    auto &v=p.play;
     v.sent=v.pending=true;v.token=0x20570001+v.phase;v.wait=0;
-    v.owned|=picasso_play_acquires(v.phase);++v.events;
+    v.owned|=picasso_play_acquires(v.phase);
+    if(v.phase==PicassoPlayWrite) {
+        unsigned slot=v.tone?v.writeSent&1:0;p.pcm.busyMask|=1U<<slot;
+        if(v.tone) {
+            v.token=0x20571001+v.writeSent;v.writeSequence[slot]=v.writeSent;
+            v.writeWait[slot]=0;v.inflight|=1U<<slot;
+            v.bytesSent+=picasso_pcm_chunk_bytes(v.writeSent);++v.writeSent;
+            v.sent=v.bufferReady=false; // another free slot may be queued
+        }
+    }
+    ++v.events;
 }
 inline void picasso_play_tick(PicassoAprProbe &p,const PicassoQmi &q) {
     auto &v=p.play;
@@ -59,6 +72,15 @@ inline void picasso_play_tick(PicassoAprProbe &p,const PicassoQmi &q) {
     if(v.phase<PicassoPlayClose && !picasso_afe_domains_up(q) && !v.error) {
         v.pending=false;v.error=-104;++v.events;
     }
+    if(v.phase==PicassoPlayWrite && v.tone && !v.error) {
+        // Per-buffer deadlines and a total bound; reply traffic cannot extend it.
+        if(++v.streamTicks>500)v.error=-60;
+        for(unsigned i=0;i<2;++i)if((v.inflight&(1U<<i)) && ++v.writeWait[i]>100)v.error=-60;
+        if(v.error) {v.pending=false;++v.events;}
+    }
+    // A local fill/health/transport refusal may occur with the other slot
+    // still owned. Abort scheduling immediately; CLOSE must retire that slot.
+    if(v.phase==PicassoPlayWrite && v.error)v.pending=false;
     if(!v.pending && (v.responded || v.error)) {
         if(v.error) {
             if(v.phase<PicassoPlayClose && !v.firstError)v.firstError=v.error;
@@ -95,6 +117,7 @@ inline void picasso_play_tick(PicassoAprProbe &p,const PicassoQmi &q) {
         v.error=picasso_audio_pins_activate(v.pins);
         if(v.error) {++v.events;return;}
     }
+    if(v.phase==PicassoPlayWrite && v.tone)return;
     if(!v.error && ++v.wait>(v.pending?100U:250U)) {v.pending=false;v.error=-60;++v.events;}
 }
 inline bool picasso_play_due(PicassoAprProbe &p) {
@@ -103,14 +126,20 @@ inline bool picasso_play_due(PicassoAprProbe &p) {
     if(v.amplifier && v.phase==PicassoPlayOpen && !v.ampPrepared) {
         v.ampPrepared=true;v.error=v.amplifier(v,0);++v.events;if(v.error)return false;
     }
-    if(v.amplifier && v.phase==PicassoPlayWrite && !v.bufferReady) {
-        v.error=v.amplifier(v,1);++v.events;if(v.error)return false;v.tone=true;
+    if(v.amplifier && v.phase==PicassoPlayWrite && !v.ampEnabled) {
+        v.error=v.amplifier(v,1);++v.events;if(v.error)return false;v.tone=v.ampEnabled=true;
+    }
+    if(v.phase==PicassoPlayWrite && v.tone) {
+        if(v.writeSent>=PicassoPcmToneChunks || (v.inflight&(1U<<(v.writeSent&1))))return false;
+        if(v.amplifier && v.writeDone>=v.healthDone+8) {
+            v.healthDone=v.writeDone;v.error=v.amplifier(v,3);++v.events;if(v.error)return false;
+        }
     }
     if(v.amplifier && v.phase==PicassoPlayDrain) {
         v.error=v.amplifier(v,3);if(v.error) {++v.events;return false;}
     }
     if(v.phase==PicassoPlayWrite && !v.bufferReady) {
-        v.dmaError=v.tone?(p.pcm.tone?p.pcm.tone(p.pcm):-22):(p.pcm.silence?p.pcm.silence(p.pcm):-22);
+        v.dmaError=v.tone?(p.pcm.tone?p.pcm.tone(p.pcm,v.writeSent&1,v.writeSent):-22):(p.pcm.silence?p.pcm.silence(p.pcm):-22);
         if(v.dmaError) {v.error=v.dmaError;++v.events;return false;}
         v.bufferReady=true;
     }
@@ -122,7 +151,10 @@ inline bool picasso_play_due(PicassoAprProbe &p) {
 }
 inline bool picasso_play_receive(PicassoAprProbe &p,const uint8_t *b,unsigned bytes,unsigned type) {
     auto &v=p.play;
-    if(!v.pending || p.receivedToken!=v.token)return false;
+    bool streaming=v.phase==PicassoPlayWrite && v.tone;unsigned slot=2;
+    if(streaming)for(unsigned i=0;i<2;++i)
+        if((v.inflight&(1U<<i)) && p.receivedToken==0x20571001+v.writeSequence[i])slot=i;
+    if(!v.pending || (streaming?slot==2:p.receivedToken!=v.token))return false;
     v.replyPhase=v.phase;v.replyOpcode=p.opcode;v.replyType=type;v.replyBytes=bytes;
     v.replySource=p.source;v.replyDestination=p.destination;v.replyReject=0;
     for(unsigned i=0;i<4;++i)v.replyRaw[i]=bytes>=4*(i+1)?wlan_sm32(b+4*i):0;
@@ -133,6 +165,28 @@ inline bool picasso_play_receive(PicassoAprProbe &p,const uint8_t *b,unsigned by
     unsigned n=v.phase;
     bool basic=p.opcode==0x110e8 && type==1 && bytes==8 && wlan_sm32(b)==w[4];
     uint32_t status=0;int health=0,protocol=0;
+    if(streaming) {
+        uint64_t address=p.pcm.address+slot*PicassoPcmSlotBytes;
+        if(p.opcode==0x10d99 && type==0 && bytes==16 && wlan_sm32(b)==uint32_t(address) &&
+            wlan_sm32(b+4)==uint32_t(address>>32) && wlan_sm32(b+8)==v.handle) {
+            status=wlan_sm32(b+12);v.writeAddressLow=wlan_sm32(b);v.writeAddressHigh=wlan_sm32(b+4);
+            v.writeHandle=wlan_sm32(b+8);v.writeStatus=status;
+        } else if(basic && wlan_sm32(b+4))status=wlan_sm32(b+4);
+        else return reject(basic?4:2);
+        v.inflight&=~(1U<<slot);p.pcm.busyMask&=~(1U<<slot);
+        if(!v.inflight)v.owned&=~PicassoPlayBuffer;
+        health=p.pcm.check?p.pcm.check(p.pcm):-22;
+        v.status=v.statuses[n]=status;v.opcode=p.opcode;
+        if(status || health) {
+            v.error=status?-5:health;v.dmaError=health;v.pending=false;
+        } else {
+            ++v.writeDone;v.bytesDone+=picasso_pcm_chunk_bytes(v.writeSequence[slot]);
+            v.consumed=v.writeDone==PicassoPcmToneChunks && v.writeSent==PicassoPcmToneChunks && !v.inflight;
+            v.pending=!!v.inflight;v.responded=v.consumed;
+            if(v.consumed)v.accepted|=1U<<n;
+        }
+        ++v.events;return true;
+    }
     if(n==PicassoPlayMapBuffer && p.opcode==0x10d93 && type==1 && bytes==4 && wlan_sm32(b))v.handle=wlan_sm32(b);
     else if(n==PicassoPlayOpenCopp && p.opcode==0x10329 && type==1 && bytes==8) {
         status=wlan_sm32(b);
@@ -146,7 +200,7 @@ inline bool picasso_play_receive(PicassoAprProbe &p,const uint8_t *b,unsigned by
     } else if(n==PicassoPlayWrite && p.opcode==0x10d99 && type==0 && bytes==16 &&
         wlan_sm32(b)==uint32_t(p.pcm.address) && wlan_sm32(b+4)==uint32_t(p.pcm.address>>32) && wlan_sm32(b+8)==v.handle) {
         status=wlan_sm32(b+12);v.writeAddressLow=wlan_sm32(b);v.writeAddressHigh=wlan_sm32(b+4);
-        v.writeHandle=wlan_sm32(b+8);v.writeStatus=status;v.owned&=~PicassoPlayBuffer;
+        v.writeHandle=wlan_sm32(b+8);v.writeStatus=status;v.owned&=~PicassoPlayBuffer;p.pcm.busyMask=0;
         health=p.pcm.check?p.pcm.check(p.pcm):-22;v.consumed=!status && !health;
     } else if(n==PicassoPlayDrain && p.opcode==0x10c1c && type==0 && bytes==0) {
         v.drained=true;
@@ -158,10 +212,10 @@ inline bool picasso_play_receive(PicassoAprProbe &p,const uint8_t *b,unsigned by
     // Configuration/START can leave port state behind even on failure.
     // Stock START status9 means either already running OR not configured;
     // neither proves an idle port. Keep it owned until a real STOP ACK.
-    if(status)v.owned&=~(picasso_play_acquires(n)&~PicassoPlayPort);
+    if(status) {v.owned&=~(picasso_play_acquires(n)&~PicassoPlayPort);if(n==PicassoPlayWrite)p.pcm.busyMask=0;}
     else if(!protocol) {
         v.accepted|=1U<<n;
-        if(n==PicassoPlayClose)v.owned&=~(PicassoPlayStream|PicassoPlayBuffer);
+        if(n==PicassoPlayClose) {v.owned&=~(PicassoPlayStream|PicassoPlayBuffer);v.inflight=p.pcm.busyMask=0;}
         if(n==PicassoPlayCloseCopp)v.owned&=~PicassoPlayCopp;
         if(n==PicassoPlayUnmap) {v.owned&=~PicassoPlayMap;health=p.pcm.check?p.pcm.check(p.pcm):-22;}
         if(n==PicassoPlayStop)v.owned&=~PicassoPlayPort;

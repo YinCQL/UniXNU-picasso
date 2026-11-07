@@ -279,8 +279,8 @@ inline void picasso_tfa_run(const PicassoTfaIo &io,PicassoTfa &o) {
 // No OTP copy/program command, calibration execution or protection bypass.
 struct PicassoTfaPlayback {
     uint32_t stage,registers,polls;
-    uint16_t status[4],control[3]; // 10,11,13,14 and 00,01,02
-    bool attempted,configured,clockReady,enabled,wasEnabled,stopped,resetSafe;
+    uint16_t status[4],control[3],serial[6]; // 10/11/13/14, 00/01/02, 20/21/22/23/26/6e
+    bool attempted,configured,clockReady,enabled,wasEnabled,enableRequested,stopped,resetSafe;
     int error,stopError;
 };
 inline int picasso_tfa_field(PicassoTfaSession &s,unsigned reg,uint16_t mask,uint16_t value) {
@@ -290,12 +290,19 @@ inline int picasso_tfa_field(PicassoTfaSession &s,unsigned reg,uint16_t mask,uin
 inline int picasso_tfa_play_status(PicassoTfaSession &s,PicassoTfaPlayback &a,bool operating) {
     const unsigned regs[]={0x10,0x11,0x13,0x14};
     for(unsigned i=0;i<4;++i) {int e=picasso_tfa_read_register(s,regs[i],a.status[i]);if(e)return e;}
+    int control=picasso_tfa_read_register(s,0,a.control[0]);if(control)return control;
+    a.enabled=!!(a.control[0]&8);a.wasEnabled|=a.enabled;
     // Stock field names are otpOK/uvpOK/ovpOK: these bits must be ONE.
     // NOCLK is sticky from reset; use current CLKS; reject alarm/TDM faults.
     if((a.status[0]&0x68) || (a.status[0]&0x16)!=0x16 || (a.status[1]&0x100) || !(a.status[2]&0x100))return -5;
     if(!(a.status[1]&0x80))return -11;
     if(operating && (!(a.status[1]&0x4000) || !(a.status[2]&0x8000)))return -11;
     return 0;
+}
+inline int picasso_tfa_play_serial(PicassoTfaSession &s,PicassoTfaPlayback &a) {
+    const unsigned regs[]={0x20,0x21,0x22,0x23,0x26,0x6e};
+    for(unsigned i=0;i<6;++i) {int e=picasso_tfa_read_register(s,regs[i],a.serial[i]);if(e)return e;}
+    return 0; // Raw LP1/LA and serial input snapshot, not an audibility claim.
 }
 inline int picasso_tfa_play_prepare(PicassoTfaSession &s,PicassoTfaPlayback &a) {
     if(a.attempted)return -16;a.attempted=true;a.stage=1;
@@ -370,9 +377,18 @@ inline int picasso_tfa_play_prepare(PicassoTfaSession &s,PicassoTfaPlayback &a) 
     }
     if(e)return a.error=e;
     a.stage=3;
-    // Probus INIT_CF: I2C configured, then power up with AMPE still zero.
+    // Probus INIT_CF: request AMPE zero at power-up. The hardware manager
+    // may set it itself; status() reports the observed bit, not our intent.
     e=picasso_tfa_field(s,1,4,4);
-    if(!e)e=picasso_tfa_field(s,0,9,0);
+    if(!e) {
+        uint16_t old=0,back=0;e=picasso_tfa_read_register(s,0,old);
+        if(!e)e=picasso_tfa_write_register(s,0,uint16_t(old&~9U));
+        if(!e)e=picasso_tfa_read_register(s,0,back);
+        // AMPE is also manager-controlled: the device was observed at 0x18
+        // before explicit enable. Still verify PWDN and every other bit.
+        if(!e && (back&~8U)!=(old&~9U))e=-84;
+        if(!e) {a.control[0]=back;a.enabled=!!(back&8);a.wasEnabled|=a.enabled;}
+    }
     for(unsigned n=0;n<50 && !e;++n) {
         ++a.polls;int health=picasso_tfa_play_status(s,a,false);
         if(!health) {a.clockReady=true;break;}
@@ -380,11 +396,12 @@ inline int picasso_tfa_play_prepare(PicassoTfaSession &s,PicassoTfaPlayback &a) 
     }
     if(!e && !a.clockReady)e=-60;
     for(unsigned i=0;i<3 && !e;++i)e=picasso_tfa_read_register(s,i,a.control[i]);
+    if(!e)e=picasso_tfa_play_serial(s,a);
     a.configured=!e;a.error=e;return e;
 }
 inline int picasso_tfa_play_enable(PicassoTfaSession &s,PicassoTfaPlayback &a) {
-    if(!a.configured || a.enabled || a.error || a.stopped)return -22;
-    a.stage=4;int e=picasso_tfa_play_status(s,a,false);
+    if(!a.configured || a.enableRequested || a.error || a.stopped)return -22;
+    a.enableRequested=true;a.stage=4;int e=picasso_tfa_play_status(s,a,false);
     if(!e)e=picasso_tfa_field(s,0,1,0);
     if(!e)e=picasso_tfa_field(s,1,4,4);
     // The stock no-DSP mute callback is a no-op. Track the real AMPE write.
@@ -397,7 +414,8 @@ inline int picasso_tfa_play_enable(PicassoTfaSession &s,PicassoTfaPlayback &a) {
     }
     if(!e && !ready)e=-60;
     if(!e)e=picasso_tfa_read_register(s,0,a.control[0]);
-    a.enabled=!e;a.error=e;return e;
+    if(!e)e=picasso_tfa_play_serial(s,a);
+    a.error=e;return e;
 }
 inline int picasso_tfa_play_finish(PicassoTfaSession &s,PicassoTfaPlayback &a) {
     if(!a.attempted || a.stopped)return a.stopError;

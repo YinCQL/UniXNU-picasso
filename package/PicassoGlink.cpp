@@ -279,11 +279,17 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
         if(port && !a.port.phase && s->failed)a.port.uncertain=true;
         if(stream && !a.stream.phase && s->failed)a.stream.uncertain=true;
         if(pcm && !a.pcm.phase && s->failed)a.pcm.uncertain=true;
-        if(play && s->failed)a.play.owned|=picasso_play_acquires(a.play.phase);
+        if(play && s->failed) {
+            a.play.owned|=picasso_play_acquires(a.play.phase);
+            if(a.play.phase==PicassoPlayWrite) {
+                unsigned slot=a.play.tone?a.play.writeSent&1:0;
+                a.pcm.busyMask|=1U<<slot;a.play.inflight|=1U<<slot;
+            }
+        }
         return error;
     }
     slot->busy = true;
-    if(play)picasso_play_sent(a.play);
+    if(play)picasso_play_sent(a);
     else if(pcm) { a.pcm.sent=a.pcm.pending=true;a.pcm.token=words[7];a.pcm.wait=0;if(!a.pcm.phase)a.pcm.uncertain=true;++a.pcm.events; }
     else if(stream) { a.stream.sent=a.stream.pending=true;a.stream.token=words[7];a.stream.wait=0;if(!a.stream.phase)a.stream.uncertain=true;++a.stream.events; }
     else if(port) { a.port.sent=a.port.pending=true;a.port.token=words[7];a.port.wait=0;if(!a.port.phase)a.port.uncertain=true;++a.port.events; }

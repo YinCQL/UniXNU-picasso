@@ -3,6 +3,7 @@
 #define PICASSO_PLAYBACK_H
 #include <stdint.h>
 #include "PicassoAudioPins.h"
+#include "PicassoPcm.h"
 #include "PicassoTfa.h"
 enum { PicassoPlayClock=1,PicassoPlayPort=2,PicassoPlayStream=4,
     PicassoPlayMap=8,PicassoPlayCopp=16,PicassoPlayBuffer=32 };
@@ -13,8 +14,8 @@ enum PicassoPlayPhase {
     PicassoPlayClose, PicassoPlayCloseCopp, PicassoPlayUnmap,
     PicassoPlayStop, PicassoPlayClockOff, PicassoPlayDone
 };
-// One bounded buffer and real rendered-EOS drain. Production uses a brief
-// low-level tone with a TFA lease; this is not an IOAudio device.
+// Bounded two-slot PCM stream and real rendered-EOS drain with a TFA lease.
+// This is not an IOAudio device.
 struct PicassoPlayback {
     int (*amplifier)(PicassoPlayback &,unsigned); // prepare, enable, finish, health
     PicassoTfaPlayback amp;
@@ -25,7 +26,9 @@ struct PicassoPlayback {
     uint32_t replyPhase,replyOpcode,replyType,replyBytes,replySource,replyDestination;
     uint32_t replyRaw[4],replyReject,rejected;
     PicassoAudioPins pins;
-    bool bufferReady;
+    bool bufferReady,ampEnabled;
+    uint32_t writeSent,writeDone,inflight,writeSequence[2],writeWait[2],streamTicks,healthDone;
+    uint32_t bytesSent,bytesDone;
     bool enabled,attempted,sent,pending,responded,done,complete,consumed;
     int error,firstError,cleanupError,dmaError;
 };
