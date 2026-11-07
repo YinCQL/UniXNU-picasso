@@ -148,9 +148,38 @@ static UInt32 objects(AudioObjectID o, AudioObjectPropertyScope scope, AudioObje
     return n;
 }
 
+// AudioHardwareBase.h: OwnedObjects qualifiers include subclasses, and are
+// independent of the stream/control list selectors.
+static bool objectMatchesClass(AudioObjectID object, AudioClassID wanted) {
+    if(wanted==kAudioObjectClassID)return true;
+    if(object==kDevice)return wanted==kAudioDeviceClassID;
+    if(object==kOutStream || object==kTapStream)return wanted==kAudioStreamClassID;
+    if(object==kVolume)return wanted==kAudioControlClassID || wanted==kAudioLevelControlClassID || wanted==kAudioVolumeControlClassID;
+    if(object==kMute)return wanted==kAudioControlClassID || wanted==kAudioBooleanControlClassID || wanted==kAudioMuteControlClassID;
+    return false;
+}
+static OSStatus ownedObjects(AudioObjectID o,AudioObjectPropertyScope scope,UInt32 qs,const void *q,UInt32 capacity,UInt32 *size,void *data){
+    if(qs && (!q || qs%sizeof(AudioClassID)))return kAudioHardwareBadPropertySizeError;
+    AudioObjectID list[4];UInt32 count=objects(o,scope,list),out=0;
+    for(UInt32 i=0;i<count;++i){
+        bool match=!qs;
+        for(UInt32 j=0;j<qs/sizeof(AudioClassID)&&!match;++j){
+            AudioClassID c;memcpy(&c,(const uint8_t *)q+j*sizeof c,sizeof c);match=objectMatchesClass(list[i],c);
+        }
+        if(!match)continue;
+        if((out+1)*sizeof(AudioObjectID)>capacity)break;
+        memcpy((uint8_t *)data+out*sizeof(AudioObjectID),&list[i],sizeof(AudioObjectID));++out;
+    }
+    *size=out*sizeof(AudioObjectID);return 0;
+}
+
 static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 inDataSize,
                              UInt32 *outDataSize, void *outData) {
     const AudioObjectPropertySelector s = a->mSelector;
+    if(s==kAudioObjectPropertyOwnedObjects && o>=kPlugIn && o<=kTapStream){
+        if(o==kTapStream && !gTapEnabled)return kAudioHardwareBadObjectError;
+        return ownedObjects(o,a->mScope,qs,q,inDataSize,outDataSize,outData);
+    }
     if(o==kTapStream && !gTapEnabled)return kAudioHardwareBadObjectError;
     if (o >= kPlugIn && o <= kTapStream && (s == kAudioObjectPropertyCustomPropertyInfoList || ((s == kAudioPlugInPropertyBoxList ||
         s == kAudioPlugInPropertyClockDeviceList) && o == kPlugIn))) {
@@ -164,7 +193,6 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kAudioObjectPropertyClass: REPLY(AudioClassID, kAudioPlugInClassID);
         case kAudioObjectPropertyOwner: REPLY(AudioObjectID, kAudioObjectUnknown);
         case kAudioObjectPropertyManufacturer: REPLY_STR("UniXNU");
-        case kAudioObjectPropertyOwnedObjects:
         case kAudioPlugInPropertyDeviceList: {
             if (inDataSize < sizeof(AudioObjectID)) {*outDataSize = 0; return 0;}
             ((AudioObjectID *)outData)[0] = kDevice; *outDataSize = sizeof(AudioObjectID); return 0;
@@ -237,7 +265,6 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
             if (channels == 2) l->mChannelDescriptions[1].mChannelLabel = kAudioChannelLabel_Right;
             *outDataSize = bytes; return 0;
         }
-        case kAudioObjectPropertyOwnedObjects:
         case kAudioDevicePropertyStreams:
         case kAudioObjectPropertyControlList: {
             AudioObjectID list[4];

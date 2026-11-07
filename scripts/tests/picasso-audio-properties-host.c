@@ -62,6 +62,13 @@ struct uuid_command {uint32_t cmd,cmdsize;uint8_t uuid[16];};
 struct segment_command_64 {uint32_t cmd,cmdsize;char segname[16];uint64_t vmaddr,vmsize,fileoff,filesize;int32_t maxprot,initprot;uint32_t nsects,flags;};
 struct section_64 {char sectname[16],segname[16];uint64_t addr,size;uint32_t offset,align,reloff,nreloc,flags,reserved1,reserved2,reserved3;};
 typedef uintptr_t vm_address_t;typedef size_t vm_size_t;typedef unsigned mach_msg_type_number_t,mach_port_t;typedef int *vm_region_info_t;
+// Only registered fixture bytes may be read; bad pointers never reach memcpy.
+static uintptr_t readableBase;static size_t readableSize;static bool shortRead;
+static int vm_read_overwrite(unsigned task,vm_address_t address,vm_size_t bytes,vm_address_t target,vm_size_t *copied){
+    assert(task==1);*copied=0;
+    if(address<readableBase || bytes>readableSize || address-readableBase>readableSize-bytes)return 1;
+    *copied=shortRead&&bytes?bytes-1:bytes;memcpy((void *)target,(const void *)address,*copied);return 0;
+}
 typedef struct {int protection;} vm_region_basic_info_data_64_t;
 #define VM_REGION_BASIC_INFO_COUNT_64 1
 #define VM_REGION_BASIC_INFO_64 9
@@ -223,15 +230,100 @@ static void speakerReference(void){
     gClients[0]=1;gThreadLive=false;assert(!StopIO(NULL,kDevice,0)&&!gIoUsers);
     assert(picasso_tap_read(&gTap,PicassoMixFrames-1,2,got)==2);
 }
+static void ownedFilters(void){
+    AudioObjectPropertyAddress a={kAudioObjectPropertyOwnedObjects,kAudioObjectPropertyScopeGlobal,0};
+    UInt32 n,list[4],cls;gTapEnabled=true;
+    const struct {UInt32 cls,count,first;} cases[]={
+        {kAudioObjectClassID,4,kOutStream},{kAudioStreamClassID,2,kOutStream},
+        {kAudioControlClassID,2,kVolume},{kAudioLevelControlClassID,1,kVolume},
+        {kAudioVolumeControlClassID,1,kVolume},{kAudioBooleanControlClassID,1,kMute},
+        {kAudioMuteControlClassID,1,kMute},{kAudioDeviceClassID,0,0},{0xffffffff,0,0}
+    };
+    for(unsigned i=0;i<sizeof cases/sizeof cases[0];++i){
+        cls=cases[i].cls;
+        assert(!GetPropertyDataSize(NULL,kDevice,0,&a,4,&cls,&n)&&n==cases[i].count*4);
+        memset(list,0xcc,sizeof list);
+        assert(!GetPropertyData(NULL,kDevice,0,&a,4,&cls,sizeof list,&n,list)&&n==cases[i].count*4);
+        if(n)assert(list[0]==cases[i].first);
+    }
+    UInt32 filters[]={kAudioControlClassID,kAudioVolumeControlClassID,kAudioStreamClassID,kAudioControlClassID};
+    assert(!GetPropertyData(NULL,kDevice,0,&a,sizeof filters,filters,sizeof list,&n,list)&&n==16);
+    assert(list[0]==kOutStream&&list[1]==kTapStream&&list[2]==kVolume&&list[3]==kMute);
+    a.mScope=kAudioObjectPropertyScopeInput;
+    assert(!GetPropertyData(NULL,kDevice,0,&a,sizeof filters,filters,sizeof list,&n,list)&&n==4&&list[0]==kTapStream);
+    a.mScope=kAudioObjectPropertyScopeOutput;
+    assert(!GetPropertyData(NULL,kDevice,0,&a,sizeof filters,filters,sizeof list,&n,list)&&n==12&&list[0]==kOutStream&&list[1]==kVolume);
+    a.mScope=kAudioObjectPropertyScopeGlobal;cls=kAudioControlClassID;
+    assert(!GetPropertyData(NULL,kDevice,0,&a,4,&cls,7,&n,list)&&n==4&&list[0]==kVolume);
+    assert(!GetPropertyData(NULL,kDevice,0,&a,4,&cls,0,&n,NULL)&&n==0);
+    uint8_t unaligned[5];memcpy(unaligned+1,&cls,4);
+    assert(!GetPropertyData(NULL,kDevice,0,&a,4,unaligned+1,sizeof list,&n,list)&&n==8);
+    assert(GetPropertyDataSize(NULL,kDevice,0,&a,3,&cls,&n)==(OSStatus)kAudioHardwareBadPropertySizeError&&n==0);
+    assert(GetPropertyDataSize(NULL,kDevice,0,&a,4,NULL,&n)==(OSStatus)kAudioHardwareBadPropertySizeError&&n==0);
+    cls=kAudioDeviceClassID;
+    assert(!GetPropertyData(NULL,kPlugIn,0,&a,4,&cls,sizeof list,&n,list)&&n==4&&list[0]==kDevice);
+    cls=kAudioStreamClassID;
+    assert(!GetPropertyData(NULL,kPlugIn,0,&a,4,&cls,sizeof list,&n,list)&&n==0);
+    assert(!GetPropertyData(NULL,kOutStream,0,&a,0,NULL,sizeof list,&n,list)&&n==0);
+    assert(!GetPropertyData(NULL,kVolume,0,&a,0,NULL,sizeof list,&n,list)&&n==0);
+    gTapEnabled=false;
+    assert(!GetPropertyData(NULL,kDevice,0,&a,4,&cls,sizeof list,&n,list)&&n==4&&list[0]==kOutStream);
+    assert(GetPropertyData(NULL,kTapStream,0,&a,0,NULL,sizeof list,&n,list)==(OSStatus)kAudioHardwareBadObjectError);
+}
+static void registryReset(void){gRouteCount=gRouteFlushed=0;atomic_store(&gRoutePortSamples,0);}
+static void registrySummary(int result,unsigned count){
+    assert(gRouteCount);PicassoAudioClientNote *n=&gRouteNotes[gRouteCount-1];
+    assert(n->kind==14&&n->selector==6&&n->result==result&&n->value==count&&n->missingFrames==6);
+}
+static void registry(unsigned char *image){
+    uintptr_t base=(uintptr_t)image,manager=base+0x640000,head=manager+0x58;
+    uintptr_t *nodes=(void *)(image+0x641000);uint8_t *port=image+0x642000;
+    *(uintptr_t *)(image+0x63e9d0)=manager;*(uintptr_t *)head=head;
+    image[0x63f538]=1;registryReset();routePorts();registrySummary(0,0);
+    assert(gRouteNotes[0].calls==1);
+    *(uintptr_t *)head=(uintptr_t)nodes;nodes[0]=head;nodes[1]=head;nodes[2]=(uintptr_t)port;
+    *(uintptr_t *)port=base+0x629848;*(UInt32 *)(port+0x38)='pspk';*(UInt32 *)(port+0x3c)='pcbi';*(uint16_t *)(port+0x60)=5;
+    *(uintptr_t *)(port+0x68)=123;port[0x1b0]=1;
+    registryReset();routePorts();registrySummary(0,1);assert(gRouteCount==4);
+    assert(gRouteNotes[0].selector==7&&gRouteNotes[0].value=='pspk'&&gRouteNotes[0].calls==5&&gRouteNotes[0].sentFrames==1);
+    assert(gRouteNotes[1].selector==10&&gRouteNotes[1].calls=='pcbi');
+    assert(gRouteNotes[2].selector==8&&gRouteNotes[2].calls==0x629848&&gRouteNotes[2].sentFrames==1);
+    *(uintptr_t *)port=base+0x611780;registryReset();routePorts();registrySummary(0,1);
+    assert(gRouteNotes[0].sentFrames==UINT32_MAX);*(uintptr_t *)port=base+0x629848;
+    nodes[0]=(uintptr_t)nodes;registryReset();routePorts();registrySummary(-3,1);nodes[0]=head;
+    nodes[2]=UINTPTR_MAX-8;registryReset();routePorts();registrySummary(-4,1);nodes[2]=(uintptr_t)port;
+    *(uintptr_t *)port=base;registryReset();routePorts();registrySummary(-5,'pspk');*(uintptr_t *)port=base+0x629848;
+    for(unsigned i=0;i<17;++i){nodes[i*3]=i==16?head:(uintptr_t)&nodes[(i+1)*3];nodes[i*3+2]=(uintptr_t)port;}
+    registryReset();routePorts();registrySummary(-6,16);
+    nodes[0]=head;shortRead=true;registryReset();routePorts();registrySummary(-1,0);shortRead=false;
+    *(uintptr_t *)(image+0x63e9d0)=UINTPTR_MAX;registryReset();routePorts();registrySummary(-1,0);
+    *(uintptr_t *)(image+0x63e9d0)=base+readableSize-0x60;registryReset();routePorts();registrySummary(-4,1);
+    *(uintptr_t *)(image+0x63e9d0)=base+readableSize;registryReset();routePorts();registrySummary(-2,0);
+    *(uintptr_t *)(image+0x63e9d0)=manager;registryReset();gRoutePortLayout=false;routePorts();assert(!gRouteCount);gRoutePortLayout=true;
+    struct {uint64_t vtable;int32_t status;uint32_t pad;} ca={0,0x6e6f7274,0};const char *type[2]={NULL,"11CAException"};
+    int before=routeCalls;routeThrow(&ca,type,NULL);assert(routeCalls==before+1);registrySummary(0,1);
+    routePorts();routePorts();unsigned count=gRouteCount;
+    for(unsigned i=0;i<100;++i)routePorts();assert(gRouteCount==count&&atomic_load(&gRoutePortSamples)==3);
+    UInt32 v;assert(!routeRead(0,&v,4)&&!routeRead(UINTPTR_MAX-1,&v,4));
+    registryReset();
+}
 static void routing(void){
     gRouteCount=gRouteFlushed=0;
-    unsigned char *image=aligned_alloc(16384,0x610000);assert(image);memset(image,0,0x610000);struct mach_header_64 *h=(void *)image;
+    unsigned char *image=aligned_alloc(16384,0x664000);assert(image);memset(image,0,0x664000);struct mach_header_64 *h=(void *)image;readableBase=(uintptr_t)image;readableSize=0x664000;
     *h=(struct mach_header_64){MH_MAGIC_64,CPU_TYPE_ARM64,CPU_SUBTYPE_ARM64_ALL,MH_DYLIB,36,4040,0,0};
     struct uuid_command *u=(void *)(h+1);*u=(struct uuid_command){LC_UUID,24,{0x31,0x96,0x33,0x3f,0x5a,0x48,0x37,0x3b,0xb4,0x27,0x01,0x46,0xdc,0x11,0x77,0xfb}};
     struct segment_command_64 *s=(void *)(u+1);s->cmd=LC_SEGMENT_64;s->cmdsize=sizeof *s+sizeof(struct section_64);strcpy(s->segname,"__DATA_CONST");s->vmaddr=0x60c000;s->vmsize=0x28000;s->nsects=1;
     struct section_64 *sec=(void *)(s+1);strcpy(sec->sectname,"__got");sec->addr=0x60c000;sec->size=0x1300;sec->flags=S_NON_LAZY_SYMBOL_POINTERS;
-    unsigned char *at=(void *)(sec+1);for(unsigned i=0;i<34;++i){struct load_command *lc=(void *)at;lc->cmd=0;lc->cmdsize=i==33?4040-(unsigned)(at-(unsigned char *)(h+1)):8;at+=lc->cmdsize;}
-    assert(routeImageMatches(h));u->uuid[0]^=1;assert(!routeImageMatches(h));u->uuid[0]^=1;
+    struct segment_command_64 *data=(void *)(sec+1);*data=(struct segment_command_64){.cmd=LC_SEGMENT_64,.cmdsize=sizeof *data,.vmaddr=0x634000,.vmsize=0x30000,.filesize=0x4000};strcpy(data->segname,"__DATA");
+    const uintptr_t wordOffsets[]={0x120d0,0x120d4,0xa6bec,0xa6bf0,0x3e664,0x1b70e4};
+    const UInt32 words[]={0x90003168,0xf944e900,0xf9400288,0xf9400918,0xb9403a6a,0x3906c268};
+    for(unsigned i=0;i<6;++i)memcpy(image+wordOffsets[i],&words[i],4);
+    unsigned char *at=(void *)(data+1);for(unsigned i=0;i<33;++i){struct load_command *lc=(void *)at;lc->cmd=0;lc->cmdsize=i==32?4040-(unsigned)(at-(unsigned char *)(h+1)):8;at+=lc->cmdsize;}
+    assert(routeImageMatches(h));assert(routePortLayoutMatches(h));
+    data->filesize=0;assert(!routePortLayoutMatches(h));data->filesize=0x4000;
+    for(unsigned i=0;i<6;++i){image[wordOffsets[i]]^=1;assert(!routePortLayoutMatches(h));image[wordOffsets[i]]^=1;}
+    shortRead=true;assert(!routePortLayoutMatches(h));shortRead=false;
+    u->uuid[0]^=1;assert(!routeImageMatches(h));u->uuid[0]^=1;
     s->nsects=500;assert(!routeImageMatches(h));s->nsects=1;
     sec->size=0x100;assert(!routeImageMatches(h));sec->size=0x1300;
     h->cpusubtype=2;assert(!routeImageMatches(h));h->cpusubtype=0;
@@ -256,14 +348,16 @@ static void routing(void){
     gConnect=0;flushRouteNotes();assert(!gRouteFlushed);
     assert(gRouteNotes[gRouteCount-1].selector==3&&gRouteNotes[gRouteCount-1].value==0x669eebc5);gConnect=1;flushRouteNotes();assert(gRouteFlushed==gRouteCount);
     for(unsigned i=0;i<200;++i)routeNote(9,-1,i,0,0,0,0);assert(gRouteCount==128);
-    free(image);
+    registry(image);free(image);readableBase=readableSize=0;
 }
 int main(int argc,char **argv){
-    properties();speakerReference();routing();
+    properties();speakerReference();ownedFilters();routing();
     if(argc==2){
-        unsigned char header[4072];FILE *f=fopen(argv[1],"rb");assert(f);
-        assert(fread(header,1,sizeof header,f)==sizeof header);fclose(f);
-        assert(routeImageMatches((const void *)header));
+        FILE *f=fopen(argv[1],"rb");assert(f);assert(!fseek(f,0,SEEK_END));long bytes=ftell(f);assert(bytes>0x634000);rewind(f);
+        unsigned char *file=malloc((size_t)bytes);assert(file);assert(fread(file,1,(size_t)bytes,f)==(size_t)bytes);fclose(f);
+        readableBase=(uintptr_t)file;readableSize=(size_t)bytes;
+        assert(routeImageMatches((const void *)file)&&routePortLayoutMatches((const void *)file));
+        free(file);readableBase=readableSize=0;
     }
     puts("PASS actual HAL scope, activation, volume, bounded trace and guarded forwarding");return 0;
 }
