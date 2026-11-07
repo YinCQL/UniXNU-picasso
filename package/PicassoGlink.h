@@ -40,10 +40,15 @@ struct PicassoAprProbe {
         uint32_t token,wait,status,opcode,events,api,config[5];
         uint32_t payloadBytes,headerBytes,raw[12],rejected;
         uint32_t phase; // 0 initial GET, 1 SET configuration, 2 verify GET
-        bool setAccepted,verified;
+        bool setAccepted,verified,readbackCompatible,stereoUnreported;
         bool sent,pending,responded,valid;
         int error;
     } afe;
+    struct {
+        uint32_t phase,token,wait,status,opcode,events; // 0 clock enable, 1 release
+        bool attempted,sent,pending,responded,enableAccepted,disableAccepted,uncertain,completed;
+        int error,enableError;
+    } clock;
 };
 struct PicassoGlink {
     // Contains pointers into its own static storage: prepare in final location,

@@ -27,6 +27,15 @@ inline void picasso_afe_query(uint32_t (&w)[14]) {
 inline uint32_t picasso_afe_config_word(unsigned n) {
     const uint32_t config[5]={1,0x00010010,0x00010001,48000,0};return config[n];
 }
+inline bool picasso_afe_stereo_unreported(const PicassoAprProbe &p) {
+    // Picasso ADSP.VT.5.6.1: SET b05afa94..b05afa9c stores channels=2;
+    // GET b05afdac unconditionally writes mono_stereo=0. Do not rewrite the
+    // raw response or claim that stereo was read back. Other fields stay exact.
+    if(p.fw.build[0]!=2 || p.fw.build[1]!=9 || p.fw.build[2] || p.fw.build[3] || p.afe.api!=7)return false;
+    for(unsigned n=0;n<5;++n)
+        if(p.afe.config[n]!=(n==2?0x00010000:picasso_afe_config_word(n)))return false;
+    return true;
+}
 inline unsigned picasso_afe_request(unsigned phase,uint32_t (&w)[18]) {
     for(auto &v:w)v=0;
     if(phase!=1) {
@@ -50,7 +59,7 @@ inline void picasso_afe_advance(PicassoAprProbe *p,const PicassoQmi &q) {
     if(!p->ready || !p->fw.valid)return;
     if(v.phase && !picasso_afe_domains_up(q)) {
         if(!v.error || v.pending || v.verified) {
-            v.pending=v.valid=v.verified=false;v.error=-104;++v.events;
+            v.pending=v.valid=v.verified=v.readbackCompatible=false;v.error=-104;++v.events;
         }
         return;
     }
@@ -74,6 +83,44 @@ inline bool picasso_afe_due(PicassoAprProbe *p) {
     }
     v.error=-2;++v.events;return false;
 }
+// Stock q6afe_clk_set_params_v1 / afe_clk_set, secondary IBIT=0x102.
+// Exercise a bounded 48k * 2 * 16 clock vote, then release it. No DEVICE_START,
+// pins, amplifier or PCM; BASIC success confirms a vote, not a measured clock.
+inline unsigned picasso_clock_request(unsigned phase,uint32_t (&w)[18]) {
+    for(auto &v:w)v=0;
+    w[0]=0x00440250;w[1]=0x504;w[2]=0x404;w[3]=0x20530001+phase;w[4]=0x100f3;
+    w[5]=32;w[9]=0x1028f;w[10]=0x10290;w[11]=20;
+    w[12]=1;w[13]=0x102;w[14]=1536000;w[15]=1;w[16]=phase?0:1;
+    return 68;
+}
+inline void picasso_clock_stop(PicassoAprProbe *p,int error) {
+    auto &c=p->clock;if(!c.attempted)return;
+    c.pending=false;c.completed=false;c.error=error;++c.events;
+    // Preserve uncertain until an actual disable ACK; SSR is not that ACK.
+}
+inline void picasso_clock_tick(PicassoAprProbe *p,const PicassoQmi &q) {
+    auto &c=p->clock;
+    if(!p->ready || !p->fw.valid)return;
+    if(!c.attempted && p->afe.setAccepted && p->afe.valid && !p->afe.error &&
+        (p->afe.verified || p->afe.readbackCompatible) && picasso_afe_domains_up(q)) {
+        c.attempted=true;++c.events;
+    }
+    if(!c.attempted || c.completed)return;
+    if(!c.phase && !picasso_afe_domains_up(q) && !c.error) {
+        c.pending=false;c.error=-104;++c.events;
+    }
+    if(!c.phase && c.sent && !c.pending && (c.responded || c.error)) {
+        c.enableError=c.error;c.phase=1;c.sent=c.pending=c.responded=false;
+        c.wait=c.status=c.opcode=0;c.error=0;++c.events;
+    }
+    if(!c.error && (c.pending || !c.sent) && ++c.wait>(c.pending?100U:250U)) {
+        c.pending=false;c.error=-60;++c.events;
+    }
+}
+inline bool picasso_clock_due(const PicassoAprProbe &p) {
+    const auto &c=p.clock;
+    return p.ready && p.fw.valid && c.attempted && !c.sent && !c.error && !c.completed;
+}
 inline void picasso_apr_receive(PicassoAprProbe *p, const uint8_t *data, uint32_t size) {
     ++p->received;
     p->bytes=size;
@@ -90,6 +137,15 @@ inline void picasso_apr_receive(PicassoAprProbe *p, const uint8_t *data, uint32_
         ++p->malformed; return;
     }
     uint32_t type=(header>>8)&3;
+    if(p->clock.pending && p->receivedToken==p->clock.token) {
+        auto &c=p->clock;const auto *b=data+headerBytes;
+        if(type!=1 || p->source!=0x404 || p->destination!=0x504 || p->opcode!=0x110e8 ||
+            size-headerBytes!=8 || wlan_sm32(b)!=0x100f3) { ++p->ignored;return; }
+        c.status=wlan_sm32(b+4);c.opcode=p->opcode;c.pending=false;c.responded=true;c.error=c.status?-5:0;
+        if(!c.phase)c.enableAccepted=!c.status;
+        else if(!c.status) { c.disableAccepted=true;c.uncertain=false;c.completed=c.enableAccepted && !c.enableError; }
+        ++c.events;return;
+    }
     if(p->afe.pending && p->receivedToken==p->afe.token) {
         auto &v=p->afe;const auto *b=data+headerBytes;unsigned bytes=size-headerBytes;
         if(type>1 || p->source!=0x404 || p->destination!=0x504) { ++p->ignored;return; }
@@ -126,7 +182,9 @@ inline void picasso_apr_receive(PicassoAprProbe *p, const uint8_t *data, uint32_
             if(!status && v.phase==2) {
                 v.verified=v.setAccepted;
                 for(unsigned i=0;i<5;++i)if(v.config[i]!=picasso_afe_config_word(i))v.verified=false;
-                if(!v.verified)v.error=-84;
+                v.stereoUnreported=v.setAccepted && picasso_afe_stereo_unreported(*p);
+                v.readbackCompatible=v.verified || v.stereoUnreported;
+                if(!v.readbackCompatible)v.error=-84;
             }
             ++v.events;
         } else ++p->ignored;

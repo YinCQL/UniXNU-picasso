@@ -41,6 +41,7 @@ static void tftpTests();
 static void afeTests();
 static void registryQmiTests();
 static void afeConfigureTests();
+static void afeClockTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -126,7 +127,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
+    afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -599,6 +600,109 @@ __attribute__((noinline)) static void afeConfigureTests() {
     rx=afeEmpty(s);lateDomains(s.qrtr.qmi);step(s);drain(s);message(s,rx,3,7,0);step(s);
     assert(!s.apr.afe.pending && !s.apr.afe.verified && s.apr.afe.error==-104);
     puts("PASS AFE empty-config gate, stock SET wire, confirmed ACK then exact GET verification, stale replies, mismatch, failures and ownership");
+}
+static unsigned afeConfigured(PicassoGlink &s) {
+    unsigned rx=afeEmpty(s);lateDomains(s.qrtr.qmi);step(s);drain(s);
+    const uint32_t ack[]={0x00280181,0x404,0x504,0x20520002,0x110e8,0,0,0,0x100ef,0};
+    packet(s,rx,1,reinterpret_cast<const uint8_t *>(ack),sizeof ack);message(s,rx,14,7,91);step(s);drain(s);
+    step(s);drain(s);assert(s.apr.afe.phase==2 && s.apr.afe.pending);
+    // Exact 21:38 payload. The extension header words remain synthetic.
+    const uint32_t config[]={0x00500181,0x404,0x504,0x20520003,0x10106,0,0,0,0,0x1020c,0x1020d,20,1,0x10010,0x10000,48000,0,0,0,0};
+    packet(s,rx,1,reinterpret_cast<const uint8_t *>(config),sizeof config);message(s,rx,14,7,91);step(s);drain(s);
+    assert(s.apr.afe.readbackCompatible && s.apr.afe.stereoUnreported && !s.apr.afe.verified && !s.apr.afe.error);
+    assert(!s.apr.clock.attempted);return rx;
+}
+__attribute__((noinline)) static void afeClockTests() {
+    // Fixed-zero readback is specific to the observed build/API and otherwise
+    // exact config. Keep the original mono field and exact-verified=false.
+    uint32_t config[]={0x00500181,0x404,0x504,0x20520003,0x10106,0,0,0,0,0x1020c,0x1020d,20,1,0x10010,0x10000,48000,0,0,0,0};
+    for(unsigned bad=0;bad<10;++bad) {
+        PicassoAprProbe a={};a.fw.build[0]=2;a.fw.build[1]=9;a.afe.api=7;
+        a.afe.phase=2;a.afe.setAccepted=a.afe.pending=true;a.afe.token=0x20520003;
+        if(bad<4)++a.fw.build[bad];else if(bad==4)++a.afe.api;else if(bad==5)a.afe.setAccepted=false;
+        else if(bad==6)config[13]=0x20010;else if(bad==7)config[14]=0;else if(bad==8)config[15]=44100;else config[16]=1;
+        picasso_apr_receive(&a,reinterpret_cast<uint8_t *>(config),sizeof config);
+        assert(a.afe.valid && !a.afe.verified && !a.afe.readbackCompatible && a.afe.error==-84);
+        config[13]=0x10010;config[14]=0x10000;config[15]=48000;config[16]=0;
+    }
+    uint32_t req[18],expected[]={0x00440250,0x504,0x404,0x20530001,0x100f3,32,0,0,0,0x1028f,0x10290,20,1,0x102,1536000,1,1};
+    assert(picasso_clock_request(0,req)==68 && !memcmp(req,expected,sizeof expected) && !req[17]);
+    assert(picasso_clock_request(1,req)==68 && req[3]==0x20530002 && !req[16]);
+    PicassoGlink s={};unsigned rx=afeConfigured(s),at=s.txHead;
+    step(s);drain(s);assert(s.apr.clock.pending && s.apr.clock.uncertain && !s.apr.clock.phase);
+    bool found=false;for(unsigned n=at;n+88<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x10009) {
+        assert(r32(s.tx.offset+n+8)==68 && !memcmp(ram+s.tx.offset+n+16,expected,sizeof expected) && !r32(s.tx.offset+n+84));found=true;
+    }assert(found);
+    uint32_t ack[]={0x00280181,0x404,0x504,0x20530001,0x110e8,0,0,0,0x100f3,0};
+    auto receive=[&](unsigned bytes){picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),bytes);};
+    for(unsigned n=0;n<sizeof ack;++n)receive(n);
+    const unsigned badAck[]={1,2,3,4,8};
+    for(unsigned i:badAck) { ack[i]^=1;receive(sizeof ack);ack[i]^=1; }
+    ack[0]=0x00280081;receive(sizeof ack);ack[0]=0x00280181;
+    assert(s.apr.clock.pending && !s.apr.clock.enableAccepted);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(ack),sizeof ack);step(s);drain(s);
+    assert(s.apr.clock.enableAccepted && !s.apr.clock.completed && s.remoteIntent[0].busy);
+    step(s);drain(s);assert(s.apr.clock.phase==1 && !s.apr.clock.sent && s.remoteIntent[0].busy);
+    message(s,rx,14,7,91);step(s);drain(s);at=s.txHead;step(s);drain(s);
+    assert(s.apr.clock.pending && s.apr.clock.token==0x20530002);
+    expected[3]=0x20530002;expected[16]=0;found=false;
+    for(unsigned n=at;n+88<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x10009) {
+        assert(!memcmp(ram+s.tx.offset+n+16,expected,sizeof expected));found=true;
+    }assert(found);
+    receive(sizeof ack);assert(s.apr.clock.pending && !s.apr.clock.disableAccepted);
+    ack[3]=0x20530002;packet(s,rx,1,reinterpret_cast<uint8_t *>(ack),sizeof ack);message(s,rx,14,7,91);step(s);drain(s);
+    assert(s.apr.clock.completed && s.apr.clock.disableAccepted && !s.apr.clock.uncertain && s.apr.afe.stereoUnreported);
+    unsigned events=s.apr.clock.events;for(unsigned n=0;n<300;++n){step(s);drain(s);}assert(s.apr.clock.events==events);
+    // A failed/timed-out enable still releases the vote with a different token.
+    for(unsigned mode=0;mode<3;++mode) {
+        rx=afeConfigured(s);step(s);drain(s);ack[3]=0x20530001;
+        if(mode==0) {ack[9]=2;receive(sizeof ack);ack[9]=0;}
+        else if(mode==1) {for(unsigned n=0;n<101;++n){step(s);drain(s);}}
+        else picasso_qmi_lost(&s.qrtr.qmi);
+        message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+        assert(s.apr.clock.phase==1 && s.apr.clock.pending && s.apr.clock.enableError==(mode==0?-5:mode==1?-60:-104));
+        receive(sizeof ack);assert(!s.apr.clock.enableAccepted && s.apr.clock.pending);
+        ack[3]=0x20530002;receive(sizeof ack);
+        assert(s.apr.clock.disableAccepted && !s.apr.clock.uncertain && !s.apr.clock.completed);
+    }
+    rx=afeConfigured(s);s.qrtr.qmi.domains[2].state=0;step(s);assert(!s.apr.clock.attempted);
+    // No remote intent is reclaimed on a timeout, and failed release is explicit.
+    rx=afeConfigured(s);step(s);drain(s);ack[3]=0x20530001;receive(sizeof ack);
+    message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+    for(unsigned n=0;n<101;++n){step(s);drain(s);}
+    assert(s.apr.clock.error==-60 && s.apr.clock.uncertain && !s.apr.clock.completed && s.remoteIntent[0].busy);
+    ack[3]=0x20530002;receive(sizeof ack);assert(!s.apr.clock.disableAccepted);
+    rx=afeConfigured(s);step(s);drain(s);ack[3]=0x20530001;receive(sizeof ack);
+    message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);ack[3]=0x20530002;ack[9]=1;receive(sizeof ack);ack[9]=0;
+    assert(s.apr.clock.error==-5 && s.apr.clock.uncertain && !s.apr.clock.disableAccepted);
+    rx=afeConfigured(s);s.remoteIntent[0].size=56;step(s);drain(s);message(s,rx,8,7,0);step(s);drain(s);
+    assert(s.apr.clock.error==-28 && !s.apr.clock.sent && !s.apr.clock.uncertain && !s.apr.error && !s.failed);
+    rx=afeConfigured(s);p32(s.desc.offset,(s.txHead+8)%s.tx.size);
+    for(unsigned n=0;n<251;++n)step(s);
+    assert(s.apr.clock.error==-60 && !s.apr.clock.sent && !s.apr.clock.uncertain);
+    rx=afeConfigured(s);step(s);drain(s);message(s,rx,3,7,0);step(s);
+    assert(s.apr.clock.error==-104 && !s.apr.clock.pending && s.apr.clock.uncertain && !s.apr.clock.completed);
+    rx=afeConfigured(s);writes=0;step(s);unsigned total=writes;bool kick;
+    for(unsigned n=1;n<=total;++n) {
+        rx=afeConfigured(s);writes=0;failWrite=n;
+        assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && !s.apr.clock.pending && !s.apr.clock.completed);
+        // Earlier writes retire the GET's local RX intent, before clock TX.
+        if(n>total-23)assert(s.apr.clock.uncertain); // 22 payload words + head
+    }
+    // Releasing has its own send deadline; neither blocked nor failed release
+    // clears the uncertain vote. The enable's RX_DONE still owns its buffer.
+    rx=afeConfigured(s);step(s);drain(s);ack[3]=0x20530001;receive(sizeof ack);
+    message(s,rx,14,7,91);step(s);drain(s);p32(s.desc.offset,(s.txHead+8)%s.tx.size);
+    for(unsigned n=0;n<251;++n)step(s);
+    assert(s.apr.clock.phase==1 && !s.apr.clock.sent && s.apr.clock.error==-60 && s.apr.clock.uncertain && !s.remoteIntent[0].busy);
+    rx=afeConfigured(s);step(s);drain(s);receive(sizeof ack);
+    message(s,rx,14,7,91);step(s);drain(s);writes=0;step(s);total=writes;
+    for(unsigned n=1;n<=total;++n) {
+        rx=afeConfigured(s);step(s);drain(s);receive(sizeof ack);
+        message(s,rx,14,7,91);step(s);drain(s);writes=0;failWrite=n;
+        assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && !s.apr.clock.pending && s.apr.clock.uncertain && !s.apr.clock.completed);
+    }
+    puts("PASS Picasso fixed-zero stereo readback, exact remaining fields, stock clock vote/release, stale ACKs, failures, timeouts and ownership");
 }
 __attribute__((noinline)) static void afeTests() {
     // Stock q6afe v2 in-band wire, no mapped payload or SET/START command.

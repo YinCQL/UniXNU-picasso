@@ -8,6 +8,7 @@ int fail(PicassoGlink *s, int error) {
     s->apr.ready = false; s->apr.pending = false;
     s->apr.fw.pending=false;s->apr.fw.valid=false;s->apr.fw.error=error;
     s->apr.afe.pending=false;s->apr.afe.valid=false;s->apr.afe.verified=false;s->apr.afe.error=error;++s->apr.afe.events;
+    s->apr.afe.readbackCompatible=false;picasso_clock_stop(&s->apr,error);
     if (!s->apr.error) s->apr.error = error;
     picasso_qrtr_invalidate(&s->qrtr, error);
     picasso_rpc_stop(&s->fastrpc,error);
@@ -88,6 +89,7 @@ void clearChannel(PicassoGlink *s, PicassoGlinkChannel &c) {
         s->apr.ready=false; s->apr.pending=false; s->apr.error=-104;
         s->apr.fw.pending=false;s->apr.fw.valid=false;s->apr.fw.error=-104;
         s->apr.afe.pending=false;s->apr.afe.valid=false;s->apr.afe.verified=false;s->apr.afe.error=-104;++s->apr.afe.events;
+        s->apr.afe.readbackCompatible=false;picasso_clock_stop(&s->apr,-104);
     }
     else if(c.local==2) picasso_qrtr_invalidate(&s->qrtr,-104);
     else picasso_rpc_stop(&s->fastrpc,-104);
@@ -128,7 +130,7 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     if (!c.up) return 0;
     auto &a = s->apr;
     int qmiDue=c.local==2 ? picasso_qmi_due(&s->qrtr.qmi):-1;
-    if (c.local==1) { ++a.ticks;picasso_afe_advance(&a,s->qrtr.qmi); }
+    if (c.local==1) { ++a.ticks;picasso_afe_advance(&a,s->qrtr.qmi);picasso_clock_tick(&a,s->qrtr.qmi); }
     // Worker cadence is 20 ms. Hold expiry while responses are backpressured.
     if(c.local==2 && !s->qrtr.count && s->qrtr.tftp.announced) {
         auto &q=s->qrtr;int retry=picasso_tftp_tick(&q.tftp);
@@ -245,9 +247,10 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     // discovers AFE/ASM/ADM APIs without starting audio or assuming versions.
     bool version=a.ready && !a.fw.sent && !a.fw.error;
     bool afe=picasso_afe_due(&a);
-    if ((a.ready && !version && !afe) || a.error) return 0;
-    if (!version && !afe && (a.pending || a.ticks < a.next)) return 0;
-    unsigned requestBytes=afe?(a.afe.phase==1?68:56):20;
+    bool clock=picasso_clock_due(a);
+    if ((a.ready && !version && !afe && !clock) || a.error) return 0;
+    if (!version && !afe && !clock && (a.pending || a.ticks < a.next)) return 0;
+    unsigned requestBytes=clock?68:afe?(a.afe.phase==1?68:56):20;
     PicassoGlinkRemoteIntent *slot = nullptr;
     for (auto &i : s->remoteIntent) if (i.used && !i.busy && i.size >= requestBytes) { slot = &i; break; }
     if (!slot) {
@@ -260,11 +263,18 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     }
     uint32_t words[22] = {9U | (uint32_t(c.local) << 16), slot->id, requestBytes, 0};
     uint32_t query[5]; picasso_apr_query(version?0x18710001:a.token + 1, query);
-    if(afe) { uint32_t request[18];picasso_afe_request(a.afe.phase,request);for(unsigned i=0;i<requestBytes/4;++i)words[4+i]=request[i]; }
+    if(afe || clock) { uint32_t request[18];if(clock)picasso_clock_request(a.clock.phase,request);else picasso_afe_request(a.afe.phase,request);for(unsigned i=0;i<requestBytes/4;++i)words[4+i]=request[i]; }
     else { if(version)query[4]=0x1292c;for (unsigned i = 0; i < 5; ++i) words[4 + i] = query[i]; }
-    if ((error = transmit(io, s, words,16+((requestBytes+7)&~7U), kick))) return error;
+    if ((error = transmit(io, s, words,16+((requestBytes+7)&~7U), kick))) {
+        // I/O failure may leave publication ambiguous; lack of an ACK never
+        // establishes that an enable vote was not applied. TX pressure did not
+        // publish this request and must not acquire a vote or remote intent.
+        if(clock && !a.clock.phase && s->failed)a.clock.uncertain=true;
+        return error;
+    }
     slot->busy = true;
-    if(afe) { a.afe.sent=a.afe.pending=true;a.afe.token=words[7];a.afe.wait=0;++a.afe.events; }
+    if(clock) { a.clock.sent=a.clock.pending=true;a.clock.token=words[7];a.clock.wait=0;if(!a.clock.phase)a.clock.uncertain=true;++a.clock.events; }
+    else if(afe) { a.afe.sent=a.afe.pending=true;a.afe.token=words[7];a.afe.wait=0;++a.afe.events; }
     else if(version) {
         a.fw.sent=a.fw.pending=true;a.fw.token=query[3];a.fw.wait=0;++a.fw.events;
     } else { ++a.token; ++a.attempts; a.wait = 0; a.pending = true; }
@@ -421,7 +431,8 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
             if (c->local==1 && !s->apr.pending) {
                 auto &a=s->apr;
                 if(a.ready && a.fw.valid) {
-                    if(!a.afe.sent && !a.afe.error) { a.afe.error=-28;++a.afe.events; }
+                    if(picasso_clock_due(a)) { a.clock.error=-28;++a.clock.events; }
+                    else if(!a.afe.sent && !a.afe.error) { a.afe.error=-28;++a.afe.events; }
                 } else if(a.ready) {
                     if(!a.fw.sent && !a.fw.error) { a.fw.error=-28;++a.fw.events; }
                 } else a.error=-28;

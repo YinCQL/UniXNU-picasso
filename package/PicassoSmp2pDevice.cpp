@@ -100,6 +100,7 @@ struct BootEvents {
     uint32_t qmiEvents = 0, qmiLogs = 0;
     uint32_t locatorEvents = 0, locatorLogs = 0, fwEvents = 0, afeEvents = 0;
     uint32_t tftpEvents = 0, tftpLogs = 0;
+    uint32_t clockEvents = 0;
 };
 void logAfe(const PicassoAprProbe &a) {
     const auto &v=a.afe;
@@ -107,6 +108,8 @@ void logAfe(const PicassoAprProbe &a) {
         v.sent,v.pending,v.responded,v.valid,v.api,v.token,v.opcode,v.status,v.error);
     IOLog("PICASSO_ADSP afe-stage phase=%u set_accepted=%u verified=%u port=1002 started=0 pcm=0\n",
         v.phase,v.setAccepted,v.verified);
+    if(v.phase==2 && v.responded)IOLog("PICASSO_ADSP afe-readback compatible=%u stereo_unreported=%u requested_stereo=1 started=0 pcm=0\n",
+        v.readbackCompatible,v.stereoUnreported);
     if(v.payloadBytes) {
         IOLog("PICASSO_ADSP afe-wire header_bytes=%u payload_bytes=%u rejected=%u status=%u module=%x param=%x size_reserved=%x\n",
             v.headerBytes,v.payloadBytes,v.rejected,v.raw[0],v.raw[1],v.raw[2],v.raw[3]);
@@ -250,6 +253,13 @@ void bootService(void *context) {
         }
         if(a.fw.events!=b->fwEvents) { logFramework(a);b->fwEvents=a.fw.events; }
         if(a.afe.events!=b->afeEvents) { logAfe(a);b->afeEvents=a.afe.events; }
+        if(a.clock.events!=b->clockEvents) {
+            const auto &c=a.clock;b->clockEvents=c.events;
+            IOLog("PICASSO_ADSP afe-clock phase=%u token=%x sent=%u pending=%u responded=%u status=%u error=%d enable_error=%d id=102 hz=1536000\n",
+                c.phase,c.token,c.sent,c.pending,c.responded,c.status,c.error,c.enableError);
+            IOLog("PICASSO_ADSP afe-clock-vote enable_accepted=%u disable_accepted=%u uncertain=%u complete=%u measured=0 started=0 pcm=0\n",
+                c.enableAccepted,c.disableAccepted,c.uncertain,c.completed);
+        }
         if(q.locator.events!=b->locatorEvents && b->locatorLogs<32) {
             logLocator(q.locator);b->locatorEvents=q.locator.events;++b->locatorLogs;
         }
