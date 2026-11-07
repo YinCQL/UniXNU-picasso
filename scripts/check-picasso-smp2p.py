@@ -52,9 +52,10 @@ def main():
     for name,source in [('smp2p',core),('smp2p-device',arm),('glink',ROOT/'package/PicassoGlink.cpp')]:
         run(name+'-arm64',[a.cxx,'-target','arm64-apple-ios17.0','-std=c++17','-ffreestanding',
             '-fno-exceptions','-fno-rtti','-fno-threadsafe-statics','-mgeneral-regs-only','-Wall','-Wextra','-Werror',
+            '-Wframe-larger-than=2048',
             *includes,'-c',str(source),'-o',str(out/(name+'.o'))])
     inputs = ['package/PicassoSmp2p.h','package/PicassoSmp2p.cpp','package/PicassoSmp2pDevice.cpp',
-        'package/PicassoGlink.h','package/PicassoGlink.cpp','scripts/tests/picasso-glink-host.cpp',
+        'package/PicassoGlink.h','package/PicassoGlink.cpp','package/PicassoApr.h','scripts/tests/picasso-glink-host.cpp',
         'package/PicassoSmemLock.h','package/PicassoAdspBoot.h','package/PicassoAdsp.h','drivers/NativeWlan/WlanSmem.h','drivers/NativeAdrenoPicasso/PicassoRpmh.h',
         'scripts/check-picasso-smp2p.py','scripts/tests/picasso-smp2p-host.cpp','scripts/tests/picasso-smp2p-device-host.cpp',
         'scripts/tests/picasso-wlan-kernel-api.h','scripts/build-picasso-display.py',

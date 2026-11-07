@@ -93,6 +93,11 @@ extern "C" void picasso_adsp_boot(const PicassoAdspEvents *e) {
     assert(g->ready && g->rxTail==16 && g->txHead==16);
     assert(ram[g->tx.offset/4+2]==0x10001 && !ram[g->tx.offset/4+3]);
     assert(ipccRam[3]==0x30000);ipccRam[3]=0;
+    e->service(e->context);
+    assert(ipccRam[3]==0x30000 && g->channel[0].openSent && g->txHead==40);
+    assert(ram[(g->tx.offset+16)/4]==0x10002 && ram[(g->tx.offset+20)/4]==14);
+    assert(!memcmp(reinterpret_cast<uint8_t *>(ram)+g->tx.offset+24,"apr_audio_svc",14));
+    ipccRam[3]=0;
     e->service(e->context);assert(!ipccRam[3]);
 }
 extern "C" int picasso_rpmh_adsp_plan(){assert(!preempt && !allocations);++plans;return 0;}
@@ -124,7 +129,7 @@ int main(int argc,char **argv) {
     assert(allocations==3 && releases==3-!!failAlloc && mappings==releases && unmaps==mappings-!!failMap && !preempt);
     if(!strcmp(mode,"normal") || peer || transport) {
         assert(plans==1 && sleeps==1602 && kicks==(peer?2U:1U));
-        assert(lines==(peer?70U:transport?10U:8U));
+        assert(lines==(peer?70U:transport?11U:8U));
         assert(ram[(part+12)/4]==(peer?17200U:transport?33240U:16840U));
         if(transport)assert(!ipccRam[3]); // stopped observer never transmits GLINK
         assert(!allocatorGate && !mutexRam[0]);
