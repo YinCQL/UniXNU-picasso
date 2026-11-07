@@ -47,6 +47,7 @@ static void afePortTests();
 static void tfaPortTests();
 static void streamTests();
 static void pcmTests();
+static void playTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -132,7 +133,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    audioPinTests();afePortTests();tfaPortTests();streamTests();pcmTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
+    audioPinTests();afePortTests();tfaPortTests();streamTests();pcmTests();playTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -1523,4 +1524,115 @@ __attribute__((noinline)) static void pcmTests() {
         }
     }
     puts("PASS PCM MAP/UNMAP exact wire, real handle ownership, rejection, timeout, domain loss, faults and transport pressure");
+}
+
+static unsigned silenceCalls;
+static int playSilence(PicassoPcm &) {++silenceCalls;return pcmFault;}
+static unsigned playReady(PicassoGlink &s) {
+    unsigned rx=pcmReady(s);s.apr.pcm.prepare=nullptr;
+    s.apr.pcm.attempted=s.apr.pcm.done=s.apr.pcm.complete=s.apr.pcm.prepared=s.apr.pcm.retained=true;
+    s.apr.pcm.address=0x180000000ULL;s.apr.pcm.bytes=32768;s.apr.pcm.sid=0x1401;
+    s.apr.pcm.check=pcmHealth;s.apr.pcm.silence=playSilence;silenceCalls=0;
+    pinsReset(s.apr.pins);assert(!picasso_audio_pins_activate(s.apr.pins));picasso_audio_pins_restore(s.apr.pins);
+    s.apr.tfa.digitalApplied=s.apr.tfa.digitalRestored=true;
+    s.apr.fw.count=3;s.apr.fw.services[2][0]=8;s.apr.fw.services[2][1]=4;s.apr.play.enabled=true;return rx;
+}
+static unsigned playResponse(PicassoGlink &s,uint32_t (&reply)[12],unsigned status=0) {
+    uint32_t request[18];picasso_play_request(s.apr,request);unsigned phase=s.apr.play.phase;
+    for(auto &v:reply)v=0;
+    reply[0]=0x00280181;reply[1]=request[2];reply[2]=request[1];reply[3]=request[3];reply[4]=0x110e8;
+    reply[8]=request[4];reply[9]=status;unsigned bytes=40;
+    if(!status && phase==4) {reply[0]=0x00240181;reply[4]=0x10d93;reply[8]=0x7788;bytes=36;}
+    if(!status && phase==5) {reply[4]=0x10329;reply[8]=0;reply[9]=0;} // COPP zero is valid
+    if(phase==8) {reply[0]=0x00300081;reply[4]=0x10d99;reply[8]=0x80000000;reply[9]=1;reply[10]=s.apr.play.handle;reply[11]=status;bytes=48;}
+    return bytes;
+}
+static void playAck(PicassoGlink &s,unsigned status=0) {
+    uint32_t reply[12];unsigned bytes=playResponse(s,reply,status);picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(reply),bytes);
+}
+static void playRelease(PicassoGlink &s,unsigned rx) {message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);}
+static unsigned playAt(PicassoGlink &s,unsigned phase) {
+    unsigned rx=playReady(s);step(s);drain(s);
+    for(unsigned i=0;i<phase;++i) {assert(s.apr.play.phase==i && s.apr.play.pending);playAck(s);playRelease(s,rx);}
+    assert(s.apr.play.phase==phase && s.apr.play.pending);return rx;
+}
+static void playCleanup(PicassoGlink &s,unsigned rx) {
+    for(unsigned n=0;n<12 && !s.apr.play.done;++n) {
+        step(s);drain(s);
+        if(s.apr.play.pending) {assert(s.apr.play.phase>=9);playAck(s);playRelease(s,rx);}
+    }assert(s.apr.play.done);
+}
+__attribute__((noinline)) static void playTests() {
+    static PicassoGlink s;unsigned rx=playReady(s);step(s);drain(s);uint32_t request[18];
+    for(unsigned phase=0;phase<14;++phase) {
+        auto &v=s.apr.play;assert(v.pending && v.phase==phase);
+        unsigned bytes=picasso_play_request(s.apr,request);
+        assert(request[3]==0x20570001+phase && (request[0]>>16)==bytes);
+        if(phase==5) {const uint32_t adm[]={0x00300250,0x10020508,0x10020408,0x20570006,0x10326,0x12000,0xffff1002,0x10312,0x100002,48000,0x201,0};assert(!memcmp(request,adm,sizeof adm));}
+        if(phase==6) {const uint32_t route[]={0x00240250,0x508,0x408,0x20570007,0x10325,0,1,0x10001,0};assert(!memcmp(request,route,sizeof route));}
+        if(phase==7)assert(bytes==32 && request[4]==0x10daa && !request[5] && !request[6] && !request[7]);
+        if(phase==8) {const uint32_t write[]={0x00340250,0x01010507,0x01010407,0x20570009,0x10dab,0x80000000,1,0x7788,4096,1,0,0,0};assert(!memcmp(request,write,sizeof write) && silenceCalls==1);}
+        uint32_t reply[12];bytes=playResponse(s,reply);
+        for(unsigned n=0;n<bytes;++n)picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(reply),n);
+        for(unsigned i=1;i<=4;++i){reply[i]^=1;picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(reply),bytes);reply[i]^=1;}
+        reply[0]^=0x100;picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(reply),bytes);reply[0]^=0x100;
+        if(phase==8)for(unsigned i=8;i<=10;++i) {reply[i]^=1;picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(reply),bytes);reply[i]^=1;}
+        if(phase==4 || phase==5 || phase==8) {
+            uint32_t ack[]={0x00280181,request[2],request[1],request[3],0x110e8,0,0,0,request[4],0};
+            picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),sizeof ack);
+        }
+        assert(v.pending && !v.responded);
+        packet(s,rx,1,reinterpret_cast<uint8_t *>(reply),bytes);step(s);drain(s);
+        assert(v.responded && !v.error && s.remoteIntent[0].busy);playRelease(s,rx);
+    }
+    assert(s.apr.play.done && s.apr.play.complete && s.apr.play.consumed && !s.apr.play.owned && s.apr.play.accepted==0x3fff);
+    assert(s.apr.play.pins.restored && !s.apr.play.pins.dirty && s.apr.pcm.complete && s.apr.pcm.retained);
+    for(unsigned i=0;i<4;++i)assert(pinRam[i][0]==0x2800 && pinRam[i][1]==1);
+    // Reject explicit failure at every command; still close acquired resources.
+    for(unsigned phase=0;phase<14;++phase) {
+        rx=playAt(s,phase);playAck(s,2);playRelease(s,rx);playCleanup(s,rx);
+        assert(!s.apr.play.complete && (phase<9?s.apr.play.firstError:s.apr.play.cleanupError)==-5);
+        unsigned expected=phase==9?PicassoPlayStream:phase==10?PicassoPlayCopp:phase==11?PicassoPlayMap:phase==12?PicassoPlayPort:phase==13?PicassoPlayClock:0;
+        assert(s.apr.play.owned==expected);
+    }
+    // All response timeouts preserve unresolved ownership and skip null IDs.
+    for(unsigned phase=0;phase<14;++phase) {
+        rx=playAt(s,phase);for(unsigned i=0;i<102;++i){step(s);drain(s);}
+        playRelease(s,rx);playCleanup(s,rx);assert(!s.apr.play.complete);
+        unsigned expected=phase==4?PicassoPlayMap:phase==5?PicassoPlayCopp:phase==9?PicassoPlayStream:phase==10?PicassoPlayCopp:phase==11?PicassoPlayMap:phase==12?PicassoPlayPort:phase==13?PicassoPlayClock:0;
+        assert(s.apr.play.owned==expected);
+    }
+    // WRITE timeout plus CLOSE failure must not send UNMAP for an owned buffer.
+    rx=playAt(s,8);for(unsigned i=0;i<102;++i){step(s);drain(s);}playRelease(s,rx);
+    assert(s.apr.play.phase==9 && s.apr.play.pending);playAck(s,2);playRelease(s,rx);playCleanup(s,rx);
+    assert(s.apr.play.owned==(PicassoPlayStream|PicassoPlayBuffer|PicassoPlayMap) && !(s.apr.play.accepted&(1U<<11)));
+    for(unsigned phase=0;phase<9;++phase) {
+        rx=playAt(s,phase);s.qrtr.qmi.domains[0].state=0;playRelease(s,rx);playCleanup(s,rx);
+        assert(!s.apr.play.complete && s.apr.play.firstError==-104);
+    }
+    for(unsigned phase=0;phase<14;++phase) {
+        rx=playAt(s,phase);unsigned owned=s.apr.play.owned;picasso_glink_stop(&s);
+        assert(s.apr.play.done && !s.apr.play.complete && s.apr.play.owned==owned && !s.apr.play.pins.dirty);
+    }
+    // Each actual packet write fault, with ownership retained after ambiguous TX.
+    for(unsigned phase=0;phase<14;++phase) {
+        auto before=[&](){rx=playReady(s);for(unsigned i=0;i<phase;++i){step(s);drain(s);assert(s.apr.play.pending);playAck(s);message(s,rx,14,7,91);step(s);drain(s);}};
+        before();writes=0;step(s);unsigned total=writes;assert(total);bool kick;
+        for(unsigned i=1;i<=total;++i) {before();writes=0;failWrite=i;
+            assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && s.apr.play.done && !s.apr.play.complete);
+            assert(!s.apr.play.pins.dirty);
+        }
+    }
+    rx=playReady(s);s.apr.fw.services[2][1]=0;step(s);assert(s.apr.play.done && s.apr.play.error==-95);
+    rx=playReady(s);s.apr.tfa.digitalDirty=1;step(s);assert(!s.apr.play.attempted);
+    rx=playReady(s);s.qrtr.qmi.domains[0].state=0;step(s);assert(!s.apr.play.attempted);
+    rx=playAt(s,3);pcmFault=-5;playAck(s);playRelease(s,rx);playCleanup(s,rx);assert(s.apr.play.dmaError==-5 && !(s.apr.play.accepted&(1U<<4)));
+    rx=playAt(s,7);s.apr.pcm.silence=nullptr;playAck(s);playRelease(s,rx);playCleanup(s,rx);assert(!s.apr.play.consumed && s.apr.play.dmaError==-22);
+    rx=playAt(s,8);pcmFault=-5;playAck(s);playRelease(s,rx);playCleanup(s,rx);assert(!s.apr.play.consumed && !s.apr.play.complete);
+    rx=playReady(s);pinFailRead=pinReads+1;step(s);drain(s);playAck(s);playRelease(s,rx);playCleanup(s,rx);
+    assert(!(s.apr.play.accepted&(1U<<1)) && !s.apr.play.owned);
+    rx=playReady(s);s.remoteIntent[0].size=20;step(s);drain(s);message(s,rx,8,7,0);step(s);drain(s);step(s);assert(s.apr.play.done && s.apr.play.firstError==-28 && !s.apr.play.owned);
+    rx=playReady(s);p32(s.desc.offset,(s.txHead+8)%s.tx.size);for(unsigned i=0;i<253;++i)step(s);
+    assert(s.apr.play.done && s.apr.play.firstError==-60 && !s.apr.play.owned);
+    puts("PASS 14-stage silent ADM/ASM data route, exact WRITE_DONE, COPP zero, every timeout/error/TX fault, ownership and pin rollback");
 }

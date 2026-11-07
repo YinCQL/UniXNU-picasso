@@ -7,6 +7,7 @@
 struct PicassoPcm {
     void (*prepare)(PicassoPcm &);
     int (*check)(PicassoPcm &);
+    int (*silence)(PicassoPcm &);
     uint32_t events,phase,token,wait,status,opcode,handle,statuses[2];
     uint32_t sid,bytes,slot,bank,asid,fsr,farLow,farHigh,syndrome;
     uint64_t address,physical;

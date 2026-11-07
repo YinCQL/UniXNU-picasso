@@ -177,6 +177,7 @@ inline bool picasso_pcm_due(PicassoAprProbe &p) {
     return !v.phase || (v.mapped && v.handle);
 }
 inline void picasso_clock_stop(PicassoAprProbe *p,int error) {
+    picasso_play_stop(p->play,error);
     auto &pcm=p->pcm;
     if(pcm.attempted) { pcm.pending=false;pcm.done=true;pcm.complete=false;pcm.error=error;++pcm.events; }
 
@@ -252,6 +253,7 @@ inline bool picasso_clock_due(const PicassoAprProbe &p) {
     const auto &c=p.clock;
     return p.ready && p.fw.valid && c.attempted && !c.sent && !c.error && !c.completed;
 }
+#include "PicassoPlaybackApr.h"
 inline void picasso_apr_receive(PicassoAprProbe *p, const uint8_t *data, uint32_t size) {
     ++p->received;
     p->bytes=size;
@@ -268,6 +270,7 @@ inline void picasso_apr_receive(PicassoAprProbe *p, const uint8_t *data, uint32_
         ++p->malformed; return;
     }
     uint32_t type=(header>>8)&3;
+    if(picasso_play_receive(*p,data+headerBytes,size-headerBytes,type))return;
     if(p->pcm.pending && p->receivedToken==p->pcm.token) {
         auto &v=p->pcm;const auto *b=data+headerBytes;unsigned bytes=size-headerBytes;
         if(type!=1 || p->source!=0x407 || p->destination!=0x507) { ++p->ignored;return; }

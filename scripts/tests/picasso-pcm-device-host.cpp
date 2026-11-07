@@ -67,6 +67,13 @@ int main(int argc,char **argv) {
         for(unsigned i=0;i<1536;++i)if(i!=2 && i!=512 && (i<1024 || i>=1032))assert(!table[i]);
         for(unsigned i=0;i<8;++i)assert(table[1024+i]==((0x123450000ULL+4096*i)|3|(1U<<6)|(2U<<8)|(1U<<10)|(1U<<11)|(3ULL<<53)));
         for(unsigned i=45056;i<sizeof storage;++i)assert(storage[i]==0xa5);
+        registers[(187*4096+0x58)/4]=0x400;assert(!p.check(p) && p.fsr==0x400);
+        for(unsigned bit=1;bit<32;++bit)if((1U<<bit)&0xc00001feU) {
+            registers[(187*4096+0x58)/4]=0x400|(1U<<bit);assert(p.check(p)==-5);
+        }
+        registers[(187*4096+0x58)/4]=0x400;
+        memset(storage,0xa5,8192);assert(p.silence && !p.silence(p));
+        for(unsigned i=0;i<8192;++i)assert(storage[i]==(i<4096?0:0xa5));
         if(mode==14){registers[(187*4096+0x58)/4]=2;assert(p.check(p)==-5 && p.fsr==2);}
         if(mode==15){registers[(187*4096+4)/4]^=1;assert(p.check(p)==-5);}
     }

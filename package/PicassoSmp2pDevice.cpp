@@ -123,14 +123,25 @@ void logStream(const PicassoAprProbe &a) {
     IOLog("PICASSO_ADSP asm-result open_error=%d format_error=%d status=%u/%u/%u\n",
         v.openError,v.formatError,v.statuses[0],v.statuses[1],v.statuses[2]);
 }
+void logPlay(const PicassoAprProbe &a) {
+    const auto &v=a.play;
+    IOLog("PICASSO_ADSP play phase=%u token=%x pending=%u opcode=%x status=%u error=%d first_error=%d cleanup_error=%d dma_error=%d\n",
+        v.phase,v.token,v.pending,v.opcode,v.status,v.error,v.firstError,v.cleanupError,v.dmaError);
+    IOLog("PICASSO_ADSP play-state accepted=%x owned=%x copp=%u handle=%x consumed=%u done=%u complete=%u bytes=4096 silence=1 amp_enable=0\n",
+        v.accepted,v.owned,v.copp,v.handle,v.consumed,v.done,v.complete);
+    IOLog("PICASSO_ADSP play-pins active=%u restored=%u dirty=%x error=%d restore_error=%d\n",
+        v.pins.active,v.pins.restored,v.pins.dirty,v.pins.error,v.pins.restoreError);
+    IOLog("PICASSO_ADSP play-write address=%08x%08x handle=%x status=%u fsr=%x fault=%x\n",
+        v.writeAddressHigh,v.writeAddressLow,v.writeHandle,v.writeStatus,a.pcm.fsr,a.pcm.fsr&0xc00001feU);
+}
 void logPcm(const PicassoAprProbe &a) {
     const auto &v=a.pcm;
     IOLog("PICASSO_ADSP pcm-map phase=%u token=%x sent=%u pending=%u responded=%u opcode=%x status=%u error=%d map_error=%d dma_error=%d\n",
         v.phase,v.token,v.sent,v.pending,v.responded,v.opcode,v.status,v.error,v.mapError,v.dmaError);
     IOLog("PICASSO_ADSP pcm-state prepared=%u handle=%x mapped=%u unmapped=%u uncertain=%u done=%u complete=%u retained=%u status=%u/%u run=0 write=0 pcm=0\n",
         v.prepared,v.handle,v.mapped,v.unmapped,v.uncertain,v.done,v.complete,v.retained,v.statuses[0],v.statuses[1]);
-    IOLog("PICASSO_ADSP pcm-buffer sid=%x address=%08x%08x bytes=%u bank=%u asid=%u fsr=%x far=%08x%08x syndrome=%x\n",
-        v.sid,uint32_t(v.address>>32),uint32_t(v.address),v.bytes,v.bank,v.asid,v.fsr,v.farHigh,v.farLow,v.syndrome);
+    IOLog("PICASSO_ADSP pcm-buffer sid=%x address=%08x%08x bytes=%u bank=%u asid=%u fsr=%x far=%08x%08x syndrome=%x fault=%x\n",
+        v.sid,uint32_t(v.address>>32),uint32_t(v.address),v.bytes,v.bank,v.asid,v.fsr,v.farHigh,v.farLow,v.syndrome,v.fsr&0xc00001feU);
 }
 int prepare(SmemDevice *d, const PicassoSmemIo *io, PicassoSmp2p *s, PicassoGlink *glink) {
     s->audit.phase = "lock";
@@ -174,7 +185,7 @@ struct BootEvents {
     uint32_t qmiEvents = 0, qmiLogs = 0;
     uint32_t locatorEvents = 0, locatorLogs = 0, fwEvents = 0, afeEvents = 0;
     uint32_t tftpEvents = 0, tftpLogs = 0;
-    uint32_t clockEvents = 0, portEvents = 0, pinEvents = 0, tfaEvents = 0, streamEvents = 0, pcmEvents = 0;
+    uint32_t clockEvents = 0, portEvents = 0, pinEvents = 0, tfaEvents = 0, streamEvents = 0, pcmEvents = 0, playEvents = 0;
 };
 void logAudioPins(const PicassoAudioPins &p) {
 IOLog("PICASSO_ADSP afe-pins attempted=%u active=%u restored=%u dirty=%x error=%d restore_error=%d ctl=%x/%x/%x/%x amplifier=0 pcm=0\n",
@@ -350,6 +361,7 @@ void bootService(void *context) {
             logAudioPins(p);
         }
         if(a.tfa.events!=b->tfaEvents) { b->tfaEvents=a.tfa.events;logTfa(a.tfa); }
+        if(a.play.events!=b->playEvents) { b->playEvents=a.play.events;logPlay(a); }
         if(a.pcm.events!=b->pcmEvents) { b->pcmEvents=a.pcm.events;logPcm(a); }
         if(a.stream.events!=b->streamEvents) { b->streamEvents=a.stream.events;logStream(a); }
         if(q.locator.events!=b->locatorEvents && b->locatorLogs<32) {
@@ -441,7 +453,7 @@ extern "C" void picasso_smp2p_start(void) {
         error, s.created, s.partition.offset, s.partition.size, s.out.offset, s.out.size, lockRead(&d));
     logAudit(s);
     if (error) return;
-    glink.apr.pins.read=audioPinRead;glink.apr.pins.write=audioPinWrite;glink.apr.tfa.probe=tfaProbe;glink.apr.pcm.prepare=picasso_pcm_device_prepare;
+    glink.apr.pins.read=audioPinRead;glink.apr.pins.write=audioPinWrite;glink.apr.tfa.probe=tfaProbe;glink.apr.pcm.prepare=picasso_pcm_device_prepare;glink.apr.play.enabled=true;
     smpKick(&d);
     IOLog("PICASSO_ADSP glink stage=prepared descriptor=%x/%x tx=%x/%x remote_pid=2\n",
         glink.desc.offset,glink.desc.size,glink.tx.offset,glink.tx.size);

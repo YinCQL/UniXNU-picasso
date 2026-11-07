@@ -231,6 +231,9 @@ int main(int argc,char **argv) {
     auto &pcm=stream.pcm;pcm.phase=pcm.token=pcm.opcode=pcm.status=pcm.handle=pcm.sid=pcm.bytes=pcm.bank=pcm.asid=pcm.fsr=pcm.farHigh=pcm.farLow=pcm.syndrome=0xffffffff;
     pcm.address=~0ULL;pcm.error=pcm.mapError=pcm.dmaError=-2147483647;
     pcm.statuses[0]=pcm.statuses[1]=0xffffffff;logPcm(stream);
+    auto &play=stream.play;play.phase=play.token=play.opcode=play.status=play.copp=play.handle=play.accepted=play.owned=0xffffffff;
+    play.writeAddressHigh=play.writeAddressLow=play.writeHandle=play.writeStatus=0xffffffff;
+    play.error=play.firstError=play.cleanupError=play.dmaError=-2147483647;logPlay(stream);
     PicassoRpcDomain record={};record.pd=record.requests=record.lastHandle=record.lastScalar=0xffffffffU;
     record.wireBytes=record.decodeResult=record.previousResult=0xffffffffU;
     memset(record.name,'n',127);memset(record.fs.target,'t',127);
