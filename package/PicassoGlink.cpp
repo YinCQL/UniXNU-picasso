@@ -7,7 +7,7 @@ int fail(PicassoGlink *s, int error) {
     s->failed = true; s->error = error; s->ready = false;
     s->apr.ready = false; s->apr.pending = false;
     s->apr.fw.pending=false;s->apr.fw.valid=false;s->apr.fw.error=error;
-    s->apr.afe.pending=false;s->apr.afe.valid=false;s->apr.afe.error=error;++s->apr.afe.events;
+    s->apr.afe.pending=false;s->apr.afe.valid=false;s->apr.afe.verified=false;s->apr.afe.error=error;++s->apr.afe.events;
     if (!s->apr.error) s->apr.error = error;
     picasso_qrtr_invalidate(&s->qrtr, error);
     picasso_rpc_stop(&s->fastrpc,error);
@@ -87,7 +87,7 @@ void clearChannel(PicassoGlink *s, PicassoGlinkChannel &c) {
     if (c.local==1) {
         s->apr.ready=false; s->apr.pending=false; s->apr.error=-104;
         s->apr.fw.pending=false;s->apr.fw.valid=false;s->apr.fw.error=-104;
-        s->apr.afe.pending=false;s->apr.afe.valid=false;s->apr.afe.error=-104;++s->apr.afe.events;
+        s->apr.afe.pending=false;s->apr.afe.valid=false;s->apr.afe.verified=false;s->apr.afe.error=-104;++s->apr.afe.events;
     }
     else if(c.local==2) picasso_qrtr_invalidate(&s->qrtr,-104);
     else picasso_rpc_stop(&s->fastrpc,-104);
@@ -128,7 +128,7 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     if (!c.up) return 0;
     auto &a = s->apr;
     int qmiDue=c.local==2 ? picasso_qmi_due(&s->qrtr.qmi):-1;
-    if (c.local==1) ++a.ticks;
+    if (c.local==1) { ++a.ticks;picasso_afe_advance(&a,s->qrtr.qmi); }
     // Worker cadence is 20 ms. Hold expiry while responses are backpressured.
     if(c.local==2 && !s->qrtr.count && s->qrtr.tftp.announced) {
         auto &q=s->qrtr;int retry=picasso_tftp_tick(&q.tftp);
@@ -247,7 +247,7 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     bool afe=picasso_afe_due(&a);
     if ((a.ready && !version && !afe) || a.error) return 0;
     if (!version && !afe && (a.pending || a.ticks < a.next)) return 0;
-    unsigned requestBytes=afe?56:20;
+    unsigned requestBytes=afe?(a.afe.phase==1?68:56):20;
     PicassoGlinkRemoteIntent *slot = nullptr;
     for (auto &i : s->remoteIntent) if (i.used && !i.busy && i.size >= requestBytes) { slot = &i; break; }
     if (!slot) {
@@ -258,9 +258,9 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
         }
         return 0;
     }
-    uint32_t words[18] = {9U | (uint32_t(c.local) << 16), slot->id, requestBytes, 0};
+    uint32_t words[22] = {9U | (uint32_t(c.local) << 16), slot->id, requestBytes, 0};
     uint32_t query[5]; picasso_apr_query(version?0x18710001:a.token + 1, query);
-    if(afe) { uint32_t request[14];picasso_afe_query(request);for(unsigned i=0;i<14;++i)words[4+i]=request[i]; }
+    if(afe) { uint32_t request[18];picasso_afe_request(a.afe.phase,request);for(unsigned i=0;i<requestBytes/4;++i)words[4+i]=request[i]; }
     else { if(version)query[4]=0x1292c;for (unsigned i = 0; i < 5; ++i) words[4 + i] = query[i]; }
     if ((error = transmit(io, s, words,16+((requestBytes+7)&~7U), kick))) return error;
     slot->busy = true;

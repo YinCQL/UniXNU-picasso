@@ -21,6 +21,49 @@ inline void picasso_afe_query(uint32_t (&w)[14]) {
     w[9]=0x1020c;w[10]=0x1020d; // audio device interface / I2S config
     w[11]=0x1020c;w[12]=0x1020d;w[13]=20;
 }
+// Picasso DTS: secondary RX SD0, AP master. Stock kona.c MI2S defaults:
+// 48 kHz / S16_LE / two channels. Only cache the AFE port configuration;
+// enabling clocks, DEVICE_START and amplifier/PCM setup are separate work.
+inline uint32_t picasso_afe_config_word(unsigned n) {
+    const uint32_t config[5]={1,0x00010010,0x00010001,48000,0};return config[n];
+}
+inline unsigned picasso_afe_request(unsigned phase,uint32_t (&w)[18]) {
+    for(auto &v:w)v=0;
+    if(phase!=1) {
+        uint32_t query[14];picasso_afe_query(query);
+        for(unsigned n=0;n<14;++n)w[n]=query[n];
+        if(phase==2)w[3]=0x20520003;
+        return 56;
+    }
+    w[0]=0x00440250;w[1]=0x504;w[2]=0x404;w[3]=0x20520002;w[4]=0x100ef;
+    w[5]=0x00201002;w[9]=0x1020c;w[10]=0x1020d;w[11]=20;
+    for(unsigned n=0;n<5;++n)w[12+n]=picasso_afe_config_word(n);
+    return 68;
+}
+inline bool picasso_afe_domains_up(const PicassoQmi &q) {
+    if(!q.bound || q.lost || q.round!=1)return false;
+    for(const auto &d:q.domains)if(!d.completed || !d.stateValid || d.state!=0x1fffffff || d.error)return false;
+    return true;
+}
+inline void picasso_afe_advance(PicassoAprProbe *p,const PicassoQmi &q) {
+    auto &v=p->afe;
+    if(!p->ready || !p->fw.valid)return;
+    if(v.phase && !picasso_afe_domains_up(q)) {
+        if(!v.error || v.pending || v.verified) {
+            v.pending=v.valid=v.verified=false;v.error=-104;++v.events;
+        }
+        return;
+    }
+    bool configure=!v.phase && v.responded && v.error==-5 && v.status==2 &&
+        v.opcode==0x10106 && v.payloadBytes==48 && v.raw[1]==0x1020c && v.raw[2]==0x1020d && !v.raw[3] &&
+        picasso_afe_domains_up(q);
+    bool verify=v.phase==1 && v.setAccepted && !v.error;
+    if(!configure && !verify)return;
+    ++v.phase;v.sent=v.pending=v.responded=v.valid=false;v.wait=v.status=v.opcode=0;
+    v.payloadBytes=v.headerBytes=v.rejected=0;v.error=0;
+    for(auto &word:v.raw)word=0;
+    ++v.events;
+}
 inline bool picasso_afe_due(PicassoAprProbe *p) {
     auto &v=p->afe;
     if(!p->ready || !p->fw.valid || v.sent || v.error)return false;
@@ -50,6 +93,11 @@ inline void picasso_apr_receive(PicassoAprProbe *p, const uint8_t *data, uint32_
     if(p->afe.pending && p->receivedToken==p->afe.token) {
         auto &v=p->afe;const auto *b=data+headerBytes;unsigned bytes=size-headerBytes;
         if(type>1 || p->source!=0x404 || p->destination!=0x504) { ++p->ignored;return; }
+        if(v.phase==1) {
+            if(p->opcode!=0x110e8 || type!=1 || bytes!=8 || wlan_sm32(b)!=0x100ef) { ++p->ignored;return; }
+            v.status=wlan_sm32(b+4);v.opcode=p->opcode;v.pending=false;v.responded=true;
+            v.setAccepted=!v.status;v.error=v.status?-5:0;++v.events;return;
+        }
         if(p->opcode==0x110e8 && type==1 && bytes==8 && wlan_sm32(b)==0x100f0) {
             v.status=wlan_sm32(b+4);v.opcode=p->opcode;
             if(v.status) { v.pending=false;v.responded=true;v.error=-5;++v.events; }
@@ -75,6 +123,11 @@ inline void picasso_apr_receive(PicassoAprProbe *p, const uint8_t *data, uint32_
             // A nonzero DSP status is an actual response, never a usable route.
             v.status=status;v.opcode=p->opcode;v.pending=false;v.responded=true;v.valid=!status;v.error=status?-5:0;
             if(!status)for(unsigned i=0;i<5;++i)v.config[i]=wlan_sm32(b+16+i*4);
+            if(!status && v.phase==2) {
+                v.verified=v.setAccepted;
+                for(unsigned i=0;i<5;++i)if(v.config[i]!=picasso_afe_config_word(i))v.verified=false;
+                if(!v.verified)v.error=-84;
+            }
             ++v.events;
         } else ++p->ignored;
         return;

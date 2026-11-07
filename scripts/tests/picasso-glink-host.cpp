@@ -40,6 +40,7 @@ static void fastrpcTests();
 static void tftpTests();
 static void afeTests();
 static void registryQmiTests();
+static void afeConfigureTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -125,7 +126,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
+    afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -518,6 +519,86 @@ static unsigned afeReady(PicassoGlink &s) {
     uint32_t fw[]={0x00340150,0x403,0x503,0x18710001,0x1292d,2,9,0,0,1,4,7,0};
     packet(s,rx,1,reinterpret_cast<uint8_t *>(fw),sizeof fw);message(s,rx,14,7,91);
     step(s);drain(s);assert(s.apr.fw.valid && !s.apr.afe.sent);return rx;
+}
+static void lateDomains(PicassoQmi &q) {
+    q.bound=true;q.round=1;q.registryRequests=1283;
+    for(auto &d:q.domains) { d.sent=d.completed=d.stateValid=true;d.state=0x1fffffff; }
+}
+static unsigned afeEmpty(PicassoGlink &s) {
+    unsigned rx=afeReady(s);step(s);drain(s);
+    // Captured 21:23 payload, extension bytes are deliberately synthetic.
+    const uint32_t empty[]={0x00500181,0x404,0x504,0x20520001,0x10106,0,0,0,2,0x1020c,0x1020d,0,0,0,0,0,0,0,0,0};
+    packet(s,rx,1,reinterpret_cast<const uint8_t *>(empty),sizeof empty);message(s,rx,14,7,91);
+    step(s);drain(s);assert(s.apr.afe.responded && s.apr.afe.status==2 && !s.apr.afe.phase);return rx;
+}
+__attribute__((noinline)) static void afeConfigureTests() {
+    uint32_t request[18];const uint32_t expected[]={0x00440250,0x504,0x404,0x20520002,0x100ef,0x00201002,0,0,0,0x1020c,0x1020d,20,1,0x10010,0x10001,48000,0};
+    assert(picasso_afe_request(1,request)==68 && !memcmp(request,expected,sizeof expected) && !request[17]);
+    assert(picasso_afe_request(2,request)==56 && request[3]==0x20520003 && request[4]==0x100f0);
+    PicassoGlink s={};unsigned rx=afeEmpty(s);
+    for(unsigned n=0;n<10;++n){step(s);drain(s);}assert(!s.apr.afe.phase);
+    lateDomains(s.qrtr.qmi);s.qrtr.qmi.round=0;step(s);drain(s);assert(!s.apr.afe.phase);
+    s.qrtr.qmi.round=1;s.qrtr.qmi.domains[1].state=0x0fffffff;step(s);drain(s);assert(!s.apr.afe.phase);
+    s.qrtr.qmi.domains[1].state=0x1fffffff;
+    unsigned at=s.txHead;step(s);drain(s);
+    assert(s.apr.afe.phase==1 && s.apr.afe.pending && !s.apr.afe.setAccepted);
+    bool found=false;for(unsigned n=at;n+88<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x10009) {
+        assert(r32(s.tx.offset+n+8)==68 && !memcmp(ram+s.tx.offset+n+16,expected,sizeof expected));
+        assert(!r32(s.tx.offset+n+84));found=true;
+    }assert(found);
+    uint32_t ack[]={0x00280181,0x404,0x504,0x20520002,0x110e8,0,0,0,0x100ef,0};
+    auto receive=[&](const void *p,unsigned bytes){picasso_apr_receive(&s.apr,static_cast<const uint8_t *>(p),bytes);};
+    for(unsigned i=0;i<sizeof ack;++i)receive(ack,i);
+    assert(s.apr.afe.pending && !s.apr.afe.setAccepted);
+    const unsigned bad[]={1,2,3,4,8};for(unsigned i:bad) {ack[i]^=1;receive(ack,sizeof ack);ack[i]^=1;assert(s.apr.afe.pending && !s.apr.afe.setAccepted);}
+    ack[0]=0x00280081;receive(ack,sizeof ack);assert(!s.apr.afe.setAccepted);ack[0]=0x00280181;
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(ack),sizeof ack);message(s,rx,14,7,91);step(s);drain(s);
+    assert(s.apr.afe.setAccepted && s.apr.afe.phase==1 && !s.apr.afe.verified);
+    at=s.txHead;step(s);drain(s);assert(s.apr.afe.phase==2 && s.apr.afe.pending && s.apr.afe.token==0x20520003);
+    found=false;for(unsigned n=at;n+72<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x10009) {
+        assert(r32(s.tx.offset+n+8)==56 && r32(s.tx.offset+n+28)==0x20520003 && r32(s.tx.offset+n+32)==0x100f0);found=true;
+    }assert(found);
+    receive(ack,sizeof ack);assert(s.apr.afe.pending && !s.apr.afe.verified);
+    uint32_t config[]={0x00500181,0x404,0x504,0x20520003,0x10106,0,0,0,0,0x1020c,0x1020d,20,1,0x10010,0x10001,48000,0,0,0,0};
+    config[3]=0x20520001;receive(config,sizeof config);assert(s.apr.afe.pending && !s.apr.afe.verified);config[3]=0x20520003;
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(config),37,43);step(s);drain(s);assert(!s.apr.afe.verified);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(config)+37,43,0,true);step(s);drain(s);
+    assert(s.apr.afe.verified && s.apr.afe.valid && s.apr.afe.setAccepted && !s.apr.afe.error && s.apr.ready);
+    unsigned events=s.apr.afe.events;for(unsigned n=0;n<300;++n){step(s);drain(s);}assert(s.apr.afe.events==events);
+    picasso_qmi_lost(&s.qrtr.qmi);step(s);assert(!s.apr.afe.verified && !s.apr.afe.valid && s.apr.afe.error==-104 && !s.failed);
+    // A config mismatch, GET error, or SET failure never becomes verified.
+    PicassoAprProbe a={};a.afe.phase=2;a.afe.setAccepted=a.afe.pending=true;a.afe.token=0x20520003;
+    config[15]=44100;picasso_apr_receive(&a,reinterpret_cast<uint8_t *>(config),sizeof config);
+    assert(a.afe.valid && !a.afe.verified && a.afe.error==-84);config[15]=48000;
+    a={};a.afe.phase=2;a.afe.setAccepted=a.afe.pending=true;a.afe.token=0x20520003;
+    config[8]=2;picasso_apr_receive(&a,reinterpret_cast<uint8_t *>(config),sizeof config);assert(!a.afe.valid && !a.afe.verified && a.afe.error==-5);config[8]=0;
+    rx=afeEmpty(s);lateDomains(s.qrtr.qmi);step(s);drain(s);ack[9]=3;receive(ack,sizeof ack);ack[9]=0;
+    for(unsigned n=0;n<10;++n){step(s);drain(s);}assert(s.apr.afe.phase==1 && !s.apr.afe.setAccepted && s.apr.afe.error==-5 && !s.failed);
+    // Never configure after arbitrary errors or mismatched empty parameters.
+    for(unsigned which=0;which<4;++which) {
+        rx=afeEmpty(s);lateDomains(s.qrtr.qmi);
+        if(which==0)s.apr.afe.status=3;else if(which==1)s.apr.afe.raw[1]++;else if(which==2)s.apr.afe.raw[3]=20;else s.apr.afe.responded=false;
+        step(s);drain(s);assert(!s.apr.afe.phase);
+    }
+    rx=afeEmpty(s);lateDomains(s.qrtr.qmi);s.remoteIntent[0].size=56;step(s);drain(s);
+    assert(s.apr.afe.phase==1 && !s.apr.afe.sent && s.apr.intentAsked);
+    message(s,rx,8,7,0);step(s);drain(s);assert(s.apr.afe.error==-28 && !s.apr.error && !s.failed);
+    rx=afeEmpty(s);lateDomains(s.qrtr.qmi);p32(s.desc.offset,(s.txHead+8)%s.tx.size);
+    for(unsigned n=0;n<251;++n)step(s);assert(s.apr.afe.error==-60 && !s.apr.afe.sent && !s.remoteIntent[0].busy);
+    rx=afeEmpty(s);lateDomains(s.qrtr.qmi);step(s);drain(s);
+    for(unsigned n=0;n<101;++n){step(s);drain(s);}assert(s.apr.afe.error==-60 && !s.apr.afe.pending && s.remoteIntent[0].busy);
+    receive(ack,sizeof ack);assert(!s.apr.afe.setAccepted);
+    rx=afeEmpty(s);lateDomains(s.qrtr.qmi);step(s);drain(s);receive(ack,sizeof ack);
+    message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+    assert(s.apr.afe.phase==2 && s.apr.afe.pending);for(unsigned n=0;n<101;++n){step(s);drain(s);}assert(s.apr.afe.error==-60 && !s.apr.afe.verified);
+    rx=afeEmpty(s);lateDomains(s.qrtr.qmi);writes=0;step(s);unsigned total=writes;bool kick;
+    for(unsigned n=1;n<=total;++n) {
+        rx=afeEmpty(s);lateDomains(s.qrtr.qmi);writes=0;failWrite=n;
+        assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && !s.apr.afe.pending && !s.apr.afe.verified);
+    }
+    rx=afeEmpty(s);lateDomains(s.qrtr.qmi);step(s);drain(s);message(s,rx,3,7,0);step(s);
+    assert(!s.apr.afe.pending && !s.apr.afe.verified && s.apr.afe.error==-104);
+    puts("PASS AFE empty-config gate, stock SET wire, confirmed ACK then exact GET verification, stale replies, mismatch, failures and ownership");
 }
 __attribute__((noinline)) static void afeTests() {
     // Stock q6afe v2 in-band wire, no mapped payload or SET/START command.

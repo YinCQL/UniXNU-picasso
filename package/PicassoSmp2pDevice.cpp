@@ -105,6 +105,8 @@ void logAfe(const PicassoAprProbe &a) {
     const auto &v=a.afe;
     IOLog("PICASSO_ADSP afe sent=%u pending=%u responded=%u valid=%u api=%u token=%x opcode=%x status=%u error=%d port=1002 pcm=0\n",
         v.sent,v.pending,v.responded,v.valid,v.api,v.token,v.opcode,v.status,v.error);
+    IOLog("PICASSO_ADSP afe-stage phase=%u set_accepted=%u verified=%u port=1002 started=0 pcm=0\n",
+        v.phase,v.setAccepted,v.verified);
     if(v.payloadBytes) {
         IOLog("PICASSO_ADSP afe-wire header_bytes=%u payload_bytes=%u rejected=%u status=%u module=%x param=%x size_reserved=%x\n",
             v.headerBytes,v.payloadBytes,v.rejected,v.raw[0],v.raw[1],v.raw[2],v.raw[3]);

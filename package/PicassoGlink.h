@@ -39,6 +39,8 @@ struct PicassoAprProbe {
     struct {
         uint32_t token,wait,status,opcode,events,api,config[5];
         uint32_t payloadBytes,headerBytes,raw[12],rejected;
+        uint32_t phase; // 0 initial GET, 1 SET configuration, 2 verify GET
+        bool setAccepted,verified;
         bool sent,pending,responded,valid;
         int error;
     } afe;
