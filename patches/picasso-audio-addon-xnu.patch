@@ -1,0 +1,70 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7652,6 +7652,8 @@
+ 		native_gpu_addon_error = EINVAL;
+ 		return;
+ 	}
++	uint32_t audio_only = 0;
++	PE_parse_boot_argn("picasso-audio-addon", &audio_only, sizeof(audio_only));
+ 	/* Validate the whole addon before writing anything. */
+ 	uint64_t at = 24;
+ 	for (uint32_t i = 0; i < count; ++i) {
+@@ -7670,6 +7672,12 @@
+ 		const char *name = (const char *)(addon + at);
+ 		if (name_bytes < 2 || name_bytes > 160 || bytes - at < name_padded || name[name_bytes - 1] || strnlen(name, name_bytes) != name_bytes - 1 ||
+ 		    name[0] == '/' || (mode & ~0777) || size > INT32_MAX || !packed || packed > INT32_MAX || bytes - at - name_padded < size_padded) {
++			native_gpu_addon_error = EINVAL;
++			return;
++		}
++		if (audio_only == 1 && (count != 2 ||
++		    (i == 0 && (strcmp(name, "audio/PicassoAudio.driver/Info.plist") || mode != 0644)) ||
++		    (i == 1 && (strcmp(name, "audio/PicassoAudio.driver/PicassoAudio") || mode != 0755)))) {
+ 			native_gpu_addon_error = EINVAL;
+ 			return;
+ 		}
+@@ -7728,7 +7736,7 @@
+ 	 * left behind by an earlier published addon survives the Data volume and
+ 	 * kept the Metal plugin in its production path after the unpublished addon
+ 	 * was installed (wf214 -> wf215/wf216), which wedges the render server. */
+-	if (!saw_publish) {
++	if (!saw_publish && audio_only != 1) {
+ 		struct unlink_args request = { .path = scratch + 0x800 };
+ 		const char *stale = "/private/var/ngpu/addons/NativeAdrenoMetal.publish";
+ 		int32_t result = 0;
+@@ -7736,7 +7744,7 @@
+ 			(void)unlink(p, &request, &result);
+ 		}
+ 	}
+-	if (!saw_clients) {
++	if (!saw_clients && audio_only != 1) {
+ 		struct unlink_args request = { .path = scratch + 0x900 };
+ 		const char *stale = "/private/var/ngpu/addons/NativeAdrenoMetal.clients";
+ 		int32_t result = 0;
+@@ -7748,11 +7756,23 @@
+ static void
+ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ {
+-	uint32_t enabled = 0;
+-	if (!PE_parse_boot_argn("sheng-gpu-addon", &enabled, sizeof(enabled)) || enabled != 1) {
+-		return;
+-	}
++	uint32_t enabled = 0, audio = 0;
++	PE_parse_boot_argn("sheng-gpu-addon", &enabled, sizeof(enabled));
++	PE_parse_boot_argn("picasso-audio-addon", &audio, sizeof(audio));
++	if (enabled != 1 && audio != 1) return;
+ 	native_gpu_addon_install(p, scratch);
++	if (audio == 1) {
++		static const char source[] = "/private/var/ngpu/audio", point[] = "/System/Library/Audio/Plug-Ins/HAL";
++		static volatile int stage, status;
++		if (!native_gpu_addon_failed && native_gpu_addon_files == 2) {
++			native_gpu_addon_mount(p, scratch, 0xa00, source, sizeof(source), point, sizeof(point),
++			    "/System/Library/Audio/Plug-Ins/HAL/BuiltinAudioPlugin.driver",
++			    "/System/Library/Audio/Plug-Ins/HAL/PicassoAudio.driver/Info.plist", &stage, &status);
++		} else { stage = -1; status = native_gpu_addon_error; }
++		printf("PICASSO_AUDIO addon files=%d written=%d same=%d failed=%d stage=%d error=%d\n",
++		    native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, stage, status);
++	}
++	if (enabled != 1) return;
+ 	static const char extensions_source[] = "/private/var/ngpu/addons", extensions_point[] = "/System/Library/Extensions";
+ 	static const char daemons_source[] = "/private/var/ngpu/daemons", daemons_point[] = "/System/Library/LaunchDaemons";
+ 	native_gpu_addon_mount(p, scratch, 0x400, extensions_source, sizeof(extensions_source), extensions_point,

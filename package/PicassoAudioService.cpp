@@ -6,6 +6,8 @@
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <mach/kmod.h>
+#include <sys/proc.h>
+#include <sys/codesign.h>
 #include "PicassoAudioQueue.h"
 #include "PicassoApr.h"
 extern "C" kmod_info_t g_kernel_kmod_info;
@@ -14,6 +16,7 @@ static PicassoAudioQueue queue;
 static IOLock *queueLock;
 static uint8_t scratch[16384]; // worker-only staging, never stack or user DMA
 static bool attempted,published,registered,active,registrationFailed;
+static unsigned clientNotes,clientOpens;
 static unsigned testPhase,testFrames,testPause,lastEvents,startWait;
 
 static const PicassoAudioFormat format={1,48000,2,16};
@@ -28,6 +31,17 @@ static int audioCall(uint64_t owner,unsigned selector,const void *input,unsigned
         e=picasso_audio_begin(queue,owner,*static_cast<const PicassoAudioFormat *>(input));
     else if(selector==PicassoAudioWrite && !output)e=picasso_audio_write(queue,owner,static_cast<const uint8_t *>(input),bytes);
     else if((selector==PicassoAudioEnd || selector==PicassoAudioCancel) && !bytes && !output)e=picasso_audio_end(queue,owner,selector==PicassoAudioCancel);
+    else if(selector==PicassoAudioNote && input && bytes==sizeof(PicassoAudioClientNote) && !output) {
+        const auto &n=*static_cast<const PicassoAudioClientNote *>(input);
+        if(n.version==1 && n.kind>=1 && n.kind<=6 && !n.reserved) {
+            // Client-provided observations, separately labeled from DSP state.
+            if(clientNotes<64 || (n.kind==3 && !(n.sentFrames&0x3ffff))) {
+                IOLog("PICASSO_AUDIO hal-note kind=%u result=%d selector=%x value=%u calls=%llu sent_frames=%llu missing_frames=%llu client_report=1\n",
+                    n.kind,n.result,n.selector,n.value,n.calls,n.sentFrames,n.missingFrames);++clientNotes;
+            }
+            e=0;
+        }
+    }
     IOLockUnlock(queueLock);return e;
 }
 class PicassoAudio : public IOService {
@@ -47,7 +61,18 @@ class PicassoAudioUserClient : public IOUserClient {
     bool closed=false;
 public:
     bool initWithTask(task_t task,void *security,UInt32 type,OSDictionary *props) override {
-        if(type || clientHasPrivilege(task,kIOClientPrivilegeAdministrator)!=kIOReturnSuccess)return false;
+        IOReturn privilege=clientHasPrivilege(task,kIOClientPrivilegeAdministrator);
+        // iOS's audio server may run without uid 0. Permit only the platform
+        // signed audio-server identity in the calling task, not a process name
+        // supplied by a client. Existing sandbox checks remain in force.
+        proc_t process=proc_self();
+        const char *identity=process?csproc_get_identity(process):nullptr;
+        bool audioServer=process && proc_task(process)==task && csproc_get_platform_binary(process) &&
+            identity && !strcmp(identity,"com.apple.mediaserverd");
+        if(clientOpens++<16)IOLog("PICASSO_AUDIO client-init type=%u privilege=%x audio_server=%u identity=%.64s\n",
+            type,privilege,audioServer,identity?identity:"<none>");
+        if(process)proc_rele(process);
+        if(type || (privilege!=kIOReturnSuccess && !audioServer))return false;
         return IOUserClient::initWithTask(task,security,type,props);
     }
     bool start(IOService *provider) override {
@@ -91,7 +116,7 @@ static void publishAudio() {
     published=attached && service->start(provider);
     if(!published) {registrationFailed=true;if(attached)service->detach(provider);}
     if(service)service->release();
-    IOLog("PICASSO_AUDIO published=%u output=1 input=0 rate=48000 bits=16 channels=2 hal=0\n",published);
+    IOLog("PICASSO_AUDIO published=%u output=1 input=0 rate=48000 bits=16 channels=2 hal_client=awaiting\n",published);
 }
 static int audioSource(PicassoPlayback &,PicassoPcm &pcm,unsigned slot,unsigned *bytes) {
     *bytes=0;IOLockLock(queueLock);

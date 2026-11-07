@@ -94,7 +94,7 @@ def check(tree, work, kernelcache, output):
                      '__ZN12PicassoAudio10gMetaClassE', '__ZN22PicassoAudioUserClient10gMetaClassE'} <= linked_names,
                     'Missing PCM worker, audio-service initializer or client metaclasses')
     report['audio_service'] = {'worker_linked': True, 'late_initializer_verified': True,
-                               'classes_linked': True, 'hal_installed': False, 'runtime_qualified': False}
+                               'classes_linked': True, 'hal_payload_checked_separately': True, 'runtime_qualified': False}
     report['hid'] = hid.verify(platform, aes, native, OriginalReference(kernelcache, board),
                                directory, kernel.read_bytes(), plan)
     config = (work / '.config').read_text()

@@ -17,6 +17,14 @@ struct IOExternalMethodArguments {
 enum {kIOReturnSuccess=0,kIOReturnBadArgument=-1,kIOReturnNotReady=-2,kIOReturnNotOpen=-3,
     kIOReturnNotPermitted=-4,kIOReturnNoSpace=-5,kIOReturnBusy=-6};
 static const char *kIOClientPrivilegeAdministrator="root";
+using proc_t=void *;
+static bool platformAudio=false;
+static const char *clientIdentity="com.apple.mediaserverd";
+static proc_t proc_self(){return reinterpret_cast<void *>(1);}
+static task_t proc_task(proc_t){return nullptr;}
+static const char *csproc_get_identity(proc_t){return clientIdentity;}
+static int csproc_get_platform_binary(proc_t){return platformAudio;}
+static void proc_rele(proc_t){}
 static bool privileged=true;static unsigned registrations,metaCalls,lockDepth;
 struct IOLock {};
 static IOLock *IOLockAlloc(){static IOLock l;return &l;}
@@ -113,12 +121,19 @@ int main() {
     assert(picasso_play_base(p.play)==0x20590000 && !p.pcm.busyMask && p.play.complete);
     PicassoAudio provider;PicassoAudioUserClient c,other;
     privileged=false;assert(!c.initWithTask(nullptr,nullptr,0,nullptr));privileged=true;
+    privileged=false;platformAudio=true;assert(c.initWithTask(nullptr,nullptr,0,nullptr));
+    clientIdentity="com.example.spoof";assert(!c.initWithTask(nullptr,nullptr,0,nullptr));
+    clientIdentity="com.apple.mediaserverd";platformAudio=false;privileged=true;
     assert(!c.initWithTask(nullptr,nullptr,1,nullptr));assert(c.initWithTask(nullptr,nullptr,0,nullptr) && c.start(&provider));
     assert(other.initWithTask(nullptr,nullptr,0,nullptr) && other.start(&provider));
     IOExternalMethodArguments malformed;malformed.scalarInputCount=1;
     assert(c.externalMethod(1,&malformed,nullptr,nullptr,nullptr)==kIOReturnBadArgument);
     PicassoAudioStatus status;assert(!call(c,0,nullptr,0,&status,sizeof status) && status.version==1 && status.epoch==2);
     assert(call(c,99)==kIOReturnBadArgument && call(c,0,nullptr,0,&status,4)==kIOReturnBadArgument);
+    PicassoAudioClientNote note={1,1,0,0,0,0,0,0,0};
+    assert(!call(c,PicassoAudioNote,&note,sizeof note));note.reserved=1;
+    assert(call(c,PicassoAudioNote,&note,sizeof note)==kIOReturnBadArgument);
+    assert(call(c,PicassoAudioNote,&note,sizeof note-4)==kIOReturnBadArgument);
     assert(!call(c,1,&format,sizeof format));assert(call(other,1,&format,sizeof format)==kIOReturnBusy);
     static uint8_t data[4096];memset(data,0x25,sizeof data);
     assert(call(other,2,data,4096)==kIOReturnNotPermitted);
