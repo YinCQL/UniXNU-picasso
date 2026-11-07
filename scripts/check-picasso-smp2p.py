@@ -74,7 +74,17 @@ def main():
         run('pcm-device-compile'+suffix,[a.cxx,'-std=c++17','-O1','-Wall','-Wextra','-Werror',*flags,*includes,
             str(ROOT/'scripts/tests/picasso-pcm-device-host.cpp'),str(ROOT/'package/PicassoRpcFs.cpp'),'-o',str(exe)])
         for case in range(16):run('pcm-device-'+str(case)+suffix,[str(exe),str(case)])
-    inputs = ['scripts/tests/picasso-pcm-device-host.cpp','scripts/tests/picasso-rpc-fs-host.cpp','scripts/make-picasso-rpc-stock.py','package/PicassoRpcFs.h','package/PicassoRpcFs.cpp','package/PicassoRpcStock.inc','package/PicassoFastrpc.h','package/PicassoPlayback.h','package/PicassoPlaybackApr.h','package/PicassoPcm.h','package/PicassoRpcDma.h','package/PicassoRpcDma.cpp','scripts/tests/picasso-fastrpc-host.cpp','package/PicassoTftp.h','scripts/tests/picasso-tftp-host.cpp','package/PicassoServloc.h','scripts/tests/picasso-servloc-host.cpp','package/PicassoSmp2p.h','package/PicassoSmp2p.cpp','package/PicassoSmp2pDevice.cpp',
+    audio_body = re.sub(r'^#include <[^>]+>[^\n]*\n', '', (ROOT/'package/PicassoAudioService.cpp').read_text(), flags=re.M)
+    audio_body = re.sub(r'^extern "C" void picasso_audio_static_init.*\n', '', audio_body, flags=re.M)
+    (out/'PicassoAudioService-body.inc').write_text(audio_body, encoding='utf8', newline='\n')
+    for sanitized in (False, True):
+        suffix='-asan' if sanitized else ''
+        flags=['-fsanitize=address,undefined','-fno-omit-frame-pointer'] if sanitized else []
+        exe=out/('audio-service'+suffix)
+        run('audio-service-compile'+suffix,[a.cxx,'-std=c++17','-O1','-Wall','-Wextra','-Werror',*flags,*includes,
+            str(ROOT/'scripts/tests/picasso-audio-service-host.cpp'),'-o',str(exe)])
+        run('audio-service'+suffix,[str(exe)])
+    inputs = ['package/PicassoAudioService.cpp','package/PicassoAudioQueue.h','package/PicassoAudioAbi.h','scripts/tests/picasso-audio-service-host.cpp', 'scripts/tests/picasso-pcm-device-host.cpp','scripts/tests/picasso-rpc-fs-host.cpp','scripts/make-picasso-rpc-stock.py','package/PicassoRpcFs.h','package/PicassoRpcFs.cpp','package/PicassoRpcStock.inc','package/PicassoFastrpc.h','package/PicassoPlayback.h','package/PicassoPlaybackApr.h','package/PicassoPcm.h','package/PicassoRpcDma.h','package/PicassoRpcDma.cpp','scripts/tests/picasso-fastrpc-host.cpp','package/PicassoTftp.h','scripts/tests/picasso-tftp-host.cpp','package/PicassoServloc.h','scripts/tests/picasso-servloc-host.cpp','package/PicassoSmp2p.h','package/PicassoSmp2p.cpp','package/PicassoSmp2pDevice.cpp',
         'package/PicassoGlink.h','package/PicassoGlink.cpp','package/PicassoApr.h','package/PicassoAudioPins.h','package/PicassoTfa.h','scripts/tests/picasso-tfa-host.cpp','package/PicassoQrtr.h','package/PicassoQmi.h','scripts/tests/picasso-glink-host.cpp','scripts/tests/picasso-qrtr-host.cpp','scripts/tests/picasso-qmi-host.cpp',
         'package/PicassoSmemLock.h','package/PicassoAdspBoot.h','package/PicassoAdsp.h','drivers/NativeWlan/WlanSmem.h','drivers/NativeAdrenoPicasso/PicassoRpmh.h',
         'scripts/check-picasso-smp2p.py','scripts/tests/picasso-smp2p-host.cpp','scripts/tests/picasso-smp2p-device-host.cpp',

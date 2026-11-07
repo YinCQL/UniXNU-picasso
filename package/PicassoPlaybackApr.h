@@ -32,27 +32,27 @@ inline unsigned picasso_play_request(const PicassoAprProbe &p,uint32_t (&w)[18])
         bytes=32;w[1]=0x01010507;w[2]=0x01010407;w[4]=0x10daa; // immediate RUN, timestamp zero
     } else if(n==PicassoPlayWrite) {
         bytes=52;w[1]=0x01010507;w[2]=0x01010407;w[4]=0x10dab;
-        uint64_t address=p.pcm.address+(v.tone?(v.writeSent&1)*PicassoPcmSlotBytes:0);
+        uint64_t address=p.pcm.address+(picasso_play_queued(v)?(v.writeSent&1)*PicassoPcmSlotBytes:0);
         w[5]=uint32_t(address);w[6]=uint32_t(address>>32);w[7]=v.handle;
-        w[8]=v.tone?picasso_pcm_chunk_bytes(v.writeSent):4096;
-        w[9]=v.tone?0x20571001+v.writeSent:1; // stock seq_id after buf_size; timestamps/flags zero
+        w[8]=picasso_play_bytes(v);
+        w[9]=picasso_play_queued(v)?picasso_play_base(v)+0x1001+v.writeSent:1; // stock seq_id after buf_size; timestamps/flags zero
     } else if(n==PicassoPlayDrain) {
         w[1]=0x01010507;w[2]=0x01010407;w[4]=0x10bdb; // EOS, wait for RENDERED_EOS
     } else if(n==PicassoPlayCloseCopp) {
         w[1]=0x10020508;w[2]=(v.copp<<16)|0x408;w[4]=0x10327;
     } else return 0;
-    w[0]=(bytes<<16)|0x250;w[3]=n==PicassoPlayWrite && v.tone?0x20571001+v.writeSent:0x20570001+n;return bytes;
+    w[0]=(bytes<<16)|0x250;w[3]=n==PicassoPlayWrite && picasso_play_queued(v)?picasso_play_base(v)+0x1001+v.writeSent:picasso_play_base(v)+1+n;return bytes;
 }
 inline void picasso_play_sent(PicassoAprProbe &p) {
     auto &v=p.play;
-    v.sent=v.pending=true;v.token=0x20570001+v.phase;v.wait=0;
+    v.sent=v.pending=true;v.token=picasso_play_base(v)+1+v.phase;v.wait=0;
     v.owned|=picasso_play_acquires(v.phase);
     if(v.phase==PicassoPlayWrite) {
-        unsigned slot=v.tone?v.writeSent&1:0;p.pcm.busyMask|=1U<<slot;
-        if(v.tone) {
-            v.token=0x20571001+v.writeSent;v.writeSequence[slot]=v.writeSent;
+        unsigned slot=picasso_play_queued(v)?v.writeSent&1:0;p.pcm.busyMask|=1U<<slot;
+        if(picasso_play_queued(v)) {
+            v.token=picasso_play_base(v)+0x1001+v.writeSent;v.writeSequence[slot]=v.writeSent;
             v.writeWait[slot]=0;v.inflight|=1U<<slot;
-            v.bytesSent+=picasso_pcm_chunk_bytes(v.writeSent);++v.writeSent;
+            v.writeBytes[slot]=picasso_play_bytes(v);v.bytesSent+=v.writeBytes[slot];++v.writeSent;
             v.sent=v.bufferReady=false; // another free slot may be queued
         }
     }
@@ -68,13 +68,28 @@ inline void picasso_play_tick(PicassoAprProbe &p,const PicassoQmi &q) {
         for(unsigned i=0;i<p.fw.count;++i)if(p.fw.services[i][0]==8)v.api=p.fw.services[i][1];
         if(!v.api) {v.error=v.firstError=-95;v.done=true;return;}
     }
+    // A new source session can wait for domain readiness before any command.
+    // Bound that wait as well; no resources have been acquired at this point.
+    if(v.enabled && v.source && !v.attempted && !v.done && ++v.wait>250) {
+        v.error=v.firstError=-60;v.done=true;++v.events;
+    }
     if(!v.attempted || v.done)return;
     if(v.phase<PicassoPlayClose && !picasso_afe_domains_up(q) && !v.error) {
         v.pending=false;v.error=-104;++v.events;
     }
-    if(v.phase==PicassoPlayWrite && v.tone && !v.error) {
+    if(v.phase==PicassoPlayWrite && picasso_play_queued(v) && !v.error) {
         // Per-buffer deadlines and a total bound; reply traffic cannot extend it.
-        if(++v.streamTicks>500)v.error=-60;
+        ++v.streamTicks;
+        if(!v.source && v.streamTicks>500)v.error=-60;
+        if(v.source && !v.inflight && !v.bufferReady && !v.sourceEnded && ++v.starveTicks>100)v.error=-60;
+        // A prepared chunk can still wait forever for a GLINK intent or FIFO.
+        // Bound publication independently of producer starvation/completions.
+        if(v.source && !v.inflight && !v.sourceEnded && ++v.wait>250)v.error=-60;
+        if(v.source && v.sourceEnded && !v.inflight && !v.error) {
+            v.consumed=v.writeSent && v.writeDone==v.writeSent;
+            if(v.consumed) {v.accepted|=1U<<PicassoPlayWrite;v.responded=true;}
+            else v.error=-22;
+        }
         for(unsigned i=0;i<2;++i)if((v.inflight&(1U<<i)) && ++v.writeWait[i]>100)v.error=-60;
         if(v.error) {v.pending=false;++v.events;}
     }
@@ -117,7 +132,7 @@ inline void picasso_play_tick(PicassoAprProbe &p,const PicassoQmi &q) {
         v.error=picasso_audio_pins_activate(v.pins);
         if(v.error) {++v.events;return;}
     }
-    if(v.phase==PicassoPlayWrite && v.tone)return;
+    if(v.phase==PicassoPlayWrite && picasso_play_queued(v))return;
     if(!v.error && ++v.wait>(v.pending?100U:250U)) {v.pending=false;v.error=-60;++v.events;}
 }
 inline bool picasso_play_due(PicassoAprProbe &p) {
@@ -127,10 +142,12 @@ inline bool picasso_play_due(PicassoAprProbe &p) {
         v.ampPrepared=true;v.error=v.amplifier(v,0);++v.events;if(v.error)return false;
     }
     if(v.amplifier && v.phase==PicassoPlayWrite && !v.ampEnabled) {
-        v.error=v.amplifier(v,1);++v.events;if(v.error)return false;v.tone=v.ampEnabled=true;
+        v.error=v.amplifier(v,1);++v.events;if(v.error)return false;v.ampEnabled=true;v.tone=!v.source;
     }
-    if(v.phase==PicassoPlayWrite && v.tone) {
-        if(v.writeSent>=PicassoPcmToneChunks || (v.inflight&(1U<<(v.writeSent&1))))return false;
+    if(v.phase==PicassoPlayWrite && picasso_play_queued(v)) {
+        if(v.sourceEnded || (!v.source && v.writeSent>=PicassoPcmToneChunks) || (v.inflight&(1U<<(v.writeSent&1))))return false;
+        if(v.writeSent>=0xeffe) {v.error=-75;++v.events;return false;} // never reuse a token
+
         if(v.amplifier && v.writeDone>=v.healthDone+8) {
             v.healthDone=v.writeDone;v.error=v.amplifier(v,3);++v.events;if(v.error)return false;
         }
@@ -139,7 +156,14 @@ inline bool picasso_play_due(PicassoAprProbe &p) {
         v.error=v.amplifier(v,3);if(v.error) {++v.events;return false;}
     }
     if(v.phase==PicassoPlayWrite && !v.bufferReady) {
-        v.dmaError=v.tone?(p.pcm.tone?p.pcm.tone(p.pcm,v.writeSent&1,v.writeSent):-22):(p.pcm.silence?p.pcm.silence(p.pcm):-22);
+        if(v.source) {
+            unsigned bytes=0;int result=v.source(v,p.pcm,v.writeSent&1,&bytes);
+            if(result==-11)return false;
+            if(result==-125) {v.error=result;++v.events;return false;}
+            if(result==1 && !bytes) {v.sourceEnded=true;++v.events;return false;}
+            v.dmaError=result?result:(!bytes || bytes>PicassoPcmSlotBytes || (bytes&3))?-22:0;
+            if(!v.dmaError) {v.nextBytes=bytes;v.starveTicks=0;}
+        } else v.dmaError=v.tone?(p.pcm.tone?p.pcm.tone(p.pcm,v.writeSent&1,v.writeSent):-22):(p.pcm.silence?p.pcm.silence(p.pcm):-22);
         if(v.dmaError) {v.error=v.dmaError;++v.events;return false;}
         v.bufferReady=true;
     }
@@ -151,9 +175,9 @@ inline bool picasso_play_due(PicassoAprProbe &p) {
 }
 inline bool picasso_play_receive(PicassoAprProbe &p,const uint8_t *b,unsigned bytes,unsigned type) {
     auto &v=p.play;
-    bool streaming=v.phase==PicassoPlayWrite && v.tone;unsigned slot=2;
+    bool streaming=v.phase==PicassoPlayWrite && picasso_play_queued(v);unsigned slot=2;
     if(streaming)for(unsigned i=0;i<2;++i)
-        if((v.inflight&(1U<<i)) && p.receivedToken==0x20571001+v.writeSequence[i])slot=i;
+        if((v.inflight&(1U<<i)) && p.receivedToken==picasso_play_base(v)+0x1001+v.writeSequence[i])slot=i;
     if(!v.pending || (streaming?slot==2:p.receivedToken!=v.token))return false;
     v.replyPhase=v.phase;v.replyOpcode=p.opcode;v.replyType=type;v.replyBytes=bytes;
     v.replySource=p.source;v.replyDestination=p.destination;v.replyReject=0;
@@ -180,8 +204,8 @@ inline bool picasso_play_receive(PicassoAprProbe &p,const uint8_t *b,unsigned by
         if(status || health) {
             v.error=status?-5:health;v.dmaError=health;v.pending=false;
         } else {
-            ++v.writeDone;v.bytesDone+=picasso_pcm_chunk_bytes(v.writeSequence[slot]);
-            v.consumed=v.writeDone==PicassoPcmToneChunks && v.writeSent==PicassoPcmToneChunks && !v.inflight;
+            ++v.writeDone;v.bytesDone+=v.writeBytes[slot];
+            v.consumed=(v.source?v.sourceEnded && v.writeSent && v.writeDone==v.writeSent:v.writeDone==PicassoPcmToneChunks && v.writeSent==PicassoPcmToneChunks) && !v.inflight;
             v.pending=!!v.inflight;v.responded=v.consumed;
             if(v.consumed)v.accepted|=1U<<n;
         }
@@ -223,5 +247,17 @@ inline bool picasso_play_receive(PicassoAprProbe &p,const uint8_t *b,unsigned by
     }
     if(health) {if(!v.dmaError)v.dmaError=health;if(!v.error)v.error=health;}
     ++v.events;return true;
+}
+inline bool picasso_play_rearm(PicassoAprProbe &p) {
+    auto &v=p.play;
+    bool cancelled=v.firstError==-125 && !v.cleanupError && !v.dmaError;
+    if(!v.done || (!v.complete && !cancelled) || v.owned || v.inflight || p.pcm.busyMask || v.pins.dirty ||
+        (v.amplifier && !v.amp.stopped) || picasso_play_base(v)>=0x7ffe0000)return false;
+    auto amp=v.amplifier;auto source=v.source;auto pins=v.pins;
+    unsigned base=picasso_play_base(v)+0x10000,events=v.events+1;
+    // Byte clearing avoids placing a complete playback state on the kernel stack.
+    auto *bytes=reinterpret_cast<uint8_t *>(&v);for(unsigned i=0;i<sizeof v;++i)bytes[i]=0;
+    v.amplifier=amp;v.source=source;v.enabled=true;v.tokenBase=base;v.events=events;
+    v.pins.context=pins.context;v.pins.read=pins.read;v.pins.write=pins.write;return true;
 }
 #endif

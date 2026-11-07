@@ -97,6 +97,11 @@ int main(int argc,char **argv) {
         assert(p.tone(p,2,0)==-22 && p.tone(p,0,24)==-22);
         registers[(187*4096+0x58)/4]=2;assert(p.tone(p,0,0)==-5);registers[(187*4096+0x58)/4]=0x400;
         assert(!memcmp(saved,storage,sizeof storage));
+        static uint8_t input[16384];memset(input,0x43,sizeof input);p.busyMask=1;
+        assert(p.copy && p.copy(p,0,input,4096)==-16 && !memcmp(saved,storage,sizeof storage));p.busyMask=0;
+        assert(!p.copy(p,1,input,16384) && !memcmp(storage+16384,input,16384));
+        assert(!memcmp(storage,saved,16384) && !memcmp(storage+32768,saved+32768,sizeof storage-32768));
+        assert(p.copy(p,2,input,4)==-22 && p.copy(p,0,input,3)==-22 && p.copy(p,0,nullptr,4)==-22);
         assert(picasso_pcm_tone(nullptr,16384,0)==-22 && picasso_pcm_tone(storage,32768,0)==-22);
         assert(picasso_pcm_tone(storage,16384,95000)==-22 && picasso_pcm_tone(storage,3,0)==-22);
         if(mode==14){registers[(187*4096+0x58)/4]=2;assert(p.check(p)==-5 && p.fsr==2);}

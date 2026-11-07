@@ -13,6 +13,7 @@
 #include "PicassoAdsp.h"
 #include "PicassoGlink.h"
 #include "PicassoRpcDma.h"
+extern "C" void picasso_audio_service_tick(PicassoAprProbe &,bool);
 
 // Display also builds without the optional Adreno archive. A missing shared
 // owner means no power plan; never create an independent RSC writer.
@@ -114,6 +115,11 @@ int tfaPlayback(PicassoPlayback &v,unsigned action) {
     auto &a=v.amp;int e=0;
     if(action==0) {
         if(playTfaMapped || a.attempted)return -16;
+        if(playTfa.attempted) {
+            if(!playTfa.restored || playTfa.dirty || playTfa.uncertain)return -16;
+            playTfa={};playTfaSession.pinDirty=playTfaSession.configDirty=0;
+            playTfaSession.voteDirty=playTfaSession.command=playTfaSession.stretch=playTfaSession.prepared=false;
+        }
         if(!&native_novatek_touch_stage || native_novatek_touch_stage<2)return a.error=-16;
         for(unsigned i=0;i<7 && !e;++i) {
             playTfaMaps[i]=smemMap(picasso_tfa_base(i),i?0x1000:0x4000);
@@ -169,9 +175,9 @@ void logPlay(const PicassoAprProbe &a) {
     IOLog("PICASSO_ADSP play phase=%u token=%x pending=%u opcode=%x status=%u error=%d first_error=%d cleanup_error=%d dma_error=%d\n",
         v.phase,v.token,v.pending,v.opcode,v.status,v.error,v.firstError,v.cleanupError,v.dmaError);
     IOLog("PICASSO_ADSP play-state accepted=%x owned=%x copp=%u handle=%x consumed=%u done=%u complete=%u bytes=%u silence=%u amp_enable=%u\n",
-        v.accepted,v.owned,v.copp,v.handle,v.consumed,v.done,v.complete,v.tone?v.bytesSent:4096,!v.tone,v.amp.wasEnabled);
-    IOLog("PICASSO_ADSP play-queue sent=%u returned=%u inflight=%x dma_busy=%x bytes=%u/%u ticks=%u chunks=24 slot_bytes=16384\n",
-        v.writeSent,v.writeDone,v.inflight,a.pcm.busyMask,v.bytesSent,v.bytesDone,v.streamTicks);
+        v.accepted,v.owned,v.copp,v.handle,v.consumed,v.done,v.complete,picasso_play_queued(v)?v.bytesSent:4096,!picasso_play_queued(v),v.amp.wasEnabled);
+    IOLog("PICASSO_ADSP play-queue sent=%u returned=%u inflight=%x dma_busy=%x bytes=%u/%u ticks=%u source=%u slot_bytes=16384\n",
+        v.writeSent,v.writeDone,v.inflight,a.pcm.busyMask,v.bytesSent,v.bytesDone,v.streamTicks,!!v.source);
     IOLog("PICASSO_ADSP play-serial regs20_21_22_23_26_6e=%x/%x/%x/%x/%x/%x enable_requested=%u\n",
         v.amp.serial[0],v.amp.serial[1],v.amp.serial[2],v.amp.serial[3],v.amp.serial[4],v.amp.serial[5],v.amp.enableRequested);
     IOLog("PICASSO_ADSP play-pins active=%u restored=%u dirty=%x error=%d restore_error=%d\n",
@@ -186,7 +192,7 @@ void logPlay(const PicassoAprProbe &a) {
         v.amp.stage,v.amp.configured,v.amp.clockReady,v.amp.enabled,v.amp.stopped,v.amp.resetSafe,v.amp.error,v.amp.stopError,v.amp.registers,v.amp.polls,v.drained);
     if(v.amplifier)IOLog("PICASSO_ADSP play-amp-bus reg=%x irq=%x commands=%u writes=%u dirty=%x uncertain=%u cleanup_error=%d\n",
         playTfa.reg,playTfa.irq,playTfa.commands,playTfa.registerWrites,playTfa.dirty,playTfa.uncertain,playTfa.cleanupError);
-    IOLog("PICASSO_ADSP play-amp-reg status10_11_13_14=%x/%x/%x/%x control00_01_02=%x/%x/%x tone_peak=512 frames=96000\n",
+    IOLog("PICASSO_ADSP play-amp-reg status10_11_13_14=%x/%x/%x/%x control00_01_02=%x/%x/%x\n",
         v.amp.status[0],v.amp.status[1],v.amp.status[2],v.amp.status[3],v.amp.control[0],v.amp.control[1],v.amp.control[2]);
 }
 void logPcm(const PicassoAprProbe &a) {
@@ -417,6 +423,7 @@ void bootService(void *context) {
         }
         if(a.tfa.events!=b->tfaEvents) { b->tfaEvents=a.tfa.events;logTfa(a.tfa); }
         if(a.play.events!=b->playEvents) { b->playEvents=a.play.events;logPlay(a); }
+        picasso_audio_service_tick(a,g->failed);
         if(a.pcm.events!=b->pcmEvents) { b->pcmEvents=a.pcm.events;logPcm(a); }
         if(a.stream.events!=b->streamEvents) { b->streamEvents=a.stream.events;logStream(a); }
         if(q.locator.events!=b->locatorEvents && b->locatorLogs<32) {
@@ -520,6 +527,7 @@ extern "C" void picasso_smp2p_start(void) {
     PicassoAdspEvents events={&boot,bootPoll,bootSnapshot,bootService};
     picasso_adsp_boot(&events);
     picasso_glink_stop(&glink);
+    picasso_audio_service_tick(glink.apr,true);
     unsigned missing = 0, logs = 0;
     bool wasOpen = false, hadValue = false;
     for (;;) {

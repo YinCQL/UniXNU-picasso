@@ -18,6 +18,8 @@ enum PicassoPlayPhase {
 // This is not an IOAudio device.
 struct PicassoPlayback {
     int (*amplifier)(PicassoPlayback &,unsigned); // prepare, enable, finish, health
+    // 0: a real CPU PCM chunk copied to slot; -11: wait; 1: end of source.
+    int (*source)(PicassoPlayback &,PicassoPcm &,unsigned,unsigned *);
     PicassoTfaPlayback amp;
     bool ampPrepared,ampFinished,tone,drained;
     uint32_t phase,events,token,wait,status,opcode,api,copp,handle,owned;
@@ -28,10 +30,16 @@ struct PicassoPlayback {
     PicassoAudioPins pins;
     bool bufferReady,ampEnabled;
     uint32_t writeSent,writeDone,inflight,writeSequence[2],writeWait[2],streamTicks,healthDone;
-    uint32_t bytesSent,bytesDone;
+    uint32_t bytesSent,bytesDone,tokenBase,nextBytes,writeBytes[2],starveTicks;
+    bool sourceEnded;
     bool enabled,attempted,sent,pending,responded,done,complete,consumed;
     int error,firstError,cleanupError,dmaError;
 };
+inline bool picasso_play_queued(const PicassoPlayback &v) {return v.tone || v.source;}
+inline uint32_t picasso_play_base(const PicassoPlayback &v) {return v.tokenBase?v.tokenBase:0x20570000;}
+inline uint32_t picasso_play_bytes(const PicassoPlayback &v) {
+    return v.source?v.nextBytes:v.tone?picasso_pcm_chunk_bytes(v.writeSent):4096;
+}
 inline void picasso_play_stop(PicassoPlayback &v,int error) {
     if(!v.attempted)return;
     if(v.amplifier && !v.ampFinished) {

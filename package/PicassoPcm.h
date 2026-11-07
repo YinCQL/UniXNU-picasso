@@ -9,6 +9,7 @@ struct PicassoPcm {
     int (*check)(PicassoPcm &);
     int (*silence)(PicassoPcm &);
     int (*tone)(PicassoPcm &,unsigned,unsigned); // slot, sequence
+    int (*copy)(PicassoPcm &,unsigned,const uint8_t *,unsigned); // owned CPU PCM to idle DMA slot
     uint32_t busyMask; // DMA slots remain owned until WRITE_DONE or CLOSE ACK
     uint32_t events,phase,token,wait,status,opcode,handle,statuses[2];
     uint32_t sid,bytes,slot,bank,asid,fsr,farLow,farHigh,syndrome;

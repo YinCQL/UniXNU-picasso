@@ -55,6 +55,10 @@ def check(tree, work, kernelcache, output):
     builder.require(platform.initializer_state(directory / 'PicassoBrightness.o', native, initializer, True) ==
                     platform.initializer_state(directory / 'PicassoBrightness.late.o', native, initializer, False),
                     'Late conversion changed brightness-service instructions')
+    initializer = '__GLOBAL__sub_I_PicassoAudioService.cpp'
+    builder.require(platform.initializer_state(directory / 'PicassoAudioService.o', native, initializer, True) ==
+                    platform.initializer_state(directory / 'PicassoAudioService.late.o', native, initializer, False),
+                    'Late conversion changed audio-service instructions')
     archive = directory / 'libNativeLegacyDisplay.late.a'
     builder.require(builder.sha(archive.read_bytes()) == build['archive_sha256'], 'Stale display archive')
     for name in build['members']:
@@ -66,7 +70,7 @@ def check(tree, work, kernelcache, output):
         'hid-original-bindings.o', 'NativeGOPPresenter.late.o', 'NativeGOPGlue.o',
         'PicassoPr13.o', 'PicassoButtons.o', 'PicassoBacklight.o', 'PicassoBrightness.late.o',
         'PicassoSpmi.o', 'PicassoAdsp.o', 'PicassoAdspFirmware.o', 'PicassoFat.o',
-        'PicassoQmp.o', 'PicassoAop.o', 'PicassoSmp2p.o', 'PicassoSmp2pDevice.o', 'PicassoAdspBoot.o', 'PicassoGlink.o', 'PicassoRpcDma.o', 'PicassoRpcFs.o'}, 'Wrong display/state/input archive members')
+        'PicassoAudioService.late.o', 'PicassoQmp.o', 'PicassoAop.o', 'PicassoSmp2p.o', 'PicassoSmp2pDevice.o', 'PicassoAdspBoot.o', 'PicassoGlink.o', 'PicassoRpcDma.o', 'PicassoRpcFs.o'}, 'Wrong display/state/input archive members')
     kernel = work / 'kernel/kernel.macho'
     plan = json.loads(kernel.with_suffix('.json').read_text())
     report = builder.verify_kernel(aes, native, original, kernel.read_bytes(), plan, audit)
@@ -86,6 +90,11 @@ def check(tree, work, kernelcache, output):
                     'Missing GLINK allocation, channel transport or session invalidation')
     builder.require({'_picasso_backlight_start', '_picasso_backlight_power', '_picasso_backlight_level',
                      '_picasso_backlight_current', '_picasso_brightness_allocate', '_picasso_brightness_is_service', '__GLOBAL__sub_I_PicassoBrightness.cpp'} <= linked_names, 'Missing physical display power backend')
+    builder.require({'_picasso_audio_service_tick', '__GLOBAL__sub_I_PicassoAudioService.cpp',
+                     '__ZN12PicassoAudio10gMetaClassE', '__ZN22PicassoAudioUserClient10gMetaClassE'} <= linked_names,
+                    'Missing PCM worker, audio-service initializer or client metaclasses')
+    report['audio_service'] = {'worker_linked': True, 'late_initializer_verified': True,
+                               'classes_linked': True, 'hal_installed': False, 'runtime_qualified': False}
     report['hid'] = hid.verify(platform, aes, native, OriginalReference(kernelcache, board),
                                directory, kernel.read_bytes(), plan)
     config = (work / '.config').read_text()

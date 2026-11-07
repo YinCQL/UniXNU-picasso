@@ -282,7 +282,7 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
         if(play && s->failed) {
             a.play.owned|=picasso_play_acquires(a.play.phase);
             if(a.play.phase==PicassoPlayWrite) {
-                unsigned slot=a.play.tone?a.play.writeSent&1:0;
+                unsigned slot=picasso_play_queued(a.play)?a.play.writeSent&1:0;
                 a.pcm.busyMask|=1U<<slot;a.play.inflight|=1U<<slot;
             }
         }

@@ -86,6 +86,7 @@ static void IOSleep(unsigned ms) {
 }
 static void IODelay(unsigned) {}
 #include "PicassoSmp2pDevice-body.inc"
+extern "C" void picasso_audio_service_tick(PicassoAprProbe &,bool) {}
 extern "C" { volatile uint32_t native_novatek_touch_stage=0; }
 extern "C" void picasso_pcm_device_prepare(PicassoPcm &) { assert(false && "unexpected PCM DMA without ASM completion"); }
 extern "C" void picasso_rpc_device_prepare(PicassoFastrpc *) { assert(false && "unexpected RPC DMA without an open channel"); }

@@ -252,7 +252,7 @@ def main():
                ROOT / 'kits/picasso/PicassoFat.cpp', ROOT / 'kits/picasso/PicassoQmp.cpp',
                ROOT / 'kits/picasso/PicassoAop.cpp', ROOT / 'kits/picasso/PicassoSmp2p.cpp',
                ROOT / 'kits/picasso/PicassoSmp2pDevice.cpp', ROOT / 'kits/picasso/PicassoAdspBoot.cpp',
-               ROOT / 'kits/picasso/PicassoGlink.cpp', ROOT / 'kits/picasso/PicassoRpcDma.cpp', ROOT / 'kits/picasso/PicassoRpcFs.cpp']
+               ROOT / 'kits/picasso/PicassoAudioService.cpp', ROOT / 'kits/picasso/PicassoGlink.cpp', ROOT / 'kits/picasso/PicassoRpcDma.cpp', ROOT / 'kits/picasso/PicassoRpcFs.cpp']
     audit = None
     for source in sources:
         obj = out / (source.stem + '.o')
@@ -263,7 +263,7 @@ def main():
         if source.stem == 'NativeLegacyDisplay':
             audit = audit_object(platform, native, obj, slots, aliases, names)
             platform.write_json(out / 'object-audit.json', audit)
-        if source.stem in ('NativeLegacyDisplay', 'NativeKeyStoreEvents', 'PicassoAccelerator', 'NativeGOPPresenter', 'PicassoBrightness'):
+        if source.stem in ('NativeLegacyDisplay', 'NativeKeyStoreEvents', 'PicassoAccelerator', 'NativeGOPPresenter', 'PicassoBrightness', 'PicassoAudioService'):
             late = out / (source.stem + '.late.o')
             objcopy = shutil.which('llvm-objcopy')
             require(objcopy, 'llvm-objcopy required')
@@ -284,6 +284,7 @@ def main():
     objects += hid_objects
     sources += hid_sources
     sources += [ROOT / 'drivers/NativeNovatekTouch/TouchPublish.h']
+    sources += [ROOT / 'kits/picasso/PicassoAudioAbi.h', ROOT / 'kits/picasso/PicassoAudioQueue.h']
     sources += [ROOT / 'kits/picasso/PicassoBacklightCore.h', ROOT / 'kits/picasso/PicassoButtonsCore.h',
                 ROOT / 'kits/picasso/PicassoSpmi.h', ROOT / 'kits/picasso/PicassoSpmiCore.h',
                 ROOT / 'kits/picasso/PicassoAdsp.h', ROOT / 'drivers/NativeWlan/WlanSmem.h',
