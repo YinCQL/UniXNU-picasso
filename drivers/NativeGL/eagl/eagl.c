@@ -4591,6 +4591,23 @@ install(void)
 		damage_blits = strstr(arguments, "gldamage=1") != NULL;
 		fill_accounting = strstr(arguments, "glfill=1") != NULL || strstr(arguments, "glf=1") != NULL;
 		perf_marks = strstr(arguments, "glperf=2") != NULL;
+		{
+			const char *cut = strstr(arguments, "glcut=");
+
+			if (cut != NULL) {
+				const char *at = cut + 6;
+
+				while (*at != 0 && *at != ' ' && cut_count < 8) {
+					cut_functions[cut_count++] = (unsigned)strtoul(at, NULL, 10);
+					while (*at != 0 && *at != ' ' && *at != ',') {
+						at++;
+					}
+					if (*at == ',') {
+						at++;
+					}
+				}
+			}
+		}
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
 			wait_for_frames = 0;
