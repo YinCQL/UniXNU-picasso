@@ -45,6 +45,7 @@ static void afeClockTests();
 static void audioPinTests();
 static void afePortTests();
 static void tfaPortTests();
+static void streamTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -130,7 +131,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    audioPinTests();afePortTests();tfaPortTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
+    audioPinTests();afePortTests();tfaPortTests();streamTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -1366,4 +1367,80 @@ __attribute__((noinline)) static void tftpTests() {
     }
     assert(found);picasso_glink_stop(&s);assert(!s.qrtr.tftp.announced && !s.qrtr.tftp.files[0].used);
     puts("PASS stock instance2 TFTP announcement, fault injection, RX hold, timeout retry and max DATA through production GLINK");
+}
+
+static unsigned streamReady(PicassoGlink &s) {
+    unsigned rx=afeConfigured(s);
+    s.apr.clock.attempted=s.apr.clock.completed=true;
+    s.apr.port.attempted=s.apr.port.done=s.apr.port.completed=true;
+    s.apr.pins.restored=true;
+    s.apr.tfa.identified=s.apr.tfa.complete=s.apr.tfa.restored=true;
+    s.apr.fw.count=2;s.apr.fw.services[1][0]=7;s.apr.fw.services[1][1]=2;return rx;
+}
+static void streamAck(PicassoGlink &s,unsigned phase,unsigned status=0) {
+    const uint32_t ack[]={0x00280181,0x01010407,0x01010507,0x20550001+phase,0x110e8,0,0,0,
+        phase==0?0x10db3U:phase==1?0x10d98U:0x10bcdU,status};
+    picasso_apr_receive(&s.apr,reinterpret_cast<const uint8_t *>(ack),sizeof ack);
+}
+__attribute__((noinline)) static void streamTests() {
+    uint32_t request[18];const uint32_t open[]={0x00240250,0x01010507,0x01010407,0x20550001,0x10db3,0x10000000,0x100000,0x10c68,0x10da5};
+    const uint32_t format[]={0x002c0250,0x01010507,0x01010407,0x20550002,0x10d98,20,0x100002,48000,1,0x201,0};
+    assert(picasso_stream_request(0,request)==36 && !memcmp(request,open,sizeof open));
+    assert(picasso_stream_request(1,request)==44 && !memcmp(request,format,sizeof format));
+    assert(picasso_stream_request(2,request)==20 && request[3]==0x20550003 && request[4]==0x10bcd);
+    PicassoGlink s={};unsigned rx=streamReady(s),at=s.txHead;step(s);drain(s);
+    assert(s.apr.stream.pending && s.apr.stream.uncertain && s.apr.stream.api==2);
+    bool found=false;for(unsigned n=at;n+56<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x10009) {
+        assert(r32(s.tx.offset+n+8)==36 && !memcmp(ram+s.tx.offset+n+16,open,sizeof open));found=true;
+    }assert(found);
+    uint32_t ack[]={0x00280181,0x01010407,0x01010507,0x20550001,0x110e8,0,0,0,0x10db3,0};
+    for(unsigned n=0;n<sizeof ack;++n)picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),n);
+    const unsigned corrupt[]={1,2,3,4,8};for(unsigned i:corrupt) {ack[i]^=1;picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),sizeof ack);ack[i]^=1;}
+    ack[0]=0x00280081;picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),sizeof ack);ack[0]=0x00280181;
+    assert(s.apr.stream.pending && !s.apr.stream.openAccepted);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(ack),sizeof ack);step(s);drain(s);
+    assert(s.apr.stream.openAccepted && s.remoteIntent[0].busy);
+    step(s);drain(s);assert(s.apr.stream.phase==1 && !s.apr.stream.sent);
+    message(s,rx,14,7,91);step(s);drain(s);at=s.txHead;step(s);drain(s);
+    assert(s.apr.stream.pending);found=false;
+    for(unsigned n=at;n+64<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x10009) {assert(!memcmp(ram+s.tx.offset+n+16,format,sizeof format));found=true;}assert(found);
+    streamAck(s,0);assert(!s.apr.stream.formatAccepted && s.apr.stream.pending);
+    streamAck(s,1);message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+    assert(s.apr.stream.pending && s.apr.stream.phase==2 && s.apr.stream.uncertain);
+    streamAck(s,2);step(s);drain(s);assert(s.apr.stream.completed && s.apr.stream.done && !s.apr.stream.uncertain);
+    for(unsigned phase=0;phase<3;++phase)for(unsigned mode=0;mode<3;++mode) {
+        rx=streamReady(s);step(s);drain(s);
+        for(unsigned i=0;i<phase;++i) {streamAck(s,i);message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);}
+        if(mode==0)streamAck(s,phase,2);
+        else if(mode==1)for(unsigned n=0;n<101;++n) {step(s);drain(s);}
+        else {message(s,rx,3,7,0);step(s);assert(s.apr.stream.done && s.apr.stream.uncertain && s.apr.stream.error==-104);continue;}
+        message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+        if(phase<2) {assert(s.apr.stream.phase==2 && s.apr.stream.pending);streamAck(s,2);step(s);drain(s);}
+        assert(s.apr.stream.done && !s.apr.stream.completed && s.apr.stream.uncertain==(phase==2));
+    }
+    for(unsigned phase=0;phase<2;++phase) {
+        rx=streamReady(s);step(s);drain(s);
+        if(phase){streamAck(s,0);message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);}
+        picasso_qmi_lost(&s.qrtr.qmi);message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+        assert(s.apr.stream.phase==2 && s.apr.stream.pending);streamAck(s,2);step(s);drain(s);
+        assert(s.apr.stream.done && !s.apr.stream.completed && !s.apr.stream.uncertain);
+    }
+    rx=streamReady(s);s.remoteIntent[0].size=20;step(s);drain(s);assert(s.apr.intentAsked);
+    message(s,rx,8,7,0);step(s);drain(s);step(s);drain(s);
+    assert(s.apr.stream.done && !s.apr.stream.sent && !s.apr.stream.uncertain && s.apr.stream.error==-28);
+    rx=streamReady(s);p32(s.desc.offset,(s.txHead+8)%s.tx.size);
+    for(unsigned n=0;n<252;++n)step(s);
+    assert(s.apr.stream.done && s.apr.stream.error==-60 && !s.apr.stream.uncertain);
+    // Each command publication fault is terminal; only a CLOSE ACK releases.
+    for(unsigned phase=0;phase<3;++phase) {
+        auto prepare=[&](){rx=streamReady(s);for(unsigned i=0;i<phase;++i){step(s);drain(s);streamAck(s,i);message(s,rx,14,7,91);step(s);drain(s);}};
+        prepare();writes=0;step(s);unsigned total=writes;bool kick;
+        for(unsigned n=1;n<=total;++n) {prepare();writes=0;failWrite=n;
+            assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && s.apr.stream.done && !s.apr.stream.completed);
+            assert(s.apr.stream.uncertain || phase==0);
+        }
+    }
+    PicassoAprProbe p={};PicassoQmi q={};lateDomains(q);p.clock.completed=p.port.completed=p.pins.restored=true;
+    p.tfa.identified=p.tfa.complete=p.tfa.restored=true;picasso_stream_tick(&p,q);assert(p.stream.error==-95 && p.stream.done);
+    puts("PASS ASM stock OPEN/PCM/CLOSE wire, exact ACKs, intent ownership, timeout, errors, domain loss, close and every publication fault");
 }

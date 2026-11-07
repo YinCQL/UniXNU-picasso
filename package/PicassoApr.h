@@ -93,7 +93,47 @@ inline unsigned picasso_clock_request(unsigned phase,uint32_t (&w)[18]) {
     w[12]=1;w[13]=0x102;w[14]=1536000;w[15]=1;w[16]=phase?0:1;
     return 68;
 }
+// Stock q6asm OPEN_WRITE_V3 -> PCM_V2 format -> CLOSE, session1/stream1.
+// No RUN, ADM route, shared buffer or data write: this tests PCM control only.
+inline unsigned picasso_stream_request(unsigned phase,uint32_t (&w)[18]) {
+    for(auto &v:w)v=0;
+    unsigned bytes=phase==0?36:phase==1?44:20;
+    w[0]=(bytes<<16)|0x250;w[1]=0x01010507;w[2]=0x01010407;w[3]=0x20550001+phase;
+    w[4]=phase==0?0x10db3:phase==1?0x10d98:0x10bcd;
+    if(!phase) { w[5]=0x10000000;w[6]=0x00100000;w[7]=0x10c68;w[8]=0x10da5; }
+    else if(phase==1) { w[5]=20;w[6]=0x00100002;w[7]=48000;w[8]=1;w[9]=0x201; }
+    return bytes;
+}
+inline void picasso_stream_tick(PicassoAprProbe *p,const PicassoQmi &q) {
+    auto &v=p->stream;
+    if(!v.attempted && p->clock.completed && p->port.completed && p->pins.restored &&
+        p->tfa.identified && p->tfa.complete && p->tfa.restored && picasso_afe_domains_up(q)) {
+        v.attempted=true;++v.events;
+        for(unsigned i=0;i<p->fw.count;++i)if(p->fw.services[i][0]==7)v.api=p->fw.services[i][1];
+        if(!v.api) { v.error=-95;v.done=true;return; }
+    }
+    if(!v.attempted || v.done)return;
+    if(v.phase<2 && !picasso_afe_domains_up(q) && !v.error) {
+        v.pending=false;v.error=-104;++v.events;
+    }
+    if(!v.pending && (v.responded || v.error)) {
+        if(v.phase==0 && (v.sent || v.uncertain)) {
+            v.openError=v.error;v.phase=v.openAccepted && !v.error?1:2;
+        } else if(v.phase==1) { v.formatError=v.error;v.phase=2; }
+        else { v.done=true;++v.events;return; }
+        v.sent=v.responded=false;v.wait=v.status=v.opcode=0;v.error=0;++v.events;
+    }
+    if(!v.error && (v.pending || !v.sent) && ++v.wait>(v.pending?100U:250U)) {
+        v.pending=false;v.error=-60;++v.events;
+    }
+}
+inline bool picasso_stream_due(const PicassoAprProbe &p) {
+    const auto &v=p.stream;
+    return p.ready && p.fw.valid && v.attempted && !v.done && !v.sent && !v.error;
+}
 inline void picasso_clock_stop(PicassoAprProbe *p,int error) {
+    auto &stream=p->stream;
+    if(stream.attempted) { stream.pending=false;stream.done=true;stream.completed=false;stream.error=error;++stream.events; }
     picasso_audio_pins_restore(p->pins);
     auto &v=p->port;
     if(v.attempted) { v.pending=false;v.done=true;v.completed=false;v.error=error;++v.events; }
@@ -180,6 +220,18 @@ inline void picasso_apr_receive(PicassoAprProbe *p, const uint8_t *data, uint32_
         ++p->malformed; return;
     }
     uint32_t type=(header>>8)&3;
+    if(p->stream.pending && p->receivedToken==p->stream.token) {
+        auto &v=p->stream;const auto *b=data+headerBytes;
+        unsigned expected=v.phase==0?0x10db3:v.phase==1?0x10d98:0x10bcd;
+        if(type!=1 || p->source!=0x01010407 || p->destination!=0x01010507 || p->opcode!=0x110e8 ||
+            size-headerBytes!=8 || wlan_sm32(b)!=expected) { ++p->ignored;return; }
+        v.status=wlan_sm32(b+4);v.statuses[v.phase]=v.status;v.opcode=p->opcode;
+        v.pending=false;v.responded=true;v.error=v.status?-5:0;
+        if(v.phase==0)v.openAccepted=!v.status;
+        else if(v.phase==1)v.formatAccepted=!v.status;
+        else if(!v.status) { v.closeAccepted=true;v.uncertain=false;v.completed=v.openAccepted && v.formatAccepted && !v.openError && !v.formatError; }
+        ++v.events;return;
+    }
     if(p->port.pending && p->receivedToken==p->port.token) {
         auto &v=p->port;const auto *b=data+headerBytes;
         if(type!=1 || p->source!=0x404 || p->destination!=0x504 || p->opcode!=0x110e8 ||

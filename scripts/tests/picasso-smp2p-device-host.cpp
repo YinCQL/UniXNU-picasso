@@ -222,6 +222,11 @@ int main(int argc,char **argv) {
     for(auto &v:tfa.values)v=0xffff;for(auto &v:tfa.pinBefore)v=0xffffffff;for(auto &v:tfa.pinAfter)v=0xffffffff;logTfa(tfa);
     pins.attempted=pins.active=pins.restored=true;pins.dirty=0xffffffff;
     pins.error=pins.restoreError=-2147483647;for(auto &v:pins.observed)v=0xffffffff;logAudioPins(pins);
+    tfa.complete=true;tfa.registerWrites=tfa.digitalDirty=0xffffffff;
+    tfa.digitalError=tfa.digitalRestoreError=-2147483647;for(auto &v:tfa.digital)v=0xffff;logTfa(tfa);
+    PicassoAprProbe stream={};stream.stream.phase=stream.stream.token=stream.stream.api=stream.stream.status=0xffffffff;
+    stream.stream.error=stream.stream.openError=stream.stream.formatError=-2147483647;
+    for(auto &v:stream.stream.statuses)v=0xffffffff;logStream(stream);
     PicassoRpcDomain record={};record.pd=record.requests=record.lastHandle=record.lastScalar=0xffffffffU;
     record.wireBytes=record.decodeResult=record.previousResult=0xffffffffU;
     memset(record.name,'n',127);memset(record.fs.target,'t',127);

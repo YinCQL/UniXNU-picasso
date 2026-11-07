@@ -3,12 +3,15 @@
 #define PICASSO_TFA_H
 #include <stdint.h>
 // Stock lito-qupv3, gcc-lito, pinctrl-lito, i2c-qcom-geni and TFA9874.
-// Single worker, FIFO-only register reads. No amp enable, MTP or calibration writes.
+// Single worker, bounded FIFO transactions. No amp enable, MTP or calibration writes.
 struct PicassoTfa {
     void (*probe)(PicassoTfa &);
     uint32_t stage,events,fw,ifDisable,hw[2],clockCfg,clockLevel,irq,rxStatus,ios;
     uint32_t pinBefore[3],pinAfter[3],dirty,commands,reads,reg,abortStatus;
-    uint16_t revision,values[9];
+    uint16_t revision,values[9],digital[3];
+    uint32_t registerWrites,digitalDirty;
+    bool digitalAttempted,digitalApplied,digitalRestored;
+    int digitalError,digitalRestoreError;
     bool attempted,identified,complete,restored,uncertain;
     int error,cleanupError;
 };
@@ -48,14 +51,14 @@ inline int picasso_tfa_wait(PicassoTfaSession &s,unsigned bank,unsigned reg,uint
     }
     return -60;
 }
-inline int picasso_tfa_command(PicassoTfaSession &s,unsigned op,unsigned reg,uint16_t *value=nullptr) {
+inline int picasso_tfa_command(PicassoTfaSession &s,unsigned op,unsigned reg,uint16_t *value=nullptr,bool writeValue=false) {
     auto &o=s.out;o.reg=reg;uint32_t status=0;int e=s.rd(0,0x610,status);if(e)return e;
     if(status && (e=s.wr(0,0x618,status)))return e;
-    if(op==1)e=s.wr(0,0x26c,1);else if(op==2)e=s.wr(0,0x270,2);
+    if(op==1)e=s.wr(0,0x26c,writeValue?3:1);else if(op==2)e=s.wr(0,0x270,2);
     if(e)return e;
     // Separate WRITE with STOP_STRETCH, then READ: same repeated START as Linux.
     s.command=true;o.uncertain=true;
-    e=s.wr(0,0x600,(op<<27)|(0x34U<<9)|(op==1?4:0));if(e)return e;
+    e=s.wr(0,0x600,(op<<27)|(0x34U<<9)|(op==1 && !writeValue?4:0));if(e)return e;
     ++o.commands;bool tx=false,rx=false;
     for(unsigned n=0;n<1000;++n) {
         e=s.rd(0,0x610,status);o.irq=status;if(e)return e;
@@ -64,7 +67,8 @@ inline int picasso_tfa_command(PicassoTfaSession &s,unsigned op,unsigned reg,uin
             if(status&(1U<<13))return -16;  // arbitration lost
             return -5;
         }
-        if(op==1 && !tx && (status&(1U<<30))) { e=s.wr(0,0x700,reg);if(e)return e;tx=true; }
+        if(op==1 && !tx && (status&(1U<<30))) { uint32_t word=reg;if(writeValue)word|=uint32_t(*value>>8)<<8|uint32_t(*value&255)<<16;
+            e=s.wr(0,0x700,word);if(e)return e;tx=true; }
         if(op==2 && !rx && (status&((1U<<26)|(1U<<27)|1))) {
             uint32_t count=0,word=0;e=s.rd(0,0x804,count);o.rxStatus=count;if(e)return e;
             if(count&0x1ffffff) {
@@ -77,7 +81,7 @@ inline int picasso_tfa_command(PicassoTfaSession &s,unsigned op,unsigned reg,uin
         if(status&1) {
             if((op==1 && !tx) || (op==2 && !rx))return -90;
             e=picasso_tfa_wait(s,0,0x40,1,0);if(e)return e;
-            s.command=false;s.stretch=op==1;o.uncertain=s.stretch;return 0;
+            s.command=false;s.stretch=op==1 && !writeValue;o.uncertain=s.stretch;return 0;
         }
         s.delay(10);
     }
@@ -86,6 +90,47 @@ inline int picasso_tfa_command(PicassoTfaSession &s,unsigned op,unsigned reg,uin
 inline int picasso_tfa_read_register(PicassoTfaSession &s,unsigned reg,uint16_t &v) {
     int e=picasso_tfa_command(s,1,reg);if(!e)e=picasso_tfa_command(s,2,reg,&v);
     if(!e)++s.out.reads;return e;
+}
+inline int picasso_tfa_write_register(PicassoTfaSession &s,unsigned reg,uint16_t value) {
+    ++s.out.registerWrites;return picasso_tfa_command(s,1,reg,&value,true);
+}
+inline int picasso_tfa_write_verify(PicassoTfaSession &s,unsigned reg,uint16_t value) {
+    int e=picasso_tfa_write_register(s,reg,value);uint16_t back=0;
+    if(!e)e=picasso_tfa_read_register(s,reg,back);return e?e:back==value?0:-84;
+}
+inline void picasso_tfa_digital(PicassoTfaSession &s) {
+    auto &o=s.out;o.digitalAttempted=true;o.stage=7;
+    // Verified Picasso revision. Keep POR powerdown, amplifier and boost off.
+    // Stock tfa_dev_set_tdm_bitwidth(16): TDME off, NBCK0/SLLN15/SSIZE15, on.
+    if(o.revision!=0x0c74 || (o.values[0]&0x19)!=1) { o.digitalError=-95;return; }
+    const uint16_t original[]={o.values[4],o.values[5],o.values[6]};
+    o.digital[0]=uint16_t((original[0]&~0xf000U)|0x10);
+    o.digital[1]=uint16_t((original[1]&~0x1f0U)|0xf0);
+    o.digital[2]=uint16_t((original[2]&~0x7cU)|0x3c);
+    o.digitalDirty=1;
+    int e=picasso_tfa_write_verify(s,0x20,uint16_t(original[0]&~0x10U));
+    for(unsigned i=0;i<3 && !e;++i) {
+        o.digitalDirty|=1U<<i;
+        e=picasso_tfa_write_verify(s,0x20+i,i?o.digital[i]:uint16_t(o.digital[i]&~0x10U));
+    }
+    if(!e)e=picasso_tfa_write_verify(s,0x20,o.digital[0]);
+    uint16_t power=0;
+    if(!e)e=picasso_tfa_read_register(s,0,power);
+    if(!e && (power&0x19)!=1)e=-84;
+    o.digitalApplied=!e;o.digitalError=e;
+}
+inline void picasso_tfa_digital_restore(PicassoTfaSession &s) {
+    auto &o=s.out;if(!o.digitalDirty)return;
+    if(o.uncertain) { o.digitalRestoreError=-16;return; }
+    // Disable the interface before restoring its fields; never enable after
+    // a partial restore. Final full readback is the only restored evidence.
+    int e=picasso_tfa_write_verify(s,0x20,uint16_t(o.values[4]&~0x10U));
+    for(unsigned n=3;n>1 && !e;--n) {
+        unsigned i=n-1;e=picasso_tfa_write_verify(s,0x20+i,o.values[4+i]);
+    }
+    if(!e)e=picasso_tfa_write_verify(s,0x20,o.values[4]);
+    o.digitalRestoreError=e;o.digitalRestored=!e;
+    if(!e)o.digitalDirty=0;
 }
 inline int picasso_tfa_prepare(PicassoTfaSession &s) {
     auto &o=s.out;o.stage=1;
@@ -149,7 +194,7 @@ inline int picasso_tfa_prepare(PicassoTfaSession &s) {
     if((o.ios&3)!=3)return -16;
     return 0;
 }
-inline void picasso_tfa_cleanup(PicassoTfaSession &s) {
+inline void picasso_tfa_release_bus(PicassoTfaSession &s) {
     auto &o=s.out;int e=0;
     // A lost DONE may leave the sequencer or repeated-START bus owned. Abort,
     // then STOP; never infer release from elapsed time or a register read.
@@ -165,6 +210,13 @@ inline void picasso_tfa_cleanup(PicassoTfaSession &s) {
         if(!e) { s.command=s.stretch=false;o.uncertain=false; }
         else o.cleanupError=e;
     }
+}
+inline void picasso_tfa_cleanup(PicassoTfaSession &s) {
+    auto &o=s.out;int e=0;
+    picasso_tfa_release_bus(s);
+    picasso_tfa_digital_restore(s);
+    if(o.digitalRestoreError && !o.cleanupError)o.cleanupError=o.digitalRestoreError;
+    picasso_tfa_release_bus(s); // Restore may itself lose a command ACK.
     for(unsigned n=3;n>0;--n) {
         unsigned i=n-1;if(!(s.pinDirty&(1U<<i)))continue;
         e=s.update(4+i,0,1U<<9,0);
@@ -197,7 +249,7 @@ inline void picasso_tfa_cleanup(PicassoTfaSession &s) {
             if(e) { if(!o.cleanupError)o.cleanupError=e; }else s.voteDirty=false;
         }
     }
-    o.dirty=(s.pinDirty?1:0)|(s.configDirty?2:0)|(s.voteDirty?4:0);
+    o.dirty=(s.pinDirty?1:0)|(s.configDirty?2:0)|(s.voteDirty?4:0)|(o.digitalDirty?8:0);
     o.restored=!o.dirty && !o.uncertain;++o.events;
 }
 inline void picasso_tfa_run(const PicassoTfaIo &io,PicassoTfa &o) {
@@ -217,6 +269,7 @@ inline void picasso_tfa_run(const PicassoTfaIo &io,PicassoTfa &o) {
         for(unsigned i=0;i<9 && !o.error;++i)o.error=picasso_tfa_read_register(s,picasso_tfa_register(i),o.values[i]);
         o.complete=!o.error;
     }
+    if(o.complete)picasso_tfa_digital(s);
     picasso_tfa_cleanup(s);
 }
 #endif

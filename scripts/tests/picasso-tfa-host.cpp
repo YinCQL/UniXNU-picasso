@@ -6,7 +6,8 @@
 static uint32_t mem[7][4096],original[7][4096];
 static unsigned reads,writes,failRead,failWrite,dropWrite,delays,op,currentReg,commands,injectCommand;
 static unsigned nack,arb,timeout,shortRead,overflow,badId,unstable,abortFail,stopFail;
-static bool heldBus,active,irqAsserted;
+static bool heldBus,active,irqAsserted,realRevision;
+static uint16_t amp[256];static unsigned ampWrites,failAmpWrite,writeControl;
 static int rd(void *,unsigned bank,unsigned reg,uint32_t *v) {
     assert(bank<7 && !(reg&3));
     if(++reads==failRead)return -5;
@@ -33,17 +34,22 @@ static int wr(void *,unsigned bank,unsigned reg,uint32_t v) {
         }
         if((commands==injectCommand && timeout) || (op==7 && stopFail)){mem[0][0x610/4]=0;return 0;}
         if(op==1) {
-            assert((v&4) && mem[0][0x26c/4]==1);mem[0][0x610/4]=1U<<30;
+            assert(((v&4) && mem[0][0x26c/4]==1) || (!(v&4) && mem[0][0x26c/4]==3));writeControl=v;mem[0][0x610/4]=1U<<30;
         } else if(op==2) {
             assert(heldBus && !(v&4) && mem[0][0x270/4]==2);
-            uint16_t val=currentReg==3?(badId?0x1234:unstable && commands==4?0x2a74:0x1a74):uint16_t(0x1200|currentReg);
+            uint16_t val=realRevision?amp[currentReg]:currentReg==3?(badId?0x1234:unstable && commands==4?0x2a74:0x1a74):uint16_t(0x1200|currentReg);
             mem[0][0x780/4]=(val>>8)|((val&255)<<8);
             mem[0][0x804/4]=((commands==injectCommand && overflow)?2U:1U)|0x80000000|((commands==injectCommand && shortRead)?0x10000000:0x20000000);
             mem[0][0x610/4]=(1U<<27)|1;mem[0][0x40/4]=0;heldBus=active=false;
         } else {mem[0][0x610/4]=1;mem[0][0x40/4]=0;heldBus=active=false;}
     }
     if(bank==0 && reg==0x700) {
-        assert(op==1 && v<=255);currentReg=v;heldBus=true;active=false;
+        assert(op==1);currentReg=v&255;active=false;
+        if(mem[0][0x26c/4]==3) {
+            assert(!(writeControl&4) && currentReg>=0x20 && currentReg<=0x22);
+            ++ampWrites;heldBus=false;uint16_t value=uint16_t(((v>>8)&255)<<8|((v>>16)&255));
+            if(ampWrites!=failAmpWrite)amp[currentReg]=value;
+        } else {assert(v<=255 && (writeControl&4));heldBus=true;}
         mem[0][0x40/4]=0;mem[0][0x610/4]=1;
     }
     return writes==failWrite?-5:0; // fail after the write reached hardware
@@ -55,7 +61,8 @@ static void delay(void *,unsigned us) {assert(us==10 || us==10000);delays+=us;}
 static PicassoTfaIo io={nullptr,readIo,wr,delay};
 static void setup() {
     memset(mem,0,sizeof mem);reads=writes=failRead=failWrite=dropWrite=delays=op=currentReg=commands=injectCommand=0;
-    nack=arb=timeout=shortRead=overflow=badId=unstable=abortFail=stopFail=0;heldBus=active=irqAsserted=false;
+    nack=arb=timeout=shortRead=overflow=badId=unstable=abortFail=stopFail=0;heldBus=active=irqAsserted=realRevision=false;
+    ampWrites=failAmpWrite=writeControl=0;memset(amp,0,sizeof amp);
     mem[3][2]=0xbc0000;mem[1][0x26c/4]=0x80000000;
     mem[0][0x68/4]=0x301;mem[0][0xe24/4]=0x20100000;mem[0][0xe28/4]=0x20100000;
     mem[0][0x908/4]=3;mem[1][0x284/4]=1;mem[1][0x28c/4]=1;
@@ -68,7 +75,37 @@ static void checkRestored(const PicassoTfa &o) {
     for(unsigned i=4;i<7;++i)assert(mem[i][0]==original[i][0] && (mem[i][1]&2)==(original[i][1]&2));
     for(unsigned i=0;i<20;++i)assert(mem[0][picasso_tfa_se_reg(i)/4]==original[0][picasso_tfa_se_reg(i)/4]);
 }
+static void realAmp() {
+    setup();realRevision=true;const uint16_t regs[]={0,1,2,3,4,0x20,0x21,0x22,0x23,0x26};
+    const uint16_t values[]={1,0,0x25c8,0x0c74,0,0x2890,0xc1f1,0x43c,1,0x10};
+    for(unsigned i=0;i<10;++i)amp[regs[i]]=values[i];
+}
+static void digitalTests() {
+    realAmp();PicassoTfa o={};picasso_tfa_run(io,o);
+    assert(o.complete && o.digitalAttempted && o.digitalApplied && o.digitalRestored && !o.digitalDirty);
+    assert(o.digital[0]==0x890 && o.digital[1]==0xc0f1 && o.digital[2]==0x43c);
+    assert(o.registerWrites==9 && ampWrites==9 && o.reads==21 && o.commands==51);
+    assert(amp[0]==1 && amp[0x20]==0x2890 && amp[0x21]==0xc1f1 && amp[0x22]==0x43c);checkRestored(o);
+    unsigned readCount=reads,writeCount=writes;
+    for(unsigned n=1;n<=readCount;++n) {
+        realAmp();o={};failRead=n;picasso_tfa_run(io,o);
+        assert(o.error || o.cleanupError || o.digitalError || o.digitalRestoreError);
+        assert(o.restored || o.dirty || o.uncertain);assert(amp[0]==1);
+    }
+    for(unsigned n=1;n<=writeCount;++n) {
+        realAmp();o={};failWrite=n;picasso_tfa_run(io,o);
+        assert(o.error || o.cleanupError || o.digitalError || o.digitalRestoreError);
+        assert(o.restored || o.dirty || o.uncertain);assert(amp[0]==1);
+    }
+    realAmp();o={};failAmpWrite=1;picasso_tfa_run(io,o);
+    assert(o.digitalError==-84 && !o.digitalApplied && o.digitalRestored && ampWrites==5);checkRestored(o);
+    // Refuse to configure an active amplifier or an unvalidated revision.
+    realAmp();o={};amp[0]=0x19;picasso_tfa_run(io,o);assert(o.digitalError==-95 && !ampWrites);checkRestored(o);
+    realAmp();o={};amp[3]=0x0b74;picasso_tfa_run(io,o);assert(o.digitalError==-95 && !ampWrites);checkRestored(o);
+    puts("PASS real c74 snapshot: bounded S16 TDM writes, endian/readback, power gate, all I/O failures and inverse restore");
+}
 int main() {
+    digitalTests();
     assert(picasso_tfa_base(0)==0x988000 && picasso_tfa_base(6)==0xf53a000);
     setup();PicassoTfa o={};picasso_tfa_run(io,o);
     assert(o.complete && o.identified && o.revision==0x1a74 && o.reads==11 && o.commands==22 && !o.error && !o.cleanupError);

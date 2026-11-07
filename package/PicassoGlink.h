@@ -56,6 +56,11 @@ struct PicassoAprProbe {
         bool attempted,sent,pending,responded,startAccepted,stopAccepted,uncertain,done,completed;
         int error,startError;
     } port;
+    struct {
+        uint32_t phase,token,wait,status,opcode,events,api,statuses[3];
+        bool attempted,sent,pending,responded,openAccepted,formatAccepted,closeAccepted,uncertain,done,completed;
+        int error,openError,formatError;
+    } stream;
     PicassoAudioPins pins;
     PicassoTfa tfa;
 };

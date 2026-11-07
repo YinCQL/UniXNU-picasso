@@ -109,8 +109,19 @@ void logTfa(const PicassoTfa &t) {
         t.fw,t.ifDisable,t.hw[0],t.hw[1],t.clockLevel,t.clockCfg,t.irq,t.rxStatus,t.ios,t.commands,t.reg,t.abortStatus);
     IOLog("PICASSO_ADSP tfa-pins before=%x/%x/%x active=%x/%x/%x reset_high_ms=10 reset_low_ms=10\n",
         t.pinBefore[0],t.pinBefore[1],t.pinBefore[2],t.pinAfter[0],t.pinAfter[1],t.pinAfter[2]);
-    if(t.complete)IOLog("PICASSO_ADSP tfa-config regs=00/01/02/04/20/21/22/23/26 values=%x/%x/%x/%x/%x/%x/%x/%x/%x applied=0 amplifier_write=0 pcm=0\n",
+    if(t.complete)IOLog("PICASSO_ADSP tfa-config regs=00/01/02/04/20/21/22/23/26 values=%x/%x/%x/%x/%x/%x/%x/%x/%x snapshot_before=1 pcm=0\n",
         t.values[0],t.values[1],t.values[2],t.values[3],t.values[4],t.values[5],t.values[6],t.values[7],t.values[8]);
+    IOLog("PICASSO_ADSP tfa-digital attempted=%u applied=%u error=%d restored=%u restore_error=%d dirty=%x writes=%u regs20_22=%x/%x/%x amp_enable_write=0 pcm=0\n",
+        t.digitalAttempted,t.digitalApplied,t.digitalError,t.digitalRestored,t.digitalRestoreError,t.digitalDirty,t.registerWrites,t.digital[0],t.digital[1],t.digital[2]);
+}
+void logStream(const PicassoAprProbe &a) {
+    const auto &v=a.stream;
+    IOLog("PICASSO_ADSP asm phase=%u token=%x api=%u sent=%u pending=%u responded=%u status=%u error=%d session=1 stream=1\n",
+        v.phase,v.token,v.api,v.sent,v.pending,v.responded,v.status,v.error);
+    IOLog("PICASSO_ADSP asm-state open=%u format=%u close=%u uncertain=%u done=%u complete=%u rate=48000 bits=16 channels=2 run=0 buffers=0 pcm=0\n",
+        v.openAccepted,v.formatAccepted,v.closeAccepted,v.uncertain,v.done,v.completed);
+    IOLog("PICASSO_ADSP asm-result open_error=%d format_error=%d status=%u/%u/%u\n",
+        v.openError,v.formatError,v.statuses[0],v.statuses[1],v.statuses[2]);
 }
 int prepare(SmemDevice *d, const PicassoSmemIo *io, PicassoSmp2p *s, PicassoGlink *glink) {
     s->audit.phase = "lock";
@@ -154,7 +165,7 @@ struct BootEvents {
     uint32_t qmiEvents = 0, qmiLogs = 0;
     uint32_t locatorEvents = 0, locatorLogs = 0, fwEvents = 0, afeEvents = 0;
     uint32_t tftpEvents = 0, tftpLogs = 0;
-    uint32_t clockEvents = 0, portEvents = 0, pinEvents = 0, tfaEvents = 0;
+    uint32_t clockEvents = 0, portEvents = 0, pinEvents = 0, tfaEvents = 0, streamEvents = 0;
 };
 void logAudioPins(const PicassoAudioPins &p) {
 IOLog("PICASSO_ADSP afe-pins attempted=%u active=%u restored=%u dirty=%x error=%d restore_error=%d ctl=%x/%x/%x/%x amplifier=0 pcm=0\n",
@@ -330,6 +341,7 @@ void bootService(void *context) {
             logAudioPins(p);
         }
         if(a.tfa.events!=b->tfaEvents) { b->tfaEvents=a.tfa.events;logTfa(a.tfa); }
+        if(a.stream.events!=b->streamEvents) { b->streamEvents=a.stream.events;logStream(a); }
         if(q.locator.events!=b->locatorEvents && b->locatorLogs<32) {
             logLocator(q.locator);b->locatorEvents=q.locator.events;++b->locatorLogs;
         }
