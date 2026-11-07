@@ -17,6 +17,7 @@ struct PicassoGlinkLocalIntent {
     uint8_t data[PicassoGlinkPacket];
 };
 struct PicassoGlinkRemoteIntent {
+    // The peer owns the ID namespace: zero is valid; used tracks occupancy.
     uint32_t id, size;
     bool used, busy;
 };
@@ -34,6 +35,9 @@ struct PicassoGlink {
     bool prepared, sent, peerVersion, peerAck, ready, failed;
     int error;
     uint32_t channelEvents, deferredOpens, nextIntent, dataPackets;
+    uint32_t intentFrames, intentOffers, intentSkipped, intentReplaced;
+    uint32_t intentProgress, intentCount, intentTail, intentChannel;
+    uint32_t lastIntentId, lastIntentSize, intentFault;
     bool readNotify;
     PicassoGlinkChannel channel[PicassoGlinkChannels];
     PicassoGlinkLocalIntent localIntent[PicassoGlinkLocalIntents];

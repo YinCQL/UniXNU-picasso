@@ -99,6 +99,27 @@ extern "C" void picasso_adsp_boot(const PicassoAdspEvents *e) {
     assert(!memcmp(reinterpret_cast<uint8_t *>(ram)+g->tx.offset+24,"apr_audio_svc",14));
     ipccRam[3]=0;
     e->service(e->context);assert(!ipccRam[3]);
+    // The real adapter accepts a DSP-owned ID zero, publishes it unchanged in
+    // APR TX_DATA, and only marks ready after an actual matching RX payload.
+    unsigned cursor=16;
+    auto append=[&](const uint32_t *words,unsigned bytes){
+        memcpy(reinterpret_cast<uint8_t *>(ram)+rx+cursor,words,bytes);
+        cursor+=bytes;ram[(g->desc.offset+12)/4]=cursor;
+    };
+    uint32_t open[6]={0x40002,14};memcpy(open+2,"apr_audio_svc",14);append(open,sizeof open);
+    const uint32_t ack[2]={0x10004,0};append(ack,sizeof ack);
+    e->service(e->context);assert(!g->channel[0].up); // our OPEN_ACK not sent yet
+    ipccRam[3]=0;e->service(e->context);assert(g->channel[0].up && ipccRam[3]==0x30000);
+    ram[g->desc.offset/4]=g->txHead;ipccRam[3]=0;
+    const uint32_t offer[4]={0x40005,1,512,0};append(offer,sizeof offer);
+    e->service(e->context);assert(g->remoteIntent[0].used && !g->remoteIntent[0].id && !g->apr.pending);
+    ram[g->desc.offset/4]=g->txHead;ipccRam[3]=0;unsigned tx=g->txHead;
+    e->service(e->context);assert(g->apr.pending && g->remoteIntent[0].busy && ipccRam[3]==0x30000);
+    assert(ram[(g->tx.offset+tx+16)/4]==0x10009 && !ram[(g->tx.offset+tx+20)/4]);
+    const uint32_t reply[10]={0x40009,1,24,0,0x00180150,0x403,0x503,g->apr.token,0x1290d,5};
+    append(reply,sizeof reply);e->service(e->context);assert(g->apr.ready && g->apr.state==5);
+    const uint32_t done[2]={0x40006,0};append(done,sizeof done);e->service(e->context);
+    assert(!g->remoteIntent[0].used);ipccRam[3]=0;
 }
 extern "C" int picasso_rpmh_adsp_plan(){assert(!preempt && !allocations);++plans;return 0;}
 int main(int argc,char **argv) {
@@ -129,7 +150,7 @@ int main(int argc,char **argv) {
     assert(allocations==3 && releases==3-!!failAlloc && mappings==releases && unmaps==mappings-!!failMap && !preempt);
     if(!strcmp(mode,"normal") || peer || transport) {
         assert(plans==1 && sleeps==1602 && kicks==(peer?2U:1U));
-        assert(lines==(peer?70U:transport?11U:8U));
+        assert(lines==(peer?70U:transport?16U:8U));
         assert(ram[(part+12)/4]==(peer?17200U:transport?33240U:16840U));
         if(transport)assert(!ipccRam[3]); // stopped observer never transmits GLINK
         assert(!allocatorGate && !mutexRam[0]);

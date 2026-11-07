@@ -6,6 +6,7 @@ namespace {
 int fail(PicassoGlink *s, int error) {
     s->failed = true; s->error = error; s->ready = false;
     s->apr.ready = false; s->apr.pending = false;
+    if (!s->apr.error) s->apr.error = error;
     for (auto &c : s->channel) c.up = false;
     return error;
 }
@@ -165,7 +166,7 @@ int receivePipe(const PicassoSmemIo *io, PicassoGlink *s) {
 // Unsupported channel names are retained without OPEN_ACK or receive buffers;
 // they do not prevent unrelated services sharing this FIFO from making progress.
 int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned id,
-            uint32_t data, uint32_t avail, uint32_t *length, bool *kick) {
+            uint32_t data, uint32_t avail, uint32_t *length, unsigned *intentBudget, bool *kick) {
     if (!s->ready) return fail(s, -71);
     auto *c = remoteChannel(s, id);
     int error;
@@ -215,25 +216,48 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
     if (!c) return fail(s, -71);
     if (command == 15) { c->signals = data; return 0; }
     if (command == 5) {
-        if (!c->supported || !c->ackSent || c->closing || data > PicassoGlinkRemoteIntents || !data)
+        if (!c->supported || !c->ackSent || c->closing) {
+            s->intentFault = 1;
             return fail(s, -22);
-        *length = 8 + data * 8;
-        if (*length > s->rx.size - 8) return fail(s, -90);
-        if (avail < *length) return -11;
-        uint32_t pairs[PicassoGlinkRemoteIntents * 2];
-        if ((error = peek(io, s, 8, pairs, data * 8))) return error;
-        unsigned free = 0; for (const auto &i : s->remoteIntent) if (!i.used) ++free;
-        if (data > free) return fail(s, -28);
-        for (unsigned n = 0; n < data; ++n) {
-            uint32_t size = pairs[n * 2], iid = pairs[n * 2 + 1];
-            if (!size || !iid) return fail(s, -22);
-            for (const auto &i : s->remoteIntent) if (i.used && i.id == iid) return fail(s, -17);
-            for (unsigned j = 0; j < n; ++j) if (pairs[j * 2 + 1] == iid) return fail(s, -17);
         }
-        for (unsigned n = 0; n < data; ++n)
-            for (auto &i : s->remoteIntent) if (!i.used) {
-                i.id = pairs[n * 2 + 1]; i.size = pairs[n * 2]; i.used = true; break;
+        if (s->intentProgress && (s->intentCount != data || s->intentTail != s->rxTail || s->intentChannel != id)) {
+            s->intentFault = 3; return fail(s, -71);
+        }
+        // Wire count is bounded by the FIFO, not our cache capacity. The DSP
+        // may advertise more buffers than this bounded bring-up client needs.
+        if (data > (s->rx.size - 16) / 8) { s->intentFault = 2; return fail(s, -90); }
+        *length = 8 + data * 8;
+        if (avail < *length) return -11;
+        s->intentCount = data; s->intentTail = s->rxTail; s->intentChannel = id;
+        // At most sixteen descriptors per service call. Keep RX tail until the
+        // full command is parsed; the peer cannot reuse its payload meanwhile.
+        while (s->intentProgress < data && *intentBudget) {
+            uint8_t pair[8];
+            if ((error = peek(io, s, 8 + s->intentProgress * 8, pair, sizeof(pair)))) return error;
+            uint32_t size = wlan_sm32(pair), iid = wlan_sm32(pair + 4);
+            s->lastIntentId = iid; s->lastIntentSize = size;
+            // Local IDs start at one by policy. Remote IDs are opaque u32s:
+            // stock idr_alloc(riids, ..., iid, iid+1) explicitly accepts zero.
+            if (!size) { s->intentFault = 4; return fail(s, -22); }
+            PicassoGlinkRemoteIntent *slot = nullptr;
+            for (auto &i : s->remoteIntent) {
+                if (i.used && i.id == iid) { s->intentFault = 5; return fail(s, -17); }
+                if (!i.used && !slot) slot = &i;
             }
+            if (!slot) {
+                for (auto &i : s->remoteIntent)
+                    if (!i.busy && i.size < size && (!slot || i.size < slot->size)) slot = &i;
+                if (slot) ++s->intentReplaced;
+            }
+            // Idle descriptors are remote-owned storage, not allocations held
+            // by APPS. We may leave them unused. Never evict an in-flight ID or
+            // send RX_DONE for an ignored advertisement. Keep a larger grant.
+            if (slot) { slot->id = iid; slot->size = size; slot->used = true; }
+            else ++s->intentSkipped;
+            ++s->intentOffers; ++s->intentProgress; --*intentBudget;
+        }
+        if (s->intentProgress < data) return -11;
+        s->intentProgress = 0; ++s->intentFrames;
         return 0;
     }
     if (command == 7) {
@@ -318,8 +342,10 @@ int picasso_glink_service(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) 
     if (error) return fail(s, error);
     // Only work already due at entry is sent here. Newly received OPENs are
     // acknowledged on the next service tick, after the command is committed.
-    error = channelWork(io, s, kick);
+    // Descriptors from a partially parsed command are not eligible for TX.
+    error = s->intentProgress ? 0 : channelWork(io, s, kick);
     if (s->failed) return error;
+    unsigned intentBudget = 16;
     for (unsigned budget = 0; budget < 8; ++budget) {
         uint32_t head = 0, tail = 0, words[2] = {};
         if (rd(io, s->desc.offset + 12, &head) || rd(io, s->desc.offset + 8, &tail)) return fail(s, -5);
@@ -329,6 +355,7 @@ int picasso_glink_service(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) 
         if (rd(io, s->rx.offset + tail, words) || rd(io, s->rx.offset + tail + 4, words + 1)) return fail(s, -5);
         unsigned command = words[0] & 0xffff, version = words[0] >> 16;
         uint32_t length = 8, avail = (head + s->rx.size - tail) % s->rx.size;
+        if (s->intentProgress && command != 5) { s->intentFault = 3; return fail(s, -71); }
         if (command == 0 || command == 1) {
             if (!version) return fail(s, -93);
             if (s->retries >= 16) return fail(s, -71);
@@ -343,7 +370,7 @@ int picasso_glink_service(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) 
         } else {
             s->pendingCommand = uint16_t(command);
             s->pendingChannel = uint16_t(version); s->pendingData = words[1];
-            error = receive(io, s, command, version, words[1], avail, &length, kick);
+            error = receive(io, s, command, version, words[1], avail, &length, &intentBudget, kick);
             if (error == -11) return 0; // incomplete frame or TX pressure; retry without consuming
             if (error) return error;
         }
@@ -352,6 +379,7 @@ int picasso_glink_service(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) 
         if ((error = wr(io, s, s->desc.offset + 8, next))) return error;
         fence(io); s->rxTail = next; ++s->commands;
         s->ready = s->peerVersion && s->peerAck;
+        if (!intentBudget) break;
     }
     return 0;
 }

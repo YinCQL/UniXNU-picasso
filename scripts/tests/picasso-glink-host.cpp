@@ -30,6 +30,7 @@ static void message(PicassoGlink &s,unsigned rx,unsigned cmd,unsigned a,unsigned
     p32(rx+head,cmd|(a<<16));p32(rx+head+4,b);p32(s.desc.offset+12,(head+8)%size);
 }
 static void channelTests();
+static void build184Tests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -115,7 +116,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    channelTests();
+    build184Tests();channelTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -179,10 +180,10 @@ static void channelTests(){
     rx=handshake(s);message(s,rx,2,7,0xffff);assert(picasso_glink_service(&io,&s,&kick)==-22);
     rx=handshake(s);uint32_t badName[4]={0x70002,4,0x64636261,0};frame(s,rx,badName,16);
     assert(picasso_glink_service(&io,&s,&kick)==-22);
-    rx=connect(s);message(s,rx,5,7,0x20000000);assert(picasso_glink_service(&io,&s,&kick)==-22);
+    rx=connect(s);message(s,rx,5,7,0x20000000);assert(picasso_glink_service(&io,&s,&kick)==-90);
     rx=connect(s);message(s,rx,14,7,1);assert(picasso_glink_service(&io,&s,&kick)==-95);
     rx=connect(s);uint32_t dup[6]={0x70005,2,512,91,256,91};frame(s,rx,dup,24);
-    assert(picasso_glink_service(&io,&s,&kick)==-17 && !s.remoteIntent[0].used);
+    assert(picasso_glink_service(&io,&s,&kick)==-17 && !s.apr.pending);
     // A late intent-request ACK remains valid after the granted intent was used.
     rx=connect(s);offer(s,rx);step(s);drain(s);step(s);assert(s.apr.pending && s.apr.intentAsked);
     message(s,rx,8,7,1);step(s);assert(!s.failed && !s.apr.intentAsked);
@@ -297,7 +298,96 @@ static void channelTests(){
     // A full remote intent table never overwrites an in-flight buffer.
     rx=connect(s);uint32_t intents[130]={0x70005,64};
     for(unsigned n=0;n<64;++n){intents[2+n*2]=512;intents[3+n*2]=n+1;}
-    frame(s,rx,intents,sizeof intents);step(s);drain(s);step(s);assert(s.remoteIntent[0].busy);
-    offer(s,rx,100);assert(picasso_glink_service(&io,&s,&kick)==-28 && s.remoteIntent[0].id==1);
+    frame(s,rx,intents,sizeof intents);for(unsigned n=0;n<4;++n)step(s);drain(s);step(s);assert(s.remoteIntent[0].busy);
+    offer(s,rx,100);step(s);assert(s.intentSkipped==1 && s.remoteIntent[0].id==1 && s.remoteIntent[0].busy);
     puts("PASS GLINK channel isolation, OPEN/CLOSE/intent/data, bounded APR query, fragmentation, ownership, pressure, malformed input and response matching");
+}
+// Keep this independent scenario out of main: Clang 18 Windows machine-sink
+// crashes after inlining both large fixture bodies. Production flags unchanged.
+__attribute__((noinline)) static void build184Tests(){
+    PicassoGlink s={};unsigned rx=handshake(s);bool kick;
+    // Build184's observed OPEN order and channel IDs. The log omits intent
+    // payloads: zero-ID/512 bytes below is a protocol regression, not a dump.
+    openPeer(s,rx,1,"fastrpcglink-apps-dsp");openPeer(s,rx,2,"IPCRTR");
+    openPeer(s,rx,3,"LOOPBACK_CTL_LPASS");openPeer(s,rx,4,"apr_audio_svc");
+    step(s);assert(s.rxTail==120 && s.deferredOpens==3);drain(s);step(s);
+    assert(s.txHead==48 && s.channel[0].ackSent);drain(s);
+    message(s,rx,4,1,0);uint32_t zero[4]={0x40005,1,512,0};frame(s,rx,zero,16);step(s);
+    assert(!s.failed && s.channel[0].up && s.rxTail==144);
+    assert(s.remoteIntent[0].used && s.remoteIntent[0].id==0 && s.intentOffers==1);
+    step(s);assert(s.apr.pending && s.remoteIntent[0].busy);
+    const uint32_t expected[]={0x10009,0,20,0,0x00140250,0x503,0x403,0x18300001,0x1290c,0};
+    assert(!memcmp(ram+s.tx.offset+64,expected,sizeof expected));drain(s);
+    uint32_t answer[10]={0x40009,1,24,0,0x00180150,0x403,0x503,s.apr.token,0x1290d,5};
+    frame(s,rx,answer,sizeof answer);step(s);assert(s.apr.ready && s.apr.state==5);drain(s);
+    message(s,rx,6,4,0);step(s);assert(!s.remoteIntent[0].used);
+    frame(s,rx,zero,16);step(s);assert(s.remoteIntent[0].used && !s.remoteIntent[0].busy);
+    frame(s,rx,zero,16);assert(picasso_glink_service(&io,&s,&kick)==-17 && s.intentFault==5);
+
+    // Remote IDs are opaque: zero and high unsigned IDs retain exact TX bits.
+    rx=connect(s);offer(s,rx,0xffffffff);step(s);drain(s);unsigned at=s.txHead;step(s);
+    assert(r32(s.tx.offset+at+20)==0xffffffff && s.remoteIntent[0].busy);
+    message(s,rx,6,7,0xffffffff);step(s);assert(!s.remoteIntent[0].used);
+
+    // Queue 116 independent advertisements (same byte span as 0x80..0x7c0).
+    // The inferred count is only a stress case, not an assertion about firmware.
+    rx=connect(s);unsigned tail=s.rxTail;
+    for(unsigned n=0;n<116;++n)offer(s,rx,n);
+    message(s,rx,13,0,0);
+    for(unsigned n=0;n<117;++n){drain(s);step(s);}
+    assert(s.intentOffers==116 && s.intentFrames==116 && s.intentSkipped==52);
+    assert(s.rxTail==(tail+116*16+8)%s.rx.size && s.remoteIntent[0].busy && s.remoteIntent[0].id==0);
+
+    // Batched offers larger than cache capacity are processed in chunks of 16.
+    // No query may use a staged descriptor before the whole frame is committed.
+    rx=connect(s);uint32_t batch[2+116*2]={0x70005,116};
+    for(unsigned n=0;n<116;++n){batch[2+n*2]=16;batch[3+n*2]=n;}
+    tail=s.rxTail;frame(s,rx,batch,sizeof batch);
+    for(unsigned n=1;n<=7;++n){step(s);assert(s.intentProgress==n*16 && s.rxTail==tail && !s.apr.pending);}
+    step(s);assert(s.intentProgress==0 && s.intentFrames==1 && s.intentSkipped==52 && s.rxTail!=tail);
+    // Larger remote grant must displace an idle small descriptor, never a busy one.
+    uint32_t grant[4]={0x70005,1,512,1000};frame(s,rx,grant,16);step(s);
+    assert(s.intentReplaced==1 && s.remoteIntent[0].id==1000);drain(s);step(s);assert(s.remoteIntent[0].busy);
+    grant[2]=1024;grant[3]=1001;frame(s,rx,grant,16);step(s);
+    assert(s.remoteIntent[0].busy && s.remoteIntent[0].id==1000 && s.remoteIntent[1].id==1001);
+
+    // Entire table busy: extra offers are left unused, never falsely completed.
+    rx=connect(s);for(unsigned n=0;n<PicassoGlinkRemoteIntents;++n)
+        s.remoteIntent[n]={n,16,true,true};
+    frame(s,rx,grant,16);step(s);assert(s.intentSkipped==1 && s.remoteIntent[0].busy);
+
+    // Empty lists are a valid no-op. Empty buffers are not.
+    rx=connect(s);message(s,rx,5,7,0);step(s);assert(s.intentFrames==1 && !s.intentOffers);
+    zero[0]=0x70005;zero[2]=0;frame(s,rx,zero,16);
+    assert(picasso_glink_service(&io,&s,&kick)==-22 && s.intentFault==4 && !s.lastIntentId && !s.lastIntentSize);
+
+    // Truncated and wrapped batches preserve RX tail until all bytes arrive.
+    rx=connect(s);s.rxTail=16376;p32(s.desc.offset+8,16376);p32(s.desc.offset+12,16376);
+    message(s,rx,5,7,116);step(s);assert(!s.intentProgress && s.rxTail==16376);
+    frame(s,rx,batch+2,sizeof batch-8);
+    for(unsigned n=0;n<8;++n)step(s);
+    assert(s.rxTail==(16376+sizeof batch)%s.rx.size && s.intentOffers==116);
+
+    // A changed in-progress command is a protocol fault, never a new frame.
+    rx=connect(s);frame(s,rx,batch,sizeof batch);tail=s.rxTail;step(s);
+    p32(rx+tail+4,115);assert(picasso_glink_service(&io,&s,&kick)==-71 && s.intentFault==3);
+    rx=connect(s);frame(s,rx,batch,sizeof batch);tail=s.rxTail;step(s);
+    p32(rx+tail,13);assert(picasso_glink_service(&io,&s,&kick)==-71 && s.intentFault==3);
+
+    // Duplicate zero within a batch, while busy, and across parsing boundaries.
+    rx=connect(s);batch[3+16*2]=0;frame(s,rx,batch,sizeof batch);step(s);
+    assert(picasso_glink_service(&io,&s,&kick)==-17 && s.intentFault==5 && !s.apr.pending);batch[3+16*2]=16;
+    rx=connect(s);offer(s,rx,0);step(s);drain(s);step(s);assert(s.remoteIntent[0].busy);
+    offer(s,rx,0);assert(picasso_glink_service(&io,&s,&kick)==-17 && s.remoteIntent[0].busy);
+
+    // A read failure partway through a staged batch cannot publish a query;
+    // retryable SMEM consistency scans must resume without duplicating offers.
+    rx=connect(s);frame(s,rx,batch,sizeof batch);step(s);reads=0;step(s);unsigned totalReads=reads;
+    for(unsigned n=1;n<=totalReads;++n){
+        rx=connect(s);frame(s,rx,batch,sizeof batch);step(s);reads=0;failRead=n;
+        int result=picasso_glink_service(&io,&s,&kick);unsigned count=writes;
+        if(s.failed){assert(result && !s.apr.pending);assert(picasso_glink_service(&io,&s,&kick) && writes==count);}
+        else {failRead=0;for(unsigned j=0;j<8;++j)step(s);assert(s.intentOffers==116 && s.intentFrames==1);}
+    }
+    puts("PASS build184 remote intent zero, 116 offers, bounded batches, large grants, busy ownership and diagnostics");
 }

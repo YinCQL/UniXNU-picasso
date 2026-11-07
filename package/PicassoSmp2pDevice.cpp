@@ -87,6 +87,7 @@ struct BootEvents {
     SmemDevice *device; const PicassoSmemIo *io; PicassoSmp2p *state; PicassoGlink *glink;
     bool sentLogged, readyLogged, failedLogged;
     uint32_t channelEvents = 0, channelLogs = 0, aprAttempts = 0, aprReceived = 0;
+    uint32_t intentOffers = 0, intentLogs = 0, intentFault = 0;
     int aprError = 0;
 };
 int bootPoll(void *context, PicassoSmp2pEvent *event) {
@@ -127,6 +128,14 @@ void bootService(void *context) {
                     c.name,c.local,c.remote,c.priority,c.supported,c.openSent,c.openAck,c.ackSent,c.up,c.closing,c.closeAck);
         }
         auto &a = g->apr;
+        if ((g->intentOffers != b->intentOffers && b->intentLogs < 16) || g->intentFault != b->intentFault) {
+            unsigned cached = 0, busy = 0;
+            for (const auto &i : g->remoteIntent) { cached += i.used; busy += i.used && i.busy; }
+            IOLog("PICASSO_ADSP glink intents frames=%u offers=%u cached=%u busy=%u skipped=%u replaced=%u progress=%u/%u last_id=%x last_size=%u fault=%u\n",
+                g->intentFrames,g->intentOffers,cached,busy,g->intentSkipped,g->intentReplaced,
+                g->intentProgress,g->intentCount,g->lastIntentId,g->lastIntentSize,g->intentFault);
+            ++b->intentLogs; b->intentOffers=g->intentOffers; b->intentFault=g->intentFault;
+        }
         if (a.attempts != b->aprAttempts || a.received != b->aprReceived || a.error != b->aprError) {
             if (a.received <= 32 || a.error != b->aprError)
                 IOLog("PICASSO_ADSP apr query=1290c attempts=%u token=%x pending=%u received=%u opcode=%x response_token=%x state=%x status=%x ready=%u ignored=%u malformed=%u error=%d pcm=0\n",
@@ -141,9 +150,10 @@ int bootSnapshot(void *context) {
     IOLog("PICASSO_ADSP boot snapshot crash_error=%d reason=%.255s glink_error=%d fifo=%x/%x/%x/%x\n",
         s.crash_error,s.crash,s.glink_error,s.fifo[0],s.fifo[1],s.fifo[2],s.fifo[3]);
     const auto &g = *b->glink;
-    IOLog("PICASSO_ADSP glink snapshot negotiated=%u failed=%u error=%d commands=%u tx=%u rx=%u last_command=%u channel=%u data=%x deferred=%u apr_up=%u apr_ready=%u apr_error=%d pcm=0\n",
+    IOLog("PICASSO_ADSP glink snapshot negotiated=%u failed=%u error=%d commands=%u tx=%u rx=%u last_command=%u channel=%u data=%x deferred=%u apr_up=%u apr_ready=%u apr_error=%d intent_offers=%u intent_skipped=%u intent_id=%x intent_size=%u intent_fault=%u pcm=0\n",
         g.ready,g.failed,g.error,g.commands,g.txHead,g.rxTail,g.pendingCommand,g.pendingChannel,g.pendingData,
-        g.deferredOpens,g.channel[0].up,g.apr.ready,g.apr.error);
+        g.deferredOpens,g.channel[0].up,g.apr.ready,g.apr.error,g.intentOffers,g.intentSkipped,
+        g.lastIntentId,g.lastIntentSize,g.intentFault);
     return s.glink_error;
 }
 void logAudit(const PicassoSmp2p &s) {
