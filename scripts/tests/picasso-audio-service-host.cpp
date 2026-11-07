@@ -148,7 +148,10 @@ int main(int argc,char **) {
     PicassoAudioStatus status;assert(!call(c,0,nullptr,0,&status,sizeof status) && status.version==1 && status.epoch==2);
     assert(call(c,99)==kIOReturnBadArgument && call(c,0,nullptr,0,&status,4)==kIOReturnBadArgument);
     PicassoAudioClientNote note={1,1,0,0,0,0,0,0,0};
-    assert(!call(c,PicassoAudioNote,&note,sizeof note));note.reserved=1;
+    assert(!call(c,PicassoAudioNote,&note,sizeof note));
+    for(unsigned kind=7;kind<=14;++kind){note.kind=kind;assert(!call(c,PicassoAudioNote,&note,sizeof note));}
+    note.kind=15;assert(call(c,PicassoAudioNote,&note,sizeof note)==kIOReturnBadArgument);
+    note.kind=1;note.reserved=1;
     assert(call(c,PicassoAudioNote,&note,sizeof note)==kIOReturnBadArgument);
     assert(call(c,PicassoAudioNote,&note,sizeof note-4)==kIOReturnBadArgument);
     assert(!call(c,1,&format,sizeof format));assert(call(other,1,&format,sizeof format)==kIOReturnBusy);

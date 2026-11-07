@@ -16,7 +16,7 @@ static PicassoAudioQueue queue;
 static IOLock *queueLock;
 static uint8_t scratch[16384]; // worker-only staging, never stack or user DMA
 static bool attempted,published,registered,active,registrationFailed;
-static unsigned clientNotes,clientOpens,clientPropertyNotes;
+static unsigned clientNotes,clientOpens,clientPropertyNotes,clientRouteNotes;
 static unsigned testPhase,testFrames,testPause,lastEvents,startWait;
 
 static const PicassoAudioFormat format={1,48000,2,16};
@@ -33,13 +33,18 @@ static int audioCall(uint64_t owner,unsigned selector,const void *input,unsigned
     else if((selector==PicassoAudioEnd || selector==PicassoAudioCancel) && !bytes && !output)e=picasso_audio_end(queue,owner,selector==PicassoAudioCancel);
     else if(selector==PicassoAudioNote && input && bytes==sizeof(PicassoAudioClientNote) && !output) {
         const auto &n=*static_cast<const PicassoAudioClientNote *>(input);
-        if(n.version==1 && n.kind>=1 && n.kind<=8 && !n.reserved) {
+        if(n.version==1 && n.kind>=1 && n.kind<=14 && !n.reserved) {
             // Client-provided observations, separately labeled from DSP state.
-            bool property=n.kind==5 || n.kind==7;
-            unsigned &budget=property?clientPropertyNotes:clientNotes;
-            if(budget<(property?48U:64U) || (n.kind==3 && !(n.sentFrames&0x3ffff))) {
-                IOLog("PICASSO_AUDIO hal-note kind=%u result=%d selector=%x value=%u calls=%llu sent_frames=%llu missing_frames=%llu client_report=1\n",
-                    n.kind,n.result,n.selector,n.value,n.calls,n.sentFrames,n.missingFrames);++budget;
+            bool property=n.kind==5 || n.kind==7,route=n.kind>=9;
+            unsigned &budget=route?clientRouteNotes:property?clientPropertyNotes:clientNotes;
+            if(budget<((property||route)?128U:64U) || (n.kind==3 && !(n.sentFrames&0x3ffff))) {
+                if(n.kind==7 || route)
+                    IOLog("PICASSO_AUDIO %s kind=%u result=%d selector=%x object=%u scope=%llx element=%llu op=%llu client_report=1\n",
+                        route?"route-note":"property",n.kind,n.result,n.selector,n.value,n.calls,n.sentFrames,n.missingFrames);
+                else
+                    IOLog("PICASSO_AUDIO hal-note kind=%u result=%d selector=%x value=%u calls=%llu sent_frames=%llu missing_frames=%llu client_report=1\n",
+                        n.kind,n.result,n.selector,n.value,n.calls,n.sentFrames,n.missingFrames);
+                ++budget;
             }
             e=0;
         }

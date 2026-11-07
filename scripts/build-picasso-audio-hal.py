@@ -48,7 +48,7 @@ def main():
     assert info['AudioServerPlugIn_IOKitUserClients']==['PicassoAudioUserClient']
     files=[('audio/PicassoAudio.driver/Info.plist',0o644,(bundle/'Info.plist').read_bytes()),('audio/PicassoAudio.driver/PicassoAudio',0o755,binary.read_bytes())]
     addon=out/'audio.addon';addon.write_bytes(pack(files))
-    sources={str(p.relative_to(ROOT)):sha(p) for p in [source,ROOT/'hal/PicassoAudioMix.h',ROOT/'hal/Info.plist',ROOT/'package/PicassoAudioAbi.h',Path(__file__)]}
+    sources={str(p.relative_to(ROOT)):sha(p) for p in [source,ROOT/'hal/PicassoAudioRouteTrace.h',ROOT/'hal/PicassoAudioMix.h',ROOT/'hal/Info.plist',ROOT/'package/PicassoAudioAbi.h',Path(__file__)]}
     # Hash all SDK files used by the compiler via its dependency output.
     deps=subprocess.check_output(command[:-4]+['-M','-MT','hal',str(source)],text=True)
     inputs={}

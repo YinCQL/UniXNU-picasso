@@ -18,6 +18,11 @@ typedef struct PicassoAudioStatus {
 } PicassoAudioStatus;
 // Bounded diagnostics reported by the HAL client; never interpreted as DSP
 // completion, timestamps, pointer values or register operations.
+// kind 7: selector/object/scope/element/operation in selector/value/calls/
+// sentFrames/missingFrames (Get=0, Size=1, Has=2, Set=3).
+// kinds 9..12: VirtualAudio Get/Size/Has/Set with the same fields; 13: throw
+// offset and exception category (CA=1, logic=2, runtime=3, invalid_argument=4).
+// kind 14: guarded trace installation result. These are observations only.
 typedef struct PicassoAudioClientNote {
     uint32_t version,kind;
     int32_t result;

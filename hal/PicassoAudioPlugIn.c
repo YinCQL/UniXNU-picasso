@@ -32,8 +32,9 @@ static pthread_t gThread,gWatch;
 static bool gWatchLive;
 static PicassoAudioMix gMix;
 static uint64_t gSent,gMissing,gReservedEnd;
-static uint32_t gCalls,gUnknown,gPropertyNotes;
-static uint64_t gPropertySeen;
+static uint32_t gCalls,gPropertyNotes;
+static bool gStreamActive=true;
+static struct {AudioObjectID object;AudioObjectPropertyAddress address;unsigned operation;OSStatus result;} gPropertySeen[128];
 static int16_t gChunk[2048];
 static PicassoAudioFormat gFormat={1,48000,2,16};
 static const Float32 kMinDb=-36;
@@ -50,6 +51,7 @@ static void note(unsigned kind,int result,unsigned selector,unsigned value){
     PicassoAudioClientNote n={1,kind,result,selector,value,0,gCalls,gSent,gMissing};
     (void)method(PicassoAudioNote,&n,sizeof n,NULL,NULL);
 }
+#include "PicassoAudioRouteTrace.h"
 static int connectService(void){
     if(gConnect)return 0;
     io_service_t service=IOServiceGetMatchingService(MACH_PORT_NULL,IOServiceMatching(PICASSO_AUDIO_CLASS));
@@ -88,6 +90,7 @@ static void *watchService(void *arg){
             rc=gHost->PropertiesChanged(gHost,kDevice,1,&a);
             pthread_mutex_lock(&gLock);note(8,rc,a.mSelector,kDevice);pthread_mutex_unlock(&gLock);
         }
+        flushRouteNotes();
         usleep(1000000);
     }return NULL;
 }
@@ -215,7 +218,7 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kAudioObjectPropertyOwner: REPLY(AudioObjectID, kDevice);
         case kAudioObjectPropertyName: REPLY_STR("Picasso Speaker");
         case kAudioObjectPropertyOwnedObjects: *outDataSize = 0; return 0;
-        case kAudioStreamPropertyIsActive: REPLY(UInt32, 1);
+        case kAudioStreamPropertyIsActive: REPLY(UInt32, gStreamActive);
         case kAudioStreamPropertyDirection: REPLY(UInt32, 0);
         case kAudioStreamPropertyTerminalType: REPLY(UInt32, kAudioStreamTerminalTypeSpeaker);
         case kAudioStreamPropertyStartingChannel: REPLY(UInt32, 1);
@@ -255,28 +258,42 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
 }
 
 
-static OSStatus GetPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 n,UInt32 *z,void *v){
-    (void)d;(void)pid;if(!a||!z||(!v&&n))return kAudioHardwareIllegalOperationError;
-    pthread_mutex_lock(&gLock);OSStatus rc=propertyData(o,a,qs,q,n,z,v);
-    // Bounded first-observation diagnostics identify enumeration vs routing.
-    uint64_t bit=1ULL<<((a->mSelector^(a->mSelector>>8)^o)%64);
-    if(gConnect && gPropertyNotes<32 && !(gPropertySeen&bit)){
-        gPropertySeen|=bit;++gPropertyNotes;note(7,rc,a->mSelector,o);
+// Exact keys retain input/output scope and distinguish Has/Size/Get/Set. A hash
+// bit previously hid unrelated selectors and merged all three query operations.
+static void propertyNote(AudioObjectID o,const AudioObjectPropertyAddress *a,unsigned operation,OSStatus rc){
+    if(!gConnect || gPropertyNotes>=128)return;
+    for(unsigned i=0;i<gPropertyNotes;++i){
+        if(gPropertySeen[i].object==o && gPropertySeen[i].address.mSelector==a->mSelector &&
+           gPropertySeen[i].address.mScope==a->mScope && gPropertySeen[i].address.mElement==a->mElement &&
+           gPropertySeen[i].operation==operation && gPropertySeen[i].result==rc)return;
     }
-    if(rc==kAudioHardwareUnknownPropertyError && gConnect && gUnknown<32){++gUnknown;note(5,rc,a->mSelector,o);}pthread_mutex_unlock(&gLock);return rc;
+    gPropertySeen[gPropertyNotes].object=o;gPropertySeen[gPropertyNotes].address=*a;
+    gPropertySeen[gPropertyNotes].operation=operation;gPropertySeen[gPropertyNotes++].result=rc;
+    PicassoAudioClientNote n={1,7,rc,a->mSelector,o,0,a->mScope,a->mElement,operation};
+    (void)method(PicassoAudioNote,&n,sizeof n,NULL,NULL);
+}
+static OSStatus queryProperty(AudioObjectID o,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 n,UInt32 *z,void *v,unsigned operation){
+    if(!a||!z||(!v&&n))return kAudioHardwareIllegalOperationError;
+    pthread_mutex_lock(&gLock);*z=0;OSStatus rc=propertyData(o,a,qs,q,n,z,v);
+    propertyNote(o,a,operation,rc);pthread_mutex_unlock(&gLock);return rc;
+}
+static OSStatus GetPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 n,UInt32 *z,void *v){
+    (void)d;(void)pid;return queryProperty(o,a,qs,q,n,z,v,0);
 }
 static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 *z){
-    union {uint64_t align;uint8_t b[1024];} v={0};return GetPropertyData(d,o,pid,a,qs,q,sizeof v,z,&v);
+    (void)d;(void)pid;union {uint64_t align;uint8_t b[1024];} v={0};return queryProperty(o,a,qs,q,sizeof v,z,&v,1);
 }
-static Boolean HasProperty(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a){UInt32 n;return !GetPropertyDataSize(d,o,pid,a,0,NULL,&n);}
+static Boolean HasProperty(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a){
+    (void)d;(void)pid;UInt32 n;union {uint64_t align;uint8_t b[1024];} v={0};return !queryProperty(o,a,0,NULL,sizeof v,&n,&v,2);
+}
 static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,Boolean *set){
     if(!a||!set)return kAudioHardwareIllegalOperationError;
     *set=(o==kVolume&&(a->mSelector==kAudioLevelControlPropertyScalarValue||a->mSelector==kAudioLevelControlPropertyDecibelValue))||
-        (o==kOutStream&&(a->mSelector==kAudioStreamPropertyVirtualFormat||a->mSelector==kAudioStreamPropertyPhysicalFormat))||
+        (o==kOutStream&&(a->mSelector==kAudioStreamPropertyVirtualFormat||a->mSelector==kAudioStreamPropertyPhysicalFormat||a->mSelector==kAudioStreamPropertyIsActive))||
         (o==kDevice&&a->mSelector==kAudioDevicePropertyNominalSampleRate);
     return HasProperty(d,o,pid,a)?0:kAudioHardwareUnknownPropertyError;
 }
-static OSStatus SetPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 n,const void *v){
+static OSStatus setPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 n,const void *v){
     (void)d;(void)pid;(void)qs;(void)q;if(!a||!v)return kAudioHardwareIllegalOperationError;
     if(o==kVolume&&(a->mSelector==kAudioLevelControlPropertyScalarValue||a->mSelector==kAudioLevelControlPropertyDecibelValue)){
         if(n!=sizeof(Float32))return kAudioHardwareBadPropertySizeError;float x=*(const Float32 *)v;if(!isfinite(x))return kAudioHardwareIllegalOperationError;
@@ -285,11 +302,27 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid
         AudioObjectPropertyAddress changed[2]={{kAudioLevelControlPropertyScalarValue,kAudioObjectPropertyScopeGlobal,kAudioObjectPropertyElementMaster},{kAudioLevelControlPropertyDecibelValue,kAudioObjectPropertyScopeGlobal,kAudioObjectPropertyElementMaster}};
         if(gHost)gHost->PropertiesChanged(gHost,kVolume,2,changed);return 0;
     }
+    if(o==kOutStream&&a->mSelector==kAudioStreamPropertyIsActive){
+        if(n!=sizeof(UInt32))return kAudioHardwareBadPropertySizeError;
+        pthread_mutex_lock(&gLock);bool active=*(const UInt32 *)v!=0,changed=active!=gStreamActive;
+        gStreamActive=active;
+        // Disabling the stream discards queued software mixes; DMA already
+        // submitted remains owned by the worker and completes normally.
+        if(!active)memset(&gMix,0,sizeof gMix);
+        pthread_mutex_unlock(&gLock);
+        if(changed&&gHost)gHost->PropertiesChanged(gHost,kOutStream,1,a);
+        return 0;
+    }
     if(o==kOutStream&&(a->mSelector==kAudioStreamPropertyVirtualFormat||a->mSelector==kAudioStreamPropertyPhysicalFormat)){
         AudioStreamBasicDescription f=format(2);return n==sizeof f&&!memcmp(v,&f,sizeof f)?0:kAudioDeviceUnsupportedFormatError;
     }
     if(o==kDevice&&a->mSelector==kAudioDevicePropertyNominalSampleRate)return n==sizeof(Float64)&&*(const Float64 *)v==kRate?0:kAudioDeviceUnsupportedFormatError;
     return kAudioHardwareUnknownPropertyError;
+}
+static OSStatus SetPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 n,const void *v){
+    OSStatus rc=setPropertyData(d,o,pid,a,qs,q,n,v);
+    if(a){pthread_mutex_lock(&gLock);propertyNote(o,a,3,rc);pthread_mutex_unlock(&gLock);}
+    return rc;
 }
 // Only the worker calls the kernel writer. The real-time IO callbacks enqueue
 // time-indexed mixes without waiting for ring space or a DSP transaction.
@@ -369,6 +402,7 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d,AudioObjectID o,Audio
     double t=info->mOutputTime.mSampleTime;if(!isfinite(t)||t<0||t>9007199254740991.0||floor(t)!=t)return kAudioHardwareIllegalOperationError;
     if(pthread_mutex_trylock(&gLock))return kAudioHardwareNotRunningError;
     if(!gIoUsers||gFault||gStop){pthread_mutex_unlock(&gLock);return kAudioHardwareNotRunningError;}
+    if(!gStreamActive){pthread_mutex_unlock(&gLock);return 0;}
     int rc=picasso_mix_add(&gMix,gReservedEnd?gReservedEnd:gSent,(uint64_t)t,frames,main,gain());++gCalls;
     if(rc && gCalls<32)note(4,rc,op,frames);pthread_mutex_unlock(&gLock);
     return rc?kAudioHardwareIllegalOperationError:0;
