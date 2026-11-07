@@ -1613,6 +1613,53 @@ __attribute__((noinline)) static void playTests() {
     assert(s.apr.play.done && s.apr.play.complete && s.apr.play.consumed && !s.apr.play.owned && s.apr.play.accepted==0x7fff);
     assert(s.apr.play.pins.restored && !s.apr.play.pins.dirty && s.apr.pcm.complete && s.apr.pcm.retained);
     for(unsigned i=0;i<4;++i)assert(pinRam[i][0]==0x2800 && pinRam[i][1]==1);
+    // Stock success writer stores only u32 status/u16 ID into an 8-byte
+    // stack payload. Dirty reserved bits must not become part of the COPP ID.
+    const uint32_t reservedWords[]={0,0x00010000,0xa55a0000,0xffff0000};
+    const unsigned coppIds[]={0,1,4,0xfe};
+    for(unsigned id:coppIds)for(uint32_t reserved:reservedWords) {
+        rx=playAt(s,PicassoPlayOpenCopp);uint32_t reply[12];unsigned bytes=playResponse(s,reply);
+        reply[9]=reserved|id;packet(s,rx,1,reinterpret_cast<uint8_t *>(reply),bytes);step(s);drain(s);
+        assert(s.apr.play.responded && !s.apr.play.error && s.apr.play.copp==id && !s.apr.play.replyReject);
+        assert(s.apr.play.replyRaw[0]==0 && s.apr.play.replyRaw[1]==(reserved|id));
+        playRelease(s,rx);assert(s.apr.play.phase==PicassoPlayRoute);
+        picasso_play_request(s.apr,request);assert(request[8]==id); // padding remains zero
+        for(unsigned phase=PicassoPlayRoute;phase<PicassoPlayDone;++phase) {
+            assert(s.apr.play.phase==phase && s.apr.play.pending);
+            picasso_play_request(s.apr,request);
+            if(phase==PicassoPlayCloseCopp)assert(request[2]==((id<<16)|0x408));
+            playAck(s);playRelease(s,rx);
+        }
+        assert(s.apr.play.complete && s.apr.play.consumed && !s.apr.play.owned);
+    }
+    // Parse remote failure even with dirty reserved/invalid ID; never route it.
+    rx=playAt(s,PicassoPlayOpenCopp);uint32_t admFailure[12];playResponse(s,admFailure);
+    admFailure[8]=2;admFailure[9]=0xbeefffff;
+    picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(admFailure),40);
+    assert(s.apr.play.responded && s.apr.play.status==2 && s.apr.play.error==-5 && !(s.apr.play.owned&PicassoPlayCopp));
+    playRelease(s,rx);playCleanup(s,rx);assert(!s.apr.play.complete && !s.apr.play.owned);
+    // Status0 with no usable ID is a protocol failure, not a silent timeout
+    // or success; unknown ownership must remain, without guessing a CLOSE ID.
+    const unsigned invalidIds[]={0xff,0x100,0xffff};
+    for(unsigned id:invalidIds) {
+        rx=playAt(s,PicassoPlayOpenCopp);uint32_t reply[12];playResponse(s,reply);reply[9]=0xa55a0000|id;
+        picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(reply),40);
+        assert(!s.apr.play.pending && s.apr.play.error==-22 && s.apr.play.replyReject==3 && s.apr.play.status==0);
+        playRelease(s,rx);playCleanup(s,rx);
+        assert(!s.apr.play.complete && s.apr.play.owned==PicassoPlayCopp && s.apr.play.firstError==-22);
+        assert(!(s.apr.play.accepted&(1U<<PicassoPlayRoute)) && !(s.apr.play.accepted&(1U<<PicassoPlayCloseCopp)));
+    }
+    // Capture only complete words in short replies, and preserve strict headers.
+    rx=playAt(s,PicassoPlayOpenCopp);uint32_t shortReply[12];playResponse(s,shortReply);
+    shortReply[0]=0x00270181;shortReply[8]=0x12345678;shortReply[9]=0xffffffff;
+    picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(shortReply),39);
+    assert(s.apr.play.pending && s.apr.play.replyBytes==7 && s.apr.play.replyReject==2);
+    assert(s.apr.play.replyRaw[0]==0x12345678 && !s.apr.play.replyRaw[1] && !s.apr.play.copp);
+    shortReply[0]=0x00280181;shortReply[1]^=1;
+    picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(shortReply),40);
+    assert(s.apr.play.pending && s.apr.play.replyReject==1 && !s.apr.play.copp);
+    playAck(s,2);playRelease(s,rx);playCleanup(s,rx);
+    puts("PASS stock ADM u16 COPP/dirty reserved response, nonzero route/CLOSE, remote failure and bounded rejection diagnostics");
     // Reject explicit failure at every command; still close acquired resources.
     for(unsigned phase=0;phase<PicassoPlayDone;++phase) {
         rx=playAt(s,phase);playAck(s,2);playRelease(s,rx);playCleanup(s,rx);

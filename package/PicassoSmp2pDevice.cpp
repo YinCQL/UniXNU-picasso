@@ -133,6 +133,10 @@ void logPlay(const PicassoAprProbe &a) {
         v.pins.active,v.pins.restored,v.pins.dirty,v.pins.error,v.pins.restoreError);
     IOLog("PICASSO_ADSP play-write address=%08x%08x handle=%x status=%u fsr=%x fault=%x\n",
         v.writeAddressHigh,v.writeAddressLow,v.writeHandle,v.writeStatus,a.pcm.fsr,a.pcm.fsr&0xc00001feU);
+    IOLog("PICASSO_ADSP play-rx phase=%u opcode=%x type=%u bytes=%u source=%x destination=%x reject=%u rejected=%u\n",
+        v.replyPhase,v.replyOpcode,v.replyType,v.replyBytes,v.replySource,v.replyDestination,v.replyReject,v.rejected);
+    IOLog("PICASSO_ADSP play-raw words=%08x/%08x/%08x/%08x\n",
+        v.replyRaw[0],v.replyRaw[1],v.replyRaw[2],v.replyRaw[3]);
 }
 void logPcm(const PicassoAprProbe &a) {
     const auto &v=a.pcm;

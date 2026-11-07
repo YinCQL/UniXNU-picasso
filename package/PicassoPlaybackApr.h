@@ -108,16 +108,26 @@ inline bool picasso_play_due(PicassoAprProbe &p) {
 inline bool picasso_play_receive(PicassoAprProbe &p,const uint8_t *b,unsigned bytes,unsigned type) {
     auto &v=p.play;
     if(!v.pending || p.receivedToken!=v.token)return false;
+    v.replyPhase=v.phase;v.replyOpcode=p.opcode;v.replyType=type;v.replyBytes=bytes;
+    v.replySource=p.source;v.replyDestination=p.destination;v.replyReject=0;
+    for(unsigned i=0;i<4;++i)v.replyRaw[i]=bytes>=4*(i+1)?wlan_sm32(b+4*i):0;
+    ++v.events;
+    auto reject=[&](unsigned reason) {v.replyReject=reason;++v.rejected;++p.ignored;return true;};
     uint32_t w[18];picasso_play_request(p,w);
-    if(p.source!=w[2] || p.destination!=w[1]) {++p.ignored;return true;}
+    if(p.source!=w[2] || p.destination!=w[1])return reject(1);
     unsigned n=v.phase;
     bool basic=p.opcode==0x110e8 && type==1 && bytes==8 && wlan_sm32(b)==w[4];
-    uint32_t status=0;int health=0;
+    uint32_t status=0;int health=0,protocol=0;
     if(n==PicassoPlayMapBuffer && p.opcode==0x10d93 && type==1 && bytes==4 && wlan_sm32(b))v.handle=wlan_sm32(b);
-    else if(n==PicassoPlayOpenCopp && p.opcode==0x10329 && type==1 && bytes==8 && !(wlan_sm32(b+4)>>16)) {
+    else if(n==PicassoPlayOpenCopp && p.opcode==0x10329 && type==1 && bytes==8) {
         status=wlan_sm32(b);
-        if(!status && wlan_sm32(b+4)>=0xff) {++p.ignored;return true;}
-        if(!status)v.copp=wlan_sm32(b+4);
+        // Stock q6adm reads u16 copp_id and ignores the reserved halfword.
+        // Picasso success path b067cffc..d010 writes status and u16 ID only;
+        // the following stack halfword is not initialized. Preserve it in
+        // replyRaw for diagnostics, never use it as part of the route ID.
+        unsigned id=wlan_sm32(b+4)&0xffff;
+        if(!status && id>=0xff) {protocol=-22;v.replyReject=3;++v.rejected;}
+        else if(!status)v.copp=id;
     } else if(n==PicassoPlayWrite && p.opcode==0x10d99 && type==0 && bytes==16 &&
         wlan_sm32(b)==uint32_t(p.pcm.address) && wlan_sm32(b+4)==uint32_t(p.pcm.address>>32) && wlan_sm32(b+8)==v.handle) {
         status=wlan_sm32(b+12);v.writeAddressLow=wlan_sm32(b);v.writeAddressHigh=wlan_sm32(b+4);
@@ -125,14 +135,14 @@ inline bool picasso_play_receive(PicassoAprProbe &p,const uint8_t *b,unsigned by
         health=p.pcm.check?p.pcm.check(p.pcm):-22;v.consumed=!status && !health;
     } else if(basic) {
         status=wlan_sm32(b+4);
-        if(!status && (n==PicassoPlayMapBuffer || n==PicassoPlayOpenCopp || n==PicassoPlayWrite)) {++p.ignored;return true;}
-    } else {++p.ignored;return true;}
-    v.pending=false;v.responded=true;v.status=v.statuses[n]=status;v.opcode=p.opcode;v.error=status?-5:0;
+        if(!status && (n==PicassoPlayMapBuffer || n==PicassoPlayOpenCopp || n==PicassoPlayWrite))return reject(4);
+    } else return reject(2);
+    v.pending=false;v.responded=true;v.status=v.statuses[n]=status;v.opcode=p.opcode;v.error=status?-5:protocol;
     // Configuration/START can leave port state behind even on failure.
     // Stock START status9 means either already running OR not configured;
     // neither proves an idle port. Keep it owned until a real STOP ACK.
     if(status)v.owned&=~(picasso_play_acquires(n)&~PicassoPlayPort);
-    else {
+    else if(!protocol) {
         v.accepted|=1U<<n;
         if(n==PicassoPlayClose)v.owned&=~(PicassoPlayStream|PicassoPlayBuffer);
         if(n==PicassoPlayCloseCopp)v.owned&=~PicassoPlayCopp;

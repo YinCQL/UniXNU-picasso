@@ -17,6 +17,9 @@ enum PicassoPlayPhase {
 struct PicassoPlayback {
     uint32_t phase,events,token,wait,status,opcode,api,copp,handle,owned;
     uint32_t accepted,statuses[PicassoPlayDone],writeAddressLow,writeAddressHigh,writeHandle,writeStatus;
+    // Latest matching-token reply, including bounded raw rejected fields.
+    uint32_t replyPhase,replyOpcode,replyType,replyBytes,replySource,replyDestination;
+    uint32_t replyRaw[4],replyReject,rejected;
     PicassoAudioPins pins;
     bool bufferReady;
     bool enabled,attempted,sent,pending,responded,done,complete,consumed;
