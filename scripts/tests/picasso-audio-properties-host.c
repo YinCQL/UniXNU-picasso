@@ -24,7 +24,11 @@ typedef struct {AudioStreamBasicDescription mFormat;AudioValueRange mSampleRateR
 typedef struct {UInt32 mChannelLabel,mChannelFlags;float mCoordinates[3];} AudioChannelDescription;
 typedef struct {UInt32 mChannelLayoutTag,mChannelBitmap,mNumberChannelDescriptions;AudioChannelDescription mChannelDescriptions[1];} AudioChannelLayout;
 typedef struct {UInt32 mClientID;} AudioServerPlugInClientInfo;
-typedef struct {struct {double mSampleTime;} mOutputTime;} AudioServerPlugInIOCycleInfo;
+typedef struct {double mSampleTime;uint64_t mHostTime;double mRateScalar;uint64_t mWordClockTime;unsigned char mSMPTETime[24];UInt32 mFlags,mReserved;} AudioTimeStamp;
+typedef struct {UInt64 mIOCycleCounter;UInt32 mNominalIOBufferFrameSize;AudioTimeStamp mCurrentTime,mInputTime,mOutputTime;Float64 mMasterHostTicksPerFrame,mDeviceHostTicksPerFrame;} AudioServerPlugInIOCycleInfo;
+_Static_assert(sizeof(AudioTimeStamp)==64,"SDK AudioTimeStamp ABI");
+_Static_assert(offsetof(AudioServerPlugInIOCycleInfo,mInputTime)==80,"SDK input timestamp ABI");
+_Static_assert(offsetof(AudioServerPlugInIOCycleInfo,mOutputTime)==144,"SDK output timestamp ABI");
 struct Host;typedef const struct Host *AudioServerPlugInHostRef;
 struct Host {OSStatus (*PropertiesChanged)(AudioServerPlugInHostRef,AudioObjectID,UInt32,const AudioObjectPropertyAddress *);};
 typedef unsigned io_connect_t,io_service_t;typedef int kern_return_t;
@@ -39,8 +43,9 @@ static int IOServiceOpen(unsigned s,unsigned t,unsigned k,unsigned *c){(void)s;(
 static void IOObjectRelease(unsigned o){(void)o;}
 static int IOServiceClose(unsigned o){(void)o;return 0;}
 static unsigned notes,changed;
+static int writeResult;static bool *workerStop;static int16_t accepted[2048];
 static int IOConnectCallStructMethod(unsigned c,unsigned s,const void *in,size_t n,void *out,size_t *z){
-    (void)c;(void)out;(void)z;if(s==PicassoAudioNote){assert(in&&n==sizeof(PicassoAudioClientNote));++notes;}return 0;
+    (void)c;(void)out;(void)z;if(s==PicassoAudioWrite){assert(n==sizeof accepted);if(!writeResult)memcpy(accepted,in,n);if(workerStop)*workerStop=true;return writeResult;}if(s==PicassoAudioNote){assert(in&&n==sizeof(PicassoAudioClientNote));++notes;}return 0;
 }
 #define MH_MAGIC_64 0xfeedfacfU
 #define CPU_TYPE_ARM64 0x100000c
@@ -66,10 +71,14 @@ typedef struct {int protection;} vm_region_basic_info_data_64_t;
 #define VM_PROT_COPY 16
 typedef struct {const char *dli_fname;} Dl_info;
 #define RTLD_DEFAULT NULL
+static unsigned policyBits;static int policyClass=1;static bool missingPolicy;
+static bool fakeFeature(const char *domain,const char *key){assert(!strcmp(domain,"VirtualAudio"));return policyBits&(!strcmp(key,"core_speech_requires_tap_stream")?1:8);}
+static bool fakeAnswer(CFStringRef key){return policyBits&(!strcmp(key,"DeviceSupportsSiriBargeIn")?2:4);}
+static int fakeNumber(CFStringRef key,int fallback){assert(!strcmp(key,"DeviceClassNumber")&&!fallback);return policyClass;}
 static uint64_t fakeProduct(void){return UINT64_C(0x669eebc5);}
 static int protectError,protectCalls,regionError,resolvedWrong;static void *resolves[5];
 static int dladdr(const void *p,Dl_info *i){(void)p;i->dli_fname="/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio";return 1;}
-static void *dlsym(void *h,const char *s){(void)h;if(!strcmp(s,"MGGetProductType"))return (void *)fakeProduct;const char *n[]={"AudioObjectGetPropertyData","AudioObjectGetPropertyDataSize","AudioObjectHasProperty","AudioObjectSetPropertyData","__cxa_throw"};for(int i=0;i<5;i++)if(!strcmp(s,n[i]))return resolvedWrong?NULL:resolves[i];return NULL;}
+static void *dlsym(void *h,const char *s){(void)h;if(!strcmp(s,"_os_feature_enabled_impl"))return missingPolicy?NULL:(void *)fakeFeature;if(!strcmp(s,"MGGetBoolAnswer"))return (void *)fakeAnswer;if(!strcmp(s,"MGGetSInt32Answer"))return (void *)fakeNumber;if(!strcmp(s,"MGGetProductType"))return (void *)fakeProduct;const char *n[]={"AudioObjectGetPropertyData","AudioObjectGetPropertyDataSize","AudioObjectHasProperty","AudioObjectSetPropertyData","__cxa_throw"};for(int i=0;i<5;i++)if(!strcmp(s,n[i]))return resolvedWrong?NULL:resolves[i];return NULL;}
 static int vm_region_64(unsigned t,vm_address_t *a,vm_size_t *s,int f,vm_region_info_t i,unsigned *n,unsigned *o){(void)t;(void)a;(void)f;(void)n;*s=4096;*i=VM_PROT_READ;*o=0;return regionError;}
 static int vm_protect(unsigned t,vm_address_t a,vm_size_t n,bool b,int p){(void)t;(void)a;(void)n;(void)b;(void)p;++protectCalls;return protectError;}
 static void mach_port_deallocate(unsigned t,unsigned o){(void)t;(void)o;}
@@ -98,7 +107,7 @@ static void properties(void){
     float pcm[2]={0.5f,-0.5f};assert(!picasso_mix_add(&gMix,0,10,1,pcm,1));v=0;
     assert(!SetPropertyData(NULL,kOutStream,0,&a,0,NULL,4,&v)&&!gStreamActive&&changed==1);
     int16_t output[2];assert(picasso_mix_peek(&gMix,10,1,output)==1&&output[0]==0);
-    gIoUsers=1;AudioServerPlugInIOCycleInfo info={{10}};
+    gIoUsers=1;AudioServerPlugInIOCycleInfo info={.mOutputTime={.mSampleTime=10}};
     assert(!DoIOOperation(NULL,kDevice,kOutStream,0,kAudioServerPlugInIOOperationWriteMix,1,&info,pcm,NULL));
     assert(picasso_mix_peek(&gMix,10,1,output)==1);
     v=1;assert(!SetPropertyData(NULL,kOutStream,0,&a,0,NULL,4,&v)&&gStreamActive&&changed==2);
@@ -134,7 +143,88 @@ static void properties(void){
     assert(!picasso_mix_peek(&gMix,10,1,output)&&output[0]>0&&output[1]<0);
     for(unsigned i=0;i<200;++i){a.mSelector=0xf0000000+i;(void)HasProperty(NULL,kDevice,0,&a);}assert(gPropertyNotes==128);
 }
+static void speakerReference(void){
+    // Exhaust all original policy combinations, including stereo on non-phone.
+    for(policyClass=0;policyClass<3;++policyClass)for(policyBits=0;policyBits<16;++policyBits){
+        assert(!configureTap());assert(gTapEnabled==!!((policyBits&11)||((policyBits&4)&&policyClass==1)));
+    }
+    missingPolicy=true;assert(configureTap()==-1);missingPolicy=false;
+    policyBits=2;assert(!configureTap()&&gTapEnabled);
+    AudioObjectPropertyAddress a={kAudioDevicePropertyDeviceUID,kAudioObjectPropertyScopeGlobal,0};UInt32 n,v;CFStringRef uid;
+    assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,sizeof uid,&n,&uid)&&!strcmp(uid,"Speaker"));
+    a.mSelector=kAudioPlugInPropertyTranslateUIDToDevice;
+    assert(!GetPropertyData(NULL,kPlugIn,0,&a,sizeof uid,&uid,sizeof v,&n,&v)&&v==kDevice);
+    a.mSelector=kAudioDevicePropertyTransportType;
+    assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,sizeof v,&n,&v)&&v==kAudioDeviceTransportTypeBuiltIn);
+    UInt32 list[4];a.mSelector=kAudioObjectPropertyOwnedObjects;
+    assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,sizeof list,&n,list)&&n==16);
+    a.mSelector=kAudioDevicePropertyStreams;a.mScope=kAudioObjectPropertyScopeInput;
+    assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,sizeof list,&n,list)&&n==4&&list[0]==kTapStream);
+    a.mSelector=kAudioDevicePropertyDeviceCanBeDefaultDevice;
+    assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,sizeof v,&n,&v)&&!v);
+    a=(AudioObjectPropertyAddress){'taps',kAudioObjectPropertyScopeGlobal,0};Boolean set=true;
+    assert(!GetPropertyDataSize(NULL,kTapStream,0,&a,0,NULL,&n)&&n==4);
+    assert(!GetPropertyData(NULL,kTapStream,0,&a,0,NULL,4,&n,&v)&&v==1);
+    assert(!IsPropertySettable(NULL,kTapStream,0,&a,&set)&&!set);
+    assert(GetPropertyData(NULL,kTapStream,0,&a,0,NULL,1,&n,&v)==(OSStatus)kAudioHardwareBadPropertySizeError);
+    assert(!GetPropertyData(NULL,kOutStream,0,&a,0,NULL,4,&n,&v)&&v==0);
+    Boolean will=false,inPlace=false;
+    assert(!WillDoIOOperation(NULL,kDevice,0,kAudioServerPlugInIOOperationReadInput,&will,&inPlace)&&will&&inPlace);
+    memset(&gMix,0,sizeof gMix);memset(&gTap,0,sizeof gTap);gSent=gReservedEnd=0;gIoUsers=1;gFault=0;gStop=false;gVolume=1;gMuted=false;
+    float pcm[]={0.5f,-0.25f};AudioServerPlugInIOCycleInfo info={.mInputTime={.mSampleTime=0},.mOutputTime={.mSampleTime=0}};
+    assert(!DoIOOperation(NULL,kDevice,kOutStream,0,kAudioServerPlugInIOOperationWriteMix,1,&info,pcm,NULL));
+    float got[4]={9,9,9,9};
+    assert(!DoIOOperation(NULL,kDevice,kTapStream,0,kAudioServerPlugInIOOperationReadInput,1,&info,got,NULL)&&!got[0]&&!got[1]);
+    // Failed kernel submission must not become accepted playback history.
+    workerStop=&gStop;writeResult=kIOReturnNoSpace;gHostTicksPerFrame=1;gOrigin=1000;worker(NULL);gStop=false;
+    assert(!gSent&&picasso_tap_read(&gTap,0,1,got)==1);
+    writeResult=0;worker(NULL);gStop=false;workerStop=NULL;
+    assert(gSent==1024&&accepted[0]>0&&accepted[1]<0);
+    assert(!DoIOOperation(NULL,kDevice,kTapStream,0,kAudioServerPlugInIOOperationReadInput,1,&info,got,NULL));
+    assert(got[0]==accepted[0]/32768.0f&&got[1]==accepted[1]/32768.0f);
+    // Gain and mute propagate through the accepted PCM, not a second gain path.
+    a=(AudioObjectPropertyAddress){kDeviceVolumeScalar,kAudioObjectPropertyScopeOutput,0};float level=0.5f;
+    assert(!SetPropertyData(NULL,kDevice,0,&a,0,NULL,sizeof level,&level));
+    info.mOutputTime.mSampleTime=1024;
+    assert(!DoIOOperation(NULL,kDevice,kOutStream,0,kAudioServerPlugInIOOperationWriteMix,1,&info,pcm,NULL));
+    workerStop=&gStop;worker(NULL);gStop=false;workerStop=NULL;
+    info.mInputTime.mSampleTime=1024;
+    assert(!DoIOOperation(NULL,kDevice,kTapStream,0,kAudioServerPlugInIOOperationReadInput,1,&info,got,NULL));
+    assert(got[0]>0 && got[0]<0.25f && got[0]==accepted[0]/32768.0f);
+    a.mSelector=kDeviceMute;v=1;assert(!SetPropertyData(NULL,kDevice,0,&a,0,NULL,sizeof v,&v));
+    info.mOutputTime.mSampleTime=2048;
+    assert(!DoIOOperation(NULL,kDevice,kOutStream,0,kAudioServerPlugInIOOperationWriteMix,1,&info,pcm,NULL));
+    workerStop=&gStop;worker(NULL);gStop=false;workerStop=NULL;
+    info.mInputTime.mSampleTime=2048;
+    assert(!DoIOOperation(NULL,kDevice,kTapStream,0,kAudioServerPlugInIOOperationReadInput,1,&info,got,NULL)&&!got[0]&&!got[1]);
+    v=0;assert(!SetPropertyData(NULL,kDevice,0,&a,0,NULL,sizeof v,&v));
+    assert(gVolume==0.5f);
+    // A disabled reference must not discard queued speaker samples.
+    a=(AudioObjectPropertyAddress){kAudioStreamPropertyIsActive,kAudioObjectPropertyScopeGlobal,0};v=0;
+    assert(!SetPropertyData(NULL,kTapStream,0,&a,0,NULL,4,&v)&&!gTapActive);
+    info.mInputTime.mSampleTime=0;
+    assert(!DoIOOperation(NULL,kDevice,kTapStream,0,kAudioServerPlugInIOOperationReadInput,1,&info,got,NULL)&&!got[0]);
+    v=1;assert(!SetPropertyData(NULL,kTapStream,0,&a,0,NULL,4,&v)&&gTapActive);
+    // Input and output timestamps differ; no fabricated data from output time.
+    info.mInputTime.mSampleTime=4096;
+    assert(!DoIOOperation(NULL,kDevice,kTapStream,0,kAudioServerPlugInIOOperationReadInput,1,&info,got,NULL)&&!got[0]&&!got[1]);
+    int16_t clipped[4]={32767,-32768,123,-456};
+    picasso_tap_store(&gTap,PicassoMixFrames-1,2,clipped);
+    assert(!picasso_tap_read(&gTap,PicassoMixFrames-1,2,got)&&got[0]>0.999f&&got[1]==-1&&got[2]==123/32768.0f);
+    assert(picasso_tap_read(&gTap,0,1,got)==1&&got[0]==0);
+    info.mInputTime.mSampleTime=NAN;
+    assert(DoIOOperation(NULL,kDevice,kTapStream,0,kAudioServerPlugInIOOperationReadInput,1,&info,got,NULL)==(OSStatus)kAudioHardwareIllegalOperationError);
+    info.mInputTime.mSampleTime=0;
+    assert(DoIOOperation(NULL,kDevice,kTapStream,0,kAudioServerPlugInIOOperationReadInput,8193,&info,got,NULL)==(OSStatus)kAudioHardwareIllegalOperationError);
+    assert(DoIOOperation(NULL,kDevice,kOutStream,0,kAudioServerPlugInIOOperationReadInput,1,&info,got,NULL)==(OSStatus)kAudioHardwareIllegalOperationError);
+    gTapEnabled=false;a.mSelector='taps';
+    assert(!HasProperty(NULL,kTapStream,0,&a));
+    assert(!WillDoIOOperation(NULL,kDevice,0,kAudioServerPlugInIOOperationReadInput,&will,&inPlace)&&!will);
+    gClients[0]=1;gThreadLive=false;assert(!StopIO(NULL,kDevice,0)&&!gIoUsers);
+    assert(picasso_tap_read(&gTap,PicassoMixFrames-1,2,got)==2);
+}
 static void routing(void){
+    gRouteCount=gRouteFlushed=0;
     unsigned char *image=aligned_alloc(16384,0x610000);assert(image);memset(image,0,0x610000);struct mach_header_64 *h=(void *)image;
     *h=(struct mach_header_64){MH_MAGIC_64,CPU_TYPE_ARM64,CPU_SUBTYPE_ARM64_ALL,MH_DYLIB,36,4040,0,0};
     struct uuid_command *u=(void *)(h+1);*u=(struct uuid_command){LC_UUID,24,{0x31,0x96,0x33,0x3f,0x5a,0x48,0x37,0x3b,0xb4,0x27,0x01,0x46,0xdc,0x11,0x77,0xfb}};
@@ -169,7 +259,7 @@ static void routing(void){
     free(image);
 }
 int main(int argc,char **argv){
-    properties();routing();
+    properties();speakerReference();routing();
     if(argc==2){
         unsigned char header[4072];FILE *f=fopen(argv[1],"rb");assert(f);
         assert(fread(header,1,sizeof header,f)==sizeof header);fclose(f);

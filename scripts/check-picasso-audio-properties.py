@@ -25,7 +25,7 @@ def main():
     trace=re.sub(r'^#include <[^\n]+\n','',trace,flags=re.M)
     body=body.replace('#include "PicassoAudioRouteTrace.h"',trace)
     names=sorted(set(re.findall(r'\bk(?:Audio|IOReturn)[A-Za-z0-9_]+\b',body)))
-    c=out/'sdk-constants.c';c.write_text('#include <CoreAudio/AudioServerPlugIn.h>\n#include <IOKit/IOKitLib.h>\n'+''.join('const unsigned long long value_'+n+' = '+n+';\n' for n in names))
+    c=out/'sdk-constants.c';c.write_text('#include <CoreAudio/AudioServerPlugIn.h>\n#include <IOKit/IOKitLib.h>\n#include <stddef.h>\n_Static_assert(sizeof(AudioTimeStamp)==64,"timestamp ABI");\n_Static_assert(offsetof(AudioServerPlugInIOCycleInfo,mInputTime)==80,"input timestamp ABI");\n_Static_assert(offsetof(AudioServerPlugInIOCycleInfo,mOutputTime)==144,"output timestamp ABI");\n'+''.join('const unsigned long long value_'+n+' = '+n+';\n' for n in names))
     sdk=os.environ.get('PICASSO_AUDIO_SDK','/home/y/toolchains/audio-sdks/iPhoneOS16.5.sdk')
     headers=os.environ.get('PICASSO_AUDIO_HEADERS','/home/y/toolchains/audio-hal-headers')
     legacy_header=Path(headers)/'CoreAudio/AudioHardware.h'

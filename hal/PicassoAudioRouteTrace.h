@@ -58,7 +58,7 @@ static void routeProperty(unsigned kind,AudioObjectID o,const AudioObjectPropert
 static OSStatus routeGet(AudioObjectID o,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 *size,void *data){
     OSStatus r=gRouteGet(o,a,qs,q,size,data);
     // Transport and stream layout also show whether route creation progressed.
-    if(r || (a && (a->mSelector==kAudioDevicePropertyTransportType || a->mSelector=='slay')))
+    if(r || (a && (a->mSelector==kAudioDevicePropertyTransportType || a->mSelector=='slay' || a->mSelector=='taps' || a->mSelector=='vdb#')))
         routeProperty(9,o,a,r,0);
     return r;
 }

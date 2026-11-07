@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Public HAL object/property pattern adapted from UniXNU-sheng 4601795.
-// Output-only Picasso APR client; no shared kernel memory or clock patching.
+// Picasso speaker and software playback reference; no microphone capture.
+// No shared kernel memory or clock patching.
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -12,12 +13,13 @@
 #include <unistd.h>
 #include "PicassoAudioAbi.h"
 #include "PicassoAudioMix.h"
-enum {kPlugIn=kAudioObjectPlugInObject,kDevice=2,kOutStream=3,kVolume=4,kMute=5};
+enum {kPlugIn=kAudioObjectPlugInObject,kDevice=2,kOutStream=3,kVolume=4,kMute=5,kTapStream=6};
 // Legacy device aliases from CoreAudio/AudioHardware.h (not included by
 // AudioServerPlugIn.h). The host check verifies these against that SDK header.
 enum {kDeviceVolumeScalar='volm',kDeviceVolumeDecibels='vold',
       kDeviceVolumeRangeDecibels='vdb#',kDeviceMute='mute'};
-#define kDeviceUID "PicassoAudioDevice"
+// 20H392 VirtualAudio dispatches built-in routes by UID, not display name.
+#define kDeviceUID "Speaker"
 #define kModelUID "PicassoAudioModel"
 static const Float64 kRate=48000;
 static const UInt32 kZeroPeriod=32768;
@@ -36,6 +38,9 @@ static int gFault;
 static pthread_t gThread,gWatch;
 static bool gWatchLive;
 static PicassoAudioMix gMix;
+static PicassoAudioTap gTap;
+static bool gTapEnabled,gTapActive=true;
+static uint64_t gTapReads,gTapMissing;
 static uint64_t gSent,gMissing,gReservedEnd;
 static uint32_t gCalls,gPropertyNotes;
 static bool gStreamActive=true;
@@ -99,8 +104,28 @@ static void *watchService(void *arg){
         usleep(1000000);
     }return NULL;
 }
+// Match the original 20H392 Speaker policy (VA 0x3cfa1c). Do not change
+// MobileGestalt or feature flags. This only decides whether our real software
+// reference stream is published; it never advertises a microphone.
+static bool tapPolicy(bool speech,bool barge,bool stereo,int deviceClass,bool expanse){
+    return speech || barge || (stereo && deviceClass==1) || expanse;
+}
+static int configureTap(void){
+    bool (*feature)(const char *,const char *)=(void *)dlsym(RTLD_DEFAULT,"_os_feature_enabled_impl");
+    bool (*answer)(CFStringRef)=(void *)dlsym(RTLD_DEFAULT,"MGGetBoolAnswer");
+    int (*number)(CFStringRef,int)=(void *)dlsym(RTLD_DEFAULT,"MGGetSInt32Answer");
+    if(!feature || !answer || !number)return -1;
+    bool speech=feature("VirtualAudio","core_speech_requires_tap_stream");
+    bool barge=answer(CFSTR("DeviceSupportsSiriBargeIn"));
+    bool stereo=answer(CFSTR("DeviceSupportsStereoAudioRecording"));
+    int deviceClass=number(CFSTR("DeviceClassNumber"),0);
+    bool expanse=feature("VirtualAudio","expanseEnabled");
+    gTapEnabled=tapPolicy(speech,barge,stereo,deviceClass,expanse);
+    routeNote(14,0,4,gTapEnabled,speech|(barge<<1)|(stereo<<2)|(expanse<<3),(unsigned)deviceClass,5);
+    return 0;
+}
 static OSStatus Initialize(AudioServerPlugInDriverRef d,AudioServerPlugInHostRef host){
-    (void)d;gHost=host;pthread_mutex_lock(&gLock);(void)connectService();
+    (void)d;if(configureTap())return kAudioHardwareUnspecifiedError;gHost=host;pthread_mutex_lock(&gLock);(void)connectService();
     if(!gWatchLive){if(!pthread_create(&gWatch,NULL,watchService,NULL)){gWatchLive=true;pthread_detach(gWatch);}}
     note(8,0,0,gConnect!=0);
     pthread_mutex_unlock(&gLock);return 0;
@@ -117,7 +142,7 @@ static UInt32 objects(AudioObjectID o, AudioObjectPropertyScope scope, AudioObje
     if (o == kPlugIn) list[n++] = kDevice;
     else if (o == kDevice) {
         if (scope != kAudioObjectPropertyScopeInput) list[n++] = kOutStream;
-        
+        if (gTapEnabled && scope != kAudioObjectPropertyScopeOutput) list[n++] = kTapStream;
         if (scope != kAudioObjectPropertyScopeInput) {list[n++] = kVolume;list[n++] = kMute;}
     }
     return n;
@@ -126,8 +151,9 @@ static UInt32 objects(AudioObjectID o, AudioObjectPropertyScope scope, AudioObje
 static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 inDataSize,
                              UInt32 *outDataSize, void *outData) {
     const AudioObjectPropertySelector s = a->mSelector;
-    if (o >= kPlugIn && o <= kMute && (s == kAudioObjectPropertyCustomPropertyInfoList || ((s == kAudioPlugInPropertyBoxList ||
-        s == kAudioPlugInPropertyClockDeviceList) && o == kPlugIn) || ((s == 'taps') && (o == kOutStream)))) {
+    if(o==kTapStream && !gTapEnabled)return kAudioHardwareBadObjectError;
+    if (o >= kPlugIn && o <= kTapStream && (s == kAudioObjectPropertyCustomPropertyInfoList || ((s == kAudioPlugInPropertyBoxList ||
+        s == kAudioPlugInPropertyClockDeviceList) && o == kPlugIn))) {
         *outDataSize = 0;
         return 0;
     }
@@ -179,7 +205,7 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
             if(s==kDeviceVolumeDecibels) {REPLY(Float32,toDb(gVolume));}
             if(s==kDeviceMute) {REPLY(UInt32,gMuted);}
             REPLY(AudioValueRange,((AudioValueRange){kMinDb,0.0}));
-        case kAudioDevicePropertyTransportType: REPLY(UInt32, kAudioDeviceTransportTypeThunderbolt);
+        case kAudioDevicePropertyTransportType: REPLY(UInt32, kAudioDeviceTransportTypeBuiltIn);
         case kAudioDevicePropertyRelatedDevices: REPLY(AudioObjectID, kDevice);
         case kAudioDevicePropertyClockDomain: REPLY(UInt32, 0);
         case kAudioDevicePropertyDeviceIsAlive: REPLY(UInt32, gConnect != 0);
@@ -196,11 +222,11 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kAudioDevicePropertyClockAlgorithm: REPLY(UInt32, kAudioDeviceClockAlgorithmRaw);
         case kAudioDevicePropertyPreferredChannelsForStereo: {
             if (inDataSize < 2 * sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
-            ((UInt32 *)outData)[0] = 1; ((UInt32 *)outData)[1] = a->mScope == kAudioObjectPropertyScopeInput ? 0 : 2;
+            ((UInt32 *)outData)[0] = 1; ((UInt32 *)outData)[1] = a->mScope == kAudioObjectPropertyScopeInput && !gTapEnabled ? 0 : 2;
             *outDataSize = 2 * sizeof(UInt32); return 0;
         }
         case kAudioDevicePropertyPreferredChannelLayout: {
-            const UInt32 channels = a->mScope == kAudioObjectPropertyScopeInput ? 0 : 2;
+            const UInt32 channels = a->mScope == kAudioObjectPropertyScopeInput && !gTapEnabled ? 0 : 2;
             const UInt32 bytes = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions) + channels * sizeof(AudioChannelDescription));
             if (inDataSize < bytes) return kAudioHardwareBadPropertySizeError;
             AudioChannelLayout *l = outData;
@@ -214,11 +240,11 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kAudioObjectPropertyOwnedObjects:
         case kAudioDevicePropertyStreams:
         case kAudioObjectPropertyControlList: {
-            AudioObjectID list[3];
+            AudioObjectID list[4];
             UInt32 n = objects(kDevice, a->mScope, list), out = 0;
             for (UInt32 i = 0; i < n; ++i) {
-                if (s == kAudioDevicePropertyStreams && list[i] != kOutStream) continue;
-                if (s == kAudioObjectPropertyControlList && list[i] == kOutStream) continue;
+                if (s == kAudioDevicePropertyStreams && list[i] != kOutStream && list[i] != kTapStream) continue;
+                if (s == kAudioObjectPropertyControlList && (list[i] == kOutStream || list[i] == kTapStream)) continue;
                 if ((out + 1) * sizeof(AudioObjectID) > inDataSize) break;
                 ((AudioObjectID *)outData)[out++] = list[i];
             }
@@ -227,17 +253,22 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         default: return kAudioHardwareUnknownPropertyError;
         }
     case kOutStream:
+    case kTapStream:
     {
         const UInt32 channels = 2;
         switch (s) {
         case kAudioObjectPropertyBaseClass: REPLY(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass: REPLY(AudioClassID, kAudioStreamClassID);
         case kAudioObjectPropertyOwner: REPLY(AudioObjectID, kDevice);
-        case kAudioObjectPropertyName: REPLY_STR("Picasso Speaker");
+        case kAudioObjectPropertyName: if(o==kTapStream){REPLY_STR("Picasso Playback Reference");} REPLY_STR("Picasso Speaker");
+        // Native UInt32 stream property in iOS16 CoreAudio (not a custom CF value).
+        case 'taps':
+            if(a->mScope!=kAudioObjectPropertyScopeGlobal || a->mElement!=0)return kAudioHardwareUnknownPropertyError;
+            REPLY(UInt32,o==kTapStream);
         case kAudioObjectPropertyOwnedObjects: *outDataSize = 0; return 0;
-        case kAudioStreamPropertyIsActive: REPLY(UInt32, gStreamActive);
-        case kAudioStreamPropertyDirection: REPLY(UInt32, 0);
-        case kAudioStreamPropertyTerminalType: REPLY(UInt32, kAudioStreamTerminalTypeSpeaker);
+        case kAudioStreamPropertyIsActive: REPLY(UInt32, o==kTapStream?gTapActive:gStreamActive);
+        case kAudioStreamPropertyDirection: REPLY(UInt32, o==kTapStream);
+        case kAudioStreamPropertyTerminalType: REPLY(UInt32, o==kTapStream?kAudioStreamTerminalTypeLine:kAudioStreamTerminalTypeSpeaker);
         case kAudioStreamPropertyStartingChannel: REPLY(UInt32, 1);
         case kAudioStreamPropertyLatency: REPLY(UInt32, 0);
         case kAudioStreamPropertyVirtualFormat:
@@ -320,7 +351,7 @@ static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d,AudioObjectID o,
     *set=(outputMaster&&(a->mSelector==kDeviceVolumeScalar||a->mSelector==kDeviceVolumeDecibels||a->mSelector==kDeviceMute))||
         (o==kMute&&a->mSelector==kAudioBooleanControlPropertyValue)||
         (o==kVolume&&(a->mSelector==kAudioLevelControlPropertyScalarValue||a->mSelector==kAudioLevelControlPropertyDecibelValue))||
-        (o==kOutStream&&(a->mSelector==kAudioStreamPropertyVirtualFormat||a->mSelector==kAudioStreamPropertyPhysicalFormat||a->mSelector==kAudioStreamPropertyIsActive))||
+        ((o==kOutStream||(o==kTapStream&&gTapEnabled))&&(a->mSelector==kAudioStreamPropertyVirtualFormat||a->mSelector==kAudioStreamPropertyPhysicalFormat||a->mSelector==kAudioStreamPropertyIsActive))||
         (o==kDevice&&a->mSelector==kAudioDevicePropertyNominalSampleRate);
     return HasProperty(d,o,pid,a)?0:kAudioHardwareUnknownPropertyError;
 }
@@ -350,18 +381,19 @@ static OSStatus setPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid
             gHost->PropertiesChanged(gHost,kDevice,2,changed);}
         return 0;
     }
-    if(o==kOutStream&&a->mSelector==kAudioStreamPropertyIsActive){
+    if((o==kOutStream||(o==kTapStream&&gTapEnabled))&&a->mSelector==kAudioStreamPropertyIsActive){
         if(n!=sizeof(UInt32))return kAudioHardwareBadPropertySizeError;
-        pthread_mutex_lock(&gLock);bool active=*(const UInt32 *)v!=0,changed=active!=gStreamActive;
-        gStreamActive=active;
+        pthread_mutex_lock(&gLock);bool active=*(const UInt32 *)v!=0;
+        bool *state=o==kTapStream?&gTapActive:&gStreamActive,changed=active!=*state;
+        *state=active;
         // Disabling the stream discards queued software mixes; DMA already
         // submitted remains owned by the worker and completes normally.
-        if(!active)memset(&gMix,0,sizeof gMix);
+        if(!active && o==kOutStream)memset(&gMix,0,sizeof gMix);
         pthread_mutex_unlock(&gLock);
-        if(changed&&gHost)gHost->PropertiesChanged(gHost,kOutStream,1,a);
+        if(changed&&gHost)gHost->PropertiesChanged(gHost,o,1,a);
         return 0;
     }
-    if(o==kOutStream&&(a->mSelector==kAudioStreamPropertyVirtualFormat||a->mSelector==kAudioStreamPropertyPhysicalFormat)){
+    if((o==kOutStream||(o==kTapStream&&gTapEnabled))&&(a->mSelector==kAudioStreamPropertyVirtualFormat||a->mSelector==kAudioStreamPropertyPhysicalFormat)){
         AudioStreamBasicDescription f=format(2);return n==sizeof f&&!memcmp(v,&f,sizeof f)?0:kAudioDeviceUnsupportedFormatError;
     }
     if(o==kDevice&&a->mSelector==kAudioDevicePropertyNominalSampleRate)return n==sizeof(Float64)&&*(const Float64 *)v==kRate?0:kAudioDeviceUnsupportedFormatError;
@@ -385,7 +417,7 @@ static void *worker(void *unused){
         kern_return_t rc=method(PicassoAudioWrite,gChunk,sizeof gChunk,NULL,NULL);
         pthread_mutex_lock(&gLock);
         gReservedEnd=0;
-        if(!rc){picasso_mix_consume(&gMix,gSent,1024);gSent+=1024;gMissing+=missing;}
+        if(!rc){picasso_tap_store(&gTap,gSent,1024,gChunk);picasso_mix_consume(&gMix,gSent,1024);gSent+=1024;gMissing+=missing;}
         else if(rc!=kIOReturnNoSpace){gFault=(int)rc;note(4,gFault,2,0);pthread_mutex_unlock(&gLock);break;}
         if((gSent&16383)==0)note(3,0,0,0);
         pthread_mutex_unlock(&gLock);usleep(rc?5000:1000);
@@ -417,6 +449,7 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 clie
         kern_return_t rc=waitIdle();
         if(!rc)rc=method(PicassoAudioBegin,&gFormat,sizeof gFormat,NULL,NULL);
         if(rc){note(2,(int)rc,1,0);pthread_mutex_unlock(&gLock);return kAudioHardwareNotRunningError;}
+        memset(&gTap,0,sizeof gTap);gTapReads=gTapMissing=0;
         memset(&gMix,0,sizeof gMix);gSent=gMissing=gReservedEnd=gCalls=0;gFault=0;gOrigin=mach_absolute_time();++gSeed;
         int e=pthread_create(&gThread,NULL,worker,NULL);if(e){(void)method(PicassoAudioCancel,NULL,0,NULL,NULL);pthread_mutex_unlock(&gLock);return kAudioHardwareUnspecifiedError;}
         gThreadLive=true;note(2,0,1,0);
@@ -430,6 +463,7 @@ static OSStatus StopIO(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 clien
     if(gIoUsers){pthread_mutex_unlock(&gLock);return 0;}
     gStop=true;bool join=gThreadLive;pthread_mutex_unlock(&gLock);if(join)pthread_join(gThread,NULL);
     pthread_mutex_lock(&gLock);gThreadLive=false;(void)method(PicassoAudioCancel,NULL,0,NULL,NULL);note(2,0,4,0);
+    memset(&gTap,0,sizeof gTap);
     // The device still exists after StopIO. Keep this exclusive connection;
     // closing it here would report DeviceIsAlive=0 between previews.
     gStop=false;pthread_mutex_unlock(&gLock);return 0;
@@ -441,15 +475,27 @@ static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d,AudioObjectID o,UI
     *host=gOrigin+(uint64_t)(*sample*gHostTicksPerFrame);*seed=gSeed;pthread_mutex_unlock(&gLock);return 0;
 }
 static OSStatus WillDoIOOperation(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 client,UInt32 op,Boolean *will,Boolean *inPlace){
-    (void)d;(void)client;if(o!=kDevice||!will||!inPlace)return kAudioHardwareIllegalOperationError;*will=op==kAudioServerPlugInIOOperationWriteMix;*inPlace=true;return 0;
+    (void)d;(void)client;if(o!=kDevice||!will||!inPlace)return kAudioHardwareIllegalOperationError;*will=op==kAudioServerPlugInIOOperationWriteMix || (gTapEnabled&&op==kAudioServerPlugInIOOperationReadInput);*inPlace=true;return 0;
 }
 static OSStatus BeginIOOperation(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 c,UInt32 op,UInt32 n,const AudioServerPlugInIOCycleInfo *i){(void)d;(void)o;(void)c;(void)op;(void)n;(void)i;return 0;}
 static OSStatus DoIOOperation(AudioServerPlugInDriverRef d,AudioObjectID o,AudioObjectID stream,UInt32 client,UInt32 op,UInt32 frames,const AudioServerPlugInIOCycleInfo *info,void *main,void *secondary){
     (void)d;(void)client;(void)secondary;
-    if(o!=kDevice||stream!=kOutStream||op!=kAudioServerPlugInIOOperationWriteMix||!info||!main)return kAudioHardwareIllegalOperationError;
-    double t=info->mOutputTime.mSampleTime;if(!isfinite(t)||t<0||t>9007199254740991.0||floor(t)!=t)return kAudioHardwareIllegalOperationError;
+    bool read=op==kAudioServerPlugInIOOperationReadInput && stream==kTapStream && gTapEnabled;
+    bool write=op==kAudioServerPlugInIOOperationWriteMix && stream==kOutStream;
+    if(o!=kDevice||(!read&&!write)||!info||!main||!frames||frames>8192)return kAudioHardwareIllegalOperationError;
+    double t=read?info->mInputTime.mSampleTime:info->mOutputTime.mSampleTime;if(!isfinite(t)||t<0||t>9007199254740991.0||floor(t)!=t)return kAudioHardwareIllegalOperationError;
     if(pthread_mutex_trylock(&gLock))return kAudioHardwareNotRunningError;
     if(!gIoUsers||gFault||gStop){pthread_mutex_unlock(&gLock);return kAudioHardwareNotRunningError;}
+    if(read){
+        uint64_t missing=frames;
+        if(gTapActive)missing=picasso_tap_read(&gTap,(uint64_t)t,frames,main);
+        else memset(main,0,(size_t)frames*2*sizeof(Float32));
+        ++gTapReads;gTapMissing+=missing;
+        // Accepted PCM is a software playback reference, not measured acoustic
+        // feedback. Empty/expired frames are silence and remain counted as gaps.
+        if(gTapReads==1)routeNote(14,0,5,kTapStream,frames,(unsigned)missing,5);
+        pthread_mutex_unlock(&gLock);return 0;
+    }
     if(!gStreamActive){pthread_mutex_unlock(&gLock);return 0;}
     int rc=picasso_mix_add(&gMix,gReservedEnd?gReservedEnd:gSent,(uint64_t)t,frames,main,gain());++gCalls;
     if(rc && gCalls<32)note(4,rc,op,frames);pthread_mutex_unlock(&gLock);
