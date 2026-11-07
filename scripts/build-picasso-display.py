@@ -290,7 +290,7 @@ def main():
                 ROOT / 'kits/picasso/PicassoFat.h', ROOT / 'kits/picasso/PicassoAdspFirmwareProfile.h',
                 ROOT / 'kits/picasso/PicassoAdspLoadPlan.h', ROOT / 'kits/picasso/PicassoAdspBoot.h',
                 ROOT / 'kits/picasso/PicassoQmp.h', ROOT / 'kits/picasso/PicassoSmp2p.h', ROOT / 'kits/picasso/PicassoGlink.h',
-                ROOT / 'kits/picasso/PicassoApr.h', ROOT / 'kits/picasso/PicassoQrtr.h', ROOT / 'kits/picasso/PicassoQmi.h', ROOT / 'kits/picasso/PicassoServloc.h', ROOT / 'kits/picasso/PicassoTftp.h',
+                ROOT / 'kits/picasso/PicassoApr.h', ROOT / 'kits/picasso/PicassoAudioPins.h', ROOT / 'kits/picasso/PicassoQrtr.h', ROOT / 'kits/picasso/PicassoQmi.h', ROOT / 'kits/picasso/PicassoServloc.h', ROOT / 'kits/picasso/PicassoTftp.h',
                 ROOT / 'kits/picasso/PicassoRpcFs.h', ROOT / 'kits/picasso/PicassoRpcStock.inc',
                 ROOT / 'kits/picasso/PicassoFastrpc.h', ROOT / 'kits/picasso/PicassoRpcDma.h',
                 ROOT / 'kits/picasso/PicassoSmemLock.h']

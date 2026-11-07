@@ -42,6 +42,8 @@ static void afeTests();
 static void registryQmiTests();
 static void afeConfigureTests();
 static void afeClockTests();
+static void audioPinTests();
+static void afePortTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -127,7 +129,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
+    audioPinTests();afePortTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -601,6 +603,47 @@ __attribute__((noinline)) static void afeConfigureTests() {
     assert(!s.apr.afe.pending && !s.apr.afe.verified && s.apr.afe.error==-104);
     puts("PASS AFE empty-config gate, stock SET wire, confirmed ACK then exact GET verification, stale replies, mismatch, failures and ownership");
 }
+static uint32_t pinRam[4][2];
+static unsigned pinReads,pinWrites,pinFailRead,pinFailWrite,pinDropWrite;
+static int pinRead(void *,unsigned i,unsigned reg,uint32_t *v) {
+    assert(i<4 && (reg==0 || reg==4));
+    if(++pinReads==pinFailRead)return -5;
+    *v=pinRam[i][reg/4];return 0;
+}
+static int pinWrite(void *,unsigned i,unsigned reg,uint32_t v) {
+    assert(i<4 && (reg==0 || reg==4));++pinWrites;
+    if(pinWrites!=pinDropWrite)pinRam[i][reg/4]=v;
+    return pinWrites==pinFailWrite?-5:0; // model failure after publication
+}
+static void pinsReset(PicassoAudioPins &p) {
+    p={};p.read=pinRead;p.write=pinWrite;
+    pinReads=pinWrites=pinFailRead=pinFailWrite=pinDropWrite=0;
+    for(unsigned i=0;i<4;++i) { pinRam[i][0]=0x2800;pinRam[i][1]=1; }
+}
+__attribute__((noinline)) static void audioPinTests() {
+    PicassoAudioPins p={};
+    assert(picasso_audio_pin_pa(0)==0xf546000 && picasso_audio_pin_pa(3)==0xf54a000);
+    assert(picasso_audio_pins_activate(p)==-6 && !p.dirty);
+    pinsReset(p);pinRam[1][0]=8;assert(picasso_audio_pins_activate(p)==-16 && !pinWrites);
+    pinsReset(p);assert(!picasso_audio_pins_activate(p) && p.active && p.dirty==15);
+    unsigned reads=pinReads,writesTotal=pinWrites;
+    for(unsigned i=0;i<4;++i)assert(pinRam[i][0]==(i==2?0x38c4U:0x3ac4U));
+    picasso_audio_pins_restore(p);assert(p.restored && !p.dirty && !p.active && !p.restoreError);
+    for(unsigned i=0;i<4;++i)assert(pinRam[i][0]==0x2800 && pinRam[i][1]==1);
+    for(unsigned n=1;n<=reads;++n) {
+        pinsReset(p);pinFailRead=n;assert(picasso_audio_pins_activate(p)==-5 && !p.active && !p.dirty);
+        for(unsigned i=0;i<4;++i)assert(pinRam[i][0]==0x2800 && pinRam[i][1]==1);
+    }
+    for(unsigned n=1;n<=writesTotal;++n) {
+        pinsReset(p);pinFailWrite=n;assert(picasso_audio_pins_activate(p)==-5 && !p.active && !p.dirty);
+        for(unsigned i=0;i<4;++i)assert(pinRam[i][0]==0x2800 && pinRam[i][1]==1);
+    }
+    pinsReset(p);pinDropWrite=1;assert(picasso_audio_pins_activate(p)==-5 && p.restored);
+    pinsReset(p);assert(!picasso_audio_pins_activate(p));pinFailWrite=pinWrites+1;
+    picasso_audio_pins_restore(p);assert(p.restoreError==-5 && p.dirty==8 && !p.restored);
+    picasso_audio_pins_restore(p);assert(p.restored && !p.dirty && p.restoreError==-5);
+    puts("PASS stock MI2S pin mapping, readback, preserved bits, conflict rejection and per-I/O rollback faults");
+}
 static unsigned afeConfigured(PicassoGlink &s) {
     unsigned rx=afeEmpty(s);lateDomains(s.qrtr.qmi);step(s);drain(s);
     const uint32_t ack[]={0x00280181,0x404,0x504,0x20520002,0x110e8,0,0,0,0x100ef,0};
@@ -610,7 +653,121 @@ static unsigned afeConfigured(PicassoGlink &s) {
     const uint32_t config[]={0x00500181,0x404,0x504,0x20520003,0x10106,0,0,0,0,0x1020c,0x1020d,20,1,0x10010,0x10000,48000,0,0,0,0};
     packet(s,rx,1,reinterpret_cast<const uint8_t *>(config),sizeof config);message(s,rx,14,7,91);step(s);drain(s);
     assert(s.apr.afe.readbackCompatible && s.apr.afe.stereoUnreported && !s.apr.afe.verified && !s.apr.afe.error);
-    assert(!s.apr.clock.attempted);return rx;
+    assert(!s.apr.clock.attempted);pinsReset(s.apr.pins);return rx;
+}
+static void portAck(PicassoGlink &s,unsigned phase,unsigned status=0) {
+    const uint32_t ack[]={0x00280181,0x404,0x504,0x20540001+phase,0x110e8,0,0,0,phase?0x100e6U:0x100e5U,status};
+    picasso_apr_receive(&s.apr,reinterpret_cast<const uint8_t *>(ack),sizeof ack);
+}
+static void portCycle(PicassoGlink &s,unsigned &rx) {
+    assert(s.apr.clock.enableAccepted && !s.apr.clock.phase);
+    message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+    assert(s.apr.port.pending && !s.apr.port.phase && s.apr.pins.active && !s.apr.clock.phase);
+    portAck(s,0);message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+    assert(s.apr.port.pending && s.apr.port.phase==1 && !s.apr.clock.phase);
+    portAck(s,1);assert(s.apr.port.completed && !s.apr.port.uncertain);
+}
+static unsigned clockEnabled(PicassoGlink &s) {
+    unsigned rx=afeConfigured(s);step(s);drain(s);
+    const uint32_t ack[]={0x00280181,0x404,0x504,0x20530001,0x110e8,0,0,0,0x100f3,0};
+    picasso_apr_receive(&s.apr,reinterpret_cast<const uint8_t *>(ack),sizeof ack);
+    assert(s.apr.clock.enableAccepted && !s.apr.port.attempted);return rx;
+}
+static unsigned portStarted(PicassoGlink &s) {
+    unsigned rx=clockEnabled(s);message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+    assert(s.apr.port.pending && !s.apr.port.phase && s.apr.pins.active);return rx;
+}
+__attribute__((noinline)) static void afePortTests() {
+    uint32_t req[18],expected[]={0x00180250,0x504,0x404,0x20540001,0x100e5,0x1002};
+    assert(picasso_port_request(0,req)==24 && !memcmp(req,expected,sizeof expected));
+    for(unsigned i=6;i<18;++i)assert(!req[i]);
+    assert(picasso_port_request(1,req)==24 && req[3]==0x20540002 && req[4]==0x100e6 && req[5]==0x1002);
+    PicassoGlink s={};unsigned rx=clockEnabled(s);message(s,rx,14,7,91);step(s);drain(s);
+    unsigned at=s.txHead;step(s);drain(s);bool found=false;
+    for(unsigned n=at;n+40<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x10009) {
+        assert(r32(s.tx.offset+n+8)==24 && !memcmp(ram+s.tx.offset+n+16,expected,sizeof expected));found=true;
+    }assert(found && s.apr.port.uncertain && !s.apr.clock.phase);
+    uint32_t ack[]={0x00280181,0x404,0x504,0x20540001,0x110e8,0,0,0,0x100e5,0};
+    auto receive=[&](unsigned bytes){picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),bytes);};
+    for(unsigned n=0;n<sizeof ack;++n)receive(n);
+    const unsigned bad[]={1,2,3,4,8};for(unsigned i:bad){ack[i]^=1;receive(sizeof ack);ack[i]^=1;}
+    ack[0]=0x00280081;receive(sizeof ack);ack[0]=0x00280181;
+    assert(s.apr.port.pending && !s.apr.port.startAccepted && s.apr.pins.active);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(ack),sizeof ack);step(s);drain(s);
+    assert(s.apr.port.startAccepted && s.remoteIntent[0].busy && !s.apr.clock.phase);
+    step(s);drain(s);assert(s.apr.port.phase==1 && !s.apr.port.sent && s.apr.pins.active);
+    message(s,rx,14,7,91);step(s);drain(s);at=s.txHead;step(s);drain(s);
+    expected[3]=0x20540002;expected[4]=0x100e6;found=false;
+    for(unsigned n=at;n+40<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x10009) {
+        assert(!memcmp(ram+s.tx.offset+n+16,expected,sizeof expected));found=true;
+    }assert(found && s.apr.port.pending && !s.apr.clock.phase);
+    receive(sizeof ack);assert(!s.apr.port.stopAccepted && s.apr.port.pending);
+    ack[3]=0x20540002;ack[8]=0x100e6;
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(ack),sizeof ack);message(s,rx,14,7,91);step(s);drain(s);
+    assert(s.apr.port.completed && !s.apr.port.uncertain && !s.apr.clock.phase);
+    step(s);drain(s);assert(s.apr.port.done && s.apr.pins.restored && s.apr.clock.phase==1 && s.apr.clock.pending);
+    // START rejected, ACK lost, and PD loss all STOP before clock release.
+    for(unsigned mode=0;mode<3;++mode) {
+        rx=portStarted(s);
+        if(mode==0)portAck(s,0,2);
+        else if(mode==1)for(unsigned n=0;n<101;++n){step(s);drain(s);}
+        else picasso_qmi_lost(&s.qrtr.qmi);
+        message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+        assert(s.apr.port.phase==1 && s.apr.port.pending && s.apr.port.startError==(mode==0?-5:mode==1?-60:-104));
+        assert(!s.apr.clock.phase && s.apr.pins.active);
+        portAck(s,0);assert(!s.apr.port.startAccepted && s.apr.port.pending);
+        portAck(s,1);assert(s.apr.port.stopAccepted && !s.apr.port.uncertain && !s.apr.port.completed);
+        message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+        assert(s.apr.port.done && s.apr.pins.restored && s.apr.clock.phase==1 && s.apr.clock.pending);
+    }
+    // STOP timeout/error cannot be reported as clean port shutdown.
+    for(unsigned mode=0;mode<2;++mode) {
+        rx=portStarted(s);portAck(s,0);message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+        if(mode)portAck(s,1,1);else for(unsigned n=0;n<101;++n){step(s);drain(s);}
+        step(s);drain(s);assert(s.apr.port.done && s.apr.port.uncertain && !s.apr.port.completed && s.apr.pins.restored);
+        assert(s.apr.port.error==(mode?-5:-60) && s.apr.clock.phase==1 && s.remoteIntent[0].busy);
+        portAck(s,1);assert(!s.apr.port.stopAccepted);
+        message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);assert(s.apr.clock.pending);
+    }
+    // START unsent: pin failure/intent denial/pressure/domain loss releases
+    // pins and clock without pretending that a port command was issued.
+    for(unsigned mode=0;mode<4;++mode) {
+        rx=clockEnabled(s);message(s,rx,14,7,91);
+        if(mode==0)pinFailWrite=1;
+        if(mode==1)s.remoteIntent[0].size=20;
+        step(s);drain(s);
+        if(mode==1)message(s,rx,8,7,0);
+        if(mode==2)p32(s.desc.offset,(s.txHead+8)%s.tx.size);
+        if(mode==3)picasso_qmi_lost(&s.qrtr.qmi);
+        if(mode==2)for(unsigned n=0;n<251;++n)step(s);
+        else {step(s);drain(s);}
+        step(s);drain(s);assert(s.apr.port.done && !s.apr.port.sent && !s.apr.port.uncertain && !s.apr.pins.active);
+        assert(s.apr.clock.phase==1 && s.apr.port.error==(mode==0?-5:mode==1?-28:mode==2?-60:-104));
+    }
+    rx=portStarted(s);portAck(s,0);message(s,rx,14,7,91);step(s);drain(s);
+    p32(s.desc.offset,(s.txHead+8)%s.tx.size);for(unsigned n=0;n<251;++n)step(s);
+    step(s);assert(s.apr.port.done && s.apr.port.error==-60 && s.apr.port.uncertain && !s.remoteIntent[0].busy && s.apr.pins.restored);
+    for(unsigned phase=0;phase<2;++phase) {
+        rx=portStarted(s);if(phase){portAck(s,0);message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);}
+        message(s,rx,3,7,0);step(s);
+        assert(s.apr.port.done && s.apr.port.error==-104 && !s.apr.port.pending && s.apr.port.uncertain && s.apr.pins.restored && s.apr.clock.uncertain);
+    }
+    // Fault every SMEM write while publishing either port command.
+    for(unsigned phase=0;phase<2;++phase) {
+        auto prepare=[&](){
+            rx=clockEnabled(s);
+            if(phase){message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);portAck(s,0);}
+            message(s,rx,14,7,91);step(s);drain(s);
+        };
+        prepare();writes=0;step(s);unsigned total=writes;assert(total>=11);bool kick;
+        for(unsigned n=1;n<=total;++n) {
+            prepare();writes=0;failWrite=n;
+            assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && s.apr.port.done && !s.apr.port.pending);
+            assert(s.apr.pins.restored && s.apr.clock.uncertain && !s.apr.port.completed);
+            if(phase || n>total-11)assert(s.apr.port.uncertain);
+        }
+    }
+    puts("PASS real GLINK START/STOP wire, clock hold, strict ACKs, deadlines, PD loss, close and every TX write fault");
 }
 __attribute__((noinline)) static void afeClockTests() {
     // Fixed-zero readback is specific to the observed build/API and otherwise
@@ -634,7 +791,10 @@ __attribute__((noinline)) static void afeClockTests() {
         assert(r32(s.tx.offset+n+8)==68 && !memcmp(ram+s.tx.offset+n+16,expected,sizeof expected) && !r32(s.tx.offset+n+84));found=true;
     }assert(found);
     uint32_t ack[]={0x00280181,0x404,0x504,0x20530001,0x110e8,0,0,0,0x100f3,0};
-    auto receive=[&](unsigned bytes){picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),bytes);};
+    auto receive=[&](unsigned bytes){
+        picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),bytes);
+        if(s.apr.clock.enableAccepted && !s.apr.port.attempted && !s.apr.clock.phase)portCycle(s,rx);
+    };
     for(unsigned n=0;n<sizeof ack;++n)receive(n);
     const unsigned badAck[]={1,2,3,4,8};
     for(unsigned i:badAck) { ack[i]^=1;receive(sizeof ack);ack[i]^=1; }
@@ -642,7 +802,8 @@ __attribute__((noinline)) static void afeClockTests() {
     assert(s.apr.clock.pending && !s.apr.clock.enableAccepted);
     packet(s,rx,1,reinterpret_cast<uint8_t *>(ack),sizeof ack);step(s);drain(s);
     assert(s.apr.clock.enableAccepted && !s.apr.clock.completed && s.remoteIntent[0].busy);
-    step(s);drain(s);assert(s.apr.clock.phase==1 && !s.apr.clock.sent && s.remoteIntent[0].busy);
+    portCycle(s,rx);
+    step(s);drain(s);assert(s.apr.clock.phase==1 && !s.apr.clock.sent && s.remoteIntent[0].busy && s.apr.pins.restored);
     message(s,rx,14,7,91);step(s);drain(s);at=s.txHead;step(s);drain(s);
     assert(s.apr.clock.pending && s.apr.clock.token==0x20530002);
     expected[3]=0x20530002;expected[16]=0;found=false;

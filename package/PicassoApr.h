@@ -84,8 +84,8 @@ inline bool picasso_afe_due(PicassoAprProbe *p) {
     v.error=-2;++v.events;return false;
 }
 // Stock q6afe_clk_set_params_v1 / afe_clk_set, secondary IBIT=0x102.
-// Exercise a bounded 48k * 2 * 16 clock vote, then release it. No DEVICE_START,
-// pins, amplifier or PCM; BASIC success confirms a vote, not a measured clock.
+// Hold a bounded 48k * 2 * 16 vote through the port START/STOP probe, then
+// release it. BASIC success confirms a vote, not a measured clock.
 inline unsigned picasso_clock_request(unsigned phase,uint32_t (&w)[18]) {
     for(auto &v:w)v=0;
     w[0]=0x00440250;w[1]=0x504;w[2]=0x404;w[3]=0x20530001+phase;w[4]=0x100f3;
@@ -94,9 +94,40 @@ inline unsigned picasso_clock_request(unsigned phase,uint32_t (&w)[18]) {
     return 68;
 }
 inline void picasso_clock_stop(PicassoAprProbe *p,int error) {
+    picasso_audio_pins_restore(p->pins);
+    auto &v=p->port;
+    if(v.attempted) { v.pending=false;v.done=true;v.completed=false;v.error=error;++v.events; }
     auto &c=p->clock;if(!c.attempted)return;
     c.pending=false;c.completed=false;c.error=error;++c.events;
     // Preserve uncertain until an actual disable ACK; SSR is not that ACK.
+}
+inline unsigned picasso_port_request(unsigned phase,uint32_t (&w)[18]) {
+    for(auto &v:w)v=0;
+    // Stock afe_send_cmd_port_start / afe_close: 20-byte APR + port/reserved.
+    w[0]=0x00180250;w[1]=0x504;w[2]=0x404;w[3]=0x20540001+phase;
+    w[4]=phase?0x100e6:0x100e5;w[5]=0x1002;return 24;
+}
+inline void picasso_port_tick(PicassoAprProbe *p,const PicassoQmi &q) {
+    auto &v=p->port;
+    if(!v.attempted || v.done)return;
+    if(!v.phase && !picasso_afe_domains_up(q) && !v.error) {
+        v.pending=false;v.error=-104;++v.events;
+    }
+    if(!v.pending && (v.responded || v.error)) {
+        if(!v.phase && v.sent) {
+            // START can have taken effect even when its ACK was lost. Always
+            // issue STOP before releasing the clock, retaining uncertainty.
+            v.startError=v.error;v.phase=1;v.sent=v.responded=false;
+            v.wait=v.status=v.opcode=0;v.error=0;++v.events;
+        } else { v.done=true;++v.events;return; }
+    }
+    if(!v.error && (v.pending || !v.sent) && ++v.wait>(v.pending?100U:250U)) {
+        v.pending=false;v.error=-60;++v.events;
+    }
+}
+inline bool picasso_port_due(const PicassoAprProbe &p) {
+    const auto &v=p.port;
+    return p.ready && p.fw.valid && v.attempted && !v.done && !v.sent && !v.error;
 }
 inline void picasso_clock_tick(PicassoAprProbe *p,const PicassoQmi &q) {
     auto &c=p->clock;
@@ -106,10 +137,17 @@ inline void picasso_clock_tick(PicassoAprProbe *p,const PicassoQmi &q) {
         c.attempted=true;++c.events;
     }
     if(!c.attempted || c.completed)return;
-    if(!c.phase && !picasso_afe_domains_up(q) && !c.error) {
+    if(!c.phase && !picasso_afe_domains_up(q) && !c.error && !c.enableAccepted) {
         c.pending=false;c.error=-104;++c.events;
     }
     if(!c.phase && c.sent && !c.pending && (c.responded || c.error)) {
+        auto &v=p->port;
+        if(!v.attempted && c.enableAccepted && !c.error && p->afe.valid && !p->afe.error && picasso_afe_domains_up(q)) {
+            v.attempted=true;v.error=picasso_audio_pins_activate(p->pins);++v.events;
+        }
+        picasso_port_tick(p,q);
+        if(v.attempted && !v.done)return;
+        picasso_audio_pins_restore(p->pins);
         c.enableError=c.error;c.phase=1;c.sent=c.pending=c.responded=false;
         c.wait=c.status=c.opcode=0;c.error=0;++c.events;
     }
@@ -137,6 +175,15 @@ inline void picasso_apr_receive(PicassoAprProbe *p, const uint8_t *data, uint32_
         ++p->malformed; return;
     }
     uint32_t type=(header>>8)&3;
+    if(p->port.pending && p->receivedToken==p->port.token) {
+        auto &v=p->port;const auto *b=data+headerBytes;
+        if(type!=1 || p->source!=0x404 || p->destination!=0x504 || p->opcode!=0x110e8 ||
+            size-headerBytes!=8 || wlan_sm32(b)!=(v.phase?0x100e6U:0x100e5U)) { ++p->ignored;return; }
+        v.status=wlan_sm32(b+4);v.opcode=p->opcode;v.pending=false;v.responded=true;v.error=v.status?-5:0;
+        if(!v.phase)v.startAccepted=!v.status;
+        else if(!v.status) { v.stopAccepted=true;v.uncertain=false;v.completed=v.startAccepted && !v.startError; }
+        ++v.events;return;
+    }
     if(p->clock.pending && p->receivedToken==p->clock.token) {
         auto &c=p->clock;const auto *b=data+headerBytes;
         if(type!=1 || p->source!=0x404 || p->destination!=0x504 || p->opcode!=0x110e8 ||

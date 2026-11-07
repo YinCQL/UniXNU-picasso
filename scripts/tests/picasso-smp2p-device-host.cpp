@@ -7,7 +7,7 @@
 #include "PicassoSmp2p.h"
 #include "PicassoAdspBoot.h"
 extern "C" void picasso_adsp_boot(const PicassoAdspEvents *e);
-static uint32_t ram[WLAN_SMEM_SIZE/4], mutexRam[1024], ipccRam[1024];
+static uint32_t ram[WLAN_SMEM_SIZE/4], mutexRam[1024], ipccRam[1024], audioRam[4][1024];
 static unsigned allocations,mappings,releases,unmaps,lines,sleeps,preempt,plans,kicks;
 static unsigned failAlloc,failMap,zeroMap;
 static bool peer,transport;
@@ -25,13 +25,17 @@ public:
     unsigned slot;
     static IODeviceMemory *withRange(uint64_t base,uint64_t bytes) {
         unsigned at=base==WLAN_SMEM_BASE?0:base==0x01f43000?1:2;
-        assert(at<2 || base==0x00408000);assert(bytes==(at?4096:WLAN_SMEM_SIZE));
-        static IODeviceMemory memory[3];memory[at].slot=at;
+        if(at==2 && base!=0x00408000) {
+            const uint64_t pa[]={0xf546000,0xf547000,0xf548000,0xf54a000};
+            unsigned i=0;for(;i<4 && base!=pa[i];++i){}assert(i<4);at=3+i;
+        }
+        assert(bytes==(at?4096:WLAN_SMEM_SIZE));
+        static IODeviceMemory memory[7];memory[at].slot=at;
         return ++allocations==failAlloc?nullptr:&memory[at];
     }
     IOMemoryMap *map(unsigned flags) {
-        assert(flags==3);static IOMemoryMap maps[3];++mappings;
-        maps[slot].address=mappings==zeroMap?0:reinterpret_cast<uintptr_t>(slot==0?ram:slot==1?mutexRam:ipccRam);
+        assert(flags==3);static IOMemoryMap maps[7];++mappings;
+        maps[slot].address=mappings==zeroMap?0:reinterpret_cast<uintptr_t>(slot==0?ram:slot==1?mutexRam:slot==2?ipccRam:audioRam[slot-3]);
         return mappings==failMap?nullptr:&maps[slot];
     }
     void release(){++releases;}
@@ -170,7 +174,27 @@ int main(int argc,char **argv) {
         if(strcmp(mode,"gate"))assert(!allocatorGate);
     }
     puts("PASS SMP2P device mappings, local/remote ownership, one-shot gate, persistent poll/negotiation and bounded logging");
+    failAlloc=failMap=zeroMap=0;
+    unsigned oldAlloc=allocations;uint32_t value=0;
+    assert(audioPinRead(nullptr,4,0,&value)==-22 && audioPinRead(nullptr,0,8,&value)==-22);
+    assert(allocations==oldAlloc);
+    for(unsigned i=0;i<4;++i) {
+        audioRam[i][0]=0x2800;audioRam[i][1]=1;
+        assert(!audioPinRead(nullptr,i,0,&value) && value==0x2800);
+        assert(!audioPinWrite(nullptr,i,4,2) && audioRam[i][1]==2);
+    }
+    failAlloc=allocations+1;assert(audioPinRead(nullptr,0,0,&value)==-12);failAlloc=0;
+    failMap=mappings+1;assert(audioPinWrite(nullptr,0,4,0)==-12);failMap=0;
+    zeroMap=mappings+1;assert(audioPinRead(nullptr,0,0,&value)==-12);zeroMap=0;
+    assert(audioRam[0][1]==2);
+    PicassoAudioPins pins={};pins.read=audioPinRead;pins.write=audioPinWrite;
+    assert(!picasso_audio_pins_activate(pins) && pins.active);
+    picasso_audio_pins_restore(pins);assert(pins.restored && !pins.dirty);
+    for(unsigned i=0;i<4;++i)assert(audioRam[i][0]==0x2800 && audioRam[i][1]==2);
+    puts("PASS four exact audio GPIO mappings, invalid offsets, allocation/map/zero-VA errors and device adapter restoration");
     checkShortLogs=true;
+    pins.attempted=pins.active=pins.restored=true;pins.dirty=0xffffffff;
+    pins.error=pins.restoreError=-2147483647;for(auto &v:pins.observed)v=0xffffffff;logAudioPins(pins);
     PicassoRpcDomain record={};record.pd=record.requests=record.lastHandle=record.lastScalar=0xffffffffU;
     record.wireBytes=record.decodeResult=record.previousResult=0xffffffffU;
     memset(record.name,'n',127);memset(record.fs.target,'t',127);

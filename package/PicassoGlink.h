@@ -5,6 +5,7 @@
 #include "PicassoSmp2p.h"
 #include "PicassoQrtr.h"
 #include "PicassoFastrpc.h"
+#include "PicassoAudioPins.h"
 enum { PicassoGlinkChannels = 16, PicassoGlinkRemoteIntents = 64,
        PicassoGlinkLocalIntents = 20, PicassoGlinkPacket = 512 };
 struct PicassoGlinkChannel {
@@ -49,6 +50,12 @@ struct PicassoAprProbe {
         bool attempted,sent,pending,responded,enableAccepted,disableAccepted,uncertain,completed;
         int error,enableError;
     } clock;
+    struct {
+        uint32_t phase,token,wait,status,opcode,events; // 0 START, 1 STOP
+        bool attempted,sent,pending,responded,startAccepted,stopAccepted,uncertain,done,completed;
+        int error,startError;
+    } port;
+    PicassoAudioPins pins;
 };
 struct PicassoGlink {
     // Contains pointers into its own static storage: prepare in final location,

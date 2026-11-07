@@ -248,9 +248,10 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     bool version=a.ready && !a.fw.sent && !a.fw.error;
     bool afe=picasso_afe_due(&a);
     bool clock=picasso_clock_due(a);
-    if ((a.ready && !version && !afe && !clock) || a.error) return 0;
-    if (!version && !afe && !clock && (a.pending || a.ticks < a.next)) return 0;
-    unsigned requestBytes=clock?68:afe?(a.afe.phase==1?68:56):20;
+    bool port=picasso_port_due(a);
+    if ((a.ready && !version && !afe && !clock && !port) || a.error) return 0;
+    if (!version && !afe && !clock && !port && (a.pending || a.ticks < a.next)) return 0;
+    unsigned requestBytes=port?24:clock?68:afe?(a.afe.phase==1?68:56):20;
     PicassoGlinkRemoteIntent *slot = nullptr;
     for (auto &i : s->remoteIntent) if (i.used && !i.busy && i.size >= requestBytes) { slot = &i; break; }
     if (!slot) {
@@ -263,17 +264,19 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     }
     uint32_t words[22] = {9U | (uint32_t(c.local) << 16), slot->id, requestBytes, 0};
     uint32_t query[5]; picasso_apr_query(version?0x18710001:a.token + 1, query);
-    if(afe || clock) { uint32_t request[18];if(clock)picasso_clock_request(a.clock.phase,request);else picasso_afe_request(a.afe.phase,request);for(unsigned i=0;i<requestBytes/4;++i)words[4+i]=request[i]; }
+    if(afe || clock || port) { uint32_t request[18];if(port)picasso_port_request(a.port.phase,request);else if(clock)picasso_clock_request(a.clock.phase,request);else picasso_afe_request(a.afe.phase,request);for(unsigned i=0;i<requestBytes/4;++i)words[4+i]=request[i]; }
     else { if(version)query[4]=0x1292c;for (unsigned i = 0; i < 5; ++i) words[4 + i] = query[i]; }
     if ((error = transmit(io, s, words,16+((requestBytes+7)&~7U), kick))) {
         // I/O failure may leave publication ambiguous; lack of an ACK never
         // establishes that an enable vote was not applied. TX pressure did not
         // publish this request and must not acquire a vote or remote intent.
         if(clock && !a.clock.phase && s->failed)a.clock.uncertain=true;
+        if(port && !a.port.phase && s->failed)a.port.uncertain=true;
         return error;
     }
     slot->busy = true;
-    if(clock) { a.clock.sent=a.clock.pending=true;a.clock.token=words[7];a.clock.wait=0;if(!a.clock.phase)a.clock.uncertain=true;++a.clock.events; }
+    if(port) { a.port.sent=a.port.pending=true;a.port.token=words[7];a.port.wait=0;if(!a.port.phase)a.port.uncertain=true;++a.port.events; }
+    else if(clock) { a.clock.sent=a.clock.pending=true;a.clock.token=words[7];a.clock.wait=0;if(!a.clock.phase)a.clock.uncertain=true;++a.clock.events; }
     else if(afe) { a.afe.sent=a.afe.pending=true;a.afe.token=words[7];a.afe.wait=0;++a.afe.events; }
     else if(version) {
         a.fw.sent=a.fw.pending=true;a.fw.token=query[3];a.fw.wait=0;++a.fw.events;
@@ -431,7 +434,8 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
             if (c->local==1 && !s->apr.pending) {
                 auto &a=s->apr;
                 if(a.ready && a.fw.valid) {
-                    if(picasso_clock_due(a)) { a.clock.error=-28;++a.clock.events; }
+                    if(picasso_port_due(a)) { a.port.error=-28;++a.port.events; }
+                    else if(picasso_clock_due(a)) { a.clock.error=-28;++a.clock.events; }
                     else if(!a.afe.sent && !a.afe.error) { a.afe.error=-28;++a.afe.events; }
                 } else if(a.ready) {
                     if(!a.fw.sent && !a.fw.error) { a.fw.error=-28;++a.fw.events; }

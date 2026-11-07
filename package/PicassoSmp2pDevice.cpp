@@ -58,6 +58,18 @@ IOMemoryMap *smemMap(uint64_t base, uint64_t bytes) {
     IOMemoryMap *map = m->map(kIOMapAnywhere | kIOMapInhibitCache);
     m->release(); return map;
 }
+// One-shot audio pin transaction: map only the four documented GPIO pages.
+// No global TLMM sweep, interrupt clearing, reset or amplifier writes.
+int audioPinAccess(unsigned index,unsigned reg,uint32_t *value,bool write) {
+    if(index>=4 || (reg!=0 && reg!=4) || !value)return -22;
+    OSSharedPtr<IOMemoryMap> map(smemMap(picasso_audio_pin_pa(index),0x1000),OSNoRetain);
+    if(!map || !map->getVirtualAddress())return -12;
+    auto *p=reinterpret_cast<volatile uint32_t *>(uintptr_t(map->getVirtualAddress())+reg);
+    if(write)*p=*value;else *value=*p;
+    smemBarrier(nullptr);return 0;
+}
+int audioPinRead(void *,unsigned i,unsigned reg,uint32_t *v) { return audioPinAccess(i,reg,v,false); }
+int audioPinWrite(void *,unsigned i,unsigned reg,uint32_t v) { return audioPinAccess(i,reg,&v,true); }
 int prepare(SmemDevice *d, const PicassoSmemIo *io, PicassoSmp2p *s, PicassoGlink *glink) {
     s->audit.phase = "lock";
     if (__atomic_exchange_n(&allocatorGate, 1U, __ATOMIC_ACQ_REL)) return -16;
@@ -100,8 +112,12 @@ struct BootEvents {
     uint32_t qmiEvents = 0, qmiLogs = 0;
     uint32_t locatorEvents = 0, locatorLogs = 0, fwEvents = 0, afeEvents = 0;
     uint32_t tftpEvents = 0, tftpLogs = 0;
-    uint32_t clockEvents = 0;
+    uint32_t clockEvents = 0, portEvents = 0, pinEvents = 0;
 };
+void logAudioPins(const PicassoAudioPins &p) {
+IOLog("PICASSO_ADSP afe-pins attempted=%u active=%u restored=%u dirty=%x error=%d restore_error=%d ctl=%x/%x/%x/%x amplifier=0 pcm=0\n",
+                p.attempted,p.active,p.restored,p.dirty,p.error,p.restoreError,p.observed[0],p.observed[1],p.observed[2],p.observed[3]);
+}
 void logAfe(const PicassoAprProbe &a) {
     const auto &v=a.afe;
     IOLog("PICASSO_ADSP afe sent=%u pending=%u responded=%u valid=%u api=%u token=%x opcode=%x status=%u error=%d port=1002 pcm=0\n",
@@ -257,8 +273,19 @@ void bootService(void *context) {
             const auto &c=a.clock;b->clockEvents=c.events;
             IOLog("PICASSO_ADSP afe-clock phase=%u token=%x sent=%u pending=%u responded=%u status=%u error=%d enable_error=%d id=102 hz=1536000\n",
                 c.phase,c.token,c.sent,c.pending,c.responded,c.status,c.error,c.enableError);
-            IOLog("PICASSO_ADSP afe-clock-vote enable_accepted=%u disable_accepted=%u uncertain=%u complete=%u measured=0 started=0 pcm=0\n",
+            IOLog("PICASSO_ADSP afe-clock-vote enable_accepted=%u disable_accepted=%u uncertain=%u complete=%u measured=0 pcm=0\n",
                 c.enableAccepted,c.disableAccepted,c.uncertain,c.completed);
+        }
+        if(a.port.events!=b->portEvents) {
+            const auto &v=a.port;b->portEvents=v.events;
+            IOLog("PICASSO_ADSP afe-port phase=%u token=%x sent=%u pending=%u responded=%u status=%u error=%d start_error=%d port=1002\n",
+                v.phase,v.token,v.sent,v.pending,v.responded,v.status,v.error,v.startError);
+            IOLog("PICASSO_ADSP afe-port-state start_accepted=%u stop_accepted=%u uncertain=%u done=%u complete=%u pins=%u amplifier=0 pcm=0\n",
+                v.startAccepted,v.stopAccepted,v.uncertain,v.done,v.completed,a.pins.active);
+        }
+        if(a.pins.events!=b->pinEvents) {
+            const auto &p=a.pins;b->pinEvents=p.events;
+            logAudioPins(p);
         }
         if(q.locator.events!=b->locatorEvents && b->locatorLogs<32) {
             logLocator(q.locator);b->locatorEvents=q.locator.events;++b->locatorLogs;
@@ -349,6 +376,7 @@ extern "C" void picasso_smp2p_start(void) {
         error, s.created, s.partition.offset, s.partition.size, s.out.offset, s.out.size, lockRead(&d));
     logAudit(s);
     if (error) return;
+    glink.apr.pins.read=audioPinRead;glink.apr.pins.write=audioPinWrite;
     smpKick(&d);
     IOLog("PICASSO_ADSP glink stage=prepared descriptor=%x/%x tx=%x/%x remote_pid=2\n",
         glink.desc.offset,glink.desc.size,glink.tx.offset,glink.tx.size);
