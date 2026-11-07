@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoSubmit.h"
+#include "NativeAdrenoProfile.h"
 #include "AdrenoPM4.h"
 #include <IOKit/IOLib.h>
 #include <pexpert/pexpert.h>
@@ -126,7 +127,10 @@ IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
     /* The diagnosis is parsed here, not in the service: this board attaches through Adreno620Cp and the
      * service's CP-start block is compiled out (NATIVE_ADRENO_HAVE_COMMAND_DB), so parsing there left
      * native_adreno_diag at zero and the job timeline unallocated even with sheng-diag=1 on the command line. */
-    {unsigned diag=0,timeline=0,stamps=0;PE_parse_boot_argn("sheng-diag",&diag,sizeof(diag));
+    {unsigned diag=0,timeline=0,stamps=0,profile=0,batch=0;PE_parse_boot_argn("ngp",&profile,sizeof(profile));
+     PE_parse_boot_argn("ngb",&batch,sizeof(batch));batch_ib_peek_=batch==1;
+     native_adreno_profile_enabled=profile==1;
+     PE_parse_boot_argn("sheng-diag",&diag,sizeof(diag));if(native_adreno_profile_enabled)diag=1;
      native_adreno_diag=diag==1;
      if(!PE_parse_boot_argn("sheng-gpu-timeline",&timeline,sizeof(timeline)))timeline=diag==1;
      /* The plain path's CP stamps are off by default: the gpu19 boot that first put them in the client's ring lost the Metal device
@@ -141,6 +145,7 @@ IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
      /* The per-method call ring (8 MiB) is what separates a slow method from a method waiting on g.lock. */
      if(native_adreno_call_start && native_adreno_diag)native_adreno_call_start();
      printf("PICASSO_GPU tl attach: diag=%u timeline=%u stamps=%u cap=%u\n",native_adreno_diag,timeline,stamps,native_adreno_tl_cap);}
+    printf("PICASSO_GPU ibpeek batch=%u\n",batch_ib_peek_?1u:0u);
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoSubmit::setTableSwitching(unsigned mode,IOReturn (*write)(void *,uint64_t),void *cookie)
@@ -159,7 +164,9 @@ IOReturn NativeAdrenoSubmit::useVm(NativeAdrenoVm *vm,const NativeAdrenoRingCloc
     if(!table_mode_ || vm==table_vm_)return kIOReturnSuccess;
     if(table_mode_==2) {ring(0)->useTable(vm->ttbr0());table_vm_=vm;return kIOReturnSuccess;}
     if(!clock)return kIOReturnBadArgument;
+    NativeAdrenoProfileTimer drain(NativeProfileDrain);
     IOReturn status=waitAll(clock,2000000);
+    drain.finish();
     if(status)return status;
     status=write_table_(table_cookie_,vm->ttbr0());
     if(status)return poison();
@@ -456,6 +463,8 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
 IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitBuffer *buffers,size_t count,
     uint64_t queue,uint32_t *fence,const NativeAdrenoRingClock *clock)
 {
+    NativeAdrenoProfileTimer body(NativeProfileBody);
+    NativeAdrenoProfileTimer validation(NativeProfileValidate);
     if(!fence)return kIOReturnBadArgument;*fence=0;
     if(!vm)vm=vm_;
     NativeAdrenoVm *const vm_=vm;   /* this submission's VM: every vm_ below is the job's own */
@@ -490,7 +499,10 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
         for(size_t j=0;j<handle_count;++j)if(handles[j]==buffer.handle) {known=true;break;}
         if(!known)handles[handle_count++]=buffer.handle;
     }
+    validation.finish();
+    NativeAdrenoProfileTimer retirement(NativeProfileRetire);
     IOReturn swept=retireCompleted();
+    retirement.finish();
     if(swept)return swept;
     Job *job=free();
     if(!job)return kIOReturnNoMemory;
@@ -502,6 +514,7 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
         }
         ++stats_.references_held;
     }
+    NativeAdrenoProfileTimer audit(NativeProfileAudit);
     uint32_t value=0;
     /* int-070: the first IB word as the kernel's cacheable alias and DRAM see it before any maintenance, then DRAM after the CPU
      * caches over every mapped BO are cleaned and invalidated. The board shows the last submission's record on a stall. */
@@ -590,7 +603,10 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     static uint32_t coherence_turn;
     const bool sample=!(coherence_turn++&63);
     if(sample)(void)vm_->sampleWord(buffers[0].iova,&cached,&before);
+    audit.finish();
+    NativeAdrenoProfileTimer publication(NativeProfilePublish);
     IOReturn status=vm_->publishMapped();
+    publication.finish();
     if(!status && sample) {
         (void)vm_->sampleWord(buffers[0].iova,&ignored,&after);
         native_adreno_coherence[0]=native_adreno_coherence[0]+1;
@@ -614,13 +630,17 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     NativeAdrenoRing *const target=ring(index);
     {
         const uint32_t slot=native_adreno_ib_log_count&3;uint32_t head[28];
-        (void)vm_->peekWords(buffers[0].iova,head,28);
+        NativeAdrenoProfileTimer peek(NativeProfileIbPeek);
+        (void)vm_->peekWords(buffers[0].iova,head,28,batch_ib_peek_);
+        peek.finish();
         native_adreno_ib_log[slot][0]=target->lastSubmitted()+1;native_adreno_ib_log[slot][1]=(uint32_t)buffers[0].iova;
         native_adreno_ib_log[slot][2]=(uint32_t)(buffers[0].iova>>32);native_adreno_ib_log[slot][3]=(uint32_t)buffers[0].bytes;
         for(unsigned i=0;i<28;++i)native_adreno_ib_log[slot][4+i]=head[i];
         native_adreno_ib_log_count=native_adreno_ib_log_count+1;
     }
+    NativeAdrenoProfileTimer switching(NativeProfileSwitch);
     status=useVm(vm,clock);
+    switching.finish();
     if(status) {
         for(size_t i=0;i<handle_count;++i) {vm_->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}
         return status;
@@ -631,8 +651,10 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     uint32_t base=fence_issued_;
     for(unsigned i=0;i<ring_count_;++i)if((int32_t)(ring(i)->lastSubmitted()-base)>0)base=ring(i)->lastSubmitted();
     const uint32_t number=(value=base)+1;
+    NativeAdrenoProfileTimer ring_submit(NativeProfileRing);
     status=a6xx_?target->submit(words,word_count,&value):
         preemption()?target->submitFramed(words,word_count,number,&value):target->submitFramed(words,word_count,&value);
+    ring_submit.finish();
     if(status) {
         if(!value)fence_issued_=base;
         /* A poisoned ring may already have consumed the WPTR write, so the

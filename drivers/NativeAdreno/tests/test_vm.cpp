@@ -86,8 +86,71 @@ static IOReturn exposed(Fixture &s,size_t capacity=32,size_t pages=16)
 }
 static IOReturn object(Fixture &s,size_t pages)
 {return s.object.allocate(pages*4096,40,false,pages*4096);}
+static const NativeAdrenoMemory *peek_object;
+static unsigned peek_scalar_calls,peek_batch_calls,peek_fail_call;
+static size_t peek_short_limit;
+static bool peek_oversize;
+static int peekRead32(uint64_t physical,uint32_t *out)
+{
+    ++peek_scalar_calls;
+    for(size_t i=0;i<peek_object->spanCount();++i) {
+        const auto &span=peek_object->spans()[i];
+        if(physical>=span.physical && physical-span.physical+4<=span.bytes) {
+            std::memcpy(out,static_cast<const char *>(peek_object->descriptor()->raw)+span.offset+physical-span.physical,4);return 0;
+        }
+    }
+    return -1;
+}
+static int peekReadWords(uint64_t physical,uint32_t *out,size_t count)
+{
+    CHECK(count && !(physical&3) && (physical&4095)+count*4<=4096);
+    ++peek_batch_calls;
+    if(peek_batch_calls==peek_fail_call)return -1;
+    if(peek_oversize)return int(count+1);
+    if(peek_short_limit && count>peek_short_limit)count=peek_short_limit;
+    for(size_t i=0;i<count;++i)CHECK(!peekRead32(physical+4*i,out+i));
+    return int(count);
+}
+static void checkIbPeek()
+{
+    native_adreno_dram_read32=peekRead32;native_adreno_dram_read_words=peekReadWords;
+    for(auto mode:{Contiguous,Scattered}) {
+        Fixture s;CHECK(!exposed(s));fixture.mode=mode;
+        CHECK(!s.object.allocateSystem(3*4096,40,3*4096,true));peek_object=&s.object;
+        CHECK(!s.object.mapping());
+        for(size_t i=0;i<3*4096/4;++i)static_cast<uint32_t *>(s.object.descriptor()->raw)[i]=uint32_t(i)^0x5a6b7c8d;
+        uint64_t handle=0;CHECK(!s.vm.map(&s.object,0,0x800000,3,0,2,&handle));
+        for(size_t offset:{0,4,4092,4096,8120,8192,12284}) {
+            uint32_t scalar[28],batch[28];
+            CHECK(!s.vm.peekWords(0x800000+offset,scalar,28));
+            CHECK(!s.vm.peekWords(0x800000+offset,batch,28,true));
+            CHECK(!std::memcmp(scalar,batch,sizeof(batch)));
+        }
+        uint32_t words[28];peek_batch_calls=peek_scalar_calls=0;
+        CHECK(!s.vm.peekWords(0x800000,words,28,true) && peek_batch_calls==1 && peek_scalar_calls==28);
+        peek_batch_calls=0;CHECK(!s.vm.peekWords(0x800ffc,words,28,true) && peek_batch_calls==2);
+        peek_short_limit=3;peek_batch_calls=0;
+        CHECK(!s.vm.peekWords(0x800000,words,28,true) && peek_batch_calls==10);peek_short_limit=0;
+        peek_fail_call=2;peek_batch_calls=0;
+        CHECK(s.vm.peekWords(0x800ffc,words,28,true)==kIOReturnUnsupported);
+        CHECK(words[0]==(uint32_t(4092/4)^0x5a6b7c8d));
+        for(size_t i=1;i<28;++i)CHECK(!words[i]);peek_fail_call=0;
+        peek_oversize=true;CHECK(s.vm.peekWords(0x800000,words,28,true)==kIOReturnUnsupported);peek_oversize=false;
+        native_adreno_dram_read_words=nullptr;peek_scalar_calls=0;
+        CHECK(!s.vm.peekWords(0x800000,words,28,true) && peek_scalar_calls==28);
+        native_adreno_dram_read_words=peekReadWords;peek_batch_calls=0;
+        CHECK(!s.vm.peekWords(0x800000,words,0,true) && !peek_batch_calls);
+        CHECK(s.vm.peekWords(0x800000,nullptr,28,true)==kIOReturnBadArgument);
+        CHECK(s.vm.peekWords(0x810000,words,28,true)==kIOReturnBadArgument);
+        CHECK(!s.vm.unmap(handle) && !s.object.release() && !s.vm.detach() && !s.tables.release());
+        CHECK(fixture.live.empty() && fixture.metadata.empty());fixture.mode=Contiguous;
+    }
+    native_adreno_dram_read32=nullptr;native_adreno_dram_read_words=nullptr;peek_object=nullptr;
+    std::printf("PASS: batched IB snapshots match scalar reads across pages, scattered spans and BO tails; partial/error/fallback cases\n");
+}
 int main()
 {
+    checkIbPeek();
     /* A real map/hold/unmap transaction across the actual code paths. */
     {
         Fixture s;
