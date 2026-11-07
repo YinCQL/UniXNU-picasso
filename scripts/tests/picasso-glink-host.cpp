@@ -46,6 +46,7 @@ static void audioPinTests();
 static void afePortTests();
 static void tfaPortTests();
 static void streamTests();
+static void pcmTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -131,7 +132,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    audioPinTests();afePortTests();tfaPortTests();streamTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
+    audioPinTests();afePortTests();tfaPortTests();streamTests();pcmTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -1443,4 +1444,83 @@ __attribute__((noinline)) static void streamTests() {
     PicassoAprProbe p={};PicassoQmi q={};lateDomains(q);p.clock.completed=p.port.completed=p.pins.restored=true;
     p.tfa.identified=p.tfa.complete=p.tfa.restored=true;picasso_stream_tick(&p,q);assert(p.stream.error==-95 && p.stream.done);
     puts("PASS ASM stock OPEN/PCM/CLOSE wire, exact ACKs, intent ownership, timeout, errors, domain loss, close and every publication fault");
+}
+
+static int pcmFault;static unsigned pcmChecks,pcmPrepares;
+static int pcmHealth(PicassoPcm &) { ++pcmChecks;return pcmFault; }
+static void pcmPrepare(PicassoPcm &p) {
+    ++pcmPrepares;p.prepared=p.retained=true;p.address=0x180000000ULL;p.bytes=32768;p.sid=0x1401;p.check=pcmHealth;
+}
+static unsigned pcmReady(PicassoGlink &s) {
+    unsigned rx=streamReady(s);s.apr.stream.attempted=s.apr.stream.done=s.apr.stream.completed=true;
+    s.apr.pcm.prepare=pcmPrepare;pcmFault=0;pcmChecks=pcmPrepares=0;return rx;
+}
+static void pcmAck(PicassoGlink &s,bool unmap,unsigned status=0) {
+    const uint32_t ack[]={0x00280181,0x407,0x507,unmap?0x20560002U:0x20560001U,0x110e8,0,0,0,
+        unmap?0x10d94U:0x10d92U,status};
+    picasso_apr_receive(&s.apr,reinterpret_cast<const uint8_t *>(ack),sizeof ack);
+}
+static void pcmHandle(PicassoGlink &s) {
+    const uint32_t ack[]={0x00240181,0x407,0x507,0x20560001,0x10d93,0,0,0,0x4455};
+    picasso_apr_receive(&s.apr,reinterpret_cast<const uint8_t *>(ack),sizeof ack);
+}
+static void pcmAdvance(PicassoGlink &s,unsigned rx) {
+    pcmHandle(s);message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);
+    assert(s.apr.pcm.phase==1 && s.apr.pcm.pending && s.apr.pcm.handle==0x4455);
+}
+__attribute__((noinline)) static void pcmTests() {
+    PicassoGlink s={};unsigned rx=pcmReady(s),at=s.txHead;step(s);drain(s);
+    const uint32_t map[]={0x00280250,0x507,0x407,0x20560001,0x10d92,0x10003,0,0x80000000,1,32768};
+    bool found=false;for(unsigned n=at;n+56<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x10009) {
+        assert(r32(s.tx.offset+n+8)==40 && !memcmp(ram+s.tx.offset+n+16,map,sizeof map));found=true;
+    }assert(found && pcmPrepares==1 && pcmChecks && s.apr.pcm.pending && s.apr.pcm.uncertain);
+    pcmAck(s,false);assert(s.apr.pcm.pending && !s.apr.pcm.mapped);
+    uint32_t ack[]={0x00240181,0x407,0x507,0x20560001,0x10d93,0,0,0,0x4455};
+    for(unsigned n=0;n<sizeof ack;++n)picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),n);
+    for(unsigned n=1;n<5;++n) {ack[n]^=1;picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),sizeof ack);ack[n]^=1;}
+    ack[0]=0x00240081;picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),sizeof ack);ack[0]=0x00240181;
+    ack[8]=0;picasso_apr_receive(&s.apr,reinterpret_cast<uint8_t *>(ack),sizeof ack);ack[8]=0x4455;
+    assert(s.apr.pcm.pending && !s.apr.pcm.handle);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(ack),sizeof ack);step(s);drain(s);
+    assert(s.apr.pcm.mapped && s.remoteIntent[0].busy);
+    step(s);drain(s);assert(s.apr.pcm.phase==1 && !s.apr.pcm.sent);
+    message(s,rx,14,7,91);step(s);drain(s);at=s.txHead;step(s);drain(s);
+    const uint32_t unmap[]={0x00180250,0x507,0x407,0x20560002,0x10d94,0x4455};
+    found=false;for(unsigned n=at;n+40<=s.txHead;n+=8)if(r32(s.tx.offset+n)==0x10009) {
+        assert(r32(s.tx.offset+n+8)==24 && !memcmp(ram+s.tx.offset+n+16,unmap,sizeof unmap));found=true;
+    }assert(found);pcmHandle(s);pcmAck(s,false);assert(s.apr.pcm.pending && !s.apr.pcm.unmapped);
+    pcmAck(s,true);step(s);drain(s);assert(s.apr.pcm.done && s.apr.pcm.complete && s.apr.pcm.retained && !s.apr.pcm.uncertain && pcmPrepares==1);
+    for(unsigned phase=0;phase<2;++phase)for(unsigned mode=0;mode<4;++mode) {
+        rx=pcmReady(s);step(s);drain(s);if(phase)pcmAdvance(s,rx);
+        if(mode==0)pcmAck(s,phase,2);
+        if(mode==1)for(unsigned n=0;n<102;++n){step(s);drain(s);}
+        if(mode==2) {message(s,rx,3,7,0);step(s);drain(s);}
+        if(mode==3) {picasso_glink_stop(&s);}
+        if(mode!=3){step(s);drain(s);}auto &v=s.apr.pcm;
+        assert(v.done && !v.complete && v.retained && v.uncertain==(phase || mode!=0));
+        assert(v.handle==(phase?0x4455U:0U));
+    }
+    rx=pcmReady(s);s.qrtr.qmi.domains[0].state=0;step(s);assert(!pcmPrepares && !s.apr.pcm.attempted);
+    rx=pcmReady(s);step(s);drain(s);s.qrtr.qmi.domains[0].state=0;step(s);drain(s);step(s);
+    assert(s.apr.pcm.done && s.apr.pcm.uncertain && s.apr.pcm.error==-104);
+    rx=pcmReady(s);step(s);drain(s);pcmHandle(s);s.qrtr.qmi.domains[0].state=0;
+    message(s,rx,14,7,91);step(s);drain(s);step(s);drain(s);assert(s.apr.pcm.pending && s.apr.pcm.phase==1);
+    pcmAck(s,true);step(s);assert(s.apr.pcm.done && !s.apr.pcm.complete && !s.apr.pcm.uncertain && s.apr.pcm.mapError==-104);
+    rx=pcmReady(s);pcmFault=-5;step(s);assert(s.apr.pcm.done && !s.apr.pcm.sent && s.apr.pcm.dmaError==-5);
+    rx=pcmReady(s);step(s);drain(s);pcmAdvance(s,rx);pcmFault=-5;pcmAck(s,true);step(s);
+    assert(s.apr.pcm.done && s.apr.pcm.unmapped && !s.apr.pcm.complete && !s.apr.pcm.uncertain && s.apr.pcm.dmaError==-5);
+    rx=pcmReady(s);s.remoteIntent[0].size=20;step(s);drain(s);message(s,rx,8,7,0);step(s);drain(s);step(s);
+    assert(s.apr.pcm.done && s.apr.pcm.error==-28 && !s.apr.pcm.uncertain);
+    rx=pcmReady(s);p32(s.desc.offset,(s.txHead+8)%s.tx.size);
+    for(unsigned n=0;n<253;++n)step(s);
+    assert(s.apr.pcm.done && s.apr.pcm.error==-60 && !s.apr.pcm.uncertain);
+    for(unsigned phase=0;phase<2;++phase) {
+        auto prepare=[&](){rx=pcmReady(s);if(phase){step(s);drain(s);pcmHandle(s);message(s,rx,14,7,91);step(s);drain(s);}};
+        prepare();writes=0;step(s);unsigned total=writes;bool kick;
+        for(unsigned n=1;n<=total;++n) {prepare();writes=0;failWrite=n;
+            assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && s.apr.pcm.done && !s.apr.pcm.complete);
+            assert(s.apr.pcm.retained && (s.apr.pcm.uncertain || !phase));
+        }
+    }
+    puts("PASS PCM MAP/UNMAP exact wire, real handle ownership, rejection, timeout, domain loss, faults and transport pressure");
 }

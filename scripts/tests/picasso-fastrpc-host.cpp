@@ -213,4 +213,26 @@ static void inheritedDma() {
     assert(!writes);
     puts("PASS skip-init bank allocation, preserved ACTLR, ASID aliases, lease races and precise readback diagnostics");
 }
-int main() { initialization();reverseCalls();fileListener();errors();dma();inheritedDma();assert(published && acquired); }
+static void pcmDma() {
+    inheritedImage();auto rpc=picasso_rpc_dma_plan(rd);
+    assert(!picasso_rpc_dma_program(rpc,0,0x123450000ULL,rd,wr,wr64));
+    assert(!picasso_rpc_dma_program(rpc,1,0x123470000ULL,rd,wr,wr64));
+    auto pcm=picasso_rpc_dma_plan(rd,0x1401,1);
+    assert(!pcm.error && pcm.bank[0]==57 && pcm.bank[1]==0xffffffff && pcm.slot[0]==2 && pcm.slot[1]==0xffffffff);
+    assert(pcm.asid[0]==0x18a && pcm.streamCount==1 && pcm.firstSid==0x1401);
+    touchCount=0;assert(!picasso_rpc_dma_program(pcm,0,0x123490000ULL,rd,wr,wr64));
+    assert(rd(0x808)==0x80001401 && !picasso_rpc_dma_check(pcm,0,0x123490000ULL,true,true,rd));
+    for(unsigned i=0;i<touchCount;++i) {
+        unsigned at=touched[i];assert((at>=185*4096 && at<186*4096) || at==0x808 || at==0xc08 || at==0x1800+57*4 || at==0x1000+57*4);
+    }
+    assert(!picasso_rpc_dma_check(rpc,0,0x123450000ULL,true,true,rd));
+    assert(!picasso_rpc_dma_check(rpc,1,0x123470000ULL,true,true,rd));
+    unsigned before=writes;assert(picasso_rpc_dma_program(pcm,1,0x123490000ULL,rd,wr,wr64)==-22 && writes==before);
+    assert(picasso_rpc_dma_check(pcm,1,0x123490000ULL,true,true,rd)==-22);
+    assert(picasso_rpc_dma_plan(rd,0x1401,1).error==-16);
+    regs[(185*4096+0x58)/4]=2;assert(picasso_rpc_dma_check(pcm,0,0x123490000ULL,true,true,rd)==-5);
+    inheritedImage();regs[0x800/4]=0x9fff1400;assert(picasso_rpc_dma_plan(rd,0x1401,1).error==-16 && !writes);
+    inheritedImage();assert(picasso_rpc_dma_plan(rd,0x1401,2).error && picasso_rpc_dma_plan(rd,0x1403,1).error);
+    puts("PASS dedicated PCM SID1401 bank/ASID isolation alongside live RPC1403/1404, conflicts and fault rejection");
+}
+int main() { initialization();reverseCalls();fileListener();errors();dma();inheritedDma();pcmDma();assert(published && acquired); }

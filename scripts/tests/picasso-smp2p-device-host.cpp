@@ -87,6 +87,7 @@ static void IOSleep(unsigned ms) {
 static void IODelay(unsigned) {}
 #include "PicassoSmp2pDevice-body.inc"
 extern "C" { volatile uint32_t native_novatek_touch_stage=0; }
+extern "C" void picasso_pcm_device_prepare(PicassoPcm &) { assert(false && "unexpected PCM DMA without ASM completion"); }
 extern "C" void picasso_rpc_device_prepare(PicassoFastrpc *) { assert(false && "unexpected RPC DMA without an open channel"); }
 // Exercise the real SMEM/MMIO adapter separately from the coordinator tests,
 // which prove that this callback is gated by PAS authentication and fresh ready.
@@ -227,6 +228,9 @@ int main(int argc,char **argv) {
     PicassoAprProbe stream={};stream.stream.phase=stream.stream.token=stream.stream.api=stream.stream.status=0xffffffff;
     stream.stream.error=stream.stream.openError=stream.stream.formatError=-2147483647;
     for(auto &v:stream.stream.statuses)v=0xffffffff;logStream(stream);
+    auto &pcm=stream.pcm;pcm.phase=pcm.token=pcm.opcode=pcm.status=pcm.handle=pcm.sid=pcm.bytes=pcm.bank=pcm.asid=pcm.fsr=pcm.farHigh=pcm.farLow=pcm.syndrome=0xffffffff;
+    pcm.address=~0ULL;pcm.error=pcm.mapError=pcm.dmaError=-2147483647;
+    pcm.statuses[0]=pcm.statuses[1]=0xffffffff;logPcm(stream);
     PicassoRpcDomain record={};record.pd=record.requests=record.lastHandle=record.lastScalar=0xffffffffU;
     record.wireBytes=record.decodeResult=record.previousResult=0xffffffffU;
     memset(record.name,'n',127);memset(record.fs.target,'t',127);

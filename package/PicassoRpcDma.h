@@ -11,7 +11,7 @@ struct PicassoRpcDmaDiagnostic {
 };
 struct PicassoRpcDmaPlan {
     uint32_t id[3],pages,count,banks,slot[2],bank[2],asid[2],sctlr[2],actlr[2];
-    uint32_t usedBanks,enabledBanks,idleBanks,nonzeroActlr;
+    uint32_t usedBanks,enabledBanks,idleBanks,nonzeroActlr,firstSid,streamCount;
     PicassoRpcDmaDiagnostic diagnostic;
     int error;
 };
@@ -39,9 +39,11 @@ template<class Read> static bool rpcDmaAsidBusy(const PicassoRpcDmaPlan &p,unsig
             (read(cb+0x34)&255)==(candidate&255))return true;
     }return false;
 }
-template<class Read> static PicassoRpcDmaPlan picasso_rpc_dma_plan(Read read) {
+template<class Read> static PicassoRpcDmaPlan picasso_rpc_dma_plan(Read read,unsigned firstSid=0x1403,unsigned streams=2) {
     PicassoRpcDmaPlan p={};p.error=-95;p.diagnostic.phase="geometry";
     p.slot[0]=p.slot[1]=p.bank[0]=p.bank[1]=0xffffffffU;
+    if(!((firstSid==0x1403 && streams==2) || (firstSid==0x1401 && streams==1)))return p;
+    p.firstSid=firstSid;p.streamCount=streams;
     for(unsigned i=0;i<3;++i)p.id[i]=read(0x20+4*i);
     p.count=p.id[0]&255;p.banks=p.id[1]&255;p.pages=1U<<(((p.id[1]>>28)&7)+1);
     if(!(p.id[0]&(1U<<30)) || !(p.id[0]&(1U<<27)) || (p.id[0]&(1U<<8)) || !(p.id[2]&(1U<<12)) ||
@@ -52,13 +54,13 @@ template<class Read> static PicassoRpcDmaPlan picasso_rpc_dma_plan(Read read) {
     bool used[128]={};unsigned slots=0;
     for(unsigned i=0;i<p.count;++i) {
         uint32_t smr=read(0x800+4*i),s2cr=read(0xc00+4*i);
-        if(!(smr>>31)) { if(slots<2)p.slot[slots++]=i;continue; }
-        if(rpcDmaMatches(smr,0x1403) || rpcDmaMatches(smr,0x1404)) {
+        if(!(smr>>31)) { if(slots<streams)p.slot[slots++]=i;continue; }
+        if(rpcDmaMatches(smr,firstSid) || (streams==2 && rpcDmaMatches(smr,firstSid+1))) {
             rpcDmaConflict(p,"stream-conflict",0x800+4*i,smr);p.error=-16;return p;
         }
         if(((s2cr>>16)&3)==0 && (s2cr&255)<128)used[s2cr&255]=true;
     }
-    if(slots!=2) { p.diagnostic.phase="no-slots";p.error=-28;return p; }
+    if(slots!=streams) { p.diagnostic.phase="no-slots";p.error=-28;return p; }
     unsigned found=0,s2=(p.id[1]>>16)&255;
     for(unsigned i=p.banks;i>s2;) {
         --i;unsigned cb=(p.pages+i)*4096;
@@ -69,15 +71,15 @@ template<class Read> static PicassoRpcDmaPlan picasso_rpc_dma_plan(Read read) {
         // indicate ownership. qcom,skip-init leaves those values inherited.
         if(used[i] || (sctlr&1))continue;
         ++p.idleBanks;
-        if(found<2) { p.bank[found]=i;p.sctlr[found]=sctlr;p.actlr[found++]=actlr; }
+        if(found<streams) { p.bank[found]=i;p.sctlr[found]=sctlr;p.actlr[found++]=actlr; }
     }
-    if(found!=2) { p.diagnostic.phase="no-idle-banks";p.error=-16;return p; }
+    if(found!=streams) { p.diagnostic.phase="no-idle-banks";p.error=-16;return p; }
     // Preserve ACTLR: lito's ADSP SIDs have no qcom,actlr override, matching
     // qsmmuv500_init_cb's !has_actlr path. Revalidate before any write.
     found=0;
-    for(unsigned candidate=0x188;candidate<0x200 && found<2;++candidate)
+    for(unsigned candidate=0x188;candidate<0x200 && found<streams;++candidate)
         if(!rpcDmaAsidBusy(p,candidate,read))p.asid[found++]=candidate;
-    p.error=found==2?0:-16;p.diagnostic.phase=found==2?"planned":"no-asids";return p;
+    p.error=found==streams?0:-16;p.diagnostic.phase=found==streams?"planned":"no-asids";return p;
 }
 // Dedicated contiguous pool: first eight pages are data, last three are tables.
 // IOVA 0x80000000 is L1[2]/L2[0]/L3[0..7]; nothing else, including the tables,
@@ -95,6 +97,7 @@ static inline int picasso_rpc_dma_tables(uint64_t *tables,uint64_t physical) {
 // ACTLR is inherited, never guessed or reset; firmware changes are fatal.
 template<class Read> static int picasso_rpc_dma_check(PicassoRpcDmaPlan &p,unsigned n,uint64_t physical,
     bool enabled,bool routed,Read read) {
+    if(p.error || !p.streamCount || n>=p.streamCount)return -22;
     unsigned bank=p.bank[n],slot=p.slot[n],cb=(p.pages+bank)*4096;
     uint64_t ttbr=(uint64_t(p.asid[n])<<48)|(physical+32768);
     if(!rpcDmaCheck(p,read,"client-disabled",0,0,1))return -16;
@@ -112,12 +115,12 @@ template<class Read> static int picasso_rpc_dma_check(PicassoRpcDmaPlan &p,unsig
         !rpcDmaCheck(p,read,"mair1",cb+0x3c,0) ||
         !rpcDmaCheck(p,read,"sctlr",cb,enabled?0x127:0,~0x1000U))return -5;
     if(routed && (!rpcDmaCheck(p,read,"s2cr",0xc00+4*slot,bank) ||
-        !rpcDmaCheck(p,read,"smr",0x800+4*slot,0x80001403U+n)))return -16;
+        !rpcDmaCheck(p,read,"smr",0x800+4*slot,0x80000000U+p.firstSid+n)))return -16;
     return 0;
 }
 template<class Read,class Write,class Write64> static int picasso_rpc_dma_program(
     PicassoRpcDmaPlan &p,unsigned n,uint64_t physical,Read read,Write write,Write64 write64) {
-    if(p.error || n>1 || !physical || (physical&4095) || physical>=(1ULL<<36) ||
+    if(p.error || !p.streamCount || n>=p.streamCount || !physical || (physical&4095) || physical>=(1ULL<<36) ||
         PicassoRpcAllocation>(1ULL<<36)-physical)return -22;
     unsigned bank=p.bank[n],slot=p.slot[n],cb=(p.pages+bank)*4096;
     // Revalidate the lease immediately before the first write. A bank used
@@ -128,7 +131,7 @@ template<class Read,class Write,class Write64> static int picasso_rpc_dma_progra
         !rpcDmaCheck(p,read,"actlr-raced",cb+4,p.actlr[n]))return -16;
     for(unsigned i=0;i<p.count;++i) {
         auto smr=read(0x800+4*i),s2cr=read(0xc00+4*i);if(!(smr>>31))continue;
-        if(rpcDmaMatches(smr,0x1403+n)) {
+        if(rpcDmaMatches(smr,p.firstSid+n)) {
             rpcDmaConflict(p,"stream-raced",0x800+4*i,smr);return -16;
         }
         if(((s2cr>>16)&3)==0 && (s2cr&255)==bank) {
@@ -156,7 +159,7 @@ template<class Read,class Write,class Write64> static int picasso_rpc_dma_progra
     error=picasso_rpc_dma_check(p,n,physical,true,false,read);if(error)return error;
     write(0xc00+4*slot,bank);
     if(!rpcDmaCheck(p,read,"s2cr-readback",0xc00+4*slot,bank))return -5;
-    write(0x800+4*slot,0x80001403U+n);
+    write(0x800+4*slot,0x80000000U+p.firstSid+n);
     return picasso_rpc_dma_check(p,n,physical,true,true,read);
 }
 struct PicassoFastrpc;

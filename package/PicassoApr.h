@@ -131,7 +131,55 @@ inline bool picasso_stream_due(const PicassoAprProbe &p) {
     const auto &v=p.stream;
     return p.ready && p.fw.valid && v.attempted && !v.done && !v.sent && !v.error;
 }
+// q6asm_add_mmaphdr uses ASM service with port zero, independently of
+// session1/stream1. A BASIC MAP success is not the returned memory handle.
+inline unsigned picasso_pcm_request(const PicassoPcm &v,uint32_t (&w)[18]) {
+    for(auto &x:w)x=0;
+    unsigned bytes=v.phase?24:40;
+    w[0]=(bytes<<16)|0x250;w[1]=0x507;w[2]=0x407;w[3]=0x20560001+v.phase;
+    w[4]=v.phase?0x10d94:0x10d92;
+    if(v.phase)w[5]=v.handle;
+    else { w[5]=0x10003;w[7]=uint32_t(v.address);w[8]=uint32_t(v.address>>32);w[9]=v.bytes; }
+    return bytes;
+}
+inline void picasso_pcm_tick(PicassoAprProbe *p,const PicassoQmi &q) {
+    auto &v=p->pcm;
+    if(!v.attempted && v.prepare && p->stream.completed && p->stream.done && picasso_afe_domains_up(q)) {
+        v.attempted=true;v.prepare(v);++v.events;
+        if(!v.prepared || !v.check || v.address!=0x180000000ULL || v.bytes!=32768 || v.sid!=0x1401) {
+            v.error=v.dmaError?v.dmaError:-22;v.done=true;return;
+        }
+    }
+    if(!v.attempted || v.done)return;
+    if(!v.phase && !picasso_afe_domains_up(q) && !v.error) {
+        v.pending=false;v.error=-104;++v.events;
+    }
+    if(!v.pending && (v.responded || v.error)) {
+        if(!v.phase && v.mapped && v.handle) {
+            v.mapError=v.error;v.phase=1;v.sent=v.responded=false;
+            v.wait=v.status=v.opcode=0;v.error=0;++v.events;
+        } else {
+            if(!v.phase)v.mapError=v.error;
+            v.done=true;++v.events;return;
+        }
+    }
+    if(!v.error && (v.pending || !v.sent) && ++v.wait>(v.pending?100U:250U)) {
+        v.pending=false;v.error=-60;++v.events;
+    }
+}
+inline bool picasso_pcm_due(PicassoAprProbe &p) {
+    auto &v=p.pcm;
+    if(!p.ready || !p.fw.valid || !v.attempted || v.done || v.sent || v.error)return false;
+    if(!v.phase) {
+        v.dmaError=v.check?v.check(v):-22;
+        if(v.dmaError) { v.error=v.mapError=v.dmaError;v.done=true;++v.events;return false; }
+    }
+    return !v.phase || (v.mapped && v.handle);
+}
 inline void picasso_clock_stop(PicassoAprProbe *p,int error) {
+    auto &pcm=p->pcm;
+    if(pcm.attempted) { pcm.pending=false;pcm.done=true;pcm.complete=false;pcm.error=error;++pcm.events; }
+
     auto &stream=p->stream;
     if(stream.attempted) { stream.pending=false;stream.done=true;stream.completed=false;stream.error=error;++stream.events; }
     picasso_audio_pins_restore(p->pins);
@@ -220,6 +268,24 @@ inline void picasso_apr_receive(PicassoAprProbe *p, const uint8_t *data, uint32_
         ++p->malformed; return;
     }
     uint32_t type=(header>>8)&3;
+    if(p->pcm.pending && p->receivedToken==p->pcm.token) {
+        auto &v=p->pcm;const auto *b=data+headerBytes;unsigned bytes=size-headerBytes;
+        if(type!=1 || p->source!=0x407 || p->destination!=0x507) { ++p->ignored;return; }
+        if(!v.phase && p->opcode==0x10d93 && bytes==4 && wlan_sm32(b)) {
+            v.handle=wlan_sm32(b);v.mapped=true;v.status=0;v.opcode=p->opcode;
+            v.pending=false;v.responded=true;++v.events;return;
+        }
+        if(p->opcode!=0x110e8 || bytes!=8 || wlan_sm32(b)!=(v.phase?0x10d94U:0x10d92U)) { ++p->ignored;return; }
+        v.status=wlan_sm32(b+4);v.statuses[v.phase]=v.status;v.opcode=p->opcode;
+        if(!v.phase && !v.status) { ++p->ignored;return; }
+        v.pending=false;v.responded=true;v.error=v.status?-5:0;
+        if(!v.phase) { v.uncertain=false;v.mapError=v.error; }
+        else if(!v.status) {
+            v.unmapped=true;v.uncertain=false;v.dmaError=v.check?v.check(v):-22;
+            v.error=v.dmaError;v.complete=v.mapped && !v.mapError && !v.dmaError;
+        }
+        ++v.events;return;
+    }
     if(p->stream.pending && p->receivedToken==p->stream.token) {
         auto &v=p->stream;const auto *b=data+headerBytes;
         unsigned expected=v.phase==0?0x10db3:v.phase==1?0x10d98:0x10bcd;

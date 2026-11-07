@@ -62,7 +62,19 @@ def main():
             '-fno-exceptions','-fno-rtti','-fno-threadsafe-statics','-mgeneral-regs-only','-Wall','-Wextra','-Werror',
             '-Wframe-larger-than=2048',
             *includes,'-c',str(source),'-o',str(out/(name+'.o'))])
-    inputs = ['scripts/tests/picasso-rpc-fs-host.cpp','scripts/make-picasso-rpc-stock.py','package/PicassoRpcFs.h','package/PicassoRpcFs.cpp','package/PicassoRpcStock.inc','package/PicassoFastrpc.h','package/PicassoRpcDma.h','package/PicassoRpcDma.cpp','scripts/tests/picasso-fastrpc-host.cpp','package/PicassoTftp.h','scripts/tests/picasso-tftp-host.cpp','package/PicassoServloc.h','scripts/tests/picasso-servloc-host.cpp','package/PicassoSmp2p.h','package/PicassoSmp2p.cpp','package/PicassoSmp2pDevice.cpp',
+    # Run the actual allocator/adapter body; only ARM cache/barrier instructions
+    # are replaced with a host W1C/barrier model. No copied prepare algorithm.
+    host_dma = re.sub(r'__asm__ volatile\([^;]+;', 'dmaBarrier();', dma_body)
+    assert host_dma.count('dmaBarrier();') == 3
+    (out/'PicassoRpcDma-body.inc').write_text(host_dma, encoding='utf8', newline='\n')
+    for sanitized in (False, True):
+        suffix = '-asan' if sanitized else ''
+        flags = ['-fsanitize=address' if os.name=='nt' else '-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if sanitized else []
+        exe=out/('pcm-device'+suffix+('.exe' if os.name=='nt' else ''))
+        run('pcm-device-compile'+suffix,[a.cxx,'-std=c++17','-O1','-Wall','-Wextra','-Werror',*flags,*includes,
+            str(ROOT/'scripts/tests/picasso-pcm-device-host.cpp'),str(ROOT/'package/PicassoRpcFs.cpp'),'-o',str(exe)])
+        for case in range(16):run('pcm-device-'+str(case)+suffix,[str(exe),str(case)])
+    inputs = ['scripts/tests/picasso-pcm-device-host.cpp','scripts/tests/picasso-rpc-fs-host.cpp','scripts/make-picasso-rpc-stock.py','package/PicassoRpcFs.h','package/PicassoRpcFs.cpp','package/PicassoRpcStock.inc','package/PicassoFastrpc.h','package/PicassoPcm.h','package/PicassoRpcDma.h','package/PicassoRpcDma.cpp','scripts/tests/picasso-fastrpc-host.cpp','package/PicassoTftp.h','scripts/tests/picasso-tftp-host.cpp','package/PicassoServloc.h','scripts/tests/picasso-servloc-host.cpp','package/PicassoSmp2p.h','package/PicassoSmp2p.cpp','package/PicassoSmp2pDevice.cpp',
         'package/PicassoGlink.h','package/PicassoGlink.cpp','package/PicassoApr.h','package/PicassoAudioPins.h','package/PicassoTfa.h','scripts/tests/picasso-tfa-host.cpp','package/PicassoQrtr.h','package/PicassoQmi.h','scripts/tests/picasso-glink-host.cpp','scripts/tests/picasso-qrtr-host.cpp','scripts/tests/picasso-qmi-host.cpp',
         'package/PicassoSmemLock.h','package/PicassoAdspBoot.h','package/PicassoAdsp.h','drivers/NativeWlan/WlanSmem.h','drivers/NativeAdrenoPicasso/PicassoRpmh.h',
         'scripts/check-picasso-smp2p.py','scripts/tests/picasso-smp2p-host.cpp','scripts/tests/picasso-smp2p-device-host.cpp',

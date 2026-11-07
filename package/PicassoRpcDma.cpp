@@ -5,6 +5,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include "PicassoRpcDma.h"
 #include "PicassoFastrpc.h"
+#include "PicassoPcm.h"
 namespace {
 struct RpcMemory {
     IOMemoryMap *map;
@@ -93,4 +94,57 @@ extern "C" void picasso_rpc_device_prepare(PicassoFastrpc *f) {
         !error,error,p.id[0],p.id[1],p.id[2],p.slot[0],p.slot[1],p.bank[0],p.bank[1],p.asid[0],p.asid[1]);
     // One boot, bounded 88KiB. Retain allocations/mappings even on failures:
     // timeout or partial programming does not prove the DSP has released them.
+}
+
+namespace {
+static RpcMemory pcmMemory;
+uint32_t pcmRead(unsigned at) { return *reinterpret_cast<volatile uint32_t *>(pcmMemory.map->getVirtualAddress()+at); }
+void pcmWrite(unsigned at,uint32_t v) { barrier();*reinterpret_cast<volatile uint32_t *>(pcmMemory.map->getVirtualAddress()+at)=v;barrier(); }
+void pcmWrite64(unsigned at,uint64_t v) { barrier();*reinterpret_cast<volatile uint64_t *>(pcmMemory.map->getVirtualAddress()+at)=v;barrier(); }
+int pcmCheck(PicassoPcm &o) {
+    int e=picasso_rpc_dma_check(pcmMemory.plan,0,pcmMemory.physical[0],true,true,pcmRead);
+    auto &p=pcmMemory.plan;unsigned cb=(p.pages+p.bank[0])*4096;
+    o.fsr=pcmRead(cb+0x58);o.farLow=pcmRead(cb+0x60);o.farHigh=pcmRead(cb+0x64);o.syndrome=pcmRead(cb+0x68);
+    if(e) {
+        const auto &d=p.diagnostic;
+        IOLog("PICASSO_ADSP pcm-dma check error=%d phase=%s reg=%x actual=%x expected=%x mask=%x\n",e,d.phase,d.offset,d.actual,d.expected,d.mask);
+    }
+    barrier();return e;
+}
+}
+extern "C" void picasso_pcm_device_prepare(PicassoPcm &o) {
+    if(pcmMemory.attempted) { o.dmaError=-16;return; }
+    pcmMemory.attempted=true;int e=-12;
+    IOLog("PICASSO_ADSP pcm-dma stage=map sid=1401 bytes=32768\n");
+    auto *desc=IODeviceMemory::withRange(0x15000000,0x100000);
+    if(desc) { pcmMemory.map=desc->map(kIOMapAnywhere|kIOMapInhibitCache);desc->release(); }
+    if(!pcmMemory.map || !pcmMemory.map->getVirtualAddress()) { o.dmaError=e;return; }
+    auto &p=pcmMemory.plan;p=picasso_rpc_dma_plan(pcmRead,0x1401,1);e=p.error;
+    if(!e) {
+        auto *a=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+            static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous)|
+            static_cast<IOOptionBits>(kIOMemoryMapperNone),PicassoRpcAllocation,4096);
+        pcmMemory.allocation[0]=a;o.retained=a!=nullptr;
+        if(!a)e=-12;
+        else {
+            IOByteCount bytes=0;pcmMemory.physical[0]=a->getPhysicalSegment(0,&bytes,kIOMemoryMapperNone);
+            pcmMemory.data[0]=static_cast<uint8_t *>(a->getBytesNoCopy());
+            if(!pcmMemory.data[0] || (uintptr_t(pcmMemory.data[0])&4095) || bytes<PicassoRpcAllocation)e=-22;
+            else {
+                rpcZero(pcmMemory.data[0],PicassoRpcAllocation);
+                e=picasso_rpc_dma_tables(reinterpret_cast<uint64_t *>(pcmMemory.data[0]+32768),pcmMemory.physical[0]);
+                if(!e)cache(pcmMemory.data[0],PicassoRpcAllocation,true);
+            }
+        }
+    }
+    if(!e)e=picasso_rpc_dma_program(p,0,pcmMemory.physical[0],pcmRead,pcmWrite,pcmWrite64);
+    if(!e)e=pcmCheck(o);
+    o.dmaError=e;o.prepared=!e;o.physical=pcmMemory.physical[0];o.sid=0x1401;
+    o.slot=p.slot[0];o.bank=p.bank[0];o.asid=p.asid[0];
+    if(!e) { o.address=0x180000000ULL;o.bytes=PicassoRpcDmaBytes;o.check=pcmCheck; }
+    const auto &d=p.diagnostic;
+    IOLog("PICASSO_ADSP pcm-dma prepared=%u error=%d slot=%u bank=%u asid=%u sid=1401 address=%08x%08x bytes=%u retained=%u\n",
+        o.prepared,e,o.slot,o.bank,o.asid,uint32_t(o.address>>32),uint32_t(o.address),o.bytes,o.retained);
+    if(e)IOLog("PICASSO_ADSP pcm-dma prepare-error phase=%s reg=%x actual=%x expected=%x mask=%x\n",d.phase?d.phase:"allocation",d.offset,d.actual,d.expected,d.mask);
+    // One boot, 44 KiB pinned. No reuse/free based on a timeout or BASIC ACK.
 }

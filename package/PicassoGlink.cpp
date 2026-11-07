@@ -130,7 +130,7 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     if (!c.up) return 0;
     auto &a = s->apr;
     int qmiDue=c.local==2 ? picasso_qmi_due(&s->qrtr.qmi):-1;
-    if (c.local==1) { ++a.ticks;picasso_afe_advance(&a,s->qrtr.qmi);picasso_clock_tick(&a,s->qrtr.qmi);picasso_stream_tick(&a,s->qrtr.qmi); }
+    if (c.local==1) { ++a.ticks;picasso_afe_advance(&a,s->qrtr.qmi);picasso_clock_tick(&a,s->qrtr.qmi);picasso_stream_tick(&a,s->qrtr.qmi);picasso_pcm_tick(&a,s->qrtr.qmi); }
     // Worker cadence is 20 ms. Hold expiry while responses are backpressured.
     if(c.local==2 && !s->qrtr.count && s->qrtr.tftp.announced) {
         auto &q=s->qrtr;int retry=picasso_tftp_tick(&q.tftp);
@@ -250,9 +250,10 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     bool clock=picasso_clock_due(a);
     bool port=picasso_port_due(a);
     bool stream=picasso_stream_due(a);
-    if ((a.ready && !version && !afe && !clock && !port && !stream) || a.error) return 0;
-    if (!version && !afe && !clock && !port && !stream && (a.pending || a.ticks < a.next)) return 0;
-    unsigned requestBytes=stream?(a.stream.phase==0?36:a.stream.phase==1?44:20):port?24:clock?68:afe?(a.afe.phase==1?68:56):20;
+    bool pcm=picasso_pcm_due(a);
+    if ((a.ready && !version && !afe && !clock && !port && !stream && !pcm) || a.error) return 0;
+    if (!version && !afe && !clock && !port && !stream && !pcm && (a.pending || a.ticks < a.next)) return 0;
+    unsigned requestBytes=pcm?(a.pcm.phase?24:40):stream?(a.stream.phase==0?36:a.stream.phase==1?44:20):port?24:clock?68:afe?(a.afe.phase==1?68:56):20;
     PicassoGlinkRemoteIntent *slot = nullptr;
     for (auto &i : s->remoteIntent) if (i.used && !i.busy && i.size >= requestBytes) { slot = &i; break; }
     if (!slot) {
@@ -265,7 +266,7 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     }
     uint32_t words[22] = {9U | (uint32_t(c.local) << 16), slot->id, requestBytes, 0};
     uint32_t query[5]; picasso_apr_query(version?0x18710001:a.token + 1, query);
-    if(afe || clock || port || stream) { uint32_t request[18];if(stream)picasso_stream_request(a.stream.phase,request);else if(port)picasso_port_request(a.port.phase,request);else if(clock)picasso_clock_request(a.clock.phase,request);else picasso_afe_request(a.afe.phase,request);for(unsigned i=0;i<requestBytes/4;++i)words[4+i]=request[i]; }
+    if(afe || clock || port || stream || pcm) { uint32_t request[18];if(pcm)picasso_pcm_request(a.pcm,request);else if(stream)picasso_stream_request(a.stream.phase,request);else if(port)picasso_port_request(a.port.phase,request);else if(clock)picasso_clock_request(a.clock.phase,request);else picasso_afe_request(a.afe.phase,request);for(unsigned i=0;i<requestBytes/4;++i)words[4+i]=request[i]; }
     else { if(version)query[4]=0x1292c;for (unsigned i = 0; i < 5; ++i) words[4 + i] = query[i]; }
     if ((error = transmit(io, s, words,16+((requestBytes+7)&~7U), kick))) {
         // I/O failure may leave publication ambiguous; lack of an ACK never
@@ -274,10 +275,12 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
         if(clock && !a.clock.phase && s->failed)a.clock.uncertain=true;
         if(port && !a.port.phase && s->failed)a.port.uncertain=true;
         if(stream && !a.stream.phase && s->failed)a.stream.uncertain=true;
+        if(pcm && !a.pcm.phase && s->failed)a.pcm.uncertain=true;
         return error;
     }
     slot->busy = true;
-    if(stream) { a.stream.sent=a.stream.pending=true;a.stream.token=words[7];a.stream.wait=0;if(!a.stream.phase)a.stream.uncertain=true;++a.stream.events; }
+    if(pcm) { a.pcm.sent=a.pcm.pending=true;a.pcm.token=words[7];a.pcm.wait=0;if(!a.pcm.phase)a.pcm.uncertain=true;++a.pcm.events; }
+    else if(stream) { a.stream.sent=a.stream.pending=true;a.stream.token=words[7];a.stream.wait=0;if(!a.stream.phase)a.stream.uncertain=true;++a.stream.events; }
     else if(port) { a.port.sent=a.port.pending=true;a.port.token=words[7];a.port.wait=0;if(!a.port.phase)a.port.uncertain=true;++a.port.events; }
     else if(clock) { a.clock.sent=a.clock.pending=true;a.clock.token=words[7];a.clock.wait=0;if(!a.clock.phase)a.clock.uncertain=true;++a.clock.events; }
     else if(afe) { a.afe.sent=a.afe.pending=true;a.afe.token=words[7];a.afe.wait=0;++a.afe.events; }
@@ -437,7 +440,8 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
             if (c->local==1 && !s->apr.pending) {
                 auto &a=s->apr;
                 if(a.ready && a.fw.valid) {
-                    if(picasso_stream_due(a)) { a.stream.error=-28;++a.stream.events; }
+                    if(picasso_pcm_due(a)) { a.pcm.error=-28;++a.pcm.events; }
+                    else if(picasso_stream_due(a)) { a.stream.error=-28;++a.stream.events; }
                     else if(picasso_port_due(a)) { a.port.error=-28;++a.port.events; }
                     else if(picasso_clock_due(a)) { a.clock.error=-28;++a.clock.events; }
                     else if(!a.afe.sent && !a.afe.error) { a.afe.error=-28;++a.afe.events; }
