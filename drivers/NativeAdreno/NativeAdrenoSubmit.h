@@ -141,6 +141,7 @@ private:
     bool attached_=false,poisoned_=false;
     /* The A6xx plain profile (setA6xxPlain): no thread-control framing, no preemption. */
     bool a6xx_=false;
+    bool batch_ib_peek_=false;   /* ngb=1: batch only the diagnostic IB snapshot; the submission and cache protocol are unchanged. */
     uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */
     /* submit()'s distinct buffers and ring words: too large for the kernel stack at 128 IBs (callers serialize every method) */
     uint64_t scratch_handles_[NativeAdrenoSubmitMaxBuffers]{};

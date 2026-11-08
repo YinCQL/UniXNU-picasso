@@ -61,6 +61,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
+#include "surface_hash.h"
 #include <mach/mach_time.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -456,6 +457,7 @@ static uint32_t slot_time_calls[SLOTS];
 static uint64_t flush_clear_us, flush_real_us, flush_end_us;
 static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
+static int fast_surface_hash;           /* experimental glh=1; default detector is unchanged */
 /*
  * A frame is not drawn into its surface's memory but into a texture of the library's own, and the
  * GPU copies it into the surface at the frame's end (one blit; the display's driver waits for that
@@ -870,10 +872,14 @@ surface_changed(struct eagl *e, struct image *image)
 			e->beat_hash_calls[slot]++;
 		}
 	}
-	for (size_t at = 0; at + 8 <= size; at += 8) {
-		memcpy(&word, base + at, 8);
-		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
-		sum ^= sum >> 29;
+	if (fast_surface_hash) {
+		sum = nativegl_surface_hash(base, size);
+	} else {
+		for (size_t at = 0; at + 8 <= size; at += 8) {
+			memcpy(&word, base + at, 8);
+			sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
+			sum ^= sum >> 29;
+		}
 	}
 	if (sum == image->sum) {
 		if (size >= 256 * 1024) {
@@ -4679,6 +4685,7 @@ install(void)
 			}
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
+		fast_surface_hash = strstr(arguments, "glh=1") != NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		damage_blits = strstr(arguments, "gldamage=1") != NULL;
 		fill_accounting = strstr(arguments, "glfill=1") != NULL || strstr(arguments, "glf=1") != NULL;
