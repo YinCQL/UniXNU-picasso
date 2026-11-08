@@ -101,6 +101,8 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *
     NativeAdrenoRing *, const NativeAdrenoRingClock *, const NativeAdrenoTimer *,
     const NativeAdrenoAbiDeviceInfo *, uint32_t, uint32_t);
 extern "C" IOService *native_adreno_published_service(void);
+/* The clients' call-ring summary, printed by the monitor's 30 s round. */
+extern "C" void native_adreno_call_report(void) __attribute__((weak_import));
 
 /* The staged AGXAccelerator (drivers/NativeAdreno/NativeAdrenoAccelerator.cpp).
  * build-native-adreno-accelerator.py removes its initializer from
@@ -130,6 +132,24 @@ extern "C" volatile int native_staged_apps_stage, native_staged_apps_dirs, nativ
 /* Submissions and IBs the production submit object has seen: the plugin's
  * arrival is visible here even though its own report is not printed. */
 extern "C" volatile uint32_t native_adreno_submit_ibs[4];
+/* The ring's answers to client submissions (NativeAdrenoUserClient): [0] accepted, [1] refused, [2] the last IOReturn,
+ * [3] bad arguments, [4] not ready, [5] timeout, [6] busy/no resources, [7] calls. */
+extern "C" volatile uint32_t native_adreno_submit_result[8];
+/* NativeAdrenoRing::writeWptr (NativeAdrenoRing.cpp): [0] calls, [1] returned after the GMU AHB fence kept the
+ * write pointer back, [2] loop iterations that saw the fence still set, [3] calls that gave up at 200 tries.
+ * NativeAdrenoSubmit::noteStall (NativeAdrenoSubmit.cpp): unstick [0] attempts, [1] the fence, [2] attempts after
+ * which it completed, [3] timed-out waits it had seen, [4] drains, [5]/[6] client/arbiter halt acknowledge,
+ * [7] the last drain's fence, [8] drains after which it completed; fence_pending [i] fences pending under 1<<i ms,
+ * [7] 64 ms or more. */
+extern "C" volatile uint32_t native_adreno_wptr_fence[4];
+extern "C" volatile uint32_t native_adreno_unstick[15];
+extern "C" volatile uint32_t native_adreno_fence_pending[8];
+/* The stall handler's ring of fingerprints (NativeAdrenoSubmit.cpp): [0] the clock (us, the same boot epoch as the
+ * plugin's CLOCK_UPTIME_RAW), [1] the fence, [2] the event | stall_timeouts << 8, [3] how long it had been pending,
+ * [4] the read/write pointers before the kick | the ring's read pointer << 32 | its write pointer << 48, [5] the queue,
+ * [6] the job's first handle | buffer count << 48. Event 0 is the end of a stall, 1 the 50 ms kick, 3 the bus drain,
+ * 4 a stalled snapshot. */
+extern "C" {extern volatile uint64_t native_adreno_stall_log[32][8];extern volatile uint32_t native_adreno_stall_log_count;}
 /* The plugin's own report lines and connection counters (NativeAdrenoPublish). */
 extern "C" const char *native_adreno_metal_report(void);
 extern "C" const char *native_adreno_metal_report2(void);
@@ -160,6 +180,13 @@ constexpr uint32_t kGpuUcheWriteThruBase = 0x0E07;   /* reg64 */
 constexpr uint32_t kGpuUcheTrapBase = 0x0E09;        /* reg64 */
 constexpr uint32_t kGpuTpl1BicubicWeights = 0xB608;  /* array, 5 entries */
 constexpr uint32_t kGpuCpPerfctrCpSel0 = 0x08D0;
+/* RB block performance counters (a6xx.xml: RB_PERFCTR_RB_SEL(i) 0x8e10+i, RBBM_PERFCTR_RB(i) 0x4d6+2i; the
+ * selectors are freedreno's a6xx PERF_RB_* values from fd6_perfcntr.c). sheng-gpu-perf=1 reads them. */
+constexpr uint32_t kGpuRbPerfctrSel0 = 0x8E10;
+constexpr uint32_t kGpuRbbmPerfctrRb0 = 0x04D6;
+constexpr uint32_t kPerfRbBusyCycles = 0;
+constexpr uint32_t kPerfRb2dValidPixels = 28;
+constexpr uint32_t kPerfRb3dPixels = 29;
 constexpr uint32_t kGpuUcheFilterCntl = 0x0E18;
 constexpr uint32_t kGpuCpRoqThresholds1 = 0x08C1;
 constexpr uint32_t kGpuCpRoqThresholds2 = 0x08C2;
@@ -303,6 +330,21 @@ IOReturn gpuTimerRead32(void *, uint32_t dword, uint32_t *value)
 void gpuWrite(uint32_t dword, uint32_t value)
 {
     write32(gState->gpu, uint64_t(dword) * 4, value);
+}
+
+/* The RB perf counters, for the sheng-gpu-perf=1 sampler (NativeAdrenoPublish.cpp): 3D output pixels, 2D valid
+ * pixels, RB busy cycles. They free-run once RBBM_PERFCTR_CNTL is on and the select registers name their events;
+ * the caller reads them only while the GPU is powered (the ring is busy), so the register window is live. */
+extern "C" void native_adreno620_perf_read(uint64_t *value)
+{
+    if (!value) {
+        return;
+    }
+    for (unsigned i = 0; i < 3; ++i) {
+        const uint32_t lo = gpuRead(kGpuRbbmPerfctrRb0 + 2 * i);
+        const uint32_t hi = gpuRead(kGpuRbbmPerfctrRb0 + 2 * i + 1);
+        value[i] = (uint64_t(hi) << 32) | lo;
+    }
 }
 
 uint32_t gmuRead(uint32_t dword)
@@ -606,6 +648,10 @@ bool hardwareInit()
     gpuWrite(0x09E00, kPcDbgEcoCntl);
     gpuWrite(A620_CP_AHB_CNTL, 1);
     gpuWrite(A620_RBBM_PERFCTR_CNTL, 1);
+    /* What the RB counters count (sheng-gpu-perf=1): output pixels, 2D and 3D, and RB busy cycles. */
+    gpuWrite(kGpuRbPerfctrSel0 + 0, kPerfRb3dPixels);
+    gpuWrite(kGpuRbPerfctrSel0 + 1, kPerfRb2dValidPixels);
+    gpuWrite(kGpuRbPerfctrSel0 + 2, kPerfRbBusyCycles);
     gpuWrite(kGpuCpPerfctrCpSel0, 0);   /* PERF_CP_ALWAYS_COUNT */
 
     /* UBWC: SM7250 is UBWC 3.0 with highest bank bit 14. */
@@ -1552,6 +1598,40 @@ bool submitNoop(uint32_t *fence)
     return true;
 }
 
+/* One submission that names the same one-dword noop IB `count` times. The client's submissions name up to 82 indirect buffers
+ * (one CP_INDIRECT_BUFFER per submitted buffer), so the CP's cost per indirect buffer is a per-frame cost the single-IB probe
+ * above does not see; comparing 1, 16 and 64 names it. */
+bool submitNoopMany(unsigned count, uint32_t *fence)
+{
+    static constexpr uint32_t kMaxMany = 64;
+    if (count < 1 || count > kMaxMany) return false;
+    uint32_t nop = 0;
+    if (AdrenoPM4Type7(kCpNopOpcode, 0, &nop) != AdrenoPM4Success) return false;
+    volatile uint32_t *scratch = reinterpret_cast<volatile uint32_t *>(gState->scratch.base);
+    scratch[0] = nop;
+    clean(gState->scratch);
+    const uint32_t capacity = kMaxMany * 4 + 5;
+    uint32_t words[capacity] = {};
+    const uint32_t ib[3] = {uint32_t(GpuScratchIova), uint32_t(GpuScratchIova >> 32), 1};
+    uint32_t at = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        if (!packet(words, capacity, at, kCpIndirectBufferOpcode, ib, 3)) return false;
+        at += 4;
+    }
+    const uint64_t fenceAddress = GpuMemptrsIova + 4;
+    const uint32_t sequence = gState->sequence + 1;
+    const uint32_t event[4] = {kCacheFlushTs | kEventWriteIrq,
+        uint32_t(fenceAddress), uint32_t(fenceAddress >> 32), sequence};
+    if (!packet(words, capacity, at, kCpEventWriteOpcode, event, 4)) return false;
+    at += 5;
+    invalidate(gState->memptrs);
+    uint32_t end = 0;
+    if (!submitRing(words, at, &end)) return false;
+    gState->sequence = sequence;
+    if (fence) *fence = sequence;
+    return true;
+}
+
 bool waitFence(uint32_t fence, unsigned timeoutUs, bool verbose)
 {
     if (!fence) return false;
@@ -1775,6 +1855,19 @@ NativeAdrenoSubmit gSubmit;
 NativeAdrenoVm *gPublishedVm = nullptr;
 bool gServicePublished = false;
 
+/* The bound CP counter reader, exported for the submit path's exec timeline: a job takes one reading when its
+ * write pointer moves and one when the kernel first sees its fence pass, and the delta is the GPU's wall time
+ * (queueing included) for that job. The plain A6xx path has no CP stamps, so without this the jobs line could
+ * only show the submit-to-retire age, which a late completion inflates exactly like a slow GPU. */
+static NativeAdrenoTimer *gPublishedTimer;
+
+extern "C" uint64_t native_adreno_gpu_ticks(void)
+{
+    uint64_t ticks = 0;
+    if (!gPublishedTimer || gPublishedTimer->read(&ticks) != kIOReturnSuccess) return 0;
+    return ticks;
+}
+
 /* Publish the live GPU context through the production service: the same VM,
  * ring and submit object the A740 board hands over, with this chip's device
  * information. No user client can submit yet (the Metal plugin is not part of
@@ -1833,6 +1926,7 @@ bool publishGpu()
                 static_cast<unsigned long long>(ticks));
         }
     }
+    gPublishedTimer = gpuTimerAttached ? &gpuTimer : nullptr;
     const IOReturn published = native_adreno_publish(vm, &gSubmit, ring, &clock,
         gpuTimerAttached ? &gpuTimer : nullptr, &info, ias, 40);
     printf("PICASSO_GPU cp: publish status=%08x service=%p va_size=%llx\n",
@@ -2001,8 +2095,10 @@ void addonReport(void *, wait_result_t)
         uint64_t freq = 0;
         __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
         if (!freq) freq = 19200000;
+        if (native_adreno_call_report) native_adreno_call_report();
         printf("PICASSO_GPU submits live %u: submissions=%u ibs=%u max=%u many=%u "
-               "opens=%u report=%s apps=%d/%d/%d/%d/%x wc_us=%llu wc_reset=%u cache_us=%llu\n", round,
+               "opens=%u report=%s apps=%d/%d/%d/%d/%x wc_us=%llu wc_reset=%u cache_us=%llu "
+               "result=%u/%u last=%x bad=%u ready=%u tmo=%u busy=%u n=%u\n", round,
             native_adreno_submit_ibs[0], native_adreno_submit_ibs[1],
             native_adreno_submit_ibs[2], native_adreno_submit_ibs[3],
             native_adreno_metal_opens(), native_adreno_metal_report(),
@@ -2010,7 +2106,42 @@ void addonReport(void *, wait_result_t)
             native_staged_apps_mib, native_staged_apps_error,
             (unsigned long long)(&native_adreno_reassert_ticks ? native_adreno_reassert_ticks * 1000000 / freq : 0),
             &native_adreno_wc_audit ? native_adreno_wc_audit[5] : 0,
-            (unsigned long long)(&native_adreno_cache_stats ? native_adreno_cache_stats[0] * 1000000 / freq : 0));
+            (unsigned long long)(&native_adreno_cache_stats ? native_adreno_cache_stats[0] * 1000000 / freq : 0),
+            native_adreno_submit_result[0], native_adreno_submit_result[1],
+            native_adreno_submit_result[2], native_adreno_submit_result[3],
+            native_adreno_submit_result[4], native_adreno_submit_result[5],
+            native_adreno_submit_result[6], native_adreno_submit_result[7]);
+        /* The doorbell and stall accounting: whether the CP took each write pointer at once, and how long
+         * fences stayed pending while the frames crawled. */
+        printf("PICASSO_GPU wptr: calls=%u waited=%u spins=%u gaveup=%u unstick=%u/%u/%u/%u/%u drains=%u/%u/%u/%u pending=%u,%u,%u,%u,%u,%u,%u,%u\n",
+            native_adreno_wptr_fence[0], native_adreno_wptr_fence[1],
+            native_adreno_wptr_fence[2], native_adreno_wptr_fence[3],
+            native_adreno_unstick[0], native_adreno_unstick[1], native_adreno_unstick[2],
+            native_adreno_unstick[3], native_adreno_unstick[8],
+            native_adreno_unstick[4], native_adreno_unstick[5], native_adreno_unstick[6],
+            native_adreno_unstick[7],
+            native_adreno_fence_pending[0], native_adreno_fence_pending[1],
+            native_adreno_fence_pending[2], native_adreno_fence_pending[3],
+            native_adreno_fence_pending[4], native_adreno_fence_pending[5],
+            native_adreno_fence_pending[6], native_adreno_fence_pending[7]);
+        /* The most recent stalls' fingerprints: the fence that stayed pending past 50 ms, how many timed-out waits it
+         * had seen, and the ring's pointers when the kick ran. Read pointer == write pointer with the fence word
+         * unwritten is the completion's visibility at fault; a read pointer behind the write pointer is the CP still
+         * consuming the ring (or stopped on it). */
+        {
+            const uint32_t count=native_adreno_stall_log_count;
+            const uint32_t first=count>12?count-12:0;
+            for(uint32_t i=first;i<count;i++) {
+                volatile uint64_t *slot=native_adreno_stall_log[i&31];
+                const uint64_t word=slot[4];
+                printf("PICASSO_GPU stall[%u] t=%llu.%03llus fence=%u ev=%u to=%u hold_us=%llu "
+                       "r=%u w=%u rp=%u wp=%u q=%x\n",
+                    i,(unsigned long long)(slot[0]/1000000),(unsigned long long)((slot[0]/1000)%1000),
+                    (unsigned)slot[1],(unsigned)(slot[2]&0xff),(unsigned)(slot[2]>>8),
+                    slot[3],(unsigned)(word&0xffff),(unsigned)((word>>16)&0xffff),
+                    (unsigned)((word>>32)&0xffff),(unsigned)((word>>48)&0xffff),(unsigned)slot[5]);
+            }
+        }
     }
 }
 
@@ -2286,6 +2417,55 @@ extern "C" int native_adreno620_cp_start(void)
     native_adreno620_gmu_release_gpu_set();
     s.started = true;
     printf("PICASSO_GPU cp: ready fence=%u\n", fence);
+
+    /* The UI's frame rate is the client ring's fence age, so measure the fixed part of a submission here, with the GPU idle and
+     * no client attached: a one-dword noop IB and its CACHE_FLUSH_TS fence round trip. If this is microseconds, every slow frame
+     * is the client's own GPU work; if it is tens of milliseconds, the cost is the CP's per-submission path itself. */
+    {
+        uint64_t minimum = ~0ull, total = 0, maximum = 0;
+        unsigned count = 0;
+        for (unsigned probe = 0; probe < 8; ++probe) {
+            uint64_t began = 0;
+            NativeAdrenoKernelTime::now_us(nullptr, &began);
+            uint32_t noop = 0;
+            if (!submitNoop(&noop) || !waitFence(noop, kFenceTimeoutUs, true)) return -1;
+            uint64_t ended = 0;
+            NativeAdrenoKernelTime::now_us(nullptr, &ended);
+            const uint64_t us = ended - began;
+            if (us < minimum) minimum = us;
+            if (us > maximum) maximum = us;
+            total += us; ++count;
+            IODelay(50000);
+        }
+        printf("PICASSO_GPU cp: noop latency n=%u min=%llu mean=%llu max=%llu us\n", count,
+            (unsigned long long)minimum, (unsigned long long)(count ? total / count : 0),
+            (unsigned long long)maximum);
+    }
+    /* The same noop IB named 1, 16 and 64 times in one submission: the client's worst submissions name 82 indirect buffers, so
+     * this separates a per-indirect-buffer CP cost from the submission's own. */
+    {
+        static const unsigned counts[3] = {1, 16, 64};
+        for (unsigned index = 0; index < 3; ++index) {
+            uint64_t minimum = ~0ull, total = 0, maximum = 0;
+            unsigned count = 0;
+            for (unsigned round = 0; round < 3; ++round) {
+                uint64_t began = 0;
+                NativeAdrenoKernelTime::now_us(nullptr, &began);
+                uint32_t many = 0;
+                if (!submitNoopMany(counts[index], &many) || !waitFence(many, kFenceTimeoutUs, true)) return -1;
+                uint64_t ended = 0;
+                NativeAdrenoKernelTime::now_us(nullptr, &ended);
+                const uint64_t us = ended - began;
+                if (us < minimum) minimum = us;
+                if (us > maximum) maximum = us;
+                total += us; ++count;
+                IODelay(50000);
+            }
+            printf("PICASSO_GPU cp: noop ibs=%u latency n=%u min=%llu mean=%llu max=%llu us\n", counts[index], count,
+                (unsigned long long)minimum, (unsigned long long)(count ? total / count : 0),
+                (unsigned long long)maximum);
+        }
+    }
 
     /* Optional ring soak (sheng-gpu-cp-stress=<n>): repeated no-op
      * submissions after the OOB is released, spaced far enough apart for the

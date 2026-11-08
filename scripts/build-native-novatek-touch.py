@@ -20,9 +20,24 @@ import subprocess
 from pathlib import Path
 import picasso_touch_firmware as firmware
 
-ROOT = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[1]
+ROOT = REPO
 if not (ROOT / 'build/xnu').is_dir() and (ROOT / 'out/picasso/tree/build/xnu').is_dir():
     ROOT = ROOT / 'out/picasso/tree'
+# The pinned stock image queued by scripts/fetch-picasso-touch-firmware.py. Defaulting
+# to it keeps stage 4 in every plain kernel rebuild: without this, a rebuild that did
+# not export NOVATEK_TOUCH_FW silently regenerated the read-only archive and the next
+# boot lost the physical touch panel. The prepared tree holds copies of scripts/, so
+# search the parents too and find the worktree's out/ rather than out/picasso/tree/out/.
+def _default_firmware(root):
+    for candidate in (root, *root.parents):
+        path = candidate / 'out/picasso/novatek/firmware.bin'
+        if path.is_file():
+            return path
+    return root / 'out/picasso/novatek/firmware.bin'
+
+
+DEFAULT_FIRMWARE = _default_firmware(REPO)
 
 DRIVER = ROOT / 'drivers/NativeNovatekTouch'
 RECORD = 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'
@@ -130,7 +145,10 @@ def main():
                         help='SHA256-pinned 128 KiB Novatek stock image')
     parser.add_argument('--record', default=str(ROOT / RECORD))
     args = parser.parse_args()
-    data = read_firmware(args.firmware)
+    path = args.firmware
+    if path is None and DEFAULT_FIRMWARE.is_file():
+        path = DEFAULT_FIRMWARE
+    data = read_firmware(path)
     OUT.mkdir(parents=True, exist_ok=True)
 
     objects = []
@@ -148,7 +166,7 @@ def main():
     compile_one(args.record, fw_c, fw_obj, 'c')
     objects.append(fw_obj)
     object_hashes = inspect_objects(objects)
-    print(f'novatek-touch: firmware {args.firmware} ({size} bytes)')
+    print(f'novatek-touch: firmware {path} ({size} bytes)')
     if not size:
         print('novatek-touch: read-only probe build; stage 4 requires --firmware or NOVATEK_TOUCH_FW')
 

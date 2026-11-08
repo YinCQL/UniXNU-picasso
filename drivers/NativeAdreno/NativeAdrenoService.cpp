@@ -836,10 +836,12 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                                 ring_bytes,ring_iova,fence_mem_.mapping(),fence_bytes,fence_iova);
                                             /* With the diagnostics (sheng-diag=1) framed submissions stamp the CP's always-on counter before and after their
                                              * buffers; sheng-gpu-timeline=0 or 1 overrides that. */
-                                            {unsigned timeline=0,diag=0;PE_parse_boot_argn("sheng-diag",&diag,sizeof(diag));
+                                            {unsigned timeline=0,diag=0;const bool diag_parsed=PE_parse_boot_argn("sheng-diag",&diag,sizeof(diag));
                                              native_adreno_diag=diag==1;
                                              if(!PE_parse_boot_argn("sheng-gpu-timeline",&timeline,sizeof(timeline)))timeline=diag==1;
-                                             ring_.setTimeline(timeline!=0);}
+                                             ring_.setTimeline(timeline!=0);
+                                             printf("PICASSO_GPU diag parsed=%u value=%u timeline=%u\n",
+                                                 diag_parsed?1u:0u,diag,timeline);}
                                             if(!ring_status && sqe_bytes) {
                                                 memcpy(sqe_mem_.mapping(),native_adreno_sqe_firmware_image,
                                                     size_t(native_adreno_sqe_firmware_image_size));
