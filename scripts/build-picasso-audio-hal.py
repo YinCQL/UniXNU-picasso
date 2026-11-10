@@ -20,12 +20,19 @@ def bundle_identity(data):
     result=ns['library_identity'](data)
     if result['code_page_bytes']!=4096:raise ValueError('Require native 4K signature slots')
     return result
+AUDIO_FILES = {
+    'audio/PicassoAudio.driver/Info.plist': 0o644,
+    'audio/PicassoAudio.driver/PicassoAudio': 0o755,
+    'audio-route/VirtualAudio.plugin/Info.plist': 0o644,
+    'audio-route/VirtualAudio.plugin/VirtualAudio': 0o755,
+}
 def pack(files):
+    if [(n,m) for n,m,_ in files] != list(AUDIO_FILES.items()):raise ValueError('Require four ordered audio files')
     def pad(b):return b+bytes(-len(b)%8)
     body=b''
     for name,mode,data in files:
         encoded=name.encode()+b'\0';compressed=zlib.compress(data,9)
-        if len(encoded)>160 or not name.startswith('audio/') or '..' in name:raise ValueError('Bad audio addon path')
+        if len(encoded)>160 or name not in AUDIO_FILES or mode != AUDIO_FILES[name]:raise ValueError('Bad audio addon path/mode')
         body+=struct.pack('<IIQQ',len(encoded),mode,len(data),len(compressed))+pad(encoded)+pad(compressed)
     return b'NGPUADD2'+struct.pack('<IIQ',len(files),0,24+len(body))+body
 def main():
@@ -47,15 +54,18 @@ def main():
     assert info['AudioServerPlugIn_LoadingConditions']=={'IOService Matching':[{'IOProviderClass':'PicassoAudio'}]}
     assert info['AudioServerPlugIn_IOKitUserClients']==['PicassoAudioUserClient']
     files=[('audio/PicassoAudio.driver/Info.plist',0o644,(bundle/'Info.plist').read_bytes()),('audio/PicassoAudio.driver/PicassoAudio',0o755,binary.read_bytes())]
+    import picasso_audio_route as route
+    route_report,route_inputs=route.build(ROOT,out)
+    files += [('audio-route/VirtualAudio.plugin/Info.plist',0o644,(out/'VirtualAudio.plugin/Info.plist').read_bytes()),('audio-route/VirtualAudio.plugin/VirtualAudio',0o755,(out/'VirtualAudio.plugin/VirtualAudio').read_bytes())]
     addon=out/'audio.addon';addon.write_bytes(pack(files))
-    sources={str(p.relative_to(ROOT)):sha(p) for p in [source,ROOT/'hal/PicassoAudioRouteTrace.h',ROOT/'hal/PicassoAudioMix.h',ROOT/'hal/Info.plist',ROOT/'package/PicassoAudioAbi.h',Path(__file__)]}
+    sources={str(p.relative_to(ROOT)):sha(p) for p in [source,ROOT/'hal/PicassoAudioRouteTrace.h',ROOT/'hal/PicassoAudioMix.h',ROOT/'hal/Info.plist',ROOT/'package/PicassoAudioAbi.h',ROOT/'scripts/picasso_audio_route.py',ROOT/'scripts/picasso_ui_trust.py',ROOT/'scripts/picasso_audio_payload.py',ROOT/'board.toml',Path(__file__)]}
     # Hash all SDK files used by the compiler via its dependency output.
     deps=subprocess.check_output(command[:-4]+['-M','-MT','hal',str(source)],text=True)
-    inputs={}
+    inputs=dict(route_inputs)
     for n in deps.replace('\\\n',' ').split()[1:]:
         p=Path(n)
         if p.is_file() and (p.is_relative_to(sdk) or p.is_relative_to(headers)):inputs[str(p)]=sha(p)
     for p in [Path(cc),Path(ld)]:inputs[str(p)]=sha(p)
-    report=dict(passed=True,hardware_tested=False,target='arm64-apple-ios16.0',identity=identity,sources=sources,build_inputs=inputs,commands=commands,addon_sha256=sha(addon),files={n:dict(mode=m,bytes=len(b),sha256=hashlib.sha256(b).hexdigest()) for n,m,b in files})
+    report=dict(passed=True,hardware_tested=False,target='arm64-apple-ios16.0',identity=identity,route=route_report,sources=sources,build_inputs=inputs,commands=commands,addon_sha256=sha(addon),files={n:dict(mode=m,bytes=len(b),sha256=hashlib.sha256(b).hexdigest()) for n,m,b in files})
     (out/'build-report.json').write_text(json.dumps(report,indent=2)+'\n');print(json.dumps({'passed':True,'cdhash':identity['cdhash'],'addon_bytes':addon.stat().st_size}))
 if __name__=='__main__':main()

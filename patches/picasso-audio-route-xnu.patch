@@ -1,0 +1,82 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7632,6 +7632,18 @@
+ 	}
+ 	return 0;
+ }
++/* The payload may own only these four ordered audio files. */
++static bool
++picasso_audio_addon_entry(uint32_t count, uint32_t index, const char *name, uint32_t mode)
++{
++    static const char *const names[] = {
++        "audio/PicassoAudio.driver/Info.plist", "audio/PicassoAudio.driver/PicassoAudio",
++        "audio-route/VirtualAudio.plugin/Info.plist", "audio-route/VirtualAudio.plugin/VirtualAudio"
++    };
++    return count == 4 && index < 4 && name && !strcmp(name, names[index]) &&
++        mode == ((index & 1) ? 0755U : 0644U);
++}
++
+ static void
+ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ {
+@@ -7675,9 +7687,7 @@
+ 			native_gpu_addon_error = EINVAL;
+ 			return;
+ 		}
+-		if (audio_only == 1 && (count != 2 ||
+-		    (i == 0 && (strcmp(name, "audio/PicassoAudio.driver/Info.plist") || mode != 0644)) ||
+-		    (i == 1 && (strcmp(name, "audio/PicassoAudio.driver/PicassoAudio") || mode != 0755)))) {
++		if (audio_only == 1 && !picasso_audio_addon_entry(count, i, name, mode)) {
+ 			native_gpu_addon_error = EINVAL;
+ 			return;
+ 		}
+@@ -7778,6 +7788,32 @@
+     if (before) vnode_put(before);
+ }
+ 
++/* Mount only this exact plugin directory. Its executable is prepared and
++ * signed offline; the sealed root and all other HAL bundles stay visible.
++ * This runs during initial Data preparation, before audio server launch. */
++static void
++picasso_audio_route_mount(proc_t p, user_addr_t scratch, volatile int *stage, volatile int *status)
++{
++    static const char source[] = "/private/var/ngpu/audio-route/VirtualAudio.plugin";
++    static const char point[] = "/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin";
++    native_gpu_addon_mount(p, scratch, 0xa00, source, sizeof(source), point, sizeof(point),
++        "/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/Info.plist",
++        "/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio", stage, status);
++    printf("PICASSO_AUDIO route optional_vhaw=1 stage=%d error=%d\n", *stage, *status);
++}
++
++static void
++picasso_audio_prepare(proc_t p, user_addr_t scratch)
++{
++    volatile int stage = -1, status = native_gpu_addon_error;
++    if (!native_gpu_addon_failed && native_gpu_addon_files == 4 && !status) {
++        picasso_audio_route_mount(p, scratch, &stage, &status);
++        if (stage == 5 && !status) picasso_audio_addon_mount(p, scratch, &stage, &status);
++    }
++    printf("PICASSO_AUDIO addon files=%d written=%d same=%d failed=%d stage=%d error=%d\n",
++        native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, stage, status);
++}
++
+ static void
+ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -7786,14 +7822,8 @@
+ 	PE_parse_boot_argn("picasso-audio-addon", &audio, sizeof(audio));
+ 	if (enabled != 1 && audio != 1) return;
+ 	native_gpu_addon_install(p, scratch);
+-	if (audio == 1) {
+-		static volatile int stage, status;
+-		if (!native_gpu_addon_failed && native_gpu_addon_files == 2) {
+-			picasso_audio_addon_mount(p, scratch, &stage, &status);
+-		} else { stage = -1; status = native_gpu_addon_error; }
+-		printf("PICASSO_AUDIO addon files=%d written=%d same=%d failed=%d stage=%d error=%d\n",
+-		    native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, stage, status);
+-	}
++	if (audio == 1) picasso_audio_prepare(p, scratch);
++
+ 	if (enabled != 1) return;
+ 	static const char extensions_source[] = "/private/var/ngpu/addons", extensions_point[] = "/System/Library/Extensions";
+ 	static const char daemons_source[] = "/private/var/ngpu/daemons", daemons_point[] = "/System/Library/LaunchDaemons";

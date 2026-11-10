@@ -320,6 +320,13 @@ static void routing(void){
     for(unsigned i=0;i<6;++i)memcpy(image+wordOffsets[i],&words[i],4);
     unsigned char *at=(void *)(data+1);for(unsigned i=0;i<33;++i){struct load_command *lc=(void *)at;lc->cmd=0;lc->cmdsize=i==32?4040-(unsigned)(at-(unsigned char *)(h+1)):8;at+=lc->cmdsize;}
     assert(routeImageMatches(h));assert(routePortLayoutMatches(h));
+    const UInt32 routeWords[]={0x52800161,0x52800003,0x528c2ee4,0x72aecd04,0x528c2ee5,
+        0x72ac6d05,0x528c8cc6,0x72ad2da6,0x52800007,0x940015bb};
+    memcpy(image+0x32aeec,routeWords,sizeof routeWords);
+    assert(routeOptionalVariant((uintptr_t)h)==0);
+    image[0x32aef0]=0x23;assert(routeOptionalVariant((uintptr_t)h)==1);
+    for(unsigned i=0;i<10;++i){image[0x32aeec+i*4]^=1;assert(routeOptionalVariant((uintptr_t)h)==-1);image[0x32aeec+i*4]^=1;}
+    shortRead=true;assert(routeOptionalVariant((uintptr_t)h)==-1);shortRead=false;
     data->filesize=0;assert(!routePortLayoutMatches(h));data->filesize=0x4000;
     for(unsigned i=0;i<6;++i){image[wordOffsets[i]]^=1;assert(!routePortLayoutMatches(h));image[wordOffsets[i]]^=1;}
     shortRead=true;assert(!routePortLayoutMatches(h));shortRead=false;
@@ -357,6 +364,7 @@ int main(int argc,char **argv){
         unsigned char *file=malloc((size_t)bytes);assert(file);assert(fread(file,1,(size_t)bytes,f)==(size_t)bytes);fclose(f);
         readableBase=(uintptr_t)file;readableSize=(size_t)bytes;
         assert(routeImageMatches((const void *)file)&&routePortLayoutMatches((const void *)file));
+        assert(routeOptionalVariant((uintptr_t)file)>=0);
         free(file);readableBase=readableSize=0;
     }
     puts("PASS actual HAL scope, activation, volume, bounded trace and guarded forwarding");return 0;

@@ -172,12 +172,21 @@ static bool routeImageMatches(const struct mach_header_64 *h){
     }
     return p==end && id && got;
 }
+// Read the exact alternate constructor, never modify executable pages.
+static int routeOptionalVariant(uintptr_t base){
+    static const UInt32 expected[]={0x52800161,0x52800003,0x528c2ee4,0x72aecd04,0x528c2ee5,
+        0x72ac6d05,0x528c8cc6,0x72ad2da6,0x52800007,0x940015bb};
+    UInt32 words[10];if(!routeRead(base+0x32aeec,words,sizeof words))return -1;
+    int optional=words[1]==0x52800023;words[1]=optional?0x52800003:words[1];
+    return memcmp(words,expected,sizeof words)?-1:optional;
+}
 static void routeImageAdded(const struct mach_header *header,intptr_t slide){
     Dl_info info;
     if(!dladdr(header,&info) || !info.dli_fname ||
        strcmp(info.dli_fname,"/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio"))return;
     const struct mach_header_64 *h=(const void *)header;
     if(!routeImageMatches(h) || (uintptr_t)slide!=(uintptr_t)h){routeNote(14,-1,0,0,0,0,0);return;}
+    int variant=routeOptionalVariant((uintptr_t)h);routeNote(14,variant<0?-1:0,11,variant<0?0:(unsigned)variant,0,0,6);
     static const uintptr_t offsets[5]={0x60c100,0x60c108,0x60c110,0x60c138,0x60cc00};
     static const char *const names[5]={"AudioObjectGetPropertyData","AudioObjectGetPropertyDataSize","AudioObjectHasProperty","AudioObjectSetPropertyData","__cxa_throw"};
     void *hooks[5]={(void *)routeGet,(void *)routeSize,(void *)routeHas,(void *)routeSet,(void *)routeThrow};
