@@ -258,6 +258,33 @@ int main(int argc,char **argv) {
     play.amp.error=play.amp.stopError=-2147483647;
     for(auto &v:play.amp.status)v=0xffff;for(auto &v:play.amp.control)v=0xffff;
     logPlay(stream);
+    logPlayProgress(stream);
+    {
+        PicassoAprProbe a={};PlayLogState last={};
+        a.play.phase=PicassoPlayWrite;a.play.tokenBase=0x20570000;
+        assert(playLogKind(last,a)==PlayLogFull);
+        unsigned full=0,progress=0;
+        for(unsigned i=1;i<=4096;++i) {
+            a.play.writeSent=i;a.play.writeDone=i-1;
+            assert(playLogKind(last,a)==PlayLogNone);
+            a.play.writeDone=i;
+            PlayLogKind kind=playLogKind(last,a);
+            full+=kind==PlayLogFull;progress+=kind==PlayLogProgress;
+        }
+        assert(full==0 && progress==32);
+        a.play.error=-5;assert(playLogKind(last,a)==PlayLogFull);a.play.error=0;
+        a.play.replyReject=1;assert(playLogKind(last,a)==PlayLogFull);a.play.replyReject=0;
+        a.pcm.fsr=2;assert(playLogKind(last,a)==PlayLogFull);a.pcm.fsr=0x400;
+        assert(playLogKind(last,a)==PlayLogNone);
+        a.play.amp.stopError=-5;assert(playLogKind(last,a)==PlayLogFull);a.play.amp.stopError=0;
+        a.play.phase=PicassoPlayDrain;assert(playLogKind(last,a)==PlayLogFull);
+        a.play.phase=PicassoPlayDone;a.play.done=true;assert(playLogKind(last,a)==PlayLogFull);
+        a.play={};a.play.phase=PicassoPlayWrite;a.play.tokenBase=0x20580000;
+        assert(playLogKind(last,a)==PlayLogFull);
+        last.completed=0xffffffc0;a.play.writeDone=0x40;
+        assert(playLogKind(last,a)==PlayLogProgress);
+        puts("PASS playback log rate, session/phase transitions, immediate faults and counter wrap");
+    }
     PicassoRpcDomain record={};record.pd=record.requests=record.lastHandle=record.lastScalar=0xffffffffU;
     record.wireBytes=record.decodeResult=record.previousResult=0xffffffffU;
     memset(record.name,'n',127);memset(record.fs.target,'t',127);

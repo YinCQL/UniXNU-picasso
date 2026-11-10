@@ -978,7 +978,54 @@ surface_to_texture(struct eagl *e, struct image *image)
 	e->upload_bytes += row * (size_t)image->height;
 }
 
-/* What has been drawn into a texture, into its IOSurface, unless it is there (frame_end() waits for it). */
+/* Queue a mirror copy without publishing its IOSurface until frame_end waits. */
+static bool
+mirror_to_surface(struct eagl *e, struct image *image)
+{
+	GLint read = 0, draw = 0;
+	GLboolean scissored;
+	GLint x0 = 0, y0 = 0, x1 = image->width, y1 = image->height;
+
+	if (damage_blits && image->damaged) {
+		x0 = image->dmg[0];
+		y0 = image->dmg[1];
+		x1 = x0 + image->dmg[2];
+		y1 = y0 + image->dmg[3];
+		x0 = x0 < 0 ? 0 : x0;
+		y0 = y0 < 0 ? 0 : y0;
+		x1 = x1 > image->width ? image->width : x1;
+		y1 = y1 > image->height ? image->height : y1;
+	}
+	image->damaged = false;
+	if (x1 <= x0 || y1 <= y0) {
+		image->drawn = false;
+		return false;
+	}
+	/* the frame into the surface's memory, by the GPU (blit_targets); upside down if it is drawn so */
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	if (e->reader == 0) {
+		glGenFramebuffers(1, &e->reader);
+	}
+	if (e->writer == 0) {
+		glGenFramebuffers(1, &e->writer);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
+	// Internal copies use their own damage rectangle, independent of the caller.
+	scissored = glIsEnabled(GL_SCISSOR_TEST);
+	if (scissored) glDisable(GL_SCISSOR_TEST);
+	glBlitFramebuffer(x0, y0, x1, y1, x0, image->invert ? image->height - y1 : y0, x1,
+	    image->invert ? image->height - y0 : y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	if (scissored) glEnable(GL_SCISSOR_TEST);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+	return true;
+}
+
+/* Publish completed shared pixels, or read back an ordinary render target. */
 static void
 target_to_surface(struct eagl *e, struct image *image)
 {
@@ -987,47 +1034,7 @@ target_to_surface(struct eagl *e, struct image *image)
 	uint8_t *base;
 
 	image->drawn = false;
-	if (image->mirror != 0) {
-		GLint read = 0, draw = 0;
-		GLint x0 = 0, y0 = 0, x1 = image->width, y1 = image->height;
-
-		if (damage_blits && image->damaged) {
-			x0 = image->dmg[0];
-			y0 = image->dmg[1];
-			x1 = x0 + image->dmg[2];
-			y1 = y0 + image->dmg[3];
-			x0 = x0 < 0 ? 0 : x0;
-			y0 = y0 < 0 ? 0 : y0;
-			x1 = x1 > image->width ? image->width : x1;
-			y1 = y1 > image->height ? image->height : y1;
-		}
-		image->damaged = false;
-		if (x1 <= x0 || y1 <= y0) {
-			return;                         /* (nothing drawn into it this frame) */
-		}
-		/* the frame into the surface's memory, by the GPU (blit_targets); upside down if it is drawn so */
-		glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
-		glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
-		if (e->reader == 0) {
-			glGenFramebuffers(1, &e->reader);
-		}
-		if (e->writer == 0) {
-			glGenFramebuffers(1, &e->writer);
-		}
-		glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
-		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
-		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
-		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
-		glBlitFramebuffer(x0, y0, x1, y1, x0, image->invert ? image->height - y1 : y0, x1,
-		    image->invert ? image->height - y0 : y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
-		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
-			IOSurfaceUnlock(surface, 0, NULL);
-		}
-		return;
-	}
-	if (image->shared) {
+	if (image->shared || image->mirror != 0) {
 		/* whoever looks at the surface's seed is to see that it has changed */
 		if (IOSurfaceLock(surface, 0, NULL) == 0) {
 			IOSurfaceUnlock(surface, 0, NULL);
@@ -1271,6 +1278,7 @@ frame_end(struct eagl *e, bool finished)
 	static unsigned unfollowed;
 	uint64_t before, waited, after;
 	unsigned copied = 0, in_place = 0;
+	bool mirror_queued = false;
 
 	clear_now(e);
 	if (perf_marks && e->perf_open) {
@@ -1281,17 +1289,20 @@ frame_end(struct eagl *e, bool finished)
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
-			target_to_surface(e, &e->images[i]);    /* (the GPU's copy: before what follows sends it out) */
-			in_place++;
-			glFlush();                              /* (also after a glFinish: the copy is new since) */
+			if (mirror_to_surface(e, &e->images[i])) {
+				mirror_queued = true;
+				in_place++;
+			}
 		}
-		if (e->images[i].target && e->images[i].drawn && e->images[i].shared) {
+		if (e->images[i].target && e->images[i].drawn && e->images[i].shared && e->images[i].mirror == 0) {
 			in_place++;
 		}
 	}
-	if (in_place != 0 && !finished && wait_for_frames) {
+	if (mirror_queued) glFlush();
+	// A caller's glFinish precedes these copies and cannot have completed them.
+	if (in_place != 0 && (!finished || mirror_queued) && (finished || wait_for_frames)) {
 		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
-	} else if (in_place != 0 && !finished && sync_frames) {
+	} else if (in_place != 0 && (!finished || mirror_queued) && sync_frames) {
 		/*
 		 * The display's driver waits for the last submission that named the surface -- and Mesa's
 		 * freedreno may still hold a batch back after glFlush, to merge it with the next (submit
@@ -1310,9 +1321,9 @@ frame_end(struct eagl *e, bool finished)
 	waited = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn) {
-			copied += !e->images[i].shared;
+			copied += !e->images[i].shared && e->images[i].mirror == 0;
 			target_to_surface(e, &e->images[i]);
-			if (shown_texture != 0) {
+			if (shown_texture != 0 && e->images[i].mirror == 0) {
 				show_texture(e, &e->images[i]);
 			}
 		}
@@ -3641,7 +3652,7 @@ static void
 my_glFlush(void *context)
 {
 	struct eagl *e = context;
-	uint64_t began, t0, t1, t2;
+	uint64_t t0, t1, t2;
 
 	EAGL_ENTER(e, 0x2d8);
 	if (eagl_tracing) {
@@ -4173,7 +4184,7 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 	bool fragment = e->fragment[shader % 256], fetch;
 	const GLchar *parts[6] = { "#version 300 es\n", fragment ? fragment_start : vertex_start, "", NULL, "",
 		                   full_precision ? all_highp : "" };
-	size_t size = 1, extensions = 0;
+	size_t size = 1;
 	char *text, *line, *head;
 
 	EAGL_ENTER(e, 0x12a0);
@@ -4196,7 +4207,6 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 		strncat(head, line, length);
 		strcat(head, "\n");
 		line[0] = line[1] = '/';
-		extensions++;
 	}
 	parts[0] = head;
 	parts[3] = text;
@@ -4601,6 +4611,7 @@ install(void)
 	const char *argument;
 
 	ktrace("eagl ctor class=%p", (void *)class);
+	ktrace("eagl mirror=scissor-isolated publish=after-wait");
 
 	/* the kernel's boot-args are where a run is told things */
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {

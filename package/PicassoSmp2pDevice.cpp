@@ -171,6 +171,35 @@ void logStream(const PicassoAprProbe &a) {
     IOLog("PICASSO_ADSP asm-result open_error=%d format_error=%d status=%u/%u/%u\n",
         v.openError,v.formatError,v.statuses[0],v.statuses[1],v.statuses[2]);
 }
+struct PlayLogState {
+    uint32_t phase = ~0U, tokenBase = 0, completed = 0;
+};
+enum PlayLogKind { PlayLogNone, PlayLogFull, PlayLogProgress };
+PlayLogKind playLogKind(PlayLogState &last, const PicassoAprProbe &a) {
+    const auto &v = a.play;
+    bool transition = last.phase != v.phase || last.tokenBase != v.tokenBase;
+    bool failed = v.status || v.error || v.firstError || v.cleanupError || v.dmaError ||
+        v.writeStatus || v.replyReject || v.rejected || v.pins.error || v.pins.restoreError ||
+        v.amp.error || v.amp.stopError || a.pcm.error || a.pcm.dmaError || (a.pcm.fsr & 0xc00001feU);
+    last.phase = v.phase;
+    last.tokenBase = v.tokenBase;
+    // Preserve setup, teardown and fault details. A healthy stream needs only
+    // a progress sample every 128 completions, about eleven seconds at 48 kHz.
+    if (transition || v.phase != PicassoPlayWrite || failed || v.done || v.complete) {
+        last.completed = v.writeDone;
+        return PlayLogFull;
+    }
+    if (uint32_t(v.writeDone - last.completed) >= 128) {
+        last.completed = v.writeDone;
+        return PlayLogProgress;
+    }
+    return PlayLogNone;
+}
+void logPlayProgress(const PicassoAprProbe &a) {
+    const auto &v = a.play;
+    IOLog("PICASSO_ADSP play-queue sent=%u returned=%u inflight=%x dma_busy=%x bytes=%u/%u ticks=%u source=%u slot_bytes=16384\n",
+        v.writeSent,v.writeDone,v.inflight,a.pcm.busyMask,v.bytesSent,v.bytesDone,v.streamTicks,!!v.source);
+}
 void logPlay(const PicassoAprProbe &a) {
     const auto &v=a.play;
     IOLog("PICASSO_ADSP play phase=%u token=%x pending=%u opcode=%x status=%u error=%d first_error=%d cleanup_error=%d dma_error=%d\n",
@@ -248,6 +277,7 @@ struct BootEvents {
     uint32_t locatorEvents = 0, locatorLogs = 0, fwEvents = 0, afeEvents = 0;
     uint32_t tftpEvents = 0, tftpLogs = 0;
     uint32_t clockEvents = 0, portEvents = 0, pinEvents = 0, tfaEvents = 0, streamEvents = 0, pcmEvents = 0, playEvents = 0;
+    PlayLogState playLog = {};
 };
 void logAudioPins(const PicassoAudioPins &p) {
 IOLog("PICASSO_ADSP afe-pins attempted=%u active=%u restored=%u dirty=%x error=%d restore_error=%d ctl=%x/%x/%x/%x amplifier=0 pcm=0\n",
@@ -423,7 +453,12 @@ void bootService(void *context) {
             logAudioPins(p);
         }
         if(a.tfa.events!=b->tfaEvents) { b->tfaEvents=a.tfa.events;logTfa(a.tfa); }
-        if(a.play.events!=b->playEvents) { b->playEvents=a.play.events;logPlay(a); }
+        if(a.play.events!=b->playEvents) {
+            b->playEvents=a.play.events;
+            PlayLogKind kind=playLogKind(b->playLog,a);
+            if(kind==PlayLogFull)logPlay(a);
+            else if(kind==PlayLogProgress)logPlayProgress(a);
+        }
         picasso_audio_service_tick(a,g->failed);
         if(a.pcm.events!=b->pcmEvents) { b->pcmEvents=a.pcm.events;logPcm(a); }
         if(a.stream.events!=b->streamEvents) { b->streamEvents=a.stream.events;logStream(a); }

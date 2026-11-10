@@ -163,6 +163,10 @@ def make(work):
     hashes = sorted(bytes.fromhex(info['cdhash']) for info in identities.values())
     if len(hashes) != 4 or len(set(hashes)) != 4 or any(h + bytes([2,0,0,0]) not in trusted for h in hashes):
         raise ValueError('GPU code signature is absent from matching release trust')
+    import picasso_nativegl
+    gpu_files, gl_report = picasso_nativegl.adapt(work, gpu_files)
+    identities = {n: identity(data) for n, mode, data in gpu_files if mode == 0o755}
+    hashes = sorted(bytes.fromhex(info['cdhash']) for info in identities.values())
     gpu_module = struct.pack('<I16sI', 2, uuid.uuid5(uuid.NAMESPACE_URL,
         'picasso:gpu:' + ':'.join(h.hex() for h in hashes)).bytes, len(hashes))
     gpu_module += b''.join(h + bytes([2,0,0,0]) for h in hashes)
@@ -173,7 +177,7 @@ def make(work):
     files = audio_files + gpu_files
     addon, trust = pack(files), bundle(audio_modules + [gpu_module])
     report = dict(passed=True, runtime_qualified=False, addon_sha256=digest(addon), trust_sha256=digest(trust),
-        gpu_release_sha256=GPU_SHA, gpu_release_trust_sha256=GPU_TRUST_SHA, gpu_identities=identities,
+        gpu_release_sha256=GPU_SHA, gpu_release_trust_sha256=GPU_TRUST_SHA, gpu_identities=identities, nativegl=gl_report,
         original_modules_unchanged=True, audio_modules_unchanged=True, exact_owned_entries=7,
         excluded_release_files=[n for n, _, _ in all_gpu if n not in GPU_FILES],
         files={n:dict(mode=m, bytes=len(data), sha256=digest(data)) for n, m, data in files})
