@@ -1,0 +1,124 @@
+name: Generate Data Seed
+
+on:
+  workflow_dispatch:
+    inputs:
+      data_size_gib:
+        description: Data capacity in GiB (integer, 4-20)
+        type: string
+        default: "20"
+        required: true
+      data_uuid:
+        description: Data volume UUID (blank generates a new UUID)
+        type: string
+        default: ""
+      skip_setup:
+        description: Mark Setup as complete
+        type: boolean
+        default: true
+      retention_days:
+        description: Seed artifact retention in days (integer, 1-90)
+        type: string
+        default: "90"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: picasso-data-seed-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate seed parameters
+        id: parameters
+        env:
+          DATA_SIZE_GIB: ${{ inputs.data_size_gib }}
+          DATA_UUID: ${{ inputs.data_uuid }}
+          SKIP_SETUP: ${{ inputs.skip_setup }}
+          RETENTION_DAYS: ${{ inputs.retention_days }}
+        run: python3 scripts/picasso_data_seed.py options --output out/seed-request.json
+
+      - name: Check pinned iPhone X 20H392 inputs
+        run: |
+          python3 scripts/check-picasso-target.py --require-build-inputs \
+            --output out/picasso/logs/seed-target.json --github-env "$GITHUB_ENV"
+          TREE=$(python3 ./unixnu --prepare)
+          echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
+
+      - name: Build and sign the iOS UI library
+        run: |
+          python3 scripts/build-picasso-sb-inject.py \
+            package/picasso-springboard/picasso-springboard-probe.m out/picasso/libpicasso-sb.dylib
+
+      - name: Fetch the original OS and trust modules
+        run: |
+          python3 ./unixnu ipsw fetch OS StaticTrustCache Cryptex1,SystemTrustCache \
+            2>&1 | tee out/picasso/logs/seed-fetch.log
+          python3 scripts/prepare-original-trust.py --tree "$UNIXNU_TREE" \
+            --inputs "out/ipsw/$PICASSO_IPSW_BUILD" --output out/picasso/original-static-system.bundle
+
+      - name: Generate and verify APFS seeds
+        run: |
+          sudo env GITHUB_SHA="$GITHUB_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            "$(command -v python3)" scripts/picasso_data_seed.py generate \
+            --tree "$UNIXNU_TREE" --request out/seed-request.json \
+            --source "out/ipsw/$PICASSO_IPSW_BUILD/$PICASSO_OS_MEMBER" \
+            --original-trust out/picasso/original-static-system.bundle \
+            --work out/picasso/seed-work --output out/picasso/data-seed \
+            2>&1 | tee out/picasso/logs/seed-generation.log
+
+      - name: Verify the exported bundle
+        run: |
+          python3 scripts/picasso_data_seed.py validate --tree "$UNIXNU_TREE" --output out/picasso/data-seed
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          data = json.loads(Path('out/picasso/data-seed/seed-bundle.json').read_text())
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Generated iPhone X / 20H392 Data seed.\n\n')
+              summary.write(f"- Capacity: {data['parameters']['data_size_gib']} GiB\n")
+              summary.write(f"- Data UUID: `{data['volume_uuid']}`\n")
+              summary.write(f"- Skip Setup: {data['parameters']['skip_setup']}\n")
+              summary.write('- Verified: APFS filesystem, source ownership, offline policy, signed UI library, packed hashes.\n')
+              summary.write('- Scope: seeds only; kernel compilation and hardware behavior are not qualified by this run.\n\n')
+              summary.write('Extract the artifact, then run `python3 scripts/picasso_data_seed.py stage --tree <prepared-tree> '
+                            '--output <artifact-directory> --work <fresh-build-output>` after defconfig. '
+                            'Use the paths and Setup mode in `generated-seed/staged-inputs.json`.\n')
+          PY
+
+      - name: Retain generated seeds
+        uses: actions/upload-artifact@v4
+        with:
+          name: picasso-generated-data-seed-${{ github.run_number }}
+          path: out/picasso/data-seed/*
+          if-no-files-found: error
+          retention-days: ${{ steps.parameters.outputs.retention_days }}
+
+      - name: Retain seed diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: picasso-data-seed-diagnostics-${{ github.run_number }}
+          path: |
+            out/seed-request.json
+            out/picasso/logs/seed-*.json
+            out/picasso/logs/seed-*.log
+            out/picasso/seed-work/**/*-mount.json
+          if-no-files-found: warn
+          retention-days: 7

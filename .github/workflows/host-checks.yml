@@ -65,6 +65,11 @@ jobs:
             --output out/picasso/host-checks/linux-host
           cp out/picasso/host-checks/linux-host/results.json out/picasso/logs/linux-host-deps-host.json
 
+      - name: Check Data seed generation boundaries
+        run: |
+          python3 scripts/check-picasso-data-seed.py --tree "$UNIXNU_TREE" \
+            --output out/picasso/logs/data-seed-host.json
+
       - name: Replay UI runtime XNU changes and check errors
         run: |
           python3 scripts/check-picasso-ui-replay.py --tree "$UNIXNU_TREE" --output out/picasso/host-checks/ui-runtime
