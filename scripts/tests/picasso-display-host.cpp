@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <initializer_list>
+#include <vector>
 #ifdef _MSC_VER
 #define __builtin_memcpy memcpy
 #endif
@@ -77,6 +78,63 @@ static void pixels() {
     assert(!native_legacy_single_layer_state(1, 1, 0));
     assert(native_legacy_blank_state(0x8000000f, 0x8000000f, 0xff000000));
     assert(!native_legacy_blank_state(0x8000000f, 0x8000000f, 0xffffffff));
+}
+
+static void exactBlockCopies() {
+    alignas(8) unsigned char source[64]={}, destination[64]={}, shadow[64]={};
+    // Every bit, including alpha and the last pixel, must trigger a full block.
+    for(unsigned bit=0;bit<512;++bit) {
+        source[bit/8]^=static_cast<unsigned char>(1u<<(bit%8));
+        assert(native_legacy_copy_diff(destination,64,64,source,64,64,16,1,shadow,1)==64);
+        assert(!memcmp(source,destination,64) && !memcmp(source,shadow,64));
+        assert(native_legacy_copy_diff(destination,64,64,source,64,64,16,1,shadow,1)==0);
+    }
+    // Equal changes in different words must not cancel as they would in an XOR hash.
+    source[0]^=0x80;source[56]^=0x80;
+    assert(native_legacy_copy_diff(destination,64,64,source,64,64,16,1,shadow,1)==64);
+    assert(!memcmp(source,destination,64) && !memcmp(source,shadow,64));
+    puts("PASS: all 512 single-bit changes and cancelling-word changes remain exact");
+}
+
+static void differentialCopySequences() {
+    uint32_t state=0x71e382a5;
+    auto random=[&]() {state^=state<<13;state^=state>>17;state^=state<<5;return state;};
+    for(unsigned width : {2u,14u,16u,18u,30u,32u,34u,1080u}) {
+        for(unsigned offset : {0u,1u,7u}) {
+            const unsigned rowBytes=width*4, rows=3, sourceStride=rowBytes+12, destinationStride=rowBytes+16;
+            std::vector<unsigned char> input(sourceStride*rows+offset), saved(input.size());
+            std::vector<uint64_t> output(destinationStride*rows/8), shadow(rowBytes*rows/8);
+            std::vector<unsigned char> expected(destinationStride*rows,0xa5), previous(rowBytes*rows);
+            memset(output.data(),0xa5,expected.size());
+            unsigned char *source=input.data()+offset;
+            for(auto &byte:input)byte=static_cast<unsigned char>(random());
+            for(unsigned frame=0;frame<120;++frame) {
+                // Alternate unchanged, right-edge, sparse and completely changed frames.
+                if(frame%4==1)source[(frame%rows)*sourceStride+rowBytes-1]^=1;
+                if(frame%4==2)for(unsigned i=0;i<17;++i)source[(random()%rows)*sourceStride+random()%rowBytes]^=static_cast<unsigned char>(random());
+                if(frame%4==3)for(auto &byte:input)byte=static_cast<unsigned char>(random());
+                const bool valid=frame!=0 && frame%29!=0;
+                uint64_t bytes=0;
+                for(unsigned row=0;row<rows;++row) {
+                    const auto *in=source+row*sourceStride;
+                    auto *old=previous.data()+row*rowBytes;
+                    for(unsigned at=0;at<rowBytes;) {
+                        unsigned block=rowBytes-at>=64?64:8;
+                        if(!valid || memcmp(in+at,old+at,block))bytes+=block;
+                        at+=block;
+                    }
+                    memcpy(expected.data()+row*destinationStride,in,rowBytes);
+                }
+                saved=input;
+                assert(native_legacy_copy_diff(output.data(),expected.size(),destinationStride,source,
+                    sourceStride*rows,sourceStride,width,rows,shadow.data(),valid)==bytes);
+                assert(input==saved && !memcmp(output.data(),expected.data(),expected.size()));
+                for(unsigned row=0;row<rows;++row)memcpy(previous.data()+row*rowBytes,source+row*sourceStride,rowBytes);
+                assert(!memcmp(shadow.data(),previous.data(),previous.size()));
+            }
+        }
+    }
+    puts("PASS: 2880 frames, 1080-pixel right edge, exact allocations, unaligned sources, tails and stride padding");
 }
 
 static void setptr(unsigned char *base, unsigned offset, const void *value) { memcpy(base + offset, &value, 8); }
@@ -188,6 +246,6 @@ static void bootLogo() {
 }
 
 int main() {
-    video(); pixels(); queue(); bootLogo(); differentialCopies();
+    video(); pixels(); queue(); bootLogo(); differentialCopies(); exactBlockCopies(); differentialCopySequences();
     puts("PASS: GOP handoff, linear format, bounded pixel copies, blank frames and original queue ownership");
 }

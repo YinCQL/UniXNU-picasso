@@ -260,6 +260,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // retirement callbacks while serializing queue pumps from other threads.
     IORecursiveLock *kickLock=nullptr;
     bool benchmarked=false;
+    // Bounded metadata only: correlate late UI clipping reports with the
+    // compositor's surface geometry without reading the scanout or all pixels.
+    uint64_t observedWidth=0,observedHeight=0,observedStride=0;
+    unsigned surfaceSamples=0,surfaceChanges=0;
     // One bounded cached copy of visible pixels, independent of IOSurface lifetime.
     void *copyShadow=nullptr;
     uint64_t copyShadowBytes=0,copyShadowStride=0;
@@ -657,6 +661,18 @@ public:
            video.v_width!=width || video.v_height!=height || video.v_depth!=32 || video.v_rotate ||
            !native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
             native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
+        }
+        const uint64_t surfaceWidth=native_legacy_surface_width(surface);
+        const uint64_t surfaceHeight=native_legacy_surface_height(surface);
+        const bool geometryChanged=observedWidth!=surfaceWidth || observedHeight!=surfaceHeight || observedStride!=sourceStride;
+        ++surfaceSamples;
+        if(surfaceSamples<=4 || surfaceSamples%256==0 || (geometryChanged && surfaceChanges<64)) {
+            IOLog("PICASSO_DISPLAY surface sample=%u time_ms=%llu panel=%ux%u surface=%llux%llu stride=%llu destination_stride=%lu allocation=%llu changed=%u\n",
+                surfaceSamples,nowMs,width,height,surfaceWidth,surfaceHeight,sourceStride,video.v_rowBytes,allocation,(unsigned)geometryChanged);
+        }
+        if(geometryChanged) {
+            if(surfaceChanges<64)++surfaceChanges;
+            observedWidth=surfaceWidth;observedHeight=surfaceHeight;observedStride=sourceStride;
         }
         // The diagnostic renderer repaints the page over the scanout until it
         // is told the system owns the display; every accepted frame needs that,

@@ -144,6 +144,19 @@ static inline int native_legacy_copy_pixels(volatile void *destination,
     return 1;
 }
 
+// Keep the exact 64-byte comparison as one reduction. On ARM64 Clang can turn
+// a zero test of this expression into eight dependent load/branch pairs.
+// Materializing the value keeps paired shadow loads and one final branch,
+// without SIMD state, speculative reads past the block, or a lossy hash.
+static inline uint64_t native_legacy_block_difference(const uint64_t value[8],const uint64_t *old) {
+    uint64_t difference=(value[0]^old[0])|(value[1]^old[1])|(value[2]^old[2])|(value[3]^old[3])|
+                        (value[4]^old[4])|(value[5]^old[5])|(value[6]^old[6])|(value[7]^old[7]);
+#if defined(__aarch64__) || defined(__arm64__)
+    __asm__("" : "+r"(difference));
+#endif
+    return difference;
+}
+
 // Differential copy for the slow scanout memory: only 64-byte blocks that differ from the previous frame (kept in an ordinary
 // cached shadow buffer, rows packed at width*4) are stored to the device mapping. The shadow must start from a full copy
 // (valid=0 copies everything). Returns the number of bytes stored, or UINT64_MAX when the geometry needs the plain copy.
@@ -165,9 +178,12 @@ static inline uint64_t native_legacy_copy_diff(volatile void *destination,
         for (;w+8<=words;w+=8) {
             uint64_t v[8];
             __builtin_memcpy(v,in+(uint64_t)w*8,64);
-            if (valid && !((v[0]^old[w])|(v[1]^old[w+1])|(v[2]^old[w+2])|(v[3]^old[w+3])|
-                           (v[4]^old[w+4])|(v[5]^old[w+5])|(v[6]^old[w+6])|(v[7]^old[w+7]))) continue;
-            for (unsigned i=0;i<8;++i){out[w+i]=v[i];old[w+i]=v[i];}
+            if (valid && !native_legacy_block_difference(v,old+w)) continue;
+            // The shadow is ordinary cached memory. Copy it as one block so
+            // the compiler can pair its stores independently of the volatile
+            // aligned scanout stores, which must never read the destination.
+            __builtin_memcpy(old+w,v,64);
+            for (unsigned i=0;i<8;++i)out[w+i]=v[i];
             stored+=64;
         }
         for (;w<words;++w) {

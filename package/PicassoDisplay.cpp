@@ -40,8 +40,6 @@ kern_return_t OSKextLoadKextWithIdentifier(const char *);
 }
 
 static IOService *pendingDisplay;
-static IOService *activeDisplay;
-static IOPlatformDevice *activeNub;
 static bool initialized, screenReleased;
 static unsigned reportCounts[12][2];
 static IORegistryEntry *displayChosen;
@@ -144,7 +142,7 @@ extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t byte
     unsigned sample=__atomic_add_fetch(&count,1,__ATOMIC_RELAXED);
     if(sample<=4 || sample%64==0) {
         uint64_t hz=0;__asm__ volatile("mrs %0, cntfrq_el0":"=r"(hz));
-        IOLog("PICASSO_DISPLAY copy sample=%u ticks=%llu hz=%llu stored_bytes=%llu\n",sample,ticks,hz,bytes);
+        IOLog("PICASSO_DISPLAY copy sample=%u ticks=%llu hz=%llu stored_bytes=%llu compare=exact64-paired\n",sample,ticks,hz,bytes);
     }
 }
 extern "C" void native_legacy_vsync_observed(unsigned event, unsigned hz) { report(11, event, hz, 0); }
@@ -383,7 +381,6 @@ extern "C" void native_legacy_display_late_probe(void) {
     finishDisplayPolicy(started);
     OSSafeReleaseNULL(typeData); OSSafeReleaseNULL(ranges); OSSafeReleaseNULL(memory);
     if (started) {
-        activeDisplay = display; activeNub = nub;
         publishDisplayModes(display, (uint32_t)video.v_width, (uint32_t)video.v_height);
         publishAcceleratorStub();
         picasso_hid_start_later();
