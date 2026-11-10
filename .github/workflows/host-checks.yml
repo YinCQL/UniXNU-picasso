@@ -3,7 +3,7 @@ name: Picasso host regressions
 on:
   workflow_dispatch:
   push:
-    branches: [main-ios16, feat/ios16, feat/ios16-gpu]
+    branches: [main-ios16, feat/ios16, feat/ios16-gpu, feat/ios16-dsp]
     paths:
       - '.github/workflows/host-checks.yml'
       - 'scripts/**'
@@ -24,8 +24,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checks:
-    runs-on: ubuntu-latest
+  host-regressions:
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     defaults:
       run:
@@ -51,13 +51,19 @@ jobs:
       - name: Install host compilers
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld
+          sudo apt-get install -y clang lld libssl-dev
 
       - name: Prepare the isolated upstream source
         run: |
           TREE=$(python3 ./unixnu --prepare)
           echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
           mkdir -p out/picasso/logs
+
+      - name: Check Linux dependency reuse and live host verification
+        run: |
+          python3 scripts/check-picasso-linux-host.py --tree "$UNIXNU_TREE" --live \
+            --output out/picasso/host-checks/linux-host
+          cp out/picasso/host-checks/linux-host/results.json out/picasso/logs/linux-host-deps-host.json
 
       - name: Replay UI runtime XNU changes and check errors
         run: |
@@ -74,7 +80,7 @@ jobs:
           cp out/picasso/host-checks/ui-trust/results.json out/picasso/logs/ui-trust-host.json
 
       - name: Check PR13 GPU firmware and staged probe
-        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu'
+        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp'
         run: |
           python3 scripts/check-picasso-gpu-firmware.py --output out/picasso/host-checks/gpu-firmware
           cp out/picasso/host-checks/gpu-firmware/results.json out/picasso/logs/gpu-firmware-host.json
@@ -82,7 +88,7 @@ jobs:
             make -C drivers/NativeAdrenoPicasso/Test test CC=clang CXX=clang++
 
       - name: Check bounded DC ZVA fallback
-        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu'
+        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp'
         run: |
           python3 scripts/check-picasso-zva.py --output out/picasso/host-checks/zva
           cp out/picasso/host-checks/zva/results.json out/picasso/logs/zva-host.json
@@ -93,13 +99,29 @@ jobs:
           cp out/picasso/host-checks/astc-guard/results.json out/picasso/logs/astc-guard-host.json
 
       - name: Check PR13 WLAN firmware and handshake
-        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu'
+        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp'
         run: |
           python3 scripts/check-picasso-wlan.py --output out/picasso/host-checks/wlan
           cp out/picasso/host-checks/wlan/results.json out/picasso/logs/wlan-host.json
 
+      - name: Check Picasso ADSP survey and firmware inputs
+        if: github.ref_name == 'feat/ios16-dsp'
+        run: |
+          python3 scripts/check-picasso-adsp.py --output out/picasso/host-checks/adsp
+          cp out/picasso/host-checks/adsp/results.json out/picasso/logs/adsp-host.json
+          python3 scripts/check-picasso-firmware.py --output out/picasso/host-checks/firmware
+          cp out/picasso/host-checks/firmware/results.json out/picasso/logs/firmware-host.json
+          python3 scripts/check-picasso-qmp.py --output out/picasso/host-checks/qmp
+          cp out/picasso/host-checks/qmp/results.json out/picasso/logs/qmp-host.json
+          python3 scripts/check-picasso-smp2p.py --output out/picasso/host-checks/smp2p
+          cp out/picasso/host-checks/smp2p/results.json out/picasso/logs/smp2p-host.json
+          python3 scripts/check-picasso-rpmh.py --output out/picasso/host-checks/rpmh
+          cp out/picasso/host-checks/rpmh/results.json out/picasso/logs/rpmh-host.json
+          python3 scripts/check-picasso-adsp-boot.py --output out/picasso/host-checks/adsp-boot
+          cp out/picasso/host-checks/adsp-boot/results.json out/picasso/logs/adsp-boot-host.json
+
       - name: Check GOP import and completion ownership
-        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu'
+        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp'
         run: |
           python3 scripts/check-picasso-gop-handoff.py --output out/picasso/host-checks/gop-handoff
           cp out/picasso/host-checks/gop-handoff/results.json out/picasso/logs/gop-handoff-host.json
@@ -160,20 +182,6 @@ jobs:
           python3 scripts/check-picasso-novatek.py --output out/picasso/host-checks/novatek
           cp out/picasso/host-checks/novatek/results.json out/picasso/logs/novatek-host.json
 
-      - name: Check packed Data format and seed validation
-        run: |
-          # Fixtures contain intentional symlinks. Upload only the result JSON.
-          python3 scripts/check-picasso-ram-data.py --output out/picasso/host-checks/data \
-            --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py"
-          python3 scripts/check-picasso-data-artifacts-host.py --output out/picasso/host-checks/payload-seed
-          python3 scripts/check-picasso-setup-identity.py \
-            --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py" \
-            --output out/picasso/host-checks/setup-identity
-          mkdir -p out/picasso/logs
-          cp out/picasso/host-checks/data/results.json out/picasso/logs/data-host-check.json
-          cp out/picasso/host-checks/payload-seed/results.json out/picasso/logs/payload-seed-host.json
-          cp out/picasso/host-checks/setup-identity/results.json out/picasso/logs/setup-identity-host.json
-
       - name: Check persistent Data and dual record recovery
         run: |
           python3 scripts/check-picasso-persistence.py --tree "$UNIXNU_TREE" --output out/picasso/host-checks/persistent-data
@@ -202,7 +210,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: picasso-host-${{ github.run_id }}
+          name: picasso-host-core-${{ github.run_id }}
           # Anchor log searches outside Data fixtures containing directory symlinks.
           path: |
             device/out/picasso/logs/**
@@ -215,8 +223,97 @@ jobs:
             device/out/picasso/host-checks/ufs-cache/*.log
             device/out/picasso/host-checks/ufs-persistence/*.log
             device/out/picasso/host-checks/novatek/*.log
+            device/out/picasso/host-checks/linux-host/*.log
+            device/out/picasso/host-checks/linux-host/*.json
           if-no-files-found: warn
           retention-days: 7
+
+  # These two suites hash large logical disks. Give each its own CPU budget
+  # while driver regressions run, without shrinking fixtures or caching results.
+  seed-checks:
+    name: seed-${{ matrix.suite }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [format, identity]
+    defaults:
+      run:
+        shell: bash
+        working-directory: device
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare the pinned upstream packer
+        run: |
+          TREE=$(python3 ./unixnu --prepare)
+          echo "UNIXNU_TREE=$TREE" >> "$GITHUB_ENV"
+          mkdir -p out/picasso/seed-reports/logs
+      - name: Check packed Data format and payload seed
+        if: matrix.suite == 'format'
+        run: |
+          # bash pipefail preserves the test's failure through tee. Only logs
+          # and reports are uploaded, never sparse fixtures or their symlinks.
+          python3 scripts/check-picasso-ram-data.py --output out/picasso/host-checks/data \
+            --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py" \
+            2>&1 | tee out/picasso/seed-reports/logs/data-format.log
+          cp out/picasso/host-checks/data/results.json out/picasso/seed-reports/logs/data-host-check.json
+          python3 scripts/check-picasso-data-artifacts-host.py --output out/picasso/host-checks/payload-seed \
+            2>&1 | tee out/picasso/seed-reports/logs/payload-seed.log
+          cp out/picasso/host-checks/payload-seed/results.json out/picasso/seed-reports/logs/payload-seed-host.json
+      - name: Check upstream Setup identity and Compose reuse
+        if: matrix.suite == 'identity'
+        run: |
+          python3 scripts/check-picasso-setup-identity.py \
+            --packer "$UNIXNU_TREE/drivers/DarwinBoot/Test/packed_ramdisk.py" \
+            --output out/picasso/host-checks/setup-identity \
+            2>&1 | tee out/picasso/seed-reports/logs/setup-identity.log
+          cp out/picasso/host-checks/setup-identity/results.json out/picasso/seed-reports/logs/setup-identity-host.json
+      - name: Upload seed regression reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: picasso-host-seed-${{ matrix.suite }}-${{ github.run_id }}
+          path: device/out/picasso/seed-reports/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # Preserve the existing required check name. It must fail if any shard fails
+  # or is skipped; a successful driver job alone is not a complete host check.
+  checks:
+    if: always()
+    needs: [host-regressions, seed-checks]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Collect host regression reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: picasso-host-*-${{ github.run_id }}
+          merge-multiple: true
+          path: reports
+      - name: Publish combined host reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: picasso-host-${{ github.run_id }}
+          path: reports/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Require every regression shard
+        if: always()
+        env:
+          CORE_RESULT: ${{ needs.host-regressions.result }}
+          SEED_RESULT: ${{ needs.seed-checks.result }}
+        run: |
+          test "$CORE_RESULT" = success
+          test "$SEED_RESULT" = success
 
   ui-library:
     runs-on: macos-latest
