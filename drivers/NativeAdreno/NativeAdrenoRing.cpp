@@ -571,7 +571,7 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
     /* A plain (kernel) submission cannot carry the switch: a pending table waits for the next framed one. */
     const uint32_t extra=framed?RingPrologueWords+(reset?RingResetWords:0)+(table?RingTableWords:0)+RingFramedFenceWords+
         (stamps_?2*RingStampWords:0)+(preempt_?RingPseudoWords+RingYieldWords:0):
-        (a6xx_?RingA6xxFenceWords:RingFenceWords);
+        (a6xx_?RingA6xxFenceWords:RingFenceWords)+(stamps_?2*RingStampWords:0);
     if(word_count>size_words-extra-8)return kIOReturnNoResources;
     uint32_t rptr=0;IOReturn status=readRptr(&rptr);
     if(status)return status;
@@ -581,10 +581,24 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
     if(framed) {
         status=emitPrologue(at,reset,table,&at,number);
         if(status)return status;
+    } else if(stamps_) {
+        /* The A6xx plain path carries no prologue packet array, so the start stamp is written here: the same
+         * CP_REG_TO_MEM of CP_ALWAYS_ON_COUNTER the framed prologue ends with, into this fence's timeline slot. */
+        uint32_t stamp_words[RingStampWords]={};
+        const size_t n=stamp(stamp_words,0,fence_iova_,number,false);
+        for(size_t i=0;i<n;++i)ring_[(at+i)&mask]=stamp_words[i];
+        at=(at+(uint32_t)n)&mask;
     }
     for(size_t i=0;i<word_count;++i)ring_[(at+i)&mask]=words[i];
     at=(at+(uint32_t)word_count)&mask;
     uint32_t end=0;
+    if(!framed && stamps_) {
+        /* Before the fence packet, so the delta is the job's execution and not the completion event after it. */
+        uint32_t stamp_words[RingStampWords]={};
+        const size_t n=stamp(stamp_words,0,fence_iova_,number,true);
+        for(size_t i=0;i<n;++i)ring_[(at+i)&mask]=stamp_words[i];
+        at=(at+(uint32_t)n)&mask;
+    }
     /* Every framed submission of a ring with a preemption record ends with the yield: the second ring's too, or the CP never
      * leaves it (the switch back stays pending with STOP set). */
     status=framed?emitFramedFence(at,number,&end,preempt_):emitFence(at,number,&end);

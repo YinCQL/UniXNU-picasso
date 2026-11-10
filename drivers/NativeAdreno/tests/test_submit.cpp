@@ -112,6 +112,9 @@ void NativeAdrenoNotePhase(unsigned,size_t) {}
 // not consume the fault injected into the operational submission path.
 extern "C" boolean_t PE_parse_boot_argn(const char *name,void *value,int bytes)
 {
+    if(!std::strcmp(name,"ngb") && bytes==sizeof(unsigned)) {
+        *static_cast<unsigned *>(value)=std::getenv("NATIVE_ADRENO_TEST_IB_BATCH")?1u:0u;return 1;
+    }
     if(std::strcmp(name,"sheng-gpu-wire") || bytes!=sizeof(unsigned))return 0;
     *static_cast<unsigned *>(value)=0;return 1;
 }

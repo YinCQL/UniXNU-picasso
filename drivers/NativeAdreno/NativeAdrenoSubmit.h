@@ -67,6 +67,7 @@ private:
         NativeAdrenoVm *vm=nullptr;   /* the GPU address space (process page table) the job's buffers belong to */
         uint32_t context=0;           /* the ring context it ran in (NativeAdrenoRing::useContext) */
         uint64_t submit_us=0;         /* the clock when the write pointer moved (0: no clock), and the GPU level then (native_gpu_dcvs) */
+        uint64_t gpu_ticks=0;         /* CP_ALWAYS_ON_COUNTER when it was submitted (0: no reader), the other half of the retire delta */
         uint32_t level=0;
         int32_t owner=0;              /* the process that submitted it (nextOwner) */
         size_t word_count=0;          /* its ring words (the IB packets), kept to replay it after a GPU restart */
@@ -140,6 +141,7 @@ private:
     bool attached_=false,poisoned_=false;
     /* The A6xx plain profile (setA6xxPlain): no thread-control framing, no preemption. */
     bool a6xx_=false;
+    bool batch_ib_peek_=false;   /* ngb=1: batch only the diagnostic IB snapshot; the submission and cache protocol are unchanged. */
     uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */
     /* submit()'s distinct buffers and ring words: too large for the kernel stack at 128 IBs (callers serialize every method) */
     uint64_t scratch_handles_[NativeAdrenoSubmitMaxBuffers]{};

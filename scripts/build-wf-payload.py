@@ -56,12 +56,22 @@ def main():
         raise ValueError('Expected current 60 MiB payload layout')
     # The experiment uses physical touch; omit repeated synthetic swipe trials
     # to leave room in DarwinBoot's 1000-byte argument buffer, as in PR13.
-    for argument in ('offline-hid-swipe-delay=8', 'offline-hid-auto-home-count=8', 'offline-hid-swipe=8'):
+    for argument in ('offline-hid-swipe-delay=8', 'offline-hid-auto-home-count=8', 'offline-hid-swipe=8',
+                     'sheng-touch-hid=1'):
         board_text = board_text.replace(f'  "{argument}",\n', '')
+    # A benchmark boot adds sheng-gpu-bench=1 (19 bytes) after the buffer is full; drop the boot-logo
+    # hold (24) to make room. The logo still shows; only the hold until the UI is removed.
+    if os.environ.get('WF_DROP_LOGO_HOLD') == '1':
+        board_text = board_text.replace('  "picasso-boot-logo-hold=1",\n', '')
     # Keep the ios16 policy and identity; only this temporary device view changes.
     tomllib.loads(board_text)
+    # sheng-touch-start is omitted: BootProgress already defaults it to 60 s, and
+    # the freed command-line bytes go to experiment arguments under DarwinBoot's
+    # 1000-byte limit.
+    # sheng-touch-hid is left out: NativeHidInput's touchEnabled defaults to true when the argument is
+    # absent (its PE_parse_boot_argn call), so the 16 bytes go to experiment arguments instead.
     args = ['sheng-cpufreq=4', 'sheng-gpu=4', 'sheng-gpu-metal=1', 'sheng-gpu-addon=1',
-            'sheng-touch-hid=1', 'sheng-touch=4', 'sheng-touch-start=60']
+            'sheng-touch=4']
     if os.environ.get('GRID', '1') != '0':
         args += ['sheng-display-grid=10']
     args += extra

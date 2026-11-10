@@ -85,7 +85,7 @@ struct NativeAdrenoAbiSubmit {
     uint64_t queue;               /* open queue; 0 is created by open() */
     uint64_t wait_fence;          /* zero or an earlier fence of this client */
     uint64_t wait_timeout_ns;     /* used only when wait_fence is nonzero */
-    NativeAdrenoAbiSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
+    struct NativeAdrenoAbiSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
 };
 struct NativeAdrenoAbiMetadata {
     uint64_t handle;              /* object identity */
@@ -162,6 +162,32 @@ struct NativeAdrenoAbiDeviceInfo {
     uint32_t flags;
     uint32_t reserved;            /* zero */
 };
+/* C users of this header (the userspace libdrm stand-in) name the records without struct tags. */
+#if !defined(__cplusplus)
+typedef struct NativeAdrenoAbiParams NativeAdrenoAbiParams;
+typedef struct NativeAdrenoAbiBoAlloc NativeAdrenoAbiBoAlloc;
+typedef struct NativeAdrenoAbiBoAllocReply NativeAdrenoAbiBoAllocReply;
+typedef struct NativeAdrenoAbiBoImport NativeAdrenoAbiBoImport;
+typedef struct NativeAdrenoAbiBoMap NativeAdrenoAbiBoMap;
+typedef struct NativeAdrenoAbiBoMapReply NativeAdrenoAbiBoMapReply;
+typedef struct NativeAdrenoAbiBoFree NativeAdrenoAbiBoFree;
+typedef struct NativeAdrenoAbiSubmitBuffer NativeAdrenoAbiSubmitBuffer;
+typedef struct NativeAdrenoAbiSubmit NativeAdrenoAbiSubmit;
+typedef struct NativeAdrenoAbiMetadata NativeAdrenoAbiMetadata;
+typedef struct NativeAdrenoAbiSubmitReply NativeAdrenoAbiSubmitReply;
+typedef struct NativeAdrenoAbiWaitFence NativeAdrenoAbiWaitFence;
+typedef struct NativeAdrenoAbiTimestamp NativeAdrenoAbiTimestamp;
+typedef struct NativeAdrenoAbiBoCpuMap NativeAdrenoAbiBoCpuMap;
+typedef struct NativeAdrenoAbiBoCpuMapReply NativeAdrenoAbiBoCpuMapReply;
+typedef struct NativeAdrenoAbiBoCpuUnmap NativeAdrenoAbiBoCpuUnmap;
+typedef struct NativeAdrenoAbiPriority NativeAdrenoAbiPriority;
+typedef struct NativeAdrenoAbiNote NativeAdrenoAbiNote;
+typedef struct NativeAdrenoAbiQueue NativeAdrenoAbiQueue;
+typedef struct NativeAdrenoAbiQueueReply NativeAdrenoAbiQueueReply;
+typedef struct NativeAdrenoAbiDeviceInfo NativeAdrenoAbiDeviceInfo;
+typedef struct NativeAdrenoAbiStatus NativeAdrenoAbiStatus;
+#endif
+
 #if defined(__cplusplus)
 static_assert(sizeof(NativeAdrenoAbiDeviceInfo) == 64, "ABI device info layout");
 static_assert(sizeof(NativeAdrenoAbiParams) == 24, "ABI params layout");

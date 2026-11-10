@@ -30,7 +30,7 @@ def verify(bundle,work):
     expected,ui,identity=make(work)
     if bundle!=expected:raise ValueError('Audio trust differs from exact UI/base/audio modules')
     return ui,identity
-def check(work,tree,output):
+def check(work,tree,output,profile=None):
     # Execute the existing strict Data checker with two precisely constrained
     # adapters: the extra audio argument and the extra exact trust module. Its
     # seed, ownership, payload extraction, library and capacity checks still run.
@@ -38,11 +38,18 @@ def check(work,tree,output):
     original=picasso_ui_trust.accepted_payload_bundle
     def accepted(blob,library,device):
         if library!='out/picasso/libpicasso-sb.dylib' or Path(device).resolve()!=ROOT:raise ValueError('Bad UI trust identity')
-        ui,_=verify(blob,work);return ui
+        ui,_=(profile.verify(blob,work) if profile else verify(blob,work));return ui
     picasso_ui_trust.accepted_payload_bundle=accepted
     source=(ROOT/'scripts/check-picasso-data-artifacts.py').read_text()
     old="require(payload_report['kernel_args'] == ' '.join(spec['kernel_args']), 'Unexpected boot arguments')"
     new="require(payload_report['kernel_args'] == ' '.join(spec['kernel_args']) + ' picasso-audio-addon=1', 'Unexpected audio boot arguments')"
+    if profile:
+        base=tomllib.loads((ROOT/"board.toml").read_text())["payload"]["kernel_args"]
+        expected=" ".join(profile.kernel_args(base))
+        new="require(payload_report['kernel_args'] == "+repr(expected)+", 'Unexpected media boot arguments')"
+        size_check="require(payload.stat().st_size == 60 * 1024**2, 'Incorrect FAT payload size')"
+        if source.count(size_check)!=1:raise ValueError('Data checker size contract changed')
+        source=source.replace(size_check,"require(payload.stat().st_size == "+str(profile.PAYLOAD_MIB)+" * 1024**2, 'Incorrect media FAT payload size')")
     if source.count(old)!=1:raise ValueError('Data checker contract changed')
     ns={'__name__':'picasso_audio_data_check','__file__':str(ROOT/'scripts/check-picasso-data-artifacts.py')}
     try:
@@ -53,7 +60,7 @@ def check(work,tree,output):
     for name,digest in report['sources'].items():assert sha(ROOT/name)==digest,name
     files=output.with_suffix('.files')/'EFI/UniXNU/Payloads'
     addon=work/'audio-hal/audio.addon';assert sha(addon)==report['addon_sha256']
-    assert (files/'kernel.macho.gpuaddon').read_bytes()==addon.read_bytes()
+    assert (files/'kernel.macho.gpuaddon').read_bytes()==(profile.addon(work) if profile else addon).read_bytes()
     # Rebuild the exact whitelist payload from the signed files, rather than
     # trusting a report that might refer to a different compressed addon.
     hal=load(ROOT/'scripts/build-picasso-audio-hal.py')
@@ -69,8 +76,9 @@ def check(work,tree,output):
     if verify_route(work/'audio-hal')!=report['route']:raise ValueError('Audio route report differs')
     decode=load(ROOT/'scripts/check-picasso-adt.py').decode
     assert decode((files/'kernel.macho.adt').read_bytes())['/chosen/memory-map']['GpuAddon']==bytes(16)
-    _,identity=verify((files/'kernel.macho.trustcache').read_bytes(),work)
+    _,identity=(profile.verify if profile else verify)((files/'kernel.macho.trustcache').read_bytes(),work)
     result['audio']=dict(identity=identity,addon_sha256=sha(addon),exact_owned_entries=3,route=report['route'],hal_installed_in_payload=True,runtime_qualified=False)
+    if profile:result['media']=profile.report(work)
     output.write_text(json.dumps(result,indent=2)+'\n');return result
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('mode',choices=['prepare','check']);p.add_argument('--work',type=Path,required=True);p.add_argument('--tree',type=Path);p.add_argument('--output',type=Path);a=p.parse_args();work=a.work.resolve()
