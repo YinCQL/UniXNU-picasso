@@ -7,6 +7,16 @@
 #include <mach-o/loader.h>
 #include <stdio.h>
 #include "picasso-astc-guard-core.h"
+#include "picasso-pixel-sample.h"
+
+static void picasso_pixel_console(const char *line, int length, size_t capacity)
+{
+    int fd = open("/dev/console", O_WRONLY);
+    if (fd >= 0) {
+        if (length > 0 && (size_t)length < capacity) (void)write(fd, line, (size_t)length);
+        close(fd);
+    }
+}
 
 @protocol PicassoASTCLayout <NSObject>
 - (NSUInteger)size;
@@ -85,18 +95,54 @@ static int picasso_astc_preflight(void *plugin, int atx)
     }
 }
 
+static void picasso_astc_decode_note(void *plugin, const unsigned char *pixels,
+                                     size_t bytes, int atx, int result)
+{
+    static unsigned counts[2];
+    if (__atomic_fetch_add(&counts[atx != 0], 1, __ATOMIC_RELAXED) >= 16) return;
+    /* These fields build the original decoder's vImage_Buffer, in both
+     * qualified ASTC and ATX functions. Its return is zero only on success. */
+    uint32_t width = plugin ? picasso_astc_u32(plugin, 0xfc) : 0;
+    uint32_t height = plugin ? picasso_astc_u32(plugin, 0x100) : 0;
+    uint32_t row = plugin ? picasso_astc_u32(plugin, 0x124) : 0;
+    struct picasso_pixel_sample sample = {0};
+    struct picasso_astc_request request = {0};
+    enum picasso_astc_action action = picasso_astc_request(plugin, atx,
+        picasso_astc_texture_vtable, &request);
+    const void *texture = plugin ? (const void *)picasso_astc_pointer(plugin, 0x1c0) : NULL;
+    int rgbx = action != PICASSO_ASTC_INVALID && texture &&
+        picasso_astc_pointer(texture, 0) == picasso_astc_texture_vtable &&
+        !*((const unsigned char *)texture + 0x2a) &&
+        *((const unsigned char *)plugin + 0x184) != 1 &&
+        (!atx || (!picasso_astc_pointer(plugin, 0x230) &&
+                  !picasso_astc_pointer(plugin, 0x248) &&
+                  picasso_astc_pointer(plugin, 0x228)));
+    if (!result && rgbx) picasso_sample_rgba(pixels, bytes, width, height, row, &sample);
+    char line[320];
+    int length = snprintf(line, sizeof(line),
+        "PICASSO_ASTC_DECODE pid=%d kind=%s result=%d size=%u/%u row=%u bytes=%llu samples=%u rgb_nonzero=%u alpha_nonzero=%u varied=%u first=%08x hash=%08x\n",
+        getpid(), atx ? "atx" : "astc", result, width, height, row,
+        (unsigned long long)bytes, sample.count, sample.rgb_nonzero,
+        sample.alpha_nonzero, sample.varied, sample.first, sample.hash);
+    picasso_pixel_console(line, length, sizeof(line));
+}
+
 static int picasso_astc_guard(void *plugin, unsigned char *pixels, size_t bytes)
 {
     /* Original ASTCReadPlugin returns -50 on failure; callers discard blocks. */
     if (!picasso_astc_preflight(plugin, 0)) return -50;
-    return picasso_astc_decode(plugin, pixels, bytes);
+    int result = picasso_astc_decode(plugin, pixels, bytes);
+    picasso_astc_decode_note(plugin, pixels, bytes, 0, result);
+    return result;
 }
 
 static int picasso_atx_guard(void *plugin, unsigned char *pixels, size_t bytes)
 {
     /* ATXReadPlugin's corresponding error is -4. */
     if (!picasso_astc_preflight(plugin, 1)) return -4;
-    return picasso_atx_decode(plugin, pixels, bytes);
+    int result = picasso_atx_decode(plugin, pixels, bytes);
+    picasso_astc_decode_note(plugin, pixels, bytes, 1, result);
+    return result;
 }
 
 static int picasso_astc_hash(uintptr_t base, uintptr_t offset, size_t size, const char *expected)

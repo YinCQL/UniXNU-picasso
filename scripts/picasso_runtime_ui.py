@@ -7,7 +7,8 @@ ROOT = Path(__file__).resolve().parents[1]
 FILE = 'ui/libpicasso-sb.dylib'
 SOURCES = ['package/picasso-springboard/' + n for n in
            ['picasso-ui-runtime.m', 'picasso-input-cache.m', 'picasso-springboard-probe.m',
-            'picasso-statusbar-metrics.m', 'picasso-astc-guard.m', 'picasso-astc-guard-core.h']]
+            'picasso-statusbar-metrics.m', 'picasso-astc-guard.m', 'picasso-astc-guard-core.h',
+            'picasso-pixel-sample.h', 'picasso-wallpaper-probe.m']]
 SOURCES += ['scripts/picasso_runtime_ui.py']
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
 def build(work):
@@ -31,7 +32,7 @@ def build(work):
     for n in deps.replace('\\\n', ' ').split()[1:]:
         p = Path(n)
         if p.is_file() and p.is_relative_to(sdk): inputs[str(p)] = sha(p)
-    for n in ['Foundation', 'UIKit', 'Metal']:
+    for n in ['Foundation', 'UIKit', 'Metal', 'CoreGraphics']:
         p = sdk / ('System/Library/Frameworks/' + n + '.framework/' + n + '.tbd')
         inputs[str(p)] = sha(p)
     for p in (sdk / 'usr/lib').glob('*.tbd'): inputs[str(p)] = sha(p)
@@ -39,7 +40,7 @@ def build(work):
     run('link', [ld, '-arch', 'arm64', '-platform_version', 'ios', '16.0', '16.5', '-dylib',
                 '-install_name', '/usr/lib/libpicasso-sb.dylib', '-syslibroot', str(sdk),
                 '-lSystem', '-lobjc', '-framework', 'Foundation', '-framework', 'UIKit',
-                '-framework', 'Metal', str(out / 'runtime.o'), '-o', str(lib), '-adhoc_codesign'])
+                '-framework', 'Metal', '-framework', 'CoreGraphics', str(out / 'runtime.o'), '-o', str(lib), '-adhoc_codesign'])
     identity = library_identity(lib.read_bytes())
     if identity['code_page_bytes'] != 4096 or b'PICASSO_INPUT_CACHE' not in lib.read_bytes():
         raise ValueError('Runtime UI code signature or marker missing')
