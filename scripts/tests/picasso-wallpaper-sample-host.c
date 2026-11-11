@@ -13,13 +13,13 @@ static uintptr_t picasso_astc_texture_vtable = 0x12345678;
 #include "wallpaper-budget.inc"
 int main(void)
 {
-    for(unsigned kind=0;kind<5;++kind){
+    for(unsigned kind=0;kind<6;++kind){
         assert(picasso_wallpaper_take(kind,0) && picasso_wallpaper_take(kind,0));
         for(unsigned n=0;n<10000;++n)assert(!picasso_wallpaper_take(kind,0));
         for(unsigned n=0;n<16;++n)assert(picasso_wallpaper_take(kind,1));
         for(unsigned n=0;n<10000;++n)assert(!picasso_wallpaper_take(kind,1));
     }
-    assert(!picasso_wallpaper_take(5,1) && !picasso_wallpaper_take(UINT32_MAX,0));
+    assert(!picasso_wallpaper_take(6,1) && !picasso_wallpaper_take(UINT32_MAX,0));
     unsigned char pixels[4 * 4 * 4 + 16], before[sizeof(pixels)];
     struct picasso_pixel_sample sample;
     struct picasso_astc_request request={.linear_bytes=16};

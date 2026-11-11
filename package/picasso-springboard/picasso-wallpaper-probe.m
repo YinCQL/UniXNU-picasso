@@ -9,6 +9,7 @@ static IMP picasso_wallpaper_read_original;
 static IMP picasso_wallpaper_composite_original;
 static IMP picasso_wallpaper_baked_original;
 static IMP picasso_wallpaper_source_original;
+static IMP picasso_wallpaper_home_original;
 
 static void picasso_wallpaper_note(const char *stage, unsigned ticket, const char *state,
                                   size_t width, size_t height, size_t row, size_t bytes,
@@ -34,8 +35,8 @@ static void picasso_wallpaper_note(const char *stage, unsigned ticket, const cha
  * counters bound both logging and retained asynchronous image work. */
 static int picasso_wallpaper_take(unsigned kind, int present)
 {
-    static unsigned counts[5][2];
-    if (kind >= 5) return 0;
+    static unsigned counts[6][2];
+    if (kind >= 6) return 0;
     unsigned *slot = &counts[kind][present != 0], limit = present ? 16 : 2;
     unsigned value = __atomic_load_n(slot, __ATOMIC_RELAXED);
     while (value < limit) {
@@ -46,7 +47,7 @@ static int picasso_wallpaper_take(unsigned kind, int present)
 
 static void picasso_wallpaper_observe(id image, unsigned kind, unsigned ticket)
 {
-    static const char *stages[] = {"disk", "effect-input", "effect-output", "cache", "source"};
+    static const char *stages[] = {"disk", "effect-input", "effect-output", "cache", "source", "home-snapshot"};
     if (!picasso_wallpaper_take(kind, image != nil)) return;
     const char *stage = stages[kind];
     picasso_wallpaper_note(stage, ticket, image ? "returned" : "nil", 0, 0, 0, 0, 0, 0, NULL);
@@ -143,6 +144,13 @@ static id picasso_wallpaper_source(id receiver, SEL selector)
     return result;
 }
 
+static id picasso_wallpaper_home(id receiver, SEL selector)
+{
+    id result = ((PicassoWallpaperSnapshot)picasso_wallpaper_home_original)(receiver, selector);
+    picasso_wallpaper_observe(result, 5, picasso_wallpaper_ticket());
+    return result;
+}
+
 static int picasso_wallpaper_method(Method method, uintptr_t original, unsigned count, int error)
 {
     if (!method || method_getNumberOfArguments(method) != count ||
@@ -172,7 +180,7 @@ static void picasso_wallpaper_install_method(Class cls, SEL selector, uintptr_t 
         *saved = (IMP)original;
         class_replaceMethod(cls, selector, replacement, method_getTypeEncoding(method));
     }
-    if (ticket < 4 && !(reported & (1u << ticket))) {
+    if (ticket < 5 && !(reported & (1u << ticket))) {
         reported |= 1u << ticket;
         picasso_wallpaper_note("install", ticket, state, 0, 0, 0, 0, 0, 0, NULL);
     }
@@ -197,10 +205,21 @@ static void picasso_wallpaper_install(uintptr_t base)
         (IMP)picasso_wallpaper_source, &picasso_wallpaper_source_original, 2, 0, 3);
 }
 
+static void picasso_wallpaper_install_home(uintptr_t base)
+{
+    /* Animation completion switches the backdrop to this cached snapshot. */
+    picasso_wallpaper_install_method(objc_getClass("SBHomeScreenBackdropView"),
+        sel_registerName("homeScreenBlurredContentSnapshotImage"), base + 0x45f8fc,
+        (IMP)picasso_wallpaper_home, &picasso_wallpaper_home_original, 2, 0, 4);
+}
+
 static void picasso_wallpaper_image_added(const struct mach_header *header, intptr_t slide)
 {
     static const unsigned char uuid[16] = {
         0xcb,0x92,0x3b,0xf8,0x25,0x57,0x37,0xcc,0xa0,0x20,0xdf,0x77,0x41,0x41,0xea,0x44
+    };
+    static const unsigned char home_uuid[16] = {
+        0x22,0x03,0x4a,0xba,0x9a,0x9a,0x3b,0x94,0x93,0xa5,0xa0,0xde,0x02,0xbe,0xfd,0x2e
     };
     if (header->magic != MH_MAGIC_64 || header->cputype != CPU_TYPE_ARM64) return;
     const struct mach_header_64 *h = (const struct mach_header_64 *)header;
@@ -212,8 +231,10 @@ static void picasso_wallpaper_image_added(const struct mach_header *header, intp
         if ((size_t)(end - p) < sizeof(struct load_command)) return;
         const struct load_command *cmd = (const struct load_command *)p;
         if (cmd->cmdsize < sizeof(*cmd) || cmd->cmdsize > (size_t)(end - p)) return;
-        if (cmd->cmd == LC_UUID && cmd->cmdsize == sizeof(struct uuid_command))
-            matched = !memcmp(((const struct uuid_command *)cmd)->uuid, uuid, 16);
+        if (cmd->cmd == LC_UUID && cmd->cmdsize == sizeof(struct uuid_command)) {
+            const unsigned char *value = ((const struct uuid_command *)cmd)->uuid;
+            matched = !memcmp(value, uuid, 16) ? 1 : !memcmp(value, home_uuid, 16) ? 2 : 0;
+        }
         if (cmd->cmd == LC_SEGMENT_64 && cmd->cmdsize >= sizeof(struct segment_command_64)) {
             const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
             uintptr_t start = seg->vmaddr + slide;
@@ -222,7 +243,14 @@ static void picasso_wallpaper_image_added(const struct mach_header *header, intp
         }
         p += cmd->cmdsize;
     }
-    if (!matched || p != end || text_end < base || text_end - base < 0x5c704) return;
+    if (!matched || p != end || text_end < base) return;
+    if (matched == 2) {
+        if (text_end - base < 0x45f99c ||
+            !picasso_astc_hash(base, 0x45f8fc, 160, "69680a3fb99e35365f80cde8d02df4257b80896cd69a10547b11886da4962a5b")) return;
+        dispatch_async(dispatch_get_main_queue(), ^{ picasso_wallpaper_install_home(base); });
+        return;
+    }
+    if (text_end - base < 0x5c704) return;
     if (!picasso_astc_hash(base, 0x2e9d0, 776, "92c2cd035e34840468e4f1c1d6d69ec6f649e3f748b76f532a2ae0ff6b2385e2") ||
         !picasso_astc_hash(base, 0x2d970, 248, "4b2cfe4a60b41469e068491d1a2a9e0a71ecc3a3ab30a49e07d8764fe23a477f") ||
         !picasso_astc_hash(base, 0x2fc5c, 8, "bd237e5d99f6462770946dd64c9d5273577f92aeb78154ba485fef49e0d73851") ||
