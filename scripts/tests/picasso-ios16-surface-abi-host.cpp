@@ -87,19 +87,19 @@ int main() {
     assert(!memcmp(swap, expected.data(), expected.size())); IOFreeData(swap, expected.size()); ++scenarios;
     std::vector<uint8_t> limits(0x28), lock(0xc68), converted(0xa68);
     // The donor publishes alignment masks followed by three 64-bit maxima.
-    // iOS 16's property getter reads three adjacent 32-bit maxima at 8/12/16.
+    // iOS 16's property getter reads row bytes, width and height at 8/12/16.
     uint32_t masks[2] = {63, 127}; memcpy(limits.data(), masks, sizeof(masks));
-    wide(limits.data()+8, 16384); wide(limits.data()+16, 8192); wide(limits.data()+24, 65536);
+    wide(limits.data()+8, 65536); wide(limits.data()+16, 16384); wide(limits.data()+24, 8192);
     limits[32] = 1; limits[34] = 1;
     uint8_t small[0x18]; picasso_ios16_limits(small, limits.data());
     assert(!memcmp(small, masks, 8));
-    assert(word(small+8)==16384 && word(small+12)==8192 && word(small+16)==65536);
+    assert(word(small+8)==65536 && word(small+12)==16384 && word(small+16)==8192);
     assert(small[20]==1 && small[21]==0 && small[22]==1 && small[23]==0);
-    // Reproduce the previous memcpy: height becomes the high half of width.
+    // Reproduce the previous memcpy: width becomes the high half of row bytes.
     uint8_t broken[0x18]={};memcpy(broken,limits.data(),20);
-    assert(word(broken+12)==0 && word(broken+16)==8192);
-    assert(1080<=word(small+8) && 2400<=word(small+12) && 4352<=word(small+16));
-    assert(!(1080<=word(broken+8) && 2400<=word(broken+12))); ++scenarios;
+    assert(word(broken+12)==0 && word(broken+16)==16384);
+    assert(4352<=word(small+8) && 1080<=word(small+12) && 2400<=word(small+16));
+    assert(!(1080<=word(broken+12) && 2400<=word(broken+16))); ++scenarios;
     // Independent limits, >32-bit values and unaligned source/destination.
     for(unsigned i=0;i<3;++i){
         std::vector<uint8_t> input(41,0),output(25,0xcc);
