@@ -934,9 +934,83 @@ surface_shared(struct eagl *e, struct image *image)
 	return true;
 }
 
+#ifndef GL_PIXEL_UNPACK_BUFFER
+#define GL_PIXEL_UNPACK_BUFFER 0x88ec
+#define GL_PIXEL_UNPACK_BUFFER_BINDING 0x88ef
+#endif
+
+/* A sampled surface becomes a render target without rendering into its imported
+ * backing. Keep its pixels in a temporary texture while redefining the original
+ * name: framebuffer attachments and texture parameters still refer to that name.
+ * The final surface is imported separately by surface_mirrored().
+ */
+static bool
+surface_render_copy(struct eagl *e, struct image *image)
+{
+	GLint bound = 0, read = 0, unpack = 0;
+	GLuint snapshot = 0, framebuffer = 0;
+	GLenum error = 0, status = GL_FRAMEBUFFER_COMPLETE;
+	bool copied = false, detached = false;
+
+	if (!image->shared || !blit_targets) return true;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	/* Retain an earlier error instead of misattributing it to storage replacement. */
+	if ((error = glGetError()) != 0) goto done;
+	glGenFramebuffers(1, &framebuffer);
+	glGenTextures(1, &snapshot);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+	status = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+	if (status != GL_FRAMEBUFFER_COMPLETE) goto done;
+	glBindTexture(GL_TEXTURE_2D, snapshot);
+	glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, image->width, image->height, 0);
+	if ((error = glGetError()) != 0) goto done;
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, snapshot, 0);
+	status = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+	if (status != GL_FRAMEBUFFER_COMPLETE) goto done;
+	glBindTexture(GL_TEXTURE_2D, image->texture);
+	/* Same-size and empty images can retain the imported resource. Allocate
+	 * a different extent first; snapshot retains the complete previous GPU pixels.
+	 */
+	glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image->width == 1 && image->height == 1 ? 2 : 1,
+	    1, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
+	if ((error = glGetError()) != 0) goto done;
+	detached = true;
+	glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, image->width, image->height, 0);
+	if ((error = glGetError()) != 0) goto done;
+	image->shared = false;
+	texture_defined(e, image->texture, 6, 0, GL_RGBA, image->width, image->height, GL_RGBA, GL_UNSIGNED_BYTE);
+	copied = true;
+done:
+	if (detached && !copied) {
+		glBindTexture(GL_TEXTURE_2D, image->texture);
+		/* Keep the imported source available if allocating the copy failed. */
+		if (!hakios_gl_surface_texture(e->gl, IOSurfaceGetID(image->surface)) &&
+		    compositor_claim(2, 0x61000000u | image->texture)) {
+			compositor_text("surface-copy-restore-failed tex=%u frame=%u", image->texture, e->frames);
+		}
+	}
+	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	if (framebuffer != 0) glDeleteFramebuffers(1, &framebuffer);
+	if (snapshot != 0) glDeleteTextures(1, &snapshot);
+	if (!copied) {
+		e->errors++;
+		if (compositor_claim(2, 0x60000000u | image->texture)) {
+			compositor_text("surface-copy-failed tex=%u error=%x status=%x frame=%u",
+			    image->texture, error, status, e->frames);
+		}
+	}
+	return copied;
+}
+
 /* texImageIOSurface also creates CoreAnimation snapshot render targets. Promote
  * only a supported full-surface level-zero texture when it is actually written.
- * Do not refill it here: its existing GPU contents must survive partial draws.
+ * Preserve its existing GPU contents when detaching imported render storage.
  */
 static bool
 image_render_target(struct eagl *e, struct image *image)
@@ -957,7 +1031,7 @@ image_render_target(struct eagl *e, struct image *image)
 	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
 	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
 	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
-	if (width != image->width || height != image->height) return false;
+	if (width != image->width || height != image->height || !surface_render_copy(e, image)) return false;
 	image->target = true;
 	if (!image->shared) surface_mirrored(e, image);
 	if (compositor_claim(6, image->texture)) {

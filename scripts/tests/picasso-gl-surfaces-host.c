@@ -29,6 +29,9 @@ static void *IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef s,unsigned p){(void)p;r
 static int IOSurfaceLock(IOSurfaceRef s,unsigned f,void *v){(void)s;(void)f;(void)v;return 0;}
 static int IOSurfaceUnlock(IOSurfaceRef s,unsigned f,void *v){(void)v;if(!f)s->seed++;return 0;}
 #include "gl-body.inc"
+#ifndef GL_TEXTURE_MIN_FILTER
+#define GL_TEXTURE_MIN_FILTER 0x2801
+#endif
 #ifndef GL_PACK_SKIP_ROWS
 #define GL_PACK_SKIP_ROWS 0x0d03
 #define GL_PACK_SKIP_PIXELS 0x0d04
@@ -39,13 +42,29 @@ extern void *eglGetProcAddress(const char *);
 extern unsigned eglInitialize(void *,int *,int *),eglBindAPI(unsigned),eglChooseConfig(void *,const int *,void **,int,int *);
 extern void *eglCreateContext(void *,void *,void *,const int *);
 extern unsigned eglMakeCurrent(void *,void *,void *,void *);
+static void *egl_display;
+static void *imported_image;
+static void *(*create_image)(void *,void *,unsigned,void *,const int *);
+static unsigned (*destroy_image)(void *,void *);
+static void (*image_target)(unsigned,void *);
+static bool hakios_gl_surface_texture(struct hakios_gl *g,unsigned sid){
+    (void)g;
+    if(sid!=201||!imported_image)return false;
+    image_target(GL_TEXTURE_2D,imported_image);
+    assert(!glGetError());return true;
+}
 static void context(void){
     void *(*platform)(unsigned,void *,const int *)=(void *)eglGetProcAddress("eglGetPlatformDisplayEXT");assert(platform);
     void *display=platform(0x31dd,NULL,NULL);int a,b,n;assert(eglInitialize(display,&a,&b));
     assert(eglBindAPI(0x30a0));const int attrs[]={0x3040,0x40,0x3033,1,0x3024,8,0x3023,8,0x3022,8,0x3021,8,0x3038};
     void *config;assert(eglChooseConfig(display,attrs,&config,1,&n)&&n);
     const int ctxattrs[]={0x3098,3,0x3038};void *ctx=eglCreateContext(display,config,NULL,ctxattrs);assert(ctx);
-    assert(eglMakeCurrent(display,NULL,NULL,ctx));printf("renderer=%s version=%s\n",glGetString(GL_RENDERER),glGetString(GL_VERSION));
+    assert(eglMakeCurrent(display,NULL,NULL,ctx));egl_display=display;
+    create_image=(void *)eglGetProcAddress("eglCreateImageKHR");
+    destroy_image=(void *)eglGetProcAddress("eglDestroyImageKHR");
+    image_target=(void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    assert(create_image&&destroy_image&&image_target);
+    printf("renderer=%s version=%s\n",glGetString(GL_RENDERER),glGetString(GL_VERSION));
 }
 static void expect_state(unsigned name,GLint want){GLint v=-1;glGetIntegerv(name,&v);assert(v==want);}
 static void test_surface(bool invert){
@@ -205,7 +224,128 @@ static void test_read_boundaries(bool copy){
 #endif
     glDeleteTextures(1,&src);glDeleteTextures(1,&dst);glDeleteFramebuffers(1,&fb);free(e);
 }
+static void read_pixel(GLuint texture,unsigned char *pixel){
+    GLuint fb;GLint read;glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING,&read);
+    glGenFramebuffers(1,&fb);glBindFramebuffer(GL_READ_FRAMEBUFFER,fb);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0);
+    assert(glCheckFramebufferStatus(GL_READ_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE);
+    glReadPixels(1,1,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER,read);glDeleteFramebuffers(1,&fb);assert(!glGetError());
+}
+static void test_shared_render(bool mirror,bool copy){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);GLuint owner,texture,draw,read,other,source=0;
+    unsigned char bytes[64]={0},pixel[4];
+    struct host_surface surface={201,0,'BGRA',0,4,4,4,16,64,bytes};
+    glGenTextures(1,&owner);glBindTexture(GL_TEXTURE_2D,owner);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,4,4,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+    glGenFramebuffers(1,&draw);glBindFramebuffer(GL_FRAMEBUFFER,draw);
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,owner,0);
+    glViewport(0,0,4,4);glDisable(GL_SCISSOR_TEST);glColorMask(1,1,1,1);glClearColor(1,0,0,1);glClear(GL_COLOR_BUFFER_BIT);
+    // The host import uses a real EGLImage sibling, not a successful import stub.
+    extern void *eglGetCurrentContext(void);
+    const int attributes[]={0x30d2,1,0x3038};
+    imported_image=create_image(egl_display,eglGetCurrentContext(),0x30b1,(void *)(uintptr_t)owner,attributes);
+    assert(imported_image);
+    glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,4,4,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+    struct image *i=image_of(e,texture);assert(i&&i->shared&&!i->target);read_pixel(texture,pixel);
+    assert(pixel[0]==255&&pixel[1]==0&&pixel[2]==0&&pixel[3]==255);
+    my_glBindFramebuffer(e,GL_DRAW_FRAMEBUFFER,draw);
+    my_glFramebufferTexture2D(e,GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0);
+    // GPU contents differ from the CPU fixture. Conversion must preserve the GPU copy.
+    glEnable(GL_SCISSOR_TEST);glScissor(0,0,1,1);glClearColor(0,0,1,1);glClear(GL_COLOR_BUFFER_BIT);
+    glFinish();
+    glGenTextures(1,&other);glGenFramebuffers(1,&read);glBindFramebuffer(GL_READ_FRAMEBUFFER,read);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,0x812f);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH,9);glPixelStorei(GL_UNPACK_ALIGNMENT,8);
+    GLuint unpack;glGenBuffers(1,&unpack);glBindBuffer(0x88ec,unpack);glBufferData(0x88ec,128,NULL,0x88e8);
+    if(copy){
+        glGenTextures(1,&source);glBindTexture(GL_TEXTURE_2D,source);
+        glBindBuffer(0x88ec,0);glPixelStorei(GL_UNPACK_ROW_LENGTH,0);glPixelStorei(GL_UNPACK_ALIGNMENT,4);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,4,4,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER,read);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,source,0);
+        glDisable(GL_SCISSOR_TEST);glClearColor(0,1,0,1);glClear(GL_COLOR_BUFFER_BIT);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER,draw);glBindTexture(GL_TEXTURE_2D,texture);
+        glEnable(GL_SCISSOR_TEST);glScissor(10,10,1,1);
+        glBindBuffer(0x88ec,unpack);glPixelStorei(GL_UNPACK_ROW_LENGTH,9);glPixelStorei(GL_UNPACK_ALIGNMENT,8);
+    }else{
+        my_glBindTexture(e,GL_TEXTURE_2D,other); // Conversion must also preserve an unrelated binding.
+        glScissor(1,1,2,2);glClearColor(0,1,0,1);
+    }
+    share_surfaces=mirror;damage_blits=1;
+#ifndef EXPECT_SHARED_RENDER
+    glEnable(0xffffffffu);assert(!image_render_target(e,i));
+    assert(i->shared&&!i->target&&!i->mirror&&e->errors==1&&!glGetError());
+    expect_state(GL_READ_FRAMEBUFFER_BINDING,read);expect_state(GL_DRAW_FRAMEBUFFER_BINDING,draw);
+    expect_state(GL_TEXTURE_BINDING_2D,copy?texture:other);
+#endif
+    if(copy)my_glCopyTexSubImage2D(e,GL_TEXTURE_2D,0,1,1,0,0,2,2);
+    else {my_glClear(e,GL_COLOR_BUFFER_BIT);clear_now(e);}
+    glFinish();assert(i->target);expect_state(GL_READ_FRAMEBUFFER_BINDING,read);
+    expect_state(GL_DRAW_FRAMEBUFFER_BINDING,draw);expect_state(GL_TEXTURE_BINDING_2D,copy?texture:other);
+    expect_state(GL_UNPACK_ROW_LENGTH,9);expect_state(GL_UNPACK_ALIGNMENT,8);expect_state(0x88ef,unpack);
+    assert(glIsEnabled(GL_SCISSOR_TEST));
+    glBindTexture(GL_TEXTURE_2D,texture);GLint parameter;
+    glGetTexParameteriv(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,&parameter);assert(parameter==GL_NEAREST);
+    glGetTexParameteriv(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,&parameter);assert(parameter==0x812f);
+    read_pixel(texture,pixel);assert(pixel[0]==0&&pixel[1]==255&&pixel[2]==0&&pixel[3]==255);
+    read_pixel(owner,pixel);
+#ifdef EXPECT_SHARED_RENDER
+    assert(i->shared&&!i->mirror&&pixel[0]==0&&pixel[1]==255);
+    puts("REPRODUCED: promoted render texture still aliases imported EGLImage backing");
+#else
+    assert(!i->shared&&!!i->mirror==mirror&&pixel[0]==255&&pixel[1]==0);
+    struct texture_definition *definition=texture_definition_of(e,texture);assert(definition&&definition->source==6);
+    assert(surface.seed==0);frame_end(e,false);assert(surface.seed==1);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER,draw);unsigned char actual[64];
+    glReadPixels(0,0,4,4,GL_RGBA,GL_UNSIGNED_BYTE,actual);
+    for(unsigned y=0;y<4;y++)for(unsigned x=0;x<4;x++){
+        bool green=x>=1&&x<3&&y>=1&&y<3,blue=x==0&&y==0;
+        unsigned char *p=actual+(y*4+x)*4;
+        assert(p[0]==(!green&&!blue?255:0)&&p[1]==(green?255:0)&&p[2]==(blue?255:0)&&p[3]==255);
+    }
+    if(mirror){read_pixel(owner,pixel);assert(pixel[0]==0&&pixel[1]==255&&pixel[3]==255);}
+    else for(unsigned n=0;n<16;n++)assert(bytes[n*4]==actual[n*4+2]&&bytes[n*4+1]==actual[n*4+1]&&bytes[n*4+2]==actual[n*4]&&bytes[n*4+3]==255);
+    frame_end(e,false);assert(surface.seed==1);
+#endif
+    glBindBuffer(0x88ec,0);glDeleteBuffers(1,&unpack);glPixelStorei(GL_UNPACK_ROW_LENGTH,0);glPixelStorei(GL_UNPACK_ALIGNMENT,4);
+    glDisable(GL_SCISSOR_TEST);share_surfaces=1;damage_blits=0;image_forget(e,texture);
+    assert(destroy_image(egl_display,imported_image));imported_image=NULL;
+    glDeleteTextures(1,&owner);glDeleteTextures(1,&texture);glDeleteTextures(1,&other);if(source)glDeleteTextures(1,&source);
+    glDeleteFramebuffers(1,&draw);glDeleteFramebuffers(1,&read);
+    if(e->reader)glDeleteFramebuffers(1,&e->reader);if(e->writer)glDeleteFramebuffers(1,&e->writer);
+    assert(!glGetError());free(e);
+}
+static void test_shared_one_pixel(void){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);GLuint owner,texture,fb;unsigned char bytes[4]={0},pixel[4];
+    struct host_surface surface={201,0,'BGRA',0,4,1,1,4,4,bytes};
+    glGenTextures(1,&owner);glBindTexture(GL_TEXTURE_2D,owner);
+    const unsigned char red[]={255,0,0,255};glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,1,1,0,GL_RGBA,GL_UNSIGNED_BYTE,red);
+    extern void *eglGetCurrentContext(void);const int attributes[]={0x30d2,1,0x3038};
+    imported_image=create_image(egl_display,eglGetCurrentContext(),0x30b1,(void *)(uintptr_t)owner,attributes);assert(imported_image);
+    glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,1,1,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+    glGenFramebuffers(1,&fb);my_glBindFramebuffer(e,GL_FRAMEBUFFER,fb);
+    my_glFramebufferTexture2D(e,GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0);
+    glViewport(0,0,1,1);glDisable(GL_SCISSOR_TEST);glClearColor(0,1,0,1);my_glClear(e,GL_COLOR_BUFFER_BIT);clear_now(e);
+    struct image *i=image_of(e,texture);assert(i->target&&!i->shared&&i->mirror);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,owner,0);
+    glReadPixels(0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);assert(pixel[0]==255&&pixel[1]==0);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0);
+    frame_end(e,false);assert(surface.seed==1);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,owner,0);
+    glReadPixels(0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);assert(pixel[0]==0&&pixel[1]==255&&pixel[3]==255);
+    image_forget(e,texture);assert(destroy_image(egl_display,imported_image));imported_image=NULL;
+    glDeleteTextures(1,&owner);glDeleteTextures(1,&texture);glDeleteFramebuffers(1,&fb);
+    if(e->reader)glDeleteFramebuffers(1,&e->reader);if(e->writer)glDeleteFramebuffers(1,&e->writer);free(e);assert(!glGetError());
+}
 int main(void){context();
+#ifdef EXPECT_SHARED_RENDER
+    test_shared_render(true,false);test_shared_render(true,true);return 0;
+#endif
+
 #ifdef EXPECT_STALE_READ
     test_read_boundaries(false);test_read_boundaries(true);puts("REPRODUCED: ReadPixels and CopyTexImage2D capture old pixels before deferred clear");return 0;
 #endif
@@ -216,6 +356,6 @@ int main(void){context();
 #ifndef EXPECT_UNPUBLISHED
     struct eagl *late=calloc(1,sizeof(*late));assert(late);late->frames=700;check_errors=0;
     glEnable(0xffffffffu);frame_end(late,false);assert(late->errors==1&&!glGetError());free(late);check_errors=1;
-    test_mirror(false,false);test_mirror(true,false);test_mirror(true,true);test_copy();test_rejections();puts("PASS surface pixels, orientation/padding, seed ownership, lazy promotion, copy from independent READ framebuffer, layout/level rejection and GL pack/framebuffer state");
+    test_shared_one_pixel();test_shared_render(true,false);test_shared_render(false,false);test_shared_render(true,true);test_shared_render(false,true);test_mirror(false,false);test_mirror(true,false);test_mirror(true,true);test_copy();test_rejections();puts("PASS actual EGLImage sibling detachment (including 1x1), GPU pixel preservation, partial render/copy, mirror/CPU publication, failure state, surface orientation/padding, seed ownership and GL binding/pack/unpack/framebuffer state");
 #endif
 }

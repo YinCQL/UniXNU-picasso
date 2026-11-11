@@ -11,6 +11,7 @@ p.add_argument('--output', type=Path, required=True)
 p.add_argument('--expect-unpublished', action='store_true')
 p.add_argument('--expect-unflipped', action='store_true')
 p.add_argument('--expect-stale-read', action='store_true')
+p.add_argument('--expect-shared-render', action='store_true')
 a = p.parse_args()
 s = a.source.read_text()
 out = a.output.resolve()
@@ -52,12 +53,13 @@ static struct eagl *context_of(id o){return o;}
 static void eagl_enter(struct eagl *e,unsigned o){(void)e;(void)o;}
 static void eagl_leave(struct eagl *e,unsigned o){(void)e;(void)o;}
 static void note_format(const char *s,GLenum a,GLenum b,GLenum c,GLsizei w,GLsizei h){(void)s;(void)a;(void)b;(void)c;(void)w;(void)h;}
-static bool hakios_gl_surface_texture(struct hakios_gl *g,unsigned s){(void)g;(void)s;return false;}
+static bool hakios_gl_surface_texture(struct hakios_gl *g,unsigned s);
 #define EAGL_ENTER(e,o) eagl_enter(e,o)
 #define EAGL_LEAVE(e,o) eagl_leave(e,o)
 '''
 names = ['texture_definition_of','texture_defined','image_of','image_new','image_forget','internal_format','bytes_a_pixel',
          'surface_mirrored','surface_shared']
+if 'surface_render_copy(' in s: names += ['surface_render_copy']
 if 'image_render_target(' in s: names += ['image_render_target']
 names += ['surface_changed','surface_to_texture','mirror_to_surface','target_to_surface','frame_begin','frame_end','drawing',
           'my_glCopyTexSubImage2D','my_glBindTexture','my_glClear','clear_now','my_glFramebufferTexture2D','my_glBindFramebuffer','my_texImageIOSurface']
@@ -76,7 +78,7 @@ runs = []
 for name, flags in [('normal', []), ('asan', ['-fsanitize=address,undefined','-fno-omit-frame-pointer','-fno-sanitize-recover=all'])]:
     binary = out/name
     commands = [('compile', ['clang-18','-std=c11','-O1','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable',
-                 *flags,*(['-DEXPECT_STALE_READ'] if a.expect_stale_read else []),*(['-DEXPECT_UNFLIPPED'] if a.expect_unflipped else []),*(['-DEXPECT_UNPUBLISHED'] if a.expect_unpublished else []),'-I',str(out),'-I',str(ROOT/'drivers/NativeGL/eagl'),
+                 *flags,*(['-DEXPECT_SHARED_RENDER'] if a.expect_shared_render else []),*(['-DEXPECT_STALE_READ'] if a.expect_stale_read else []),*(['-DEXPECT_UNFLIPPED'] if a.expect_unflipped else []),*(['-DEXPECT_UNPUBLISHED'] if a.expect_unpublished else []),'-I',str(out),'-I',str(ROOT/'drivers/NativeGL/eagl'),
                  str(fixture),'-Wl,-l:libGL.so.1','-Wl,-l:libEGL.so.1','-o',str(binary)]),('run',[str(binary)])]
     for step, cmd in commands:
         result = subprocess.run(cmd,capture_output=True,text=True,timeout=90,
@@ -87,5 +89,5 @@ for name, flags in [('normal', []), ('asan', ['-fsanitize=address,undefined','-f
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
 (out/'results.json').write_text(json.dumps(dict(passed=True,hardware_tested=False,baseline=a.expect_unpublished,
     source_sha256=sha(a.source),inputs={str(p.relative_to(ROOT)):sha(p) for p in (fixture,Path(__file__))},runs=runs,
-    limitation='Real Mesa GLES pixels; IOSurface allocation, locks and seeds are a host fixture. Native shared-memory import requires device verification.'),indent=2)+'\n')
+    limitation='Real Mesa GLES pixels; IOSurface allocation, locks and seeds are a host fixture. EGLImage sibling import and storage detachment use real Mesa; native IOSurface backing and Adreno execution require device verification.'),indent=2)+'\n')
 print(runs[-1]['output'])
