@@ -58,7 +58,7 @@ inline void picasso_play_sent(PicassoAprProbe &p) {
     }
     ++v.events;
 }
-inline void picasso_play_tick(PicassoAprProbe &p,const PicassoQmi &q) {
+inline void picasso_play_tick(PicassoAprProbe &p,const PicassoQmi &q,bool elapsed=true) {
     auto &v=p.play;
     if(v.enabled && !v.attempted && p.pcm.done && p.pcm.complete && !p.pcm.uncertain &&
         p.tfa.digitalApplied && p.tfa.digitalRestored && !p.tfa.digitalError && !p.tfa.digitalRestoreError && !p.tfa.digitalDirty &&
@@ -70,14 +70,14 @@ inline void picasso_play_tick(PicassoAprProbe &p,const PicassoQmi &q) {
     }
     // A new source session can wait for domain readiness before any command.
     // Bound that wait as well; no resources have been acquired at this point.
-    if(v.enabled && v.source && !v.attempted && !v.done && ++v.wait>250) {
+    if(elapsed && v.enabled && v.source && !v.attempted && !v.done && ++v.wait>250) {
         v.error=v.firstError=-60;v.done=true;++v.events;
     }
     if(!v.attempted || v.done)return;
     if(v.phase<PicassoPlayClose && !picasso_afe_domains_up(q) && !v.error) {
         v.pending=false;v.error=-104;++v.events;
     }
-    if(v.phase==PicassoPlayWrite && picasso_play_queued(v) && !v.error) {
+    if(elapsed && v.phase==PicassoPlayWrite && picasso_play_queued(v) && !v.error) {
         // Per-buffer deadlines and a total bound; reply traffic cannot extend it.
         ++v.streamTicks;
         if(!v.source && v.streamTicks>500)v.error=-60;
@@ -133,7 +133,7 @@ inline void picasso_play_tick(PicassoAprProbe &p,const PicassoQmi &q) {
         if(v.error) {++v.events;return;}
     }
     if(v.phase==PicassoPlayWrite && picasso_play_queued(v))return;
-    if(!v.error && ++v.wait>(v.pending?100U:250U)) {v.pending=false;v.error=-60;++v.events;}
+    if(elapsed && !v.error && ++v.wait>(v.pending?100U:250U)) {v.pending=false;v.error=-60;++v.events;}
 }
 inline bool picasso_play_due(PicassoAprProbe &p) {
     auto &v=p.play;

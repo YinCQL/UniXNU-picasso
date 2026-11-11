@@ -393,11 +393,22 @@ struct image {
 	GLsizei width, height;
 };
 
+/* Recent two-dimensional storage requests, retained for an error snapshot. */
+struct texture_definition {
+	GLuint texture;
+	unsigned frame, source;
+	GLint level, internal;
+	GLsizei width, height;
+	GLenum format, type;
+};
+
 struct eagl {
 	void *table[SLOTS];             /* [EAGL_TABLE_BASE / 8] is the context itself: what every entry gets as its first argument */
 	id object;                      /* the EAGLContext */
 	struct hakios_gl *gl;
 	unsigned long api;
+	struct texture_definition definitions[256];
+	unsigned definition_next;
 	struct image images[1024];
 	unsigned image_count;
 	GLuint framebuffer;             /* the one bound */
@@ -711,6 +722,27 @@ summary(struct eagl *e)
 }
 
 /* ---- IOSurfaces ----------------------------------------------------------------------------------- */
+
+static struct texture_definition *
+texture_definition_of(struct eagl *e, GLuint texture)
+{
+	for (unsigned i = 0; i < 256; i++) {
+		if (e->definitions[i].texture == texture && texture != 0) return &e->definitions[i];
+	}
+	return NULL;
+}
+
+static void
+texture_defined(struct eagl *e, GLuint texture, unsigned source, GLint level, GLint internal,
+    GLsizei width, GLsizei height, GLenum format, GLenum type)
+{
+	struct texture_definition *d;
+
+	if (texture == 0) return;
+	d = texture_definition_of(e, texture);
+	if (d == NULL) d = &e->definitions[e->definition_next++ % 256];
+	*d = (struct texture_definition){ texture, e->frames, source, level, internal, width, height, format, type };
+}
 
 static struct image *
 image_of(struct eagl *e, GLuint texture)
@@ -2809,7 +2841,7 @@ hakios_gl_function_refused(unsigned function)
 	}
 }
 
-/* An error snapshot only: no extra glGetError calls, framebuffer binds or pixel reads. */
+/* Error-only queries preserve texture bindings; no glGetError calls or pixel reads. */
 static void
 compositor_framebuffer(struct eagl *e, const char *where)
 {
@@ -2838,6 +2870,31 @@ compositor_framebuffer(struct eagl *e, const char *where)
 		}
 		compositor_text("attachment=%x type=%x name=%d level=%d red=%d alpha=%d component=%x",
 		    attachments[i], type, name, level, red, alpha, component);
+		if (type == GL_TEXTURE && level >= 0) {
+			struct texture_definition *d = texture_definition_of(e, (GLuint)name);
+			struct image *im = image_of(e, (GLuint)name);
+
+			/* Only bind objects known to be 2D; another target must not generate a diagnostic error. */
+			if (d != NULL || (im != NULL && im->to == GL_TEXTURE_2D)) {
+				GLint bound = 0, width = 0, height = 0, internal = 0, immutable = 0;
+				glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+				glBindTexture(GL_TEXTURE_2D, (GLuint)name);
+				glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_WIDTH, &width);
+				glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_HEIGHT, &height);
+				glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_INTERNAL_FORMAT, &internal);
+				glGetTexParameteriv(GL_TEXTURE_2D, 0x912f, &immutable); /* GL_TEXTURE_IMMUTABLE_FORMAT */
+				glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+				compositor_text("storage tex=%d level=%d actual=%dx%d internal=%x immutable=%d",
+				    name, level, width, height, internal, immutable);
+			}
+			if (d != NULL)
+				compositor_text("defined tex=%u source=%u frame=%u level=%d size=%dx%d internal=%x format=%x type=%x",
+				    d->texture, d->source, d->frame, d->level, d->width, d->height, d->internal, d->format, d->type);
+			if (im != NULL)
+				compositor_text("surface tex=%d target=%u size=%dx%d internal=%x format=%x type=%x plane=%u shared=%u mirror=%u",
+				    name, (unsigned)im->target, im->width, im->height, im->internal, im->format, im->type,
+				    im->plane, (unsigned)im->shared, im->mirror);
+		}
 	}
 }
 
@@ -3856,6 +3913,8 @@ my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
 	EAGL_ENTER(e, 0x1e0);
 	clear_now(e);
 	for (GLsizei i = 0; i < n; i++) {
+		struct texture_definition *d = texture_definition_of(e, textures[i]);
+		if (d != NULL) d->texture = 0;
 		image_forget(e, textures[i]);
 		vblur_forget(e, textures[i]);
 		group_forget(e, textures[i]);
@@ -3952,6 +4011,11 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 	uint64_t began = slow_calls_us != 0 ? now_us() : 0;
 	while (glGetError() != 0) {
 	}
+	if (target == GL_TEXTURE_2D) {
+		GLint texture = 0;
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+		texture_defined(e, (GLuint)texture, 1, level, internal, width, height, format, type);
+	}
 	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
 	{
 		/* A texture CoreAnimation made that the library refused: what it asked for, so a format
@@ -3970,6 +4034,22 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 		    pixels ? "" : " (empty)", now_us() - began, began);
 	}
 	EAGL_LEAVE(e, 0x970);
+}
+
+/* Keep the storage request's origin; the original GL error consumer remains unchanged. */
+static void
+my_glTexStorage2D(void *context, GLenum target, GLsizei levels, GLenum internal, GLsizei width, GLsizei height)
+{
+	struct eagl *e = context;
+
+	EAGL_ENTER(e, 0x2040);
+	if (target == GL_TEXTURE_2D) {
+		GLint texture = 0;
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+		texture_defined(e, (GLuint)texture, 2, 0, (GLint)internal, width, height, 0, 0);
+	}
+	glTexStorage2D(target, levels, internal, width, height);
+	EAGL_LEAVE(e, 0x2040);
 }
 
 /* An upload into part of a texture: a group with a vibrant layer in it is made what it would have been first. */
@@ -4611,6 +4691,7 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	image->invert = invert;
 	image->width = width;
 	image->height = height;
+	texture_defined(e, (GLuint)texture, 3, 0, (GLint)internal, width, height, (GLenum)format, (GLenum)type);
 	note_format(invert ? "IOSurface shown, inverted" : "IOSurface shown", image->internal, image->format, image->type, width,
 	    height);
 	if (shown++ < 24) {
@@ -4670,6 +4751,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	image->height = (GLsizei)IOSurfaceGetHeight(surface);
 	image->internal = image->format = GL_BGRA;
 	image->type = GL_UNSIGNED_BYTE;
+	texture_defined(e, (GLuint)texture, 4, 0, GL_BGRA, image->width, image->height, GL_BGRA, GL_UNSIGNED_BYTE);
 	/*
 	 * A surface with no pixel format is memory CoreAnimation has made a surface around: a
 	 * picture to be shown, as an application has drawn it. Those that come this way are mostly

@@ -82,6 +82,20 @@ int main(void) {
     compositor_framebuffer(&e,"fixture");
     assert(captured_lines==2&&strstr(captured,"attachment=8ce0 type=1702"));
     verify_state(read,fb,e.group_over,second,mask);
+    /* Real storage and request provenance distinguish allocation failure from format/size mismatch. */
+    texture_defined(&e,tex,1,0,GL_RGBA,4,4,GL_RGBA,GL_UNSIGNED_BYTE);
+    captured_lines=0;all_captured[0]=0;compositor_framebuffer(&e,"fixture-defined");
+    assert(captured_lines==4 && strstr(all_captured,"actual=4x4") && strstr(all_captured,"source=1"));
+    verify_state(read,fb,e.group_over,second,mask);
+    GLuint empty;glGenTextures(1,&empty);glBindTexture(GL_TEXTURE_2D,empty);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,0,0,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+    texture_defined(&e,empty,1,0,GL_RGBA,0,0,GL_RGBA,GL_UNSIGNED_BYTE);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,empty,0);
+    glBindTexture(GL_TEXTURE_2D,second);captured_lines=0;all_captured[0]=0;
+    glEnable(0xffffffff);compositor_framebuffer(&e,"fixture-zero");
+    assert(strstr(all_captured,"status=8cd6") && strstr(all_captured,"actual=0x0"));
+    assert(glGetError()==0x500 && !glGetError());
+    verify_state(read,fb,e.group_over,second,mask);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER,read);captured_lines=0;
     glEnable(0xffffffff); /* GL_INVALID_ENUM remains owned by the original error consumer. */
     compositor_framebuffer(&e,"fixture-missing");

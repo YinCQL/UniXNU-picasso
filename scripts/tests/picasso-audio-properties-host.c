@@ -447,6 +447,8 @@ static void timeline(void){
     assert(sample==65536&&host==132072&&seed==17);
     AudioObjectPropertyAddress a={kAudioDevicePropertySafetyOffset,kAudioObjectPropertyScopeOutput,0};UInt32 n,v;
     assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&n,&v)&&v==8192);
+    a.mScope=kAudioObjectPropertyScopeInput;assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&n,&v)&&v==0);
+    a.mScope=kAudioObjectPropertyScopeOutput;
     a.mSelector=kAudioDevicePropertyLatency;assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&n,&v)&&v==16384);
     a.mSelector=kAudioDevicePropertyZeroTimeStampPeriod;assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&n,&v)&&v==32768);
     continuousTimeline(256,0);continuousTimeline(384,1536);continuousTimeline(1024,2048);continuousTimeline(8192,2048);

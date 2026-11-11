@@ -263,7 +263,8 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kAudioDevicePropertyDeviceCanBeDefaultDevice: REPLY(UInt32, a->mScope != kAudioObjectPropertyScopeInput);
         case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: REPLY(UInt32, a->mScope != kAudioObjectPropertyScopeInput);
         case kAudioDevicePropertyLatency: REPLY(UInt32, latencyFrames());
-        case kAudioDevicePropertySafetyOffset: REPLY(UInt32, kSafetyFrames);
+        // The input is already-accepted software PCM, not delayed capture DMA.
+        case kAudioDevicePropertySafetyOffset: REPLY(UInt32, a->mScope==kAudioObjectPropertyScopeInput?0:kSafetyFrames);
         case kAudioDevicePropertyNominalSampleRate: REPLY(Float64, kRate);
         case kAudioDevicePropertyAvailableNominalSampleRates: REPLY(AudioValueRange, ((AudioValueRange){kRate, kRate}));
         case kAudioDevicePropertyIsHidden: REPLY(UInt32, 0);

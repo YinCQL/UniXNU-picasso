@@ -49,6 +49,7 @@ static void streamTests();
 static void pcmTests();
 static void playTests();
 static void continuousPlayTests();
+static void controlContinuationTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -134,7 +135,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    audioPinTests();afePortTests();tfaPortTests();streamTests();pcmTests();playTests();continuousPlayTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();channelTests();qrtrTests();
+    audioPinTests();afePortTests();tfaPortTests();streamTests();pcmTests();playTests();continuousPlayTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();controlContinuationTests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -1854,4 +1855,66 @@ __attribute__((noinline)) static void continuousPlayTests() {
         assert((v.owned&PicassoPlayBuffer) && s.apr.pcm.busyMask==3 && v.amp.stopped);
     }
     puts("PASS two-slot 2s PCM: exact wire, out-of-order/stale/duplicate replies, short tail, refill, EOS, all TX faults and retained ownership");
+}
+
+static int emptySource(PicassoPlayback &,PicassoPcm &,unsigned,unsigned *bytes){*bytes=0;return -11;}
+static void controlContinuationTests(){
+    static PicassoGlink s;uint32_t reply[12];
+    // One committed control ACK plus an actual RX_DONE intent release can
+    // publish the next request in this call, without another 20ms tick.
+    unsigned rx=playAt(s,PicassoPlayConfigure);s.apr.play.source=emptySource;
+    unsigned bytes=playResponse(s,reply),ticks=s.apr.ticks;
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(reply),bytes);message(s,rx,14,7,91);
+    step(s);assert(s.apr.play.phase==PicassoPlayClock && s.apr.play.pending);
+    assert(s.apr.ticks==ticks+1 && s.apr.play.wait==0 && s.apr.play.token==0x20570002);
+    assert(s.rxTail==r32(s.desc.offset+12) && s.remoteIntent[0].busy);
+    // Keep the remote intent busy: ACK advances state, but cannot invent an
+    // RX_DONE or send into a DSP-owned buffer. A later release allows progress.
+    rx=playAt(s,PicassoPlayConfigure);s.apr.play.source=emptySource;
+    bytes=playResponse(s,reply);unsigned token=s.apr.play.token;
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(reply),bytes);step(s);
+    assert(s.apr.play.phase==PicassoPlayClock && !s.apr.play.pending && s.remoteIntent[0].busy);
+    assert(s.apr.play.token==token && s.apr.intentAsked);message(s,rx,14,7,91);step(s);drain(s);step(s);
+    assert(s.apr.play.pending && s.apr.play.phase==PicassoPlayClock);
+    // Partial payloads and malformed acknowledgements cannot advance control.
+    rx=playAt(s,PicassoPlayConfigure);s.apr.play.source=emptySource;bytes=playResponse(s,reply);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(reply),16,bytes-16);step(s);
+    assert(s.apr.play.phase==PicassoPlayConfigure && s.apr.play.pending && !s.apr.play.responded);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(reply)+16,bytes-16,0,true);message(s,rx,14,7,91);step(s);
+    assert(s.apr.play.phase==PicassoPlayClock && s.apr.play.pending);
+    rx=playAt(s,PicassoPlayConfigure);s.apr.play.source=emptySource;bytes=playResponse(s,reply);reply[3]^=1;
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(reply),bytes);message(s,rx,14,7,91);step(s);
+    assert(s.apr.play.phase==PicassoPlayConfigure && s.apr.play.pending && !s.apr.play.responded);
+    // A remote error follows existing fault cleanup on the next regular tick.
+    rx=playAt(s,PicassoPlayConfigure);s.apr.play.source=emptySource;bytes=playResponse(s,reply,2);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(reply),bytes);message(s,rx,14,7,91);step(s);
+    assert(s.apr.play.phase==PicassoPlayConfigure && s.apr.play.error==-5 && !s.apr.play.pending);
+    // TX pressure after the committed ACK must defer publication without
+    // acquiring a clock vote; later draining the FIFO permits one request.
+    rx=playAt(s,PicassoPlayConfigure);s.apr.play.source=emptySource;bytes=playResponse(s,reply);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(reply),bytes);message(s,rx,14,7,91);
+    p32(s.desc.offset,(s.txHead+32)%s.tx.size);step(s);
+    assert(s.apr.play.phase==PicassoPlayClock && !s.apr.play.pending);
+    assert(!(s.apr.play.owned&PicassoPlayClock) && !s.remoteIntent[0].busy);
+    drain(s);step(s);assert(s.apr.play.pending && s.remoteIntent[0].busy);
+    // Fault each MMIO write through ACK retirement and immediate publication.
+    // A failed tail commit must never publish the next control command.
+    rx=playAt(s,PicassoPlayConfigure);s.apr.play.source=emptySource;bytes=playResponse(s,reply);
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(reply),bytes);message(s,rx,14,7,91);
+    writes=0;step(s);unsigned total=writes;
+    for(unsigned n=1;n<=total;++n){
+        rx=playAt(s,PicassoPlayConfigure);s.apr.play.source=emptySource;bytes=playResponse(s,reply);
+        packet(s,rx,1,reinterpret_cast<uint8_t *>(reply),bytes);message(s,rx,14,7,91);
+        writes=0;failWrite=n;bool kick=false;
+        assert(picasso_glink_service(&io,&s,&kick)==-5 && s.failed && s.apr.play.done);
+        assert(!s.apr.play.complete);
+        if(s.rxTail!=r32(s.desc.offset+12))assert(!(s.apr.play.owned&PicassoPlayClock));
+    }
+    // Suppressing deadline aging never turns ACK dispatch into a faster clock.
+    PicassoAprProbe a={};PicassoQmi q={};a.play.attempted=a.play.enabled=true;
+    a.play.phase=PicassoPlayConfigure;a.play.wait=31;a.play.pending=a.play.sent=true;
+    q.bound=true;q.round=1;for(auto &d:q.domains){d.completed=d.stateValid=true;d.state=0x1fffffff;}
+    for(unsigned i=0;i<100;++i)picasso_play_tick(a,q,false);
+    assert(a.play.wait==31 && a.play.phase==PicassoPlayConfigure && !a.play.error);
+    puts("PASS source control ACK continuation: committed/fragmented RX, real intent ownership, stale/error refusal and unchanged deadline aging");
 }
