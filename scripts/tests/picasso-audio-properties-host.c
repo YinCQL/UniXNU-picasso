@@ -8,6 +8,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <errno.h>
+#include <unistd.h>
 #include "PicassoAudioAbi.h"
 #include "sdk-constants.h"
 typedef uint32_t UInt32,AudioObjectID,AudioClassID,AudioObjectPropertySelector,AudioObjectPropertyScope,AudioObjectPropertyElement;
@@ -33,7 +34,8 @@ struct Host;typedef const struct Host *AudioServerPlugInHostRef;
 struct Host {OSStatus (*PropertiesChanged)(AudioServerPlugInHostRef,AudioObjectID,UInt32,const AudioObjectPropertyAddress *);};
 typedef unsigned io_connect_t,io_service_t;typedef int kern_return_t;
 typedef struct {unsigned numer,denom;} mach_timebase_info_data_t;
-static uint64_t mach_absolute_time(void){return 1000;}
+static uint64_t fakeTime=1000;
+static uint64_t mach_absolute_time(void){return fakeTime;}
 static int mach_timebase_info(mach_timebase_info_data_t *t){t->numer=t->denom=1;return 0;}
 #define MACH_PORT_NULL 0
 static unsigned mach_task_self(void){return 1;}
@@ -44,8 +46,23 @@ static void IOObjectRelease(unsigned o){(void)o;}
 static int IOServiceClose(unsigned o){(void)o;return 0;}
 static unsigned notes,changed;
 static int writeResult;static bool *workerStop;static int16_t accepted[2048];
+static PicassoAudioStatus fakeStatus={.version=1,.state=PicassoAudioRunning};
+static unsigned statusCalls,sleeps,runningAfter,statusSize=sizeof(PicassoAudioStatus),writeCalls;
+static int statusResult;static bool inCallback;
+static void (*sleepHook)(unsigned);static int (*writeHook)(const int16_t *);
+static int fakeSleep(unsigned us){++sleeps;if(sleepHook)sleepHook(us);return 0;}
+#define usleep fakeSleep
 static int IOConnectCallStructMethod(unsigned c,unsigned s,const void *in,size_t n,void *out,size_t *z){
-    (void)c;(void)out;(void)z;if(s==PicassoAudioWrite){assert(n==sizeof accepted);if(!writeResult)memcpy(accepted,in,n);if(workerStop)*workerStop=true;return writeResult;}if(s==PicassoAudioNote){assert(in&&n==sizeof(PicassoAudioClientNote));++notes;}return 0;
+    (void)c;assert(!inCallback);
+    if(s==PicassoAudioGetStatus){
+        ++statusCalls;if(runningAfter&&statusCalls>=runningAfter)fakeStatus.state=PicassoAudioRunning;
+        assert(out&&z&&*z==sizeof fakeStatus);memcpy(out,&fakeStatus,sizeof fakeStatus);*z=statusSize;return statusResult;
+    }
+    if(s==PicassoAudioWrite){++writeCalls;assert(n==sizeof accepted);
+        if(writeHook)return writeHook(in);
+        if(!writeResult)memcpy(accepted,in,n);if(workerStop)*workerStop=true;return writeResult;
+    }
+    if(s==PicassoAudioNote){assert(in&&n==sizeof(PicassoAudioClientNote));++notes;}return 0;
 }
 #define MH_MAGIC_64 0xfeedfacfU
 #define CPU_TYPE_ARM64 0x100000c
@@ -357,8 +374,88 @@ static void routing(void){
     for(unsigned i=0;i<200;++i)routeNote(9,-1,i,0,0,0,0);assert(gRouteCount==128);
     registry(image);free(image);readableBase=readableSize=0;
 }
+
+// Drive the actual worker and DoIOOperation for seconds of periodic IO,
+// including wraparound, callback jitter and a DSP pause that fills the ring.
+// This models callback schedules; it does not emulate the iOS audio server.
+static uint64_t due,firstOutput,modelNow,modelDspDue,modelReturned,modelAccepted,modelStop,pauseUntil;
+static unsigned modelFrames,modelJitter,modelNoSpace,modelCallbacks;static bool modelPaused;
+static float waveform(uint64_t frame){return frame>=100000&&frame<102000?0:(float)((int)(frame%97)-48)/96;}
+static void modelSleep(unsigned us){
+    modelNow+=(uint64_t)us*48;fakeTime=gOrigin+modelNow;
+    uint64_t frame=modelNow/1000;
+    if(!modelPaused && frame>=96000){modelPaused=true;pauseUntil=frame+40000;modelDspDue+=40000;}
+    while(frame>=modelDspDue && frame>=pauseUntil && modelAccepted-modelReturned>=4096){
+        modelReturned+=4096;modelDspDue+=4096;
+    }
+    fakeStatus.submittedBytes=modelAccepted*4;fakeStatus.returnedBytes=modelReturned*4;
+    fakeStatus.queuedBytes=(UInt32)((modelAccepted-modelReturned)*4);
+    while(frame>=due+modelJitter){
+        float samples[16384];uint64_t at=due+kSafetyFrames;
+        for(unsigned i=0;i<modelFrames;++i)samples[i*2]=samples[i*2+1]=waveform(at+i);
+        AudioServerPlugInIOCycleInfo info={.mIOCycleCounter=++modelCallbacks,.mNominalIOBufferFrameSize=modelFrames,
+            .mCurrentTime={.mSampleTime=(double)frame},.mOutputTime={.mSampleTime=(double)at}};
+        inCallback=true;int rc=DoIOOperation(NULL,kDevice,kOutStream,0,kAudioServerPlugInIOOperationWriteMix,modelFrames,&info,samples,NULL);inCallback=false;
+        assert(!rc);due+=modelFrames;
+    }
+    if(gSent>=modelStop)gStop=true;
+}
+static int modelWrite(const int16_t *pcm){
+    assert(gReservedEnd==gSent+1024);
+    if(modelAccepted-modelReturned+1024>32768){++modelNoSpace;return kIOReturnNoSpace;}
+    for(unsigned i=0;i<1024;++i){
+        uint64_t at=gSent+i;int16_t expected=at<firstOutput?0:(int16_t)(waveform(at)*32767);
+        assert(pcm[2*i]==expected&&pcm[2*i+1]==expected);
+    }
+    modelAccepted+=1024;return 0;
+}
+static void continuousTimeline(unsigned frames,unsigned jitter){
+    memset(&gMix,0,sizeof gMix);memset(&gTap,0,sizeof gTap);
+    gIoUsers=1;gFault=0;gStop=false;gStreamActive=true;gVolume=1;gMuted=false;
+    gOrigin=1000;gHostTicksPerFrame=1000;fakeTime=1000;gSent=gMissing=gReservedEnd=gCalls=0;
+    gTimingCount=gTimingFlushed=gTimingTotal=gLastFrames=0;
+    due=22528;firstOutput=due+kSafetyFrames;modelNow=modelReturned=modelAccepted=0;
+    modelStop=240640;modelFrames=frames;modelJitter=jitter;modelNoSpace=modelCallbacks=0;
+    modelDspDue=4096;modelPaused=false;pauseUntil=0;writeHook=modelWrite;sleepHook=modelSleep;
+    worker(NULL);writeHook=NULL;sleepHook=NULL;
+    assert(!gFault&&gMissing==firstOutput&&modelNoSpace>0&&gSent==modelAccepted);
+    assert(modelAccepted-modelReturned<=32768 && gTimingTotal<=12);
+    float got[2048];assert(!picasso_tap_read(&gTap,gSent-1024,1024,got));
+    for(unsigned i=0;i<1024;++i)assert(got[2*i]==(int16_t)(waveform(gSent-1024+i)*32767)/32768.0f);
+    printf("PASS continuous IO frames=%u jitter=%u callbacks=%u missing_initial=%llu backpressure=%u\n",
+        frames,jitter,modelCallbacks,(unsigned long long)gMissing,modelNoSpace);
+    gStop=false;
+}
+static void timeline(void){
+    // Exercise the production readiness wait, including refusal and bounded timeout.
+    statusCalls=sleeps=0;runningAfter=4;fakeStatus.state=PicassoAudioStarting;
+    assert(!waitRunning()&&statusCalls==4&&sleeps==3);
+    runningAfter=0;statusCalls=sleeps=0;fakeStatus.state=PicassoAudioStarting;
+    assert(waitRunning()==kIOReturnBusy&&statusCalls==200&&sleeps==200);
+    fakeStatus.state=PicassoAudioDraining;assert(waitRunning()==kIOReturnNotReady);
+    fakeStatus.state=PicassoAudioIdle;assert(waitRunning()==kIOReturnNotReady);
+    fakeStatus.state=PicassoAudioFailed;assert(waitRunning()==kIOReturnNotReady);
+    fakeStatus.state=PicassoAudioRunning;fakeStatus.version=2;assert(waitRunning()==kIOReturnBadArgument);
+    fakeStatus.version=1;statusSize=4;assert(waitRunning()==kIOReturnBadArgument);statusSize=sizeof fakeStatus;
+    statusResult=kIOReturnNotReady;assert(waitRunning()==kIOReturnNotReady);statusResult=0;
+
+    // Keep the continuous-playback clock period and independent device latency.
+    gOrigin=1000;gHostTicksPerFrame=2;gSeed=17;double sample;UInt64 host,seed;
+    fakeTime=1000+32767*2;assert(!GetZeroTimeStamp(NULL,kDevice,0,&sample,&host,&seed));
+    assert(sample==0&&host==1000&&seed==17);
+    fakeTime=1000+65537*2;assert(!GetZeroTimeStamp(NULL,kDevice,0,&sample,&host,&seed));
+    assert(sample==65536&&host==132072&&seed==17);
+    AudioObjectPropertyAddress a={kAudioDevicePropertySafetyOffset,kAudioObjectPropertyScopeOutput,0};UInt32 n,v;
+    assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&n,&v)&&v==8192);
+    a.mSelector=kAudioDevicePropertyLatency;assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&n,&v)&&v==16384);
+    a.mSelector=kAudioDevicePropertyZeroTimeStampPeriod;assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&n,&v)&&v==32768);
+    continuousTimeline(256,0);continuousTimeline(384,1536);continuousTimeline(1024,2048);continuousTimeline(8192,2048);
+}
+
 int main(int argc,char **argv){
-    properties();speakerReference();ownedFilters();routing();
+    // Match the timebase initialization performed by the plugin factory.
+    gOrigin=1000;gHostTicksPerFrame=1;
+    properties();speakerReference();ownedFilters();routing();timeline();
     if(argc==2){
         FILE *f=fopen(argv[1],"rb");assert(f);assert(!fseek(f,0,SEEK_END));long bytes=ftell(f);assert(bytes>0x634000);rewind(f);
         unsigned char *file=malloc((size_t)bytes);assert(file);assert(fread(file,1,(size_t)bytes,f)==(size_t)bytes);fclose(f);

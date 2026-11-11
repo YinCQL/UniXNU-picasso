@@ -44,7 +44,7 @@ def main():
     (out/'plugin-body.inc').write_text(body)
     for sanitized in [False,True]:
         suffix='-asan' if sanitized else '';exe=out/('properties'+suffix)
-        flags=['-fsanitize=address,undefined','-fno-omit-frame-pointer'] if sanitized else []
+        flags=['-fsanitize=address,undefined','-fno-sanitize-recover=all','-fno-omit-frame-pointer'] if sanitized else []
         run('compile'+suffix,[cc,'-std=c11','-D_DEFAULT_SOURCE','-O1','-Wall','-Wextra','-Werror','-Wno-unused-function',*flags,'-I',str(out),'-I',str(ROOT/'package'),'-I',str(ROOT/'hal'),str(ROOT/'scripts/tests/picasso-audio-properties-host.c'),'-pthread','-lm','-o',str(exe)])
         run('properties'+suffix,[str(exe)]+([str(a.reference)] if a.reference else []))
     paths=['hal/PicassoAudioPlugIn.c','hal/PicassoAudioRouteTrace.h','hal/PicassoAudioMix.h','package/PicassoAudioAbi.h','scripts/check-picasso-audio-properties.py','scripts/tests/picasso-audio-properties-host.c']

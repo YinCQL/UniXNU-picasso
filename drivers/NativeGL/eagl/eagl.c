@@ -476,6 +476,7 @@ struct eagl {
 	unsigned beat_fill_calls[90];
 	/* everything so far */
 	unsigned frames, shaders, programs, errors, shared, refused;
+	unsigned draw_function;         /* last function observed at a draw, for error diagnostics */
 	uint64_t all_calls, all_draws, all_triangles, readback_us, wait_us, attach_us, flush_us, frame_us;
 	unsigned most_calls, most_triangles;
 	const char *sources[256];       /* the text of the shaders being made, by name (modulo this) */
@@ -564,6 +565,7 @@ static int fetch_offered = 1;
 
 static const char *eagl_slot_name(unsigned offset);
 static void census_report(void);
+static void compositor_framebuffer(struct eagl *e, const char *where);
 static void clear_now(struct eagl *e);
 
 static void
@@ -594,6 +596,7 @@ eagl_leave(struct eagl *e, unsigned offset)
 	if (check_errors && offset != 0x338 && (error = glGetError()) != 0) {
 		if (compositor_claim(2, (offset << 16) | error)) {
 			compositor_text("error=%x slot=%x frame=%u", error, offset, e->frames);
+			if (error == 0x506) compositor_framebuffer(e, "draw-error");
 		}
 		if (e->errors++ < 60) {
 			say("hakios-gl: %s: error %#x\n", eagl_slot_name(offset), error);
@@ -2806,6 +2809,38 @@ hakios_gl_function_refused(unsigned function)
 	}
 }
 
+/* An error snapshot only: no extra glGetError calls, framebuffer binds or pixel reads. */
+static void
+compositor_framebuffer(struct eagl *e, const char *where)
+{
+	GLint draw = 0, read = 0, program = 0, view[4] = { 0, 0, 0, 0 };
+	static const GLenum attachments[] = { GL_COLOR_ATTACHMENT0, 0x8d00, 0x8d20 };
+
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(0x8b8d, &program); /* GL_CURRENT_PROGRAM */
+	glGetIntegerv(GL_VIEWPORT, view);
+	compositor_text("fbo where=%s frame=%u f=%u status=%x draw=%d read=%d tracked=%u dst=%u p=%d view=%d,%d,%d,%d",
+	    where, e->frames, e->draw_function, glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER), draw, read,
+	    e->framebuffer, e->colour, program, view[0], view[1], view[2], view[3]);
+	if (draw == 0) return;
+	for (unsigned i = 0; i < 3; i++) {
+		GLint type = 0, name = 0, level = -1, red = 0, alpha = 0, component = 0;
+		glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachments[i], GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+		if (type == 0) continue;
+		glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachments[i], GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+		if (type == GL_TEXTURE)
+			glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachments[i], 0x8cd2, &level);
+		if (i == 0) {
+			glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachments[i], 0x8212, &red);
+			glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachments[i], 0x8215, &alpha);
+			glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachments[i], 0x8211, &component);
+		}
+		compositor_text("attachment=%x type=%x name=%d level=%d red=%d alpha=%d component=%x",
+		    attachments[i], type, name, level, red, alpha, component);
+	}
+}
+
 /* Only called with a function already read by a draw path. No CA pointers or pixels are read here. */
 static void
 compositor_draw(struct eagl *e, unsigned function, unsigned kind)
@@ -3171,7 +3206,8 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 	static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 	static const GLfloat corners[8] = { -1, -1, 1, -1, -1, 1, 1, 1 };
 	GLint view[4], box[4], width = 0, height = 0, enabled[3];
-	GLboolean scissored, blending;
+	GLint read = 0, draw = 0, program = 0;
+	GLboolean scissored, blending, write_mask[4];
 	GLfloat flat[4], alpha = clamp01(g->colours[19]);
 
 	if (compositor_claim(3, alpha == 0 ? 0 : 1)) {
@@ -3179,6 +3215,11 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 		    (double)alpha, (double)g->colours[16], (double)g->colours[17], (double)g->colours[18]);
 	}
 
+	/* This can run inside another replacement draw; tracked CA state is not the active GL state. */
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	glGetIntegerv(0x8b8d, &program); /* GL_CURRENT_PROGRAM */
+	glGetBooleanv(GL_COLOR_WRITEMASK, write_mask);
 	g->state = GROUP_NONE;
 	group_flattened++;
 	flat[3] = alpha;
@@ -3200,6 +3241,9 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+	if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE && compositor_claim(3, 0x10000u))
+		compositor_framebuffer(e, "group-flatten");
+	glColorMask(1, 1, 1, 1);
 	glViewport(0, 0, width, height);
 	glDisable(GL_SCISSOR_TEST);
 	if (flat[3] == 0) {
@@ -3227,10 +3271,12 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 		for (GLuint i = 0; i < 3; i++) {
 			(enabled[i] ? glEnableVertexAttribArray : glDisableVertexAttribArray)(i);
 		}
-		glUseProgram(e->program);
+		glUseProgram((GLuint)program);
 		(blending ? glEnable : glDisable)(GL_BLEND);
 	}
-	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
+	glColorMask(write_mask[0], write_mask[1], write_mask[2], write_mask[3]);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
 	glViewport(view[0], view[1], view[2], view[3]);
 	glScissor(box[0], box[1], box[2], box[3]);
 	(scissored ? glEnable : glDisable)(GL_SCISSOR_TEST);
@@ -3286,6 +3332,7 @@ group_draw_begin(struct eagl *e, GLint enabled[4])
 	GLfloat matrix[16], texmat[4] = { 1, 1, 0, 0 };
 	bool cover;
 
+	e->draw_function = function;
 	if (!group_vibrant_on || e->colour == 0 || e->framebuffer == 0) {
 		return 0;
 	}

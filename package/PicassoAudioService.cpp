@@ -16,8 +16,8 @@ static PicassoAudioQueue queue;
 static IOLock *queueLock;
 static uint8_t scratch[16384]; // worker-only staging, never stack or user DMA
 static bool attempted,published,registered,active,registrationFailed;
-static unsigned clientNotes,clientOpens,clientPropertyNotes,clientRouteNotes;
-static unsigned testPhase,testFrames,testPause,lastEvents,startWait;
+static unsigned clientNotes,clientOpens,clientPropertyNotes,clientRouteNotes,clientTimingNotes;
+static unsigned testPhase,testFrames,testPause,lastEvents;
 
 static const PicassoAudioFormat format={1,48000,2,16};
 
@@ -36,8 +36,9 @@ static int audioCall(uint64_t owner,unsigned selector,const void *input,unsigned
         if(n.version==1 && n.kind>=1 && n.kind<=14 && !n.reserved) {
             // Client-provided observations, separately labeled from DSP state.
             bool property=n.kind==5 || n.kind==7,route=n.kind>=9;
-            unsigned &budget=route?clientRouteNotes:property?clientPropertyNotes:clientNotes;
-            if(budget<((property||route)?128U:64U) || (n.kind==3 && !(n.sentFrames&0x3ffff))) {
+            bool timing=n.kind==6 && n.selector>=1 && n.selector<=3;
+            unsigned &budget=timing?clientTimingNotes:route?clientRouteNotes:property?clientPropertyNotes:clientNotes;
+            if(budget<(timing?36U:(property||route)?128U:64U) || (n.kind==3 && !(n.sentFrames&0x3ffff))) {
                 if(n.kind==7 || route)
                     IOLog("PICASSO_AUDIO %s kind=%u result=%d selector=%x object=%u scope=%llx element=%llu op=%llu client_report=1\n",
                         route?"route-note":"property",n.kind,n.result,n.selector,n.value,n.calls,n.sentFrames,n.missingFrames);
@@ -181,6 +182,10 @@ extern "C" void picasso_audio_service_tick(PicassoAprProbe &p,bool transportFail
         IOLockLock(queueLock);
         if(queue.cancel && v.phase<PicassoPlayClose && !v.error) {v.error=-125;v.pending=false;++v.events;}
         queue.returned=v.bytesDone;queue.replies=v.writeDone;
+        // RUN and amplifier enable must complete before the HAL starts its
+        // timeline. DMA ownership/completion is not an acoustic timestamp.
+        if(queue.state==PicassoAudioStarting && v.phase==PicassoPlayWrite && v.ampEnabled && !v.error)
+            queue.state=PicassoAudioRunning;
         if(v.phase>=PicassoPlayDrain && v.phase<PicassoPlayDone)queue.state=PicassoAudioDraining;
         if(transportFailed && !v.done) {v.error=-104;v.pending=false;}
         if(v.done) {
@@ -197,11 +202,10 @@ extern "C" void picasso_audio_service_tick(PicassoAprProbe &p,bool transportFail
     if(!active && testPhase==3 && queue.ready && !published)publishAudio();
     feedSelftest();
     IOLockLock(queueLock);
-    if(!active && queue.state==PicassoAudioStarting && !queue.cancel && !picasso_audio_available(queue)) {
-        if(++startWait>250) {picasso_audio_retire(queue,true,-60,false);startWait=0;}
-    } else startWait=0;
-    if(!active && queue.state==PicassoAudioStarting && !queue.cancel && picasso_audio_available(queue)) {
-        if(picasso_play_rearm(p)) {v.source=audioSource;active=true;queue.state=PicassoAudioRunning;}
+    // Prepare the real route before PCM is required. Waiting for PCM here
+    // forces the HAL to queue silence while the route is still opening.
+    if(!active && queue.state==PicassoAudioStarting && !queue.cancel) {
+        if(picasso_play_rearm(p)) {v.source=audioSource;active=true;}
         else picasso_audio_retire(queue,false,-16,false);
     } else if(!active && queue.cancel)picasso_audio_retire(queue,true,-125,false);
     if(queue.epoch!=lastEvents) {lastEvents=queue.epoch;IOLog("PICASSO_AUDIO begin epoch=%u state=%u buffered=%u test=%u\n",queue.epoch,queue.state,queue.used,testPhase);}

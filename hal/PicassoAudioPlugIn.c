@@ -23,6 +23,9 @@ enum {kDeviceVolumeScalar='volm',kDeviceVolumeDecibels='vold',
 #define kModelUID "PicassoAudioModel"
 static const Float64 kRate=48000;
 static const UInt32 kZeroPeriod=32768;
+// The worker can reserve through current time + 5120 frames. Leave another
+// 3072 frames for scheduling jitter; device latency is reported separately.
+static const UInt32 kSafetyFrames=8192;
 static AudioServerPlugInHostRef gHost;
 static pthread_mutex_t gLock=PTHREAD_MUTEX_INITIALIZER;
 static atomic_uint gRefs=1;
@@ -44,6 +47,25 @@ static uint64_t gTapReads,gTapMissing;
 static uint64_t gSent,gMissing,gReservedEnd;
 static uint32_t gCalls,gPropertyNotes;
 static bool gStreamActive=true;
+// Bounded snapshots copied under the mix lock, flushed by the worker. No
+// kernel logging or status query is performed by the realtime callback.
+static struct {
+    UInt32 frames,nominal;int result;
+    uint64_t output,current,host,sent,cycle;
+} gTiming[4];
+static unsigned gTimingCount,gTimingFlushed,gTimingTotal;
+static UInt32 gLastFrames;
+static uint64_t frameAt(uint64_t host){return host>gOrigin?(uint64_t)((host-gOrigin)/gHostTicksPerFrame):0;}
+static uint64_t observedSample(double sample){return isfinite(sample)&&sample>=0&&sample<9007199254740992.0?(uint64_t)sample:UINT64_MAX;}
+static void captureTiming(UInt32 frames,const AudioServerPlugInIOCycleInfo *info,int result){
+    bool changed=frames!=gLastFrames;gLastFrames=frames;
+    if(gTimingTotal>=12 || gTimingCount>=4 || !(gCalls<=2 || gCalls==32 || changed || result))return;
+    unsigned i=gTimingCount++;++gTimingTotal;
+    gTiming[i].frames=frames;gTiming[i].nominal=info->mNominalIOBufferFrameSize;gTiming[i].result=result;
+    gTiming[i].output=observedSample(info->mOutputTime.mSampleTime);
+    gTiming[i].current=observedSample(info->mCurrentTime.mSampleTime);
+    gTiming[i].host=frameAt(mach_absolute_time());gTiming[i].sent=gSent;gTiming[i].cycle=info->mIOCycleCounter;
+}
 static struct {AudioObjectID object;AudioObjectPropertyAddress address;unsigned operation;OSStatus result;} gPropertySeen[128];
 static int16_t gChunk[2048];
 static PicassoAudioFormat gFormat={1,48000,2,16};
@@ -241,7 +263,7 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kAudioDevicePropertyDeviceCanBeDefaultDevice: REPLY(UInt32, a->mScope != kAudioObjectPropertyScopeInput);
         case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: REPLY(UInt32, a->mScope != kAudioObjectPropertyScopeInput);
         case kAudioDevicePropertyLatency: REPLY(UInt32, latencyFrames());
-        case kAudioDevicePropertySafetyOffset: REPLY(UInt32, latencyFrames() + 4096);
+        case kAudioDevicePropertySafetyOffset: REPLY(UInt32, kSafetyFrames);
         case kAudioDevicePropertyNominalSampleRate: REPLY(Float64, kRate);
         case kAudioDevicePropertyAvailableNominalSampleRates: REPLY(AudioValueRange, ((AudioValueRange){kRate, kRate}));
         case kAudioDevicePropertyIsHidden: REPLY(UInt32, 0);
@@ -431,11 +453,39 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid
     if(a){pthread_mutex_lock(&gLock);propertyNote(o,a,3,rc);pthread_mutex_unlock(&gLock);}
     return rc;
 }
+// kind 6 selector 1: value=IO frames, calls=output sample, sent=host frame,
+// missing=accepted frame; selector 2: value=nominal frames, calls=current
+// sample, sent=IO cycle; selector 3: value=state, calls=queued frames,
+// sent=submitted frames, missing=returned frames. These are observations,
+// never acoustic positions. Other kind 6 selectors remain volume/mute notes.
+static void flushTiming(void){
+    PicassoAudioClientNote notes[8];unsigned count=0;
+    pthread_mutex_lock(&gLock);
+    while(gTimingFlushed<gTimingCount){
+        unsigned i=gTimingFlushed++;
+        notes[count++]=(PicassoAudioClientNote){1,6,gTiming[i].result,1,gTiming[i].frames,0,
+            gTiming[i].output,gTiming[i].host,gTiming[i].sent};
+        notes[count++]=(PicassoAudioClientNote){1,6,gTiming[i].result,2,gTiming[i].nominal,0,
+            gTiming[i].current,gTiming[i].cycle,0};
+    }
+    pthread_mutex_unlock(&gLock);
+    for(unsigned i=0;i<count;++i)(void)method(PicassoAudioNote,&notes[i],sizeof notes[i],NULL,NULL);
+    if(count){
+        PicassoAudioStatus status;size_t size=sizeof status;
+        kern_return_t rc=method(PicassoAudioGetStatus,NULL,0,&status,&size);
+        if(!rc && size==sizeof status && status.version==1){
+            PicassoAudioClientNote n={1,6,status.error,3,status.state,0,
+                status.queuedBytes/4,status.submittedBytes/4,status.returnedBytes/4};
+            (void)method(PicassoAudioNote,&n,sizeof n,NULL,NULL);
+        }
+    }
+}
 // Only the worker calls the kernel writer. The real-time IO callbacks enqueue
 // time-indexed mixes without waiting for ring space or a DSP transaction.
 static void *worker(void *unused){
     (void)unused;
     for(;;){
+        flushTiming();
         pthread_mutex_lock(&gLock);if(gStop){pthread_mutex_unlock(&gLock);break;}
         uint64_t now=mach_absolute_time();uint64_t frame=now>gOrigin?(uint64_t)((now-gOrigin)/gHostTicksPerFrame):0;
         if(gSent>frame+4096){pthread_mutex_unlock(&gLock);usleep(5000);continue;}
@@ -446,7 +496,7 @@ static void *worker(void *unused){
         gReservedEnd=0;
         if(!rc){picasso_tap_store(&gTap,gSent,1024,gChunk);picasso_mix_consume(&gMix,gSent,1024);gSent+=1024;gMissing+=missing;}
         else if(rc!=kIOReturnNoSpace){gFault=(int)rc;note(4,gFault,2,0);pthread_mutex_unlock(&gLock);break;}
-        if((gSent&16383)==0)note(3,0,0,0);
+        if(!rc && (gSent&16383)==0)note(3,0,0,0);
         pthread_mutex_unlock(&gLock);usleep(rc?5000:1000);
     }
     return NULL;
@@ -466,6 +516,20 @@ static kern_return_t waitIdle(void){
     }
     return kIOReturnBusy;
 }
+// Control thread only. Starting means configuration is in progress, not that
+// a speaker stream can consume PCM yet. Never seed the queue with fake audio.
+static kern_return_t waitRunning(void){
+    for(unsigned retry=0;retry<200;++retry){
+        PicassoAudioStatus status;size_t size=sizeof status;
+        kern_return_t rc=method(PicassoAudioGetStatus,NULL,0,&status,&size);
+        if(rc)return rc;
+        if(size!=sizeof status || status.version!=1)return kIOReturnBadArgument;
+        if(status.state==PicassoAudioRunning)return 0;
+        if(status.state!=PicassoAudioStarting)return kIOReturnNotReady;
+        usleep(10000);
+    }
+    return kIOReturnBusy;
+}
 static OSStatus StartIO(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 client){
     (void)d;if(o!=kDevice||client==UINT32_MAX)return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gLock);unsigned slot=32;
@@ -474,9 +538,14 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 clie
     if(!gIoUsers){
         if(connectService()){pthread_mutex_unlock(&gLock);return kAudioHardwareNotRunningError;}
         kern_return_t rc=waitIdle();
-        if(!rc)rc=method(PicassoAudioBegin,&gFormat,sizeof gFormat,NULL,NULL);
-        if(rc){note(2,(int)rc,1,0);pthread_mutex_unlock(&gLock);return kAudioHardwareNotRunningError;}
+        uint64_t start=mach_absolute_time();bool begun=false;
+        if(!rc){rc=method(PicassoAudioBegin,&gFormat,sizeof gFormat,NULL,NULL);begun=!rc;}
+        if(!rc)rc=waitRunning();
+        if(rc){if(begun)(void)method(PicassoAudioCancel,NULL,0,NULL,NULL);
+            note(2,(int)rc,1,0);pthread_mutex_unlock(&gLock);return kAudioHardwareNotRunningError;}
+        note(2,0,5,(unsigned)((mach_absolute_time()-start)/(gHostTicksPerFrame*48)));
         memset(&gTap,0,sizeof gTap);gTapReads=gTapMissing=0;
+        gTimingCount=gTimingFlushed=gLastFrames=0;
         memset(&gMix,0,sizeof gMix);gSent=gMissing=gReservedEnd=gCalls=0;gFault=0;gOrigin=mach_absolute_time();++gSeed;
         int e=pthread_create(&gThread,NULL,worker,NULL);if(e){(void)method(PicassoAudioCancel,NULL,0,NULL,NULL);pthread_mutex_unlock(&gLock);return kAudioHardwareUnspecifiedError;}
         gThreadLive=true;note(2,0,1,0);
@@ -525,7 +594,7 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d,AudioObjectID o,Audio
     }
     if(!gStreamActive){pthread_mutex_unlock(&gLock);return 0;}
     int rc=picasso_mix_add(&gMix,gReservedEnd?gReservedEnd:gSent,(uint64_t)t,frames,main,gain());++gCalls;
-    if(rc && gCalls<32)note(4,rc,op,frames);pthread_mutex_unlock(&gLock);
+    captureTiming(frames,info,rc);pthread_mutex_unlock(&gLock);
     return rc?kAudioHardwareIllegalOperationError:0;
 }
 static OSStatus EndIOOperation(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 c,UInt32 op,UInt32 n,const AudioServerPlugInIOCycleInfo *i){return BeginIOOperation(d,o,c,op,n,i);}
