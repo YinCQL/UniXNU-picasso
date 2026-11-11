@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Observe the qualified wallpaper snapshot boundaries without changing images.
 #import <CoreGraphics/CoreGraphics.h>
+#include <time.h>
 typedef id (*PicassoWallpaperRead)(id, SEL, id *);
 typedef id (*PicassoWallpaperSnapshot)(id, SEL);
 typedef id (*PicassoWallpaperComposite)(id, SEL, id, id);
@@ -16,21 +17,37 @@ static void picasso_wallpaper_note(const char *stage, unsigned ticket, const cha
 {
     struct picasso_pixel_sample empty = {0};
     if (!sample) sample = &empty;
-    char line[352];
+    struct timespec now = {0};
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    unsigned long long milliseconds = (unsigned long long)now.tv_sec * 1000 + (unsigned long long)now.tv_nsec / 1000000;
+    char line[400];
     int length = snprintf(line, sizeof(line),
-        "PICASSO_WALLPAPER pid=%d stage=%s ticket=%u state=%s size=%llu/%llu row=%llu bytes=%llu bpp=%u alpha=%u samples=%u rgb_nonzero=%u alpha_nonzero=%u varied=%u first=%08x hash=%08x\n",
-        getpid(), stage, ticket, state, (unsigned long long)width,
+        "PICASSO_WALLPAPER pid=%d stage=%s ticket=%u state=%s uptime_ms=%llu size=%llu/%llu row=%llu bytes=%llu bpp=%u alpha=%u samples=%u rgb_nonzero=%u alpha_nonzero=%u varied=%u first=%08x hash=%08x\n",
+        getpid(), stage, ticket, state, milliseconds, (unsigned long long)width,
         (unsigned long long)height, (unsigned long long)row, (unsigned long long)bytes,
         bpp, alpha, sample->count, sample->rgb_nonzero, sample->alpha_nonzero,
         sample->varied, sample->first, sample->hash);
     picasso_pixel_console(line, length, sizeof(line));
 }
 
+/* Startup nil reads must not consume the later image budget. Saturating
+ * counters bound both logging and retained asynchronous image work. */
+static int picasso_wallpaper_take(unsigned kind, int present)
+{
+    static unsigned counts[5][2];
+    if (kind >= 5) return 0;
+    unsigned *slot = &counts[kind][present != 0], limit = present ? 16 : 2;
+    unsigned value = __atomic_load_n(slot, __ATOMIC_RELAXED);
+    while (value < limit) {
+        if (__atomic_compare_exchange_n(slot, &value, value + 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return 1;
+    }
+    return 0;
+}
+
 static void picasso_wallpaper_observe(id image, unsigned kind, unsigned ticket)
 {
-    static unsigned counts[5];
     static const char *stages[] = {"disk", "effect-input", "effect-output", "cache", "source"};
-    if (kind >= 5 || __atomic_fetch_add(&counts[kind], 1, __ATOMIC_RELAXED) >= 8) return;
+    if (!picasso_wallpaper_take(kind, image != nil)) return;
     const char *stage = stages[kind];
     picasso_wallpaper_note(stage, ticket, image ? "returned" : "nil", 0, 0, 0, 0, 0, 0, NULL);
     if (!image) return;

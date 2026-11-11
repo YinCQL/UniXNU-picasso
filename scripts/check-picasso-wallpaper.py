@@ -10,6 +10,7 @@ def main():
     wrappers=src[src.index('typedef id'):src.index('static void picasso_wallpaper_note')]
     wrappers+=src[src.index('static unsigned picasso_wallpaper_ticket'):src.index('static void picasso_wallpaper_image_added')]
     (out/'wallpaper-wrapper.inc').write_text(wrappers)
+    (out/'wallpaper-budget.inc').write_text(src[src.index('static int picasso_wallpaper_take'):src.index('static void picasso_wallpaper_observe')])
     src=(ROOT/'package/picasso-springboard/picasso-astc-runtime.m').read_text()
     (out/'astc-note.inc').write_text(src[src.index('static void picasso_astc_decode_note'):src.index('static int picasso_astc_guard')])
     runs=[]
