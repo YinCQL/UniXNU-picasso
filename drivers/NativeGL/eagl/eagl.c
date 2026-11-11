@@ -416,6 +416,7 @@ struct eagl {
 	unsigned long api;
 	struct texture_definition definitions[256];
 	unsigned definition_next;
+	unsigned upload_state_reports;
 	struct image images[1024];
 	unsigned image_count;
 	GLuint framebuffer;             /* the one bound */
@@ -938,6 +939,10 @@ surface_shared(struct eagl *e, struct image *image)
 #define GL_PIXEL_UNPACK_BUFFER 0x88ec
 #define GL_PIXEL_UNPACK_BUFFER_BINDING 0x88ef
 #endif
+#ifndef GL_UNPACK_SKIP_ROWS
+#define GL_UNPACK_SKIP_ROWS 0x0cf3
+#define GL_UNPACK_SKIP_PIXELS 0x0cf4
+#endif
 
 /* A sampled surface becomes a render target without rendering into its imported
  * backing. Keep its pixels in a temporary texture while redefining the original
@@ -1114,7 +1119,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 	bool planar = IOSurfaceGetPlaneCount(surface) > 0;
 	size_t row = planar ? IOSurfaceGetBytesPerRowOfPlane(surface, image->plane) : IOSurfaceGetBytesPerRow(surface);
 	unsigned pixel = bytes_a_pixel(image->format, image->type);
-	GLint row_length = 0, alignment = 4;
+	GLint row_length = 0, alignment = 4, skip_rows = 0, skip_pixels = 0, unpack = 0;
 	uint8_t *base, *flipped = NULL;
 	bool alpha_first = image->alpha_first && !planar && pixel == 4;
 
@@ -1149,12 +1154,28 @@ surface_to_texture(struct eagl *e, struct image *image)
 	}
 	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
 	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+	glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
+	glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
+	glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
+	/* The IOSurface pointer is client memory, independent of the caller's unpack state. */
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+	glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+	glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(row / pixel));
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	glTexImage2D(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height, 0,
 	    image->format, image->type, base);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+	glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
+	glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
+	if ((skip_rows || skip_pixels || unpack) && e->upload_state_reports < 8) {
+		e->upload_state_reports++;
+		compositor_text("surface-upload frame=%u tex=%u surface=%u size=%dx%d row=%zu unpack=%d/%d/%d isolated=1",
+		    e->frames, image->texture, IOSurfaceGetID(surface), image->width, image->height, row,
+		    skip_rows, skip_pixels, unpack);
+	}
 	if (trace_placing) {
 		size_t set[4] = { 0, 0, 0, 0 }, size = row * (size_t)(image->height - 1) + (size_t)image->width * pixel;
 

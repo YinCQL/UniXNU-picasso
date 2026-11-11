@@ -12,6 +12,7 @@ p.add_argument('--expect-unpublished', action='store_true')
 p.add_argument('--expect-unflipped', action='store_true')
 p.add_argument('--expect-stale-read', action='store_true')
 p.add_argument('--expect-shared-render', action='store_true')
+p.add_argument('--expect-contaminated-upload', action='store_true')
 a = p.parse_args()
 s = a.source.read_text()
 out = a.output.resolve()
@@ -78,7 +79,7 @@ runs = []
 for name, flags in [('normal', []), ('asan', ['-fsanitize=address,undefined','-fno-omit-frame-pointer','-fno-sanitize-recover=all'])]:
     binary = out/name
     commands = [('compile', ['clang-18','-std=c11','-O1','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable',
-                 *flags,*(['-DEXPECT_SHARED_RENDER'] if a.expect_shared_render else []),*(['-DEXPECT_STALE_READ'] if a.expect_stale_read else []),*(['-DEXPECT_UNFLIPPED'] if a.expect_unflipped else []),*(['-DEXPECT_UNPUBLISHED'] if a.expect_unpublished else []),'-I',str(out),'-I',str(ROOT/'drivers/NativeGL/eagl'),
+                 *flags,*(['-DEXPECT_CONTAMINATED_UPLOAD'] if a.expect_contaminated_upload else []),*(['-DEXPECT_SHARED_RENDER'] if a.expect_shared_render else []),*(['-DEXPECT_STALE_READ'] if a.expect_stale_read else []),*(['-DEXPECT_UNFLIPPED'] if a.expect_unflipped else []),*(['-DEXPECT_UNPUBLISHED'] if a.expect_unpublished else []),'-I',str(out),'-I',str(ROOT/'drivers/NativeGL/eagl'),
                  str(fixture),'-Wl,-l:libGL.so.1','-Wl,-l:libEGL.so.1','-o',str(binary)]),('run',[str(binary)])]
     for step, cmd in commands:
         result = subprocess.run(cmd,capture_output=True,text=True,timeout=90,
@@ -87,7 +88,7 @@ for name, flags in [('normal', []), ('asan', ['-fsanitize=address,undefined','-f
         assert result.returncode == 0, result.stdout+result.stderr
         runs.append(dict(name=name+'-'+step,passed=True,output=result.stdout))
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
-(out/'results.json').write_text(json.dumps(dict(passed=True,hardware_tested=False,baseline=a.expect_unpublished,
+(out/'results.json').write_text(json.dumps(dict(passed=True,hardware_tested=False,baseline=a.expect_unpublished,contaminated_upload_reproduced=a.expect_contaminated_upload,
     source_sha256=sha(a.source),inputs={str(p.relative_to(ROOT)):sha(p) for p in (fixture,Path(__file__))},runs=runs,
     limitation='Real Mesa GLES pixels; IOSurface allocation, locks and seeds are a host fixture. EGLImage sibling import and storage detachment use real Mesa; native IOSurface backing and Adreno execution require device verification.'),indent=2)+'\n')
 print(runs[-1]['output'])

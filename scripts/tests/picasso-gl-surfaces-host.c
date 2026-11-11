@@ -29,6 +29,10 @@ static void *IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef s,unsigned p){(void)p;r
 static int IOSurfaceLock(IOSurfaceRef s,unsigned f,void *v){(void)s;(void)f;(void)v;return 0;}
 static int IOSurfaceUnlock(IOSurfaceRef s,unsigned f,void *v){(void)v;if(!f)s->seed++;return 0;}
 #include "gl-body.inc"
+#ifndef GL_UNPACK_SKIP_ROWS
+#define GL_UNPACK_SKIP_ROWS 0x0cf3
+#define GL_UNPACK_SKIP_PIXELS 0x0cf4
+#endif
 #ifndef GL_TEXTURE_MIN_FILTER
 #define GL_TEXTURE_MIN_FILTER 0x2801
 #endif
@@ -341,7 +345,77 @@ static void test_shared_one_pixel(void){
     glDeleteTextures(1,&owner);glDeleteTextures(1,&texture);glDeleteFramebuffers(1,&fb);
     if(e->reader)glDeleteFramebuffers(1,&e->reader);if(e->writer)glDeleteFramebuffers(1,&e->writer);free(e);assert(!glGetError());
 }
+
+static void test_cpu_upload(bool buffer_bound, bool invert, bool alpha_first, bool planar, GLint skip_rows){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);
+    unsigned char bytes[216]={0},actual[64],expected[64];
+    struct host_surface surface={301,0,'BGRA',planar,4,4,4,24,96,bytes};
+    GLuint texture,fb,buffer=0;
+    glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,4,4,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+    glGenFramebuffers(1,&fb);glBindFramebuffer(GL_FRAMEBUFFER,fb);
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0);
+    glDisable(GL_SCISSOR_TEST);glColorMask(1,1,1,1);glClearColor(1,0,0,1);glClear(GL_COLOR_BUFFER_BIT);
+    for(unsigned y=0;y<4;y++)for(unsigned x=0;x<4;x++){
+        unsigned char *p=bytes+y*24+x*4;
+        p[0]=31+y;p[1]=63+x;p[2]=127+y+x;p[3]=255;
+    }
+    if(buffer_bound){
+        glGenBuffers(1,&buffer);glBindBuffer(GL_PIXEL_UNPACK_BUFFER,buffer);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER,256,NULL,0x88e8);
+    }
+    glPixelStorei(GL_UNPACK_ROW_LENGTH,9);glPixelStorei(GL_UNPACK_ALIGNMENT,8);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS,skip_rows);glPixelStorei(GL_UNPACK_SKIP_PIXELS,1);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,4,4,GL_BGRA,GL_UNSIGNED_BYTE,0,invert));
+    struct image *i=image_of(e,texture);assert(i&&!i->shared&&!i->target);
+    GLenum error=glGetError();
+#ifdef EXPECT_CONTAMINATED_UPLOAD
+    (void)alpha_first;
+    assert(error==(buffer_bound?0x0502:0));
+#else
+    assert(!error);
+#endif
+    expect_state(GL_UNPACK_ROW_LENGTH,9);expect_state(GL_UNPACK_ALIGNMENT,8);
+    expect_state(GL_UNPACK_SKIP_ROWS,skip_rows);expect_state(GL_UNPACK_SKIP_PIXELS,1);expect_state(GL_PIXEL_UNPACK_BUFFER_BINDING,buffer);
+    glReadPixels(0,0,4,4,GL_RGBA,GL_UNSIGNED_BYTE,actual);assert(!glGetError());
+#ifdef EXPECT_CONTAMINATED_UPLOAD
+    for(unsigned n=0;n<16;n++){
+        assert(actual[n*4]==(buffer_bound?255:0)&&actual[n*4+1]==0&&actual[n*4+2]==0&&actual[n*4+3]==(buffer_bound?255:0));
+    }
+    puts(buffer_bound?"REPRODUCED: IOSurface pointer interpreted as unpack-buffer offset; old texture retained":"REPRODUCED: inherited unpack skips upload black padding instead of surface pixels");
+#else
+    for(unsigned pass=0;pass<2;pass++){
+        if(pass){
+            // A later bind refreshes a CPU surface under the same caller state.
+            alpha_first=alpha_first&&!planar;i->alpha_first=alpha_first;
+            for(unsigned y=0;y<4;y++)for(unsigned x=0;x<4;x++){
+                unsigned char *p=bytes+y*24+x*4;
+                p[0]=alpha_first?255:47+y;p[1]=alpha_first?47+y:79+x;
+                p[2]=alpha_first?79+x:143+y+x;p[3]=alpha_first?143+y+x:255;
+            }
+            surface.seed++;e->frames++;my_glBindTexture(e,GL_TEXTURE_2D,texture);
+            assert(!glGetError()&&i->seed==surface.seed&&e->uploads==2);
+            glReadPixels(0,0,4,4,GL_RGBA,GL_UNSIGNED_BYTE,actual);assert(!glGetError());
+        }
+        for(unsigned y=0;y<4;y++)for(unsigned x=0;x<4;x++){
+            unsigned sy=invert?3-y:y;unsigned char *p=expected+(y*4+x)*4;
+            p[0]=(pass?143:127)+sy+x;p[1]=(pass?79:63)+x;p[2]=(pass?47:31)+sy;p[3]=255;
+        }
+        assert(!memcmp(actual,expected,sizeof actual));
+        expect_state(GL_UNPACK_ROW_LENGTH,9);expect_state(GL_UNPACK_ALIGNMENT,8);
+        expect_state(GL_UNPACK_SKIP_ROWS,skip_rows);expect_state(GL_UNPACK_SKIP_PIXELS,1);expect_state(GL_PIXEL_UNPACK_BUFFER_BINDING,buffer);
+    }
+#endif
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER,0);if(buffer)glDeleteBuffers(1,&buffer);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH,0);glPixelStorei(GL_UNPACK_ALIGNMENT,4);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS,0);glPixelStorei(GL_UNPACK_SKIP_PIXELS,0);
+    image_forget(e,texture);glDeleteTextures(1,&texture);glDeleteFramebuffers(1,&fb);free(e);assert(!glGetError());
+}
 int main(void){context();
+#ifdef EXPECT_CONTAMINATED_UPLOAD
+    test_cpu_upload(false,false,false,false,4);test_cpu_upload(true,false,false,false,4);return 0;
+#endif
+
 #ifdef EXPECT_SHARED_RENDER
     test_shared_render(true,false);test_shared_render(true,true);return 0;
 #endif
@@ -352,10 +426,15 @@ int main(void){context();
 #ifdef EXPECT_UNFLIPPED
     test_mirror(true,false);test_mirror(true,true);puts("REPRODUCED: inverted GPU mirror keeps source rows in ascending order");return 0;
 #endif
+#ifndef EXPECT_UNPUBLISHED
+    test_cpu_upload(false,false,false,false,4);test_cpu_upload(true,false,false,false,4);
+    test_cpu_upload(true,true,false,false,4);test_cpu_upload(true,true,true,false,4);test_cpu_upload(true,true,false,true,4);
+    test_cpu_upload(false,false,false,false,0);
+#endif
     test_independent_reads();test_read_boundaries(false);test_read_boundaries(true);test_surface(false);test_surface(true);
 #ifndef EXPECT_UNPUBLISHED
     struct eagl *late=calloc(1,sizeof(*late));assert(late);late->frames=700;check_errors=0;
     glEnable(0xffffffffu);frame_end(late,false);assert(late->errors==1&&!glGetError());free(late);check_errors=1;
-    test_shared_one_pixel();test_shared_render(true,false);test_shared_render(false,false);test_shared_render(true,true);test_shared_render(false,true);test_mirror(false,false);test_mirror(true,false);test_mirror(true,true);test_copy();test_rejections();puts("PASS actual EGLImage sibling detachment (including 1x1), GPU pixel preservation, partial render/copy, mirror/CPU publication, failure state, surface orientation/padding, seed ownership and GL binding/pack/unpack/framebuffer state");
+    test_shared_one_pixel();test_shared_render(true,false);test_shared_render(false,false);test_shared_render(true,true);test_shared_render(false,true);test_mirror(false,false);test_mirror(true,false);test_mirror(true,true);test_copy();test_rejections();puts("PASS CPU upload/refresh with inherited skips and unpack buffer, actual EGLImage sibling detachment (including 1x1), GPU pixel preservation, partial render/copy, mirror/CPU publication, failure state, surface orientation/padding, seed ownership and GL binding/pack/unpack/framebuffer state");
 #endif
 }
