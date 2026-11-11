@@ -69,7 +69,7 @@ names = ['texture_definition_of','texture_defined','image_of','image_new','image
 if 'surface_render_copy(' in s: names += ['surface_render_copy']
 if 'image_render_target(' in s: names += ['image_render_target']
 names += ['surface_changed','surface_to_texture','mirror_to_surface','target_to_surface','frame_begin','frame_end','drawing',
-          'my_glCopyTexSubImage2D','my_glBindTexture','my_glClear','clear_now','my_glFramebufferTexture2D','my_glBindFramebuffer','my_texImageIOSurface']
+          'my_glCopyTexSubImage2D','my_glBindTexture','my_glClear','clear_now','my_glFramebufferTexture2D','my_glBindFramebuffer','my_texImageIOSurface','my_attachImage']
 for name in names: body += fn(name)
 if 'framebuffer_read_texture(' in s:
     for name in ['framebuffer_read_texture','my_glCopyTexImage2D','my_glReadPixels']: body += fn(name)

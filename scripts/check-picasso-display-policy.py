@@ -47,6 +47,9 @@ def main():
     if raw is None or len(raw) != 4:
         raise ValueError('ADT must contain one 32-bit chosen display-scale')
     scale = struct.unpack('<I', raw)[0]
+    gamut = nodes['/product'].get('artwork-display-gamut')
+    if gamut != b'sRGB\0':
+        raise ValueError('ADT must declare the supported SDR sRGB display gamut')
     source = (ROOT / 'package/PicassoDisplay.cpp').read_text(encoding='utf-8')
     markers = ['static void finishDisplayPolicy(', 'static bool matchWord(']
     if 'static bool matchDisplayScale(' in source:
@@ -61,7 +64,7 @@ def main():
     if not vcvars and not compiler:
         raise RuntimeError('No C++ compiler available')
     report = {'scope': __doc__, 'adt_sha256': hashlib.sha256(adt).hexdigest(),
-              'adt_scale': scale, 'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
+              'adt_scale': scale, 'adt_gamut': gamut.rstrip(b'\0').decode(), 'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
               'runs': [], 'pass': False}
     try:
         for asan in (False, True):

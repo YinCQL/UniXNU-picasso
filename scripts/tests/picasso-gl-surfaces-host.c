@@ -421,6 +421,45 @@ static void test_w30r_contract_note(void){
     assert(!memcmp(bytes,(unsigned char[64]){0},64)&&!glGetError());
     image_forget(e,tex);glDeleteTextures(1,&tex);free(e);
 }
+
+static void test_snapshot_attachment(bool invert){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);
+    const unsigned width=270,height=600,row=1088;size_t size=row*height;
+    unsigned char *bytes=calloc(1,size);assert(bytes);
+    struct host_surface s={76,0,0x77333072,0,4,width,height,row,size,bytes};
+    GLuint tex,fb;glGenTextures(1,&tex);my_glBindTexture(e,GL_TEXTURE_2D,tex);
+    // The unsupported packed snapshot leaves no attachment and no publication.
+    assert(!my_attachImage(e,NULL,GL_TEXTURE_2D,&s,invert)&&!image_of(e,tex));
+    glGenFramebuffers(1,&fb);my_glBindFramebuffer(e,GL_FRAMEBUFFER,fb);
+    my_glFramebufferTexture2D(e,GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,tex,0);
+    assert(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE);
+    assert(s.seed==0&&!memcmp(bytes,(unsigned char[16]){0},16));
+    for(size_t n=0;n<size;n++)assert(bytes[n]==0);
+    puts("REPRODUCED: w30r snapshot rejected by production attachImage; framebuffer incomplete, storage stays zero");
+    // A surface actually allocated and advertised as BGRA uses the supported path.
+    s.format='BGRA';
+    for(unsigned y=0;y<height;y++)memset(bytes+y*row+width*4,0xa5,row-width*4);
+    assert(my_attachImage(e,NULL,GL_TEXTURE_2D,&s,invert));
+    assert(glCheckFramebufferStatus(GL_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE&&!glGetError());
+    glViewport(0,0,width,height);glDisable(GL_SCISSOR_TEST);glColorMask(1,1,1,1);
+    glClearColor(0.25,0.5,0.75,1);my_glClear(e,GL_COLOR_BUFFER_BIT);clear_now(e);
+    glEnable(GL_SCISSOR_TEST);glScissor(0,0,width,1);glClearColor(1,0,0,1);
+    my_glClear(e,GL_COLOR_BUFFER_BIT);clear_now(e);glDisable(GL_SCISSOR_TEST);frame_end(e,false);
+    assert(s.seed==1);
+    for(unsigned y=0;y<height;y++){
+        bool red=(invert?height-1-y:y)==0;
+        for(unsigned x=0;x<width;x++){
+            unsigned char *v=bytes+y*row+x*4;
+            assert(v[0]==(red?0:191)&&v[1]==(red?0:128)&&v[2]==(red?255:64)&&v[3]==255);
+        }
+        for(unsigned x=width*4;x<row;x++)assert(bytes[y*row+x]==0xa5);
+    }
+    frame_end(e,false);assert(s.seed==1&&!glGetError());
+    image_forget(e,tex);glDeleteTextures(1,&tex);glDeleteFramebuffers(1,&fb);
+    if(e->reader)glDeleteFramebuffers(1,&e->reader);free(bytes);free(e);
+    puts("PASS: 270x600 BGRA snapshot attachment, colored GPU rendering and published pixels, orientation, padding and seed");
+}
+
 int main(void){context();
 #ifdef EXPECT_CONTAMINATED_UPLOAD
     test_cpu_upload(false,false,false,false,4);test_cpu_upload(true,false,false,false,4);return 0;
@@ -437,6 +476,7 @@ int main(void){context();
     test_mirror(true,false);test_mirror(true,true);puts("REPRODUCED: inverted GPU mirror keeps source rows in ascending order");return 0;
 #endif
 #ifndef EXPECT_UNPUBLISHED
+    test_snapshot_attachment(false);test_snapshot_attachment(true);
     test_w30r_contract_note();
     test_cpu_upload(false,false,false,false,4);test_cpu_upload(true,false,false,false,4);
     test_cpu_upload(true,true,false,false,4);test_cpu_upload(true,true,true,false,4);test_cpu_upload(true,true,false,true,4);

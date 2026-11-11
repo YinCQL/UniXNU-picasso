@@ -259,7 +259,9 @@ def main():
                             ('artwork-device-idiom', b'phone\0' if args.iphone_identity else b'pad\0'),
                             ('artwork-device-subtype', struct.pack('<I', 2436 if args.iphone_identity else 2732)),
                             ('artwork-scale-factor', struct.pack('<I', 3 if args.iphone_identity else 2)),
-                            ('artwork-display-gamut', b'P3\0'),
+                            # The display path publishes 8-bit SDR BGRA. Extended color
+                            # would make system snapshots request unsupported 10-bit surfaces.
+                            ('artwork-display-gamut', b'sRGB\0'),
                             ('compatible-device-fallback', b'iPhone9,2\0' if args.iphone_identity else b'iPad6,7\0')] if apple_identity else []),
                          *([('thin-bezel', struct.pack('<I', 1))] if args.iphone_identity else [])]),
         node('pram', [('reg', struct.pack('<2Q', PANIC_LOG_PADDR, PANIC_LOG_SIZE))]),
