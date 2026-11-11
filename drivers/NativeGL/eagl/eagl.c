@@ -103,6 +103,13 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_UNPACK_ALIGNMENT             0x0cf5
 #define GL_PACK_ROW_LENGTH              0x0d02
 #define GL_PACK_ALIGNMENT               0x0d05
+#define GL_PACK_SKIP_ROWS               0x0d03
+#define GL_PACK_SKIP_PIXELS             0x0d04
+#define GL_PIXEL_PACK_BUFFER            0x88eb
+#define GL_PIXEL_PACK_BUFFER_BINDING    0x88ed
+#define GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL 0x8cd2
+#define GL_TEXTURE_WIDTH                0x1000
+#define GL_TEXTURE_HEIGHT               0x1001
 #define GL_TEXTURE_2D                   0x0de1
 #define GL_UNSIGNED_BYTE                0x1401
 #define GL_RGBA                         0x1908
@@ -375,7 +382,7 @@ static unsigned group_covered, group_laid, group_flattened;    /* (glframes=1) t
 struct image {
 	GLuint texture;
 	IOSurfaceRef surface;
-	bool target;                    /* drawn into (attachImage) rather than shown (texImageIOSurface) */
+	bool target;                    /* attached explicitly or subsequently used as a render target */
 	bool invert, drawn;
 	bool shared;                    /* the texture is the surface's memory: nothing to copy */
 	GLuint mirror;                  /* a texture that is the surface's memory, which the GPU copies the frame into (blit_targets) */
@@ -413,6 +420,7 @@ struct eagl {
 	unsigned image_count;
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
+	GLint colour_level;             /* mip level of the draw framebuffer attachment */
 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
 	GLuint writer;                  /* ... and one to copy a frame into its surface with (blit_targets) */
 	GLuint program;                 /* the one in use, as CoreAnimation has it */
@@ -926,6 +934,39 @@ surface_shared(struct eagl *e, struct image *image)
 	return true;
 }
 
+/* texImageIOSurface also creates CoreAnimation snapshot render targets. Promote
+ * only a supported full-surface level-zero texture when it is actually written.
+ * Do not refill it here: its existing GPU contents must survive partial draws.
+ */
+static bool
+image_render_target(struct eagl *e, struct image *image)
+{
+	IOSurfaceRef surface = image->surface;
+	GLint bound = 0, width = 0, height = 0;
+	size_t row = IOSurfaceGetBytesPerRow(surface);
+
+	if (image->target) return true;
+	if (image->to != GL_TEXTURE_2D || image->plane != 0 || image->format != GL_BGRA ||
+	    image->type != GL_UNSIGNED_BYTE || image->alpha_first || IOSurfaceGetPixelFormat(surface) != 'BGRA' ||
+	    IOSurfaceGetPlaneCount(surface) != 0 || IOSurfaceGetBytesPerElement(surface) != 4 ||
+	    image->width <= 0 || image->height <= 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
+	    (size_t)image->height != IOSurfaceGetHeight(surface) || row / 4 < (size_t)image->width || row % 4 != 0 ||
+	    row > IOSurfaceGetAllocSize(surface) / (size_t)image->height) return false;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	glBindTexture(GL_TEXTURE_2D, image->texture);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+	if (width != image->width || height != image->height) return false;
+	image->target = true;
+	if (!image->shared) surface_mirrored(e, image);
+	if (compositor_claim(5, 0x40000000u | image->texture)) {
+		compositor_text("render-surface=%u tex=%u size=%dx%d shared=%u mirror=%u frame=%u",
+		    IOSurfaceGetID(surface), image->texture, width, height, image->shared, image->mirror != 0, e->frames);
+	}
+	return true;
+}
+
 /*
  * A surface that is shown goes on being drawn into after the texture has been made of it -- a
  * sign an application draws for one of its layers, a picture CoreAnimation has made a surface
@@ -1125,25 +1166,34 @@ target_to_surface(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
 	size_t row = IOSurfaceGetBytesPerRow(surface);
+	GLint read = 0, row_length = 0, alignment = 4, skip_rows = 0, skip_pixels = 0, buffer = 0;
 	uint8_t *base;
 
 	image->drawn = false;
 	if (image->shared || image->mirror != 0) {
-		/* whoever looks at the surface's seed is to see that it has changed */
+		/* Publish only after frame_end has completed the GPU writes. */
 		if (IOSurfaceLock(surface, 0, NULL) == 0) {
 			IOSurfaceUnlock(surface, 0, NULL);
 		}
 		return;
 	}
-	if (e->reader == 0) {
-		glGenFramebuffers(1, &e->reader);
-	}
-	glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
-	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
-	if (IOSurfaceLock(surface, 0, NULL) == 0) {
-		base = IOSurfaceGetBaseAddress(surface);
+	if (IOSurfaceLock(surface, 0, NULL) != 0) return;
+	base = IOSurfaceGetBaseAddress(surface);
+	if (base != NULL) {
+		glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+		glGetIntegerv(GL_PACK_ROW_LENGTH, &row_length);
+		glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
+		glGetIntegerv(GL_PACK_SKIP_ROWS, &skip_rows);
+		glGetIntegerv(GL_PACK_SKIP_PIXELS, &skip_pixels);
+		glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &buffer);
+		if (e->reader == 0) glGenFramebuffers(1, &e->reader);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
+		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(row / 4));
-		glPixelStorei(GL_PACK_ALIGNMENT, 4);
+		glPixelStorei(GL_PACK_ALIGNMENT, 1);
+		glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+		glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
 		if (!image->invert) {
 			glReadPixels(0, 0, image->width, image->height, GL_BGRA, GL_UNSIGNED_BYTE, base);
 		} else {
@@ -1151,10 +1201,14 @@ target_to_surface(struct eagl *e, struct image *image)
 				glReadPixels(0, y, image->width, 1, GL_BGRA, GL_UNSIGNED_BYTE, base + row * (size_t)(image->height - 1 - y));
 			}
 		}
-		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-		IOSurfaceUnlock(surface, 0, NULL);
+		glPixelStorei(GL_PACK_ROW_LENGTH, row_length);
+		glPixelStorei(GL_PACK_ALIGNMENT, alignment);
+		glPixelStorei(GL_PACK_SKIP_ROWS, skip_rows);
+		glPixelStorei(GL_PACK_SKIP_PIXELS, skip_pixels);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)buffer);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 	}
-	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
+	IOSurfaceUnlock(surface, 0, NULL);
 }
 
 /*
@@ -1164,8 +1218,6 @@ target_to_surface(struct eagl *e, struct image *image)
  * that much of its corner and glshow_zoom=N every pixel of it as a square of N, for a texture
  * whose few pixels in a corner are what matters (a material's backdrop, say).
  */
-#define GL_TEXTURE_WIDTH        0x1000
-#define GL_TEXTURE_HEIGHT       0x1001
 
 static GLuint shown_texture;
 /*
@@ -1379,6 +1431,16 @@ frame_end(struct eagl *e, bool finished)
 		glFinish();
 		nativegl_mark(0x6040u | e->perf_slot);
 		e->perf_open = false;
+	}
+	if (!check_errors) {
+		GLenum error = glGetError();
+		if (error != 0) {
+			e->errors++;
+			if (compositor_claim(2, 0xffff0000u | error)) {
+				compositor_text("frame-error=%x frame=%u", error, e->frames);
+				if (error == 0x506) compositor_framebuffer(e, "frame-end");
+			}
+		}
 	}
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
@@ -1664,7 +1726,8 @@ drawing(struct eagl *e)
 			e->perf_open = true;
 		}
 	}
-	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
+	if (e->framebuffer != 0 && e->colour != 0 && e->colour_level == 0 &&
+	    (image = image_of(e, e->colour)) != NULL && image_render_target(e, image)) {
 		image->drawn = image->painted = true;
 		if (damage_blits && image->mirror != 0) {
 			GLint box[4] = { 0, 0, image->width, image->height };
@@ -4088,20 +4151,41 @@ my_glCopyTexSubImage2D(void *context, GLenum target, GLint level, GLint x0, GLin
     GLsizei height)
 {
 	struct eagl *e = context;
+	struct image *image = NULL;
+	GLint read = 0, kind = 0, source = 0, texture = 0;
 
 	EAGL_ENTER(e, 0x1c8);
 	if (eagl_tracing) {
 		eagl_trace("glCopyTexSubImage2D(%#x, %d, %d, %d, %d, %d, %d, %d)\n", target, level, x0, y0, x, y, width, height);
 	}
+	frame_begin(e);
 	clear_now(e);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	if (read != 0) {
+		glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &kind);
+		if (kind == GL_TEXTURE) glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &source);
+	}
+	if (target == GL_TEXTURE_2D && level == 0 && width > 0 && height > 0) {
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+		image = image_of(e, (GLuint)texture);
+		if (image != NULL && (x0 < 0 || y0 < 0 || width > image->width || height > image->height ||
+		    x0 > image->width - width || y0 > image->height - height || !image_render_target(e, image))) image = NULL;
+	}
 	if (e->groups != NULL) {
-		group_read(e, e->colour);
+		group_read(e, (GLuint)source);
 		if (target == GL_TEXTURE_2D && e->unit < 8) {
 			group_read(e, e->bound[e->unit]);
 			group_forget(e, e->bound[e->unit]);
 		}
 	}
 	glCopyTexSubImage2D(target, level, x0, y0, x, y, width, height);
+	if (image != NULL) {
+		image->drawn = image->painted = true;
+		/* Copies ignore scissor; a full mirror copy also covers any earlier draws. */
+		image->damaged = false;
+	}
 	EAGL_LEAVE(e, 0x1c8);
 }
 
@@ -4264,6 +4348,8 @@ my_glBindFramebuffer(void *context, GLenum target, GLuint framebuffer)
 			glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 			    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
 			e->colour = (GLuint)name;
+			glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+			    GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL, &e->colour_level);
 		}
 	}
 	EAGL_LEAVE(e, 0x1508);
@@ -4278,6 +4364,7 @@ my_glFramebufferTexture2D(void *context, GLenum target, GLenum attachment, GLenu
 	clear_now(e);
 	if (attachment == GL_COLOR_ATTACHMENT0 && target != GL_READ_FRAMEBUFFER) {
 		e->colour = texture;
+		e->colour_level = level;
 	}
 	if (eagl_tracing) {
 		eagl_trace("glFramebufferTexture2D(%#x, %#x, %#x, %u, %d)\n", target, attachment, to, texture, level);
