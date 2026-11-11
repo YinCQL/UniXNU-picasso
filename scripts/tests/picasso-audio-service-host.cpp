@@ -186,16 +186,12 @@ int main(int argc,char **) {
     // Restore the fixture's previous healthy idle state only for independent
     // empty-start testing; the production service latches this fault.
     queue.state=PicassoAudioIdle;queue.ready=true;p.play.complete=true;p.play.firstError=0;
-    // Begin prepares the route with no fabricated PCM. RUN plus amp enable,
-    // not Begin or a control ACK alone, marks it ready for the HAL timeline.
-    assert(!call(other,1,&format,sizeof format));cycle(p,q);
-    assert(queue.state==PicassoAudioStarting && active && !queue.submitted && !queue.dma);
-    for(unsigned i=0;i<12 && queue.state!=PicassoAudioRunning;++i)cycle(p,q);
-    assert(queue.state==PicassoAudioRunning && p.play.ampEnabled && !queue.submitted && !queue.returned);
-    assert(!call(other,4));for(unsigned i=0;i<40;++i)cycle(p,q);
-    assert(queue.state==PicassoAudioIdle && !queue.cancel && !queue.returned);
+    // Empty start expires without touching hardware; transport loss latches unavailable.
     assert(!call(other,1,&format,sizeof format));for(unsigned i=0;i<252;++i)cycle(p,q);
-    assert(queue.state==PicassoAudioFailed && queue.error==-60 && !queue.returned);
+    assert(queue.state==PicassoAudioIdle && queue.error==-60);
+    assert(!call(other,1,&format,sizeof format));cycle(p,q);
+    assert(queue.state==PicassoAudioStarting && startWait==1);
+    assert(!call(other,4));cycle(p,q);assert(queue.state==PicassoAudioIdle && !queue.cancel);
     picasso_audio_service_tick(p,true);assert(!queue.ready && queue.state==PicassoAudioFailed && call(other,1,&format,sizeof format)==kIOReturnNotReady);
     static PicassoAprProbe stuck;p.play.complete=true;p.play.firstError=0;
     stuck.ready=stuck.fw.valid=true;stuck.play.attempted=true;stuck.play.phase=PicassoPlayWrite;

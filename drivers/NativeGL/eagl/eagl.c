@@ -258,6 +258,58 @@ ktrace(const char *format, ...)
 	nativegl_text(text);
 }
 
+/* Small, independent budgets keep compositor observations visible without full tracing.
+ * Contended observations are dropped; neither a draw nor another logger waits for this lock.
+ */
+static unsigned compositor_keys[6][32], compositor_counts[6];
+static unsigned compositor_lock;
+
+static bool
+compositor_claim(unsigned bucket, unsigned key)
+{
+	static const unsigned limits[6] = { 32, 16, 16, 8, 8, 16 };
+	bool take = false;
+
+	if (bucket >= 6 || __sync_lock_test_and_set(&compositor_lock, 1)) {
+		return false;
+	}
+	unsigned count = compositor_counts[bucket];
+	if (count < limits[bucket]) {
+		unsigned i;
+		for (i = 0; i < count && compositor_keys[bucket][i] != key; i++) {}
+		if (i == count) {
+			compositor_keys[bucket][count] = key;
+			compositor_counts[bucket] = count + 1;
+			take = true;
+		}
+	}
+	__sync_lock_release(&compositor_lock);
+	return take;
+}
+
+static void
+compositor_text(const char *format, ...)
+{
+	char line[200] = "eagl comp ";
+	va_list ap;
+
+	va_start(ap, format);
+	vsnprintf(line + 10, sizeof(line) - 10, format, ap);
+	va_end(ap);
+	for (unsigned i = 10; line[i] != 0; i++) {
+		if ((unsigned char)line[i] < 32) line[i] = ' ';
+	}
+	nativegl_text(line);
+}
+
+static void
+compositor_program(unsigned program, int good, const char *what)
+{
+	if (compositor_claim(4, program)) {
+		compositor_text("program=%u linked=%d purpose=%.80s", program, good, what);
+	}
+}
+
 static void
 eagl_trace(const char *format, ...)
 {
@@ -540,6 +592,9 @@ eagl_leave(struct eagl *e, unsigned offset)
 		slot_time_calls[offset / 8]++;
 	}
 	if (check_errors && offset != 0x338 && (error = glGetError()) != 0) {
+		if (compositor_claim(2, (offset << 16) | error)) {
+			compositor_text("error=%x slot=%x frame=%u", error, offset, e->frames);
+		}
 		if (e->errors++ < 60) {
 			say("hakios-gl: %s: error %#x\n", eagl_slot_name(offset), error);
 		}
@@ -560,6 +615,9 @@ eagl_missing(void *context, unsigned offset)
 	struct eagl *e = context;
 
 	eagl_enter(e, offset);
+	if (compositor_claim(1, 0x10000u | offset)) {
+		compositor_text("missing-slot=%x frame=%u", offset, e->frames);
+	}
 	if (slot_calls[offset / 8] == 1) {
 		say("hakios-gl: CALLED AND NOT THERE: entry %#x, %s\n", offset, eagl_slot_name(offset));
 	}
@@ -2471,6 +2529,7 @@ vblur_program(const char *vertex, const char *fragment, const char *what)
 	glLinkProgram(program);
 	glGetProgramiv(program, GL_LINK_STATUS, &good);
 	say("hakios-gl: a program of ours for the blur whose radius varies (%s): %s %s\n", what, good ? "made" : "NOT MADE", said);
+	compositor_program(program, good, what);
 	return good ? program : 0;
 }
 
@@ -2686,6 +2745,7 @@ plain_program(const char *fragment, const char *what)
 	glLinkProgram(program);
 	glGetProgramiv(program, GL_LINK_STATUS, &good);
 	say("hakios-gl: a program of ours for the draws CoreAnimation makes with none (%s): %s\n", what, good ? "made" : "NOT MADE");
+	compositor_program(program, good, what);
 	return program;
 }
 
@@ -2734,6 +2794,9 @@ static uint16_t frame_refused[90], frame_noprog[90][CENSUS_KINDS];     /* (glfra
 void
 hakios_gl_function_refused(unsigned function)
 {
+	if (function < 90 && compositor_claim(1, function)) {
+		compositor_text("refused-function=%u", function);
+	}
 	if (frame_lines && function < 90) {
 		frame_refused[function]++;
 	}
@@ -2741,6 +2804,21 @@ hakios_gl_function_refused(unsigned function)
 		census[function].refused++;
 		census[function].refused_lately++;
 	}
+}
+
+/* Only called with a function already read by a draw path. No CA pointers or pixels are read here. */
+static void
+compositor_draw(struct eagl *e, unsigned function, unsigned kind)
+{
+	GLint view[4] = { 0, 0, 0, 0 };
+	unsigned given = function < 90 ? function_given[function] : 0;
+
+	if (function > 90 || kind > 11 || !compositor_claim(kind == 9 ? 5 : 0, function * 16 + kind)) return;
+	glGetIntegerv(GL_VIEWPORT, view);
+	compositor_text("draw f=%u k=%u frame=%u p=%u src=%u,%u dst=%u fb=%u view=%d,%d,%d,%d n=%u v=%.3g,%.3g",
+	    function, kind, e->frames, e->program, e->bound[0], e->bound[1], e->colour, e->framebuffer,
+	    view[0], view[1], view[2], view[3], given,
+	    given ? (double)function_values[function][0] : 0., given >= 20 ? (double)function_values[function][19] : 0.);
 }
 
 static void
@@ -2751,6 +2829,7 @@ census_draw(struct eagl *e, unsigned function, unsigned kind)
 	float low[2] = { 0, 0 }, high[2] = { 0, 0 };
 	size_t used = 0;
 
+	compositor_draw(e, function, kind);
 	if (frame_lines && function < 90) {
 		frame_noprog[function][kind]++;
 	}
@@ -3095,6 +3174,11 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 	GLboolean scissored, blending;
 	GLfloat flat[4], alpha = clamp01(g->colours[19]);
 
+	if (compositor_claim(3, alpha == 0 ? 0 : 1)) {
+		compositor_text("flatten frame=%u tex=%u alpha=%.3g rgb=%.3g,%.3g,%.3g", e->frames, texture,
+		    (double)alpha, (double)g->colours[16], (double)g->colours[17], (double)g->colours[18]);
+	}
+
 	g->state = GROUP_NONE;
 	group_flattened++;
 	flat[3] = alpha;
@@ -3220,9 +3304,11 @@ group_draw_begin(struct eagl *e, GLint enabled[4])
 		memcpy(matrix, e->matrix != NULL ? e->matrix : identity, sizeof(matrix));
 		colours = function_values[function];
 		cover = true;
+		compositor_draw(e, function, 10);
 	} else if (e->program != 0 && e->bound[0] != 0 && e->bound[0] != e->colour && (from = group_of(e, e->bound[0])) != NULL &&
 	    from->state == GROUP_VIBRANT) {
 		/* a group that holds a vibrant layer laid over something */
+		compositor_draw(e, function, 11);
 		bool laid = function == 1 || function == 3;    /* ("img", "cim": the picture as it is, by the colour) */
 
 		if (function < 90 && !said[function]) {
@@ -3332,6 +3418,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 	resolve_feedback_clear(e, function);
 	clear_now(e);
 	if (e->program != 0) {
+		compositor_draw(e, function, 9);
 		return false;
 	}
 	if (vblur_on && reads_what_it_writes(e) && function_given[FUNCTION_VARIABLE_DOWNSAMPLE] != 0) {
@@ -4290,6 +4377,9 @@ my_glCompileShader(void *context, GLuint shader)
 	e->shaders++;
 	if (!good) {
 		glGetShaderInfoLog(shader, sizeof(said), NULL, said);
+		if (compositor_claim(2, 0x40000000u | shader)) {
+			compositor_text("compile-failed shader=%u frame=%u %.120s", shader, e->frames, said);
+		}
 		say("hakios-gl: A SHADER DOES NOT COMPILE (shader %u): %s\n", shader, said);
 		if (e->sources[shader % 256] != NULL) {
 			say_long("its text", e->sources[shader % 256]);
@@ -4314,6 +4404,9 @@ my_glLinkProgram(void *context, GLuint program)
 	e->programs++;
 	if (!good) {
 		glGetProgramInfoLog(program, sizeof(said), NULL, said);
+		if (compositor_claim(2, 0x20000000u | program)) {
+			compositor_text("link-failed program=%u frame=%u %.120s", program, e->frames, said);
+		}
 		say("hakios-gl: A PROGRAM DOES NOT LINK (program %u): %s\n", program, said);
 	}
 	EAGL_LEAVE(e, 0x12c0);

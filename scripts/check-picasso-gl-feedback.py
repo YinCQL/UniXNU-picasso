@@ -26,6 +26,7 @@ GLbitfield unclear;GLboolean unclear_boxed,unclear_write[4];GLint unclear_box[4]
 };
 static void say(const char *fmt,...){(void)fmt;}
 static void nativegl_text(const char *s){puts(s);}
+static void compositor_program(unsigned p,int good,const char *what){(void)p;(void)good;(void)what;}
 static void clear_now(struct eagl *e);
 static int eagl_tracing;
 static void eagl_trace(const char *s,...){(void)s;}
