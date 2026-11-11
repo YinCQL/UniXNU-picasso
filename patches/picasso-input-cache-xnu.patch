@@ -1,0 +1,63 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7660,7 +7660,9 @@
+     };
+     static const uint32_t modes[] = {0644, 0755, 0644, 0755, 0755, 0755, 0644, 0644};
+     if (count == 4) return picasso_audio_addon_entry(count, index, name, mode);
+-    if (!gpu || count != 12 || index >= 12) return false;
++    if (gpu && count == 13 && index == 12)
++        return name && !strcmp(name, "ui/libpicasso-sb.dylib") && mode == 0644;
++    if (!gpu || (count != 12 && count != 13) || index >= 12) return false;
+     if (index < 4) return picasso_audio_addon_entry(4, index, name, mode);
+     return name && !strcmp(name, names[index - 4]) && mode == modes[index - 4];
+ }
+@@ -7831,7 +7833,7 @@
+     uint32_t gpu = 0;
+     PE_parse_boot_argn("sheng-gpu-addon", &gpu, sizeof(gpu));
+     if (!native_gpu_addon_failed && (native_gpu_addon_files == 4 ||
+-        (gpu == 1 && native_gpu_addon_files == 12)) && !status) {
++        (gpu == 1 && (native_gpu_addon_files == 12 || native_gpu_addon_files == 13))) && !status) {
+         picasso_audio_route_mount(p, scratch, &stage, &status);
+         if (stage == 5 && !status) picasso_audio_addon_mount(p, scratch, &stage, &status);
+     }
+@@ -9387,10 +9389,15 @@
+ }
+ 
+ static int
+-picasso_ui_library_prepare(void)
++picasso_ui_library_prepare(bool runtime)
+ {
+     const char *paths[] = {"/private/var/picasso", "/private/var/picasso/usr-lib",
+         "/private/var/picasso/usr-lib/libpicasso-sb.dylib"};
++    if (runtime) {
++        paths[0] = "/private/var/ngpu";
++        paths[1] = "/private/var/ngpu/ui";
++        paths[2] = "/private/var/ngpu/ui/libpicasso-sb.dylib";
++    }
+     vfs_context_t ctx = vfs_context_current();
+     for (unsigned i = 0; i < 3; ++i) {
+         vnode_t vp = NULLVP;
+@@ -9759,11 +9766,21 @@
+     char requested[128] = {};
+     if (!PE_parse_boot_argn("picasso_inject_sb", requested, sizeof(requested)) ||
+         strcmp(requested, library)) return;
+-    int error = picasso_ui_library_prepare();
++    uint32_t audio = 0, gpu = 0;
++    PE_parse_boot_argn("picasso-audio-addon", &audio, sizeof(audio));
++    PE_parse_boot_argn("sheng-gpu-addon", &gpu, sizeof(gpu));
++    bool runtime = audio == 1 && gpu == 1 && native_gpu_addon_files == 13;
++    if (runtime && (native_gpu_addon_failed || native_gpu_addon_error)) {
++        printf("PICASSO_INJECT runtime UI addon failed error=%d\n", native_gpu_addon_error); return;
++    }
++    int error = picasso_ui_library_prepare(runtime);
+     if (error) { printf("PICASSO_INJECT view prepare error=%d\n", error); return; }
+     volatile int stage = 0, status = -1;
+-    native_gpu_addon_mount(p, scratch, 0xc00, source, sizeof(source), point, sizeof(point),
++    static const char runtime_source[] = "/private/var/ngpu/ui";
++    native_gpu_addon_mount(p, scratch, 0xc00,
++        runtime ? runtime_source : source, runtime ? sizeof(runtime_source) : sizeof(source), point, sizeof(point),
+         "/usr/lib/dyld", library, &stage, &status);
++    if (runtime) printf("PICASSO_INJECT runtime UI view stage=%d error=%d\n", stage, status);
+     printf("PICASSO_INJECT view stage=%d error=%d path=%s\n", stage, status, library);
+ }
+ #endif

@@ -104,7 +104,8 @@ def unpack(blob):
 def pack(files):
     from picasso_audio_payload import load
     hal = load(ROOT / 'scripts/build-picasso-audio-hal.py')
-    expected = list(hal.AUDIO_FILES.items()) + list(GPU_FILES.items())
+    from picasso_runtime_ui import FILE
+    expected = list(hal.AUDIO_FILES.items()) + list(GPU_FILES.items()) + [(FILE, 0o644)]
     if [(name, mode) for name, mode, _ in files] != expected:
         raise ValueError('Require exact ordered audio and GL files')
     body = bytearray()
@@ -174,11 +175,13 @@ def make(work):
     audio_files = [(n, mode, (work / 'audio-hal' / n.split('/', 1)[1]).read_bytes()) for n, mode in hal.AUDIO_FILES.items()]
     if hal.pack(audio_files) != (work / 'audio-hal/audio.addon').read_bytes():
         raise ValueError('Audio addon is stale')
-    files = audio_files + gpu_files
+    import picasso_runtime_ui
+    audio_modules, runtime_library, runtime_report = picasso_runtime_ui.replace_module(work, audio_modules)
+    files = audio_files + gpu_files + [(picasso_runtime_ui.FILE, 0o644, runtime_library)]
     addon, trust = pack(files), bundle(audio_modules + [gpu_module])
     report = dict(passed=True, runtime_qualified=False, addon_sha256=digest(addon), trust_sha256=digest(trust),
         gpu_release_sha256=GPU_SHA, gpu_release_trust_sha256=GPU_TRUST_SHA, gpu_identities=identities, nativegl=gl_report,
-        original_modules_unchanged=True, audio_modules_unchanged=True, exact_owned_entries=7,
+        original_modules_unchanged=True, audio_module_unchanged=True, exact_owned_entries=7, runtime_ui=runtime_report,
         excluded_release_files=[n for n, _, _ in all_gpu if n not in GPU_FILES],
         files={n:dict(mode=m, bytes=len(data), sha256=digest(data)) for n, m, data in files})
     return addon, trust, report, ui, audio_identity
@@ -210,6 +213,8 @@ def main():
     a = p.parse_args()
     work = a.work.resolve()
     if a.mode == 'prepare':
+        import picasso_runtime_ui
+        picasso_runtime_ui.build(work)
         raw_addon, trust, result, _, _ = make(work)
         out = work / 'media'
         out.mkdir(exist_ok=True)
