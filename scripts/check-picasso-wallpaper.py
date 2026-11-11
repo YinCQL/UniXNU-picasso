@@ -20,7 +20,7 @@ def main():
         if fixture.endswith('.m'):cmd+=['-I/usr/lib/gcc/x86_64-linux-gnu/13/include','-lobjc']
         if san:cmd+=['-fsanitize=address,undefined','-fno-sanitize-recover=all','-fno-omit-frame-pointer']
         commands=[('compile',cmd),('run',[str(exe)])]
-        if fixture.endswith('.m'):commands += [('return-abi',[str(exe),'return']),('error-abi',[str(exe),'error'])]
+        if fixture.endswith('.m'):commands += [(mode,[str(exe),mode]) for mode in ['return','error','composite-abi','snapshot-abi','missing-method','different-imp','missing-class']]
         for stage,command in commands:
           q=subprocess.run(command,capture_output=True,text=True,env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'))
           (out/(exe.name+'-'+stage+'.log')).write_text(q.stdout+q.stderr)

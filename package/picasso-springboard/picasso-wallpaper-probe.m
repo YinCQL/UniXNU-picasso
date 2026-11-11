@@ -2,11 +2,12 @@
 // Observe the qualified wallpaper snapshot boundaries without changing images.
 #import <CoreGraphics/CoreGraphics.h>
 typedef id (*PicassoWallpaperRead)(id, SEL, id *);
-typedef id (*PicassoWallpaperCache)(id, SEL, id);
+typedef id (*PicassoWallpaperSnapshot)(id, SEL);
 typedef id (*PicassoWallpaperComposite)(id, SEL, id, id);
-static PicassoWallpaperRead picasso_wallpaper_read_original;
-static PicassoWallpaperCache picasso_wallpaper_cache_original;
-static PicassoWallpaperComposite picasso_wallpaper_composite_original;
+static IMP picasso_wallpaper_read_original;
+static IMP picasso_wallpaper_composite_original;
+static IMP picasso_wallpaper_baked_original;
+static IMP picasso_wallpaper_source_original;
 
 static void picasso_wallpaper_note(const char *stage, unsigned ticket, const char *state,
                                   size_t width, size_t height, size_t row, size_t bytes,
@@ -27,9 +28,9 @@ static void picasso_wallpaper_note(const char *stage, unsigned ticket, const cha
 
 static void picasso_wallpaper_observe(id image, unsigned kind, unsigned ticket)
 {
-    static unsigned counts[4];
-    static const char *stages[] = {"disk", "effect-input", "effect-output", "cache"};
-    if (kind >= 4 || __atomic_fetch_add(&counts[kind], 1, __ATOMIC_RELAXED) >= 8) return;
+    static unsigned counts[5];
+    static const char *stages[] = {"disk", "effect-input", "effect-output", "cache", "source"};
+    if (kind >= 5 || __atomic_fetch_add(&counts[kind], 1, __ATOMIC_RELAXED) >= 8) return;
     const char *stage = stages[kind];
     picasso_wallpaper_note(stage, ticket, image ? "returned" : "nil", 0, 0, 0, 0, 0, 0, NULL);
     if (!image) return;
@@ -97,24 +98,31 @@ static unsigned picasso_wallpaper_ticket(void)
 
 static id picasso_wallpaper_read(id receiver, SEL selector, id *error)
 {
-    id result = picasso_wallpaper_read_original(receiver, selector, error);
+    id result = ((PicassoWallpaperRead)picasso_wallpaper_read_original)(receiver, selector, error);
     picasso_wallpaper_observe(result, 0, picasso_wallpaper_ticket());
     return result;
 }
 
-static id picasso_wallpaper_cache(id receiver, SEL selector, id configuration)
+static id picasso_wallpaper_composite(id receiver, SEL selector, id configuration, id image)
 {
-    id result = picasso_wallpaper_cache_original(receiver, selector, configuration);
+    unsigned ticket = picasso_wallpaper_ticket();
+    id result = ((PicassoWallpaperComposite)picasso_wallpaper_composite_original)(receiver, selector, configuration, image);
+    picasso_wallpaper_observe(image, 1, ticket);
+    picasso_wallpaper_observe(result, 2, ticket);
+    return result;
+}
+
+static id picasso_wallpaper_baked(id receiver, SEL selector)
+{
+    id result = ((PicassoWallpaperSnapshot)picasso_wallpaper_baked_original)(receiver, selector);
     picasso_wallpaper_observe(result, 3, picasso_wallpaper_ticket());
     return result;
 }
 
-static id picasso_wallpaper_composite(id receiver, SEL selector, id image, id configuration)
+static id picasso_wallpaper_source(id receiver, SEL selector)
 {
-    unsigned ticket = picasso_wallpaper_ticket();
-    id result = picasso_wallpaper_composite_original(receiver, selector, image, configuration);
-    picasso_wallpaper_observe(image, 1, ticket);
-    picasso_wallpaper_observe(result, 2, ticket);
+    id result = ((PicassoWallpaperSnapshot)picasso_wallpaper_source_original)(receiver, selector);
+    picasso_wallpaper_observe(result, 4, picasso_wallpaper_ticket());
     return result;
 }
 
@@ -133,28 +141,43 @@ static int picasso_wallpaper_method(Method method, uintptr_t original, unsigned 
     return valid;
 }
 
+static void picasso_wallpaper_install_method(Class cls, SEL selector, uintptr_t original,
+    IMP replacement, IMP *saved, unsigned count, int error, unsigned ticket)
+{
+    static unsigned reported;
+    if (*saved) return;
+    Method method = cls ? class_getInstanceMethod(cls, selector) : NULL;
+    const char *state = !cls ? "missing-class" : !method ? "missing-method" :
+        (uintptr_t)method_getImplementation(method) != original ? "different-imp" :
+        !picasso_wallpaper_method(method, original, count, error) ? "different-abi" : "installed";
+    if (!strcmp(state, "installed")) {
+        /* Publish the original before making the wrapper reachable. */
+        *saved = (IMP)original;
+        class_replaceMethod(cls, selector, replacement, method_getTypeEncoding(method));
+    }
+    if (ticket < 4 && !(reported & (1u << ticket))) {
+        reported |= 1u << ticket;
+        picasso_wallpaper_note("install", ticket, state, 0, 0, 0, 0, 0, 0, NULL);
+    }
+}
+
 static void picasso_wallpaper_install(uintptr_t base)
 {
-    static unsigned installed;
-    Class encoder = objc_getClass("PBUIImageEncoder");
-    Class provider = objc_getClass("PBUICachedSnapshotEffectProvider");
-    Class classes[] = {encoder, provider, provider};
-    SEL selectors[] = {sel_registerName("createUIImageWithError:"),
-        sel_registerName("imageForConfiguration:"), sel_registerName("compositeImage:effectConfiguration:")};
-    uintptr_t originals[] = {base + 0x2e9d0, base + 0x30260, base + 0x304a4};
-    IMP replacements[] = {(IMP)picasso_wallpaper_read, (IMP)picasso_wallpaper_cache,
-        (IMP)picasso_wallpaper_composite};
-    for (unsigned i = 0; i < 3; ++i) {
-        if (installed & (1u << i)) continue;
-        Method method = class_getInstanceMethod(classes[i], selectors[i]);
-        if (!picasso_wallpaper_method(method, originals[i], i == 2 ? 4 : 3, i == 0)) continue;
-        if (i == 0) picasso_wallpaper_read_original = (PicassoWallpaperRead)originals[i];
-        if (i == 1) picasso_wallpaper_cache_original = (PicassoWallpaperCache)originals[i];
-        if (i == 2) picasso_wallpaper_composite_original = (PicassoWallpaperComposite)originals[i];
-        class_replaceMethod(classes[i], selectors[i], replacements[i], method_getTypeEncoding(method));
-        installed |= 1u << i;
-        picasso_wallpaper_note("install", i, "installed", 0, 0, 0, 0, 0, 0, NULL);
-    }
+    /* The cached provider's image helpers are direct calls in this image,
+     * absent from its ObjC method list. Observe the dispatched compositor
+     * and the actual cached/source snapshot getters instead. */
+    picasso_wallpaper_install_method(objc_getClass("PBUIImageEncoder"),
+        sel_registerName("createUIImageWithError:"), base + 0x2e9d0,
+        (IMP)picasso_wallpaper_read, &picasso_wallpaper_read_original, 3, 1, 0);
+    picasso_wallpaper_install_method(objc_getClass("PBUIBackdropCompositor"),
+        sel_registerName("applyEffect:toImage:"), base + 0x2d970,
+        (IMP)picasso_wallpaper_composite, &picasso_wallpaper_composite_original, 4, 0, 1);
+    picasso_wallpaper_install_method(objc_getClass("PBUIBakedEffectSnapshotSource"),
+        sel_registerName("snapshot"), base + 0x2fc5c,
+        (IMP)picasso_wallpaper_baked, &picasso_wallpaper_baked_original, 2, 0, 2);
+    picasso_wallpaper_install_method(objc_getClass("PBUIURLBackedSnapshotSource"),
+        sel_registerName("snapshot"), base + 0x5c6fc,
+        (IMP)picasso_wallpaper_source, &picasso_wallpaper_source_original, 2, 0, 3);
 }
 
 static void picasso_wallpaper_image_added(const struct mach_header *header, intptr_t slide)
@@ -182,9 +205,10 @@ static void picasso_wallpaper_image_added(const struct mach_header *header, intp
         }
         p += cmd->cmdsize;
     }
-    if (!matched || p != end || text_end < base || text_end - base < 0x30530) return;
+    if (!matched || p != end || text_end < base || text_end - base < 0x5c704) return;
     if (!picasso_astc_hash(base, 0x2e9d0, 776, "92c2cd035e34840468e4f1c1d6d69ec6f649e3f748b76f532a2ae0ff6b2385e2") ||
-        !picasso_astc_hash(base, 0x30260, 308, "b2c13ef1327aaf8bcddfcca844f8bba9fb9111b1a25c4d55ec91d413ed796921") ||
-        !picasso_astc_hash(base, 0x304a4, 140, "8f429fd2cc17f1b36db216cb5fc6683d2f01eb2df1ff6b6499afbec000b58c70")) return;
+        !picasso_astc_hash(base, 0x2d970, 248, "4b2cfe4a60b41469e068491d1a2a9e0a71ecc3a3ab30a49e07d8764fe23a477f") ||
+        !picasso_astc_hash(base, 0x2fc5c, 8, "bd237e5d99f6462770946dd64c9d5273577f92aeb78154ba485fef49e0d73851") ||
+        !picasso_astc_hash(base, 0x5c6fc, 8, "095bb56e13b6dfde16ade0b592279392884c282a7c7810cb58472b839de552de")) return;
     dispatch_async(dispatch_get_main_queue(), ^{ picasso_wallpaper_install(base); });
 }
