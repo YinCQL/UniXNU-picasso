@@ -9,6 +9,7 @@ p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--source', type=Path, default=ROOT/'drivers/NativeGL/eagl/eagl.c')
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--expect-unpublished', action='store_true')
+p.add_argument('--expect-unflipped', action='store_true')
 a = p.parse_args()
 s = a.source.read_text()
 out = a.output.resolve()
@@ -66,7 +67,7 @@ runs = []
 for name, flags in [('normal', []), ('asan', ['-fsanitize=address,undefined','-fno-omit-frame-pointer','-fno-sanitize-recover=all'])]:
     binary = out/name
     commands = [('compile', ['clang-18','-std=c11','-O1','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable',
-                 *flags,*(['-DEXPECT_UNPUBLISHED'] if a.expect_unpublished else []),'-I',str(out),'-I',str(ROOT/'drivers/NativeGL/eagl'),
+                 *flags,*(['-DEXPECT_UNFLIPPED'] if a.expect_unflipped else []),*(['-DEXPECT_UNPUBLISHED'] if a.expect_unpublished else []),'-I',str(out),'-I',str(ROOT/'drivers/NativeGL/eagl'),
                  str(fixture),'-Wl,-l:libGL.so.1','-Wl,-l:libEGL.so.1','-o',str(binary)]),('run',[str(binary)])]
     for step, cmd in commands:
         result = subprocess.run(cmd,capture_output=True,text=True,timeout=90,

@@ -1152,8 +1152,8 @@ mirror_to_surface(struct eagl *e, struct image *image)
 	// Internal copies use their own damage rectangle, independent of the caller.
 	scissored = glIsEnabled(GL_SCISSOR_TEST);
 	if (scissored) glDisable(GL_SCISSOR_TEST);
-	glBlitFramebuffer(x0, y0, x1, y1, x0, image->invert ? image->height - y1 : y0, x1,
-	    image->invert ? image->height - y0 : y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glBlitFramebuffer(x0, y0, x1, y1, x0, image->invert ? image->height - y0 : y0, x1,
+	    image->invert ? image->height - y1 : y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	if (scissored) glEnable(GL_SCISSOR_TEST);
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);

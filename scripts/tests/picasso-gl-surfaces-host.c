@@ -141,10 +141,38 @@ static void test_rejections(void){
     assert(!glGetError());image_forget(e,tex);glDeleteTextures(1,&tex);glDeleteFramebuffers(1,&fb);free(e);
 }
 #endif
-int main(void){context();test_surface(false);test_surface(true);
+static void test_mirror(bool invert,bool damage){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);GLuint src,dst,fb,other;
+    unsigned char pixels[64];for(unsigned y=0;y<4;y++)for(unsigned x=0;x<4;x++){
+        unsigned char *p=pixels+(y*4+x)*4;p[0]=y?0:255;p[1]=y?255:0;p[2]=0;p[3]=255;
+    }
+    glGenTextures(1,&src);glBindTexture(GL_TEXTURE_2D,src);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,4,4,0,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    memset(pixels,0,sizeof(pixels));glGenTextures(1,&dst);glBindTexture(GL_TEXTURE_2D,dst);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,4,4,0,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    glGenFramebuffers(1,&fb);glGenFramebuffers(1,&other);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,fb);glBindFramebuffer(GL_READ_FRAMEBUFFER,other);
+    glEnable(GL_SCISSOR_TEST);glScissor(7,7,1,1);struct image i={.texture=src,.mirror=dst,.width=4,.height=4,.invert=invert,.drawn=true};
+    damage_blits=damage;if(damage){i.damaged=true;i.dmg[2]=4;i.dmg[3]=2;}
+    assert(mirror_to_surface(e,&i));glFinish();
+    expect_state(GL_READ_FRAMEBUFFER_BINDING,other);expect_state(GL_DRAW_FRAMEBUFFER_BINDING,fb);assert(glIsEnabled(GL_SCISSOR_TEST));
+    glBindFramebuffer(GL_READ_FRAMEBUFFER,e->writer);glReadPixels(0,0,4,4,GL_RGBA,GL_UNSIGNED_BYTE,pixels);assert(!glGetError());
+    for(unsigned y=0;y<4;y++)for(unsigned x=0;x<4;x++){
+        const unsigned char *p=pixels+(y*4+x)*4;unsigned gy=invert?3-y:y;
+#ifdef EXPECT_UNFLIPPED
+        if(invert)gy=damage?y-2:y;
+#endif
+        bool copied=!damage||(invert?y>=2:y<2);
+        assert(p[0]==(copied&&gy==0?255:0)&&p[1]==(copied&&gy!=0?255:0)&&p[2]==0&&p[3]==(copied?255:0));
+    }
+    glDisable(GL_SCISSOR_TEST);damage_blits=0;glDeleteTextures(1,&src);glDeleteTextures(1,&dst);
+    glDeleteFramebuffers(1,&fb);glDeleteFramebuffers(1,&other);glDeleteFramebuffers(1,&e->reader);glDeleteFramebuffers(1,&e->writer);free(e);
+}
+int main(void){context();
+#ifdef EXPECT_UNFLIPPED
+    test_mirror(true,false);test_mirror(true,true);puts("REPRODUCED: inverted GPU mirror keeps source rows in ascending order");return 0;
+#endif
+    test_surface(false);test_surface(true);
 #ifndef EXPECT_UNPUBLISHED
     struct eagl *late=calloc(1,sizeof(*late));assert(late);late->frames=700;check_errors=0;
     glEnable(0xffffffffu);frame_end(late,false);assert(late->errors==1&&!glGetError());free(late);check_errors=1;
-    test_copy();test_rejections();puts("PASS surface pixels, orientation/padding, seed ownership, lazy promotion, copy from independent READ framebuffer, layout/level rejection and GL pack/framebuffer state");
+    test_mirror(false,false);test_mirror(true,false);test_mirror(true,true);test_copy();test_rejections();puts("PASS surface pixels, orientation/padding, seed ownership, lazy promotion, copy from independent READ framebuffer, layout/level rejection and GL pack/framebuffer state");
 #endif
 }
