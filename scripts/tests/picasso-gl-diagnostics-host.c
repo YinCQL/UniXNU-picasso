@@ -36,14 +36,14 @@ static void *claim_many(void *arg) {
     return NULL;
 }
 int main(void) {
-    const unsigned limits[] = {32, 16, 16, 8, 8, 16};
+    const unsigned limits[] = {32, 16, 16, 8, 8, 16, 8, 8};
     reset();
-    assert(!compositor_claim(6, 1) && !compositor_claim(UINT32_MAX, 1));
+    assert(!compositor_claim(8, 1) && !compositor_claim(UINT32_MAX, 1));
     compositor_lock = 1;
     assert(!compositor_claim(0, 1));
     assert(compositor_counts[0] == 0 && compositor_lock == 1);
     compositor_lock = 0;
-    for (unsigned b = 0; b < 6; b++) {
+    for (unsigned b = 0; b < 8; b++) {
         for (unsigned i = 0; i < limits[b]; i++) {
             assert(compositor_claim(b, i));
             assert(!compositor_claim(b, i));
@@ -81,6 +81,7 @@ int main(void) {
     reset();
     for (unsigned i = 0; i < 90; i++) compositor_draw(&e, i, 9);
     assert(text_calls == 16);
+    assert(compositor_claim(6, 1) && compositor_claim(7, 1));
     compositor_draw(&e, 45, 0);
     assert(text_calls == 17); /* Ordinary programs cannot exhaust fallback observations. */
     reset();

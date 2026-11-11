@@ -268,16 +268,16 @@ ktrace(const char *format, ...)
 /* Small, independent budgets keep compositor observations visible without full tracing.
  * Contended observations are dropped; neither a draw nor another logger waits for this lock.
  */
-static unsigned compositor_keys[6][32], compositor_counts[6];
+static unsigned compositor_keys[8][32], compositor_counts[8];
 static unsigned compositor_lock;
 
 static bool
 compositor_claim(unsigned bucket, unsigned key)
 {
-	static const unsigned limits[6] = { 32, 16, 16, 8, 8, 16 };
+	static const unsigned limits[8] = { 32, 16, 16, 8, 8, 16, 8, 8 };
 	bool take = false;
 
-	if (bucket >= 6 || __sync_lock_test_and_set(&compositor_lock, 1)) {
+	if (bucket >= 8 || __sync_lock_test_and_set(&compositor_lock, 1)) {
 		return false;
 	}
 	unsigned count = compositor_counts[bucket];
@@ -960,7 +960,7 @@ image_render_target(struct eagl *e, struct image *image)
 	if (width != image->width || height != image->height) return false;
 	image->target = true;
 	if (!image->shared) surface_mirrored(e, image);
-	if (compositor_claim(5, 0x40000000u | image->texture)) {
+	if (compositor_claim(6, image->texture)) {
 		compositor_text("render-surface=%u tex=%u size=%dx%d shared=%u mirror=%u frame=%u",
 		    IOSurfaceGetID(surface), image->texture, width, height, image->shared, image->mirror != 0, e->frames);
 	}
@@ -4143,6 +4143,66 @@ my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y, 
 		}
 	}
 	EAGL_LEAVE(e, 0x9a0);
+}
+
+/* Snapshot reads must observe deferred clears and materialized group pixels,
+ * including when READ and DRAW name different framebuffers. */
+static GLuint
+framebuffer_read_texture(void)
+{
+	GLint read = 0, kind = 0, texture = 0;
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	if (read != 0) {
+		glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &kind);
+		if (kind == GL_TEXTURE) glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &texture);
+	}
+	return (GLuint)texture;
+}
+
+static void
+my_glCopyTexImage2D(void *context, GLenum target, GLint level, GLenum internal, GLint x, GLint y,
+    GLsizei width, GLsizei height, GLint border)
+{
+	struct eagl *e = context;
+	GLuint source;
+	GLint texture = 0;
+
+	EAGL_ENTER(e, 0x1b8);
+	frame_begin(e);
+	clear_now(e);
+	source = framebuffer_read_texture();
+	if (e->groups != NULL) group_read(e, source);
+	if (target == GL_TEXTURE_2D) {
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+		group_forget(e, (GLuint)texture);
+		texture_defined(e, (GLuint)texture, 5, level, (GLint)internal, width, height, 0, 0);
+	}
+	glCopyTexImage2D(target, level, internal, x, y, width, height, border);
+	if (compositor_claim(7, 0x10000000u | (GLuint)texture)) {
+		compositor_text("copy-image src=%u dst=%d level=%d size=%dx%d internal=%x frame=%u",
+		    source, texture, level, width, height, internal, e->frames);
+	}
+	EAGL_LEAVE(e, 0x1b8);
+}
+
+static void
+my_glReadPixels(void *context, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels)
+{
+	struct eagl *e = context;
+	GLuint source;
+
+	EAGL_ENTER(e, 0x770);
+	clear_now(e);
+	source = framebuffer_read_texture();
+	if (e->groups != NULL) group_read(e, source);
+	glReadPixels(x, y, width, height, format, type, pixels);
+	if (compositor_claim(7, 0x20000000u | source)) {
+		compositor_text("read-pixels src=%u size=%dx%d format=%x type=%x frame=%u",
+		    source, width, height, format, type, e->frames);
+	}
+	EAGL_LEAVE(e, 0x770);
 }
 
 /* A copy of what is drawn into a texture: both made what they would have been first (see group_draw_begin()). */

@@ -10,6 +10,7 @@ p.add_argument('--source', type=Path, default=ROOT/'drivers/NativeGL/eagl/eagl.c
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--expect-unpublished', action='store_true')
 p.add_argument('--expect-unflipped', action='store_true')
+p.add_argument('--expect-stale-read', action='store_true')
 a = p.parse_args()
 s = a.source.read_text()
 out = a.output.resolve()
@@ -61,13 +62,21 @@ if 'image_render_target(' in s: names += ['image_render_target']
 names += ['surface_changed','surface_to_texture','mirror_to_surface','target_to_surface','frame_begin','frame_end','drawing',
           'my_glCopyTexSubImage2D','my_glBindTexture','my_glClear','clear_now','my_glFramebufferTexture2D','my_glBindFramebuffer','my_texImageIOSurface']
 for name in names: body += fn(name)
+if 'framebuffer_read_texture(' in s:
+    for name in ['framebuffer_read_texture','my_glCopyTexImage2D','my_glReadPixels']: body += fn(name)
+else:
+    generated = (ROOT/'out/picasso/nativegl/eagl_gen.h').read_text()
+    for name, alias in [('slot_01b8','my_glCopyTexImage2D'),('slot_0770','my_glReadPixels')]:
+        at=generated.index('static void\n'+name+'(')
+        body += generated[at:generated.index('\n}',at)+2]+'\n'
+        body += '#define '+alias+' '+name+'\n'
 (out/'gl-body.inc').write_text(body)
 fixture = ROOT/'scripts/tests/picasso-gl-surfaces-host.c'
 runs = []
 for name, flags in [('normal', []), ('asan', ['-fsanitize=address,undefined','-fno-omit-frame-pointer','-fno-sanitize-recover=all'])]:
     binary = out/name
     commands = [('compile', ['clang-18','-std=c11','-O1','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable',
-                 *flags,*(['-DEXPECT_UNFLIPPED'] if a.expect_unflipped else []),*(['-DEXPECT_UNPUBLISHED'] if a.expect_unpublished else []),'-I',str(out),'-I',str(ROOT/'drivers/NativeGL/eagl'),
+                 *flags,*(['-DEXPECT_STALE_READ'] if a.expect_stale_read else []),*(['-DEXPECT_UNFLIPPED'] if a.expect_unflipped else []),*(['-DEXPECT_UNPUBLISHED'] if a.expect_unpublished else []),'-I',str(out),'-I',str(ROOT/'drivers/NativeGL/eagl'),
                  str(fixture),'-Wl,-l:libGL.so.1','-Wl,-l:libEGL.so.1','-o',str(binary)]),('run',[str(binary)])]
     for step, cmd in commands:
         result = subprocess.run(cmd,capture_output=True,text=True,timeout=90,

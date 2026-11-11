@@ -165,11 +165,54 @@ static void test_mirror(bool invert,bool damage){
     glDisable(GL_SCISSOR_TEST);damage_blits=0;glDeleteTextures(1,&src);glDeleteTextures(1,&dst);
     glDeleteFramebuffers(1,&fb);glDeleteFramebuffers(1,&other);glDeleteFramebuffers(1,&e->reader);glDeleteFramebuffers(1,&e->writer);free(e);
 }
+static void test_independent_reads(void){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);GLuint source,target,read,draw;
+    glGenTextures(1,&source);glBindTexture(GL_TEXTURE_2D,source);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,4,4,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+    glGenFramebuffers(1,&read);my_glBindFramebuffer(e,GL_FRAMEBUFFER,read);
+    my_glFramebufferTexture2D(e,GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,source,0);
+    glClearColor(0,0,1,1);glClear(GL_COLOR_BUFFER_BIT);
+    glGenTextures(1,&target);my_glBindTexture(e,GL_TEXTURE_2D,target);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,4,4,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+    glGenFramebuffers(1,&draw);my_glBindFramebuffer(e,GL_DRAW_FRAMEBUFFER,draw);
+    my_glFramebufferTexture2D(e,GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,target,0);
+    struct group_texture group={0};e->groups=&group;group_read_count=0;unsigned char pixel[4];
+    my_glReadPixels(e,0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
+    assert(group_read_count==1&&group_read_names[0]==source&&pixel[2]==255&&pixel[3]==255);
+    my_glCopyTexImage2D(e,GL_TEXTURE_2D,0,GL_RGBA,0,0,4,4,0);
+    assert(group_read_count==2&&group_read_names[1]==source);
+    expect_state(GL_READ_FRAMEBUFFER_BINDING,read);expect_state(GL_DRAW_FRAMEBUFFER_BINDING,draw);
+    assert(!glGetError());glDeleteTextures(1,&source);glDeleteTextures(1,&target);glDeleteFramebuffers(1,&read);glDeleteFramebuffers(1,&draw);free(e);
+}
+static void test_read_boundaries(bool copy){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);GLuint src,dst,fb;
+    glGenTextures(1,&src);glBindTexture(GL_TEXTURE_2D,src);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,4,4,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+    glGenFramebuffers(1,&fb);my_glBindFramebuffer(e,GL_FRAMEBUFFER,fb);
+    my_glFramebufferTexture2D(e,GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,src,0);
+    glViewport(0,0,4,4);glDisable(GL_SCISSOR_TEST);glColorMask(1,1,1,1);glClearColor(1,0,0,1);glClear(GL_COLOR_BUFFER_BIT);
+    glClearColor(0,1,0,1);my_glClear(e,GL_COLOR_BUFFER_BIT);assert(e->unclear==GL_COLOR_BUFFER_BIT);
+    glGenTextures(1,&dst);my_glBindTexture(e,GL_TEXTURE_2D,dst);
+    unsigned char pixel[4];
+    if(copy){
+        my_glCopyTexImage2D(e,GL_TEXTURE_2D,0,GL_RGBA,0,0,4,4,0);
+        my_glFramebufferTexture2D(e,GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,dst,0);
+        glReadPixels(0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
+    }else my_glReadPixels(e,0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
+    assert(!glGetError());
+#ifdef EXPECT_STALE_READ
+    assert(pixel[0]==255&&pixel[1]==0&&pixel[2]==0&&pixel[3]==255);
+#else
+    assert(pixel[0]==0&&pixel[1]==255&&pixel[2]==0&&pixel[3]==255&&e->unclear==0);
+    if(copy){struct texture_definition *d=texture_definition_of(e,dst);assert(d&&d->source==5&&d->width==4&&d->height==4);}
+#endif
+    glDeleteTextures(1,&src);glDeleteTextures(1,&dst);glDeleteFramebuffers(1,&fb);free(e);
+}
 int main(void){context();
+#ifdef EXPECT_STALE_READ
+    test_read_boundaries(false);test_read_boundaries(true);puts("REPRODUCED: ReadPixels and CopyTexImage2D capture old pixels before deferred clear");return 0;
+#endif
 #ifdef EXPECT_UNFLIPPED
     test_mirror(true,false);test_mirror(true,true);puts("REPRODUCED: inverted GPU mirror keeps source rows in ascending order");return 0;
 #endif
-    test_surface(false);test_surface(true);
+    test_independent_reads();test_read_boundaries(false);test_read_boundaries(true);test_surface(false);test_surface(true);
 #ifndef EXPECT_UNPUBLISHED
     struct eagl *late=calloc(1,sizeof(*late));assert(late);late->frames=700;check_errors=0;
     glEnable(0xffffffffu);frame_end(late,false);assert(late->errors==1&&!glGetError());free(late);check_errors=1;
