@@ -57,11 +57,21 @@ int main(void)
 {
     unsigned char *image=calloc(1,0x460000);assert(image);
     struct mach_header_64 *header=(void *)image;
-    *header=(struct mach_header_64){.magic=MH_MAGIC_64,.cputype=CPU_TYPE_ARM64,.ncmds=2,.sizeofcmds=96};
+    *header=(struct mach_header_64){.magic=MH_MAGIC_64,.cputype=CPU_TYPE_ARM64,.ncmds=224,.sizeofcmds=24136};
     struct uuid_command *uuid=(void *)(header+1);
     *uuid=(struct uuid_command){.cmd=LC_UUID,.cmdsize=24,.uuid={0x22,0x03,0x4a,0xba,0x9a,0x9a,0x3b,0x94,0x93,0xa5,0xa0,0xde,0x02,0xbe,0xfd,0x2e}};
     struct segment_command_64 *text=(void *)(uuid+1);
     *text=(struct segment_command_64){.cmd=LC_SEGMENT_64,.cmdsize=72,.segname="__TEXT",.vmaddr=0x1c57ca000,.vmsize=0x460000};
+    /* The qualified 20H392 image has 224 commands / 24136 bytes. Keep
+     * UUID and TEXT first, then valid opaque commands to exercise that
+     * real count and size without invoking unrelated loader semantics. */
+    unsigned char *cursor=(unsigned char *)(text+1);
+    for(unsigned i=0;i<222;++i){
+        struct load_command *command=(void *)cursor;
+        *command=(struct load_command){.cmd=0x80000018,.cmdsize=i==221?172:108};
+        cursor+=command->cmdsize;
+    }
+    assert(cursor==(unsigned char *)(header+1)+header->sizeofcmds);
     memcpy(image+0x45f8fc,qualified_code,sizeof(qualified_code));
     uintptr_t base=(uintptr_t)image;intptr_t slide=(intptr_t)(base-text->vmaddr);
     Class cls=objc_allocateClassPair(objc_getClass("Fixture"),"SBHomeScreenBackdropView",0);assert(cls);
@@ -71,8 +81,11 @@ int main(void)
     image[0x45f99b]^=1;picasso_wallpaper_image_added((void *)header,slide);image[0x45f99b]^=1;
     text->vmsize=0x45f99b;picasso_wallpaper_image_added((void *)header,slide);text->vmsize=0x460000;
     uuid->cmdsize=4;picasso_wallpaper_image_added((void *)header,slide);uuid->cmdsize=24;
-    header->sizeofcmds=97;picasso_wallpaper_image_added((void *)header,slide);header->sizeofcmds=96;
+    header->sizeofcmds=24137;picasso_wallpaper_image_added((void *)header,slide);header->sizeofcmds=24136;
     header->cputype=0;picasso_wallpaper_image_added((void *)header,slide);header->cputype=CPU_TYPE_ARM64;
+    header->ncmds=header->sizeofcmds/sizeof(struct load_command)+1;
+    picasso_wallpaper_image_added((void *)header,slide);header->ncmds=224;
+    header->ncmds=223;picasso_wallpaper_image_added((void *)header,slide);header->ncmds=224;
     assert(!queued && !noted && !picasso_wallpaper_home_original);
     assert(method_getImplementation(class_getInstanceMethod(cls,sel))==original);
     picasso_wallpaper_image_added((void *)header,slide);
@@ -80,6 +93,6 @@ int main(void)
     assert(method_getImplementation(class_getInstanceMethod(cls,sel))==(IMP)picasso_wallpaper_home);
     for(unsigned i=0;i<100;++i)picasso_wallpaper_image_added((void *)header,slide);
     assert(queued==101 && noted==1 && picasso_wallpaper_home_original==original);
-    free(image);puts("PASS production image callback: full SHA256 including last byte, UUID, architecture, text bounds, malformed commands, install and repeated callback");
+    free(image);puts("PASS production image callback: real 224-command/24136-byte layout, command count bounds, full SHA256 including last byte, UUID, architecture, text bounds, malformed commands, install and repeated callback");
     return 0;
 }

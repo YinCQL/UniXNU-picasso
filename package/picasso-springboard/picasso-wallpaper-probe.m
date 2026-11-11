@@ -223,7 +223,10 @@ static void picasso_wallpaper_image_added(const struct mach_header *header, intp
     };
     if (header->magic != MH_MAGIC_64 || header->cputype != CPU_TYPE_ARM64) return;
     const struct mach_header_64 *h = (const struct mach_header_64 *)header;
-    if (h->sizeofcmds > 65536 || h->ncmds > 128) return;
+    /* SpringBoard 20H392 has 224 commands. Bound their count by the
+     * already capped byte region, then validate every command below. */
+    if (h->sizeofcmds > 65536 ||
+        h->ncmds > h->sizeofcmds / sizeof(struct load_command)) return;
     const unsigned char *p = (const unsigned char *)(h + 1), *end = p + h->sizeofcmds;
     int matched = 0;
     uintptr_t base = (uintptr_t)header, text_end = 0;
