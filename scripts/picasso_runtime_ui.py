@@ -8,9 +8,20 @@ FILE = 'ui/libpicasso-sb.dylib'
 SOURCES = ['package/picasso-springboard/' + n for n in
            ['picasso-ui-runtime.m', 'picasso-input-cache.m', 'picasso-springboard-probe.m',
             'picasso-statusbar-metrics.m', 'picasso-astc-guard.m', 'picasso-astc-guard-core.h',
-            'picasso-pixel-sample.h', 'picasso-wallpaper-probe.m']]
+            'picasso-pixel-sample.h', 'picasso-wallpaper-probe.m', 'picasso-astc-runtime.m']]
 SOURCES += ['scripts/picasso_runtime_ui.py']
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+def runtime_sources():
+    # Seed sources retain their exact audited bytes. Only this runtime build
+    # substitutes the observed ASTC wrapper into the existing UI entry point.
+    source=(ROOT/SOURCES[0]).read_text()
+    probe=(ROOT/'package/picasso-springboard/picasso-springboard-probe.m').read_text()
+    old='#include "picasso-astc-guard.m"'
+    if probe.count(old)!=1: raise ValueError('Unexpected seed probe include')
+    probe=probe.replace(old,'#include "picasso-astc-runtime.m"')
+    source=source.replace('#include "picasso-springboard-probe.m"','#include "runtime-probe.m"')
+    return {'runtime-source.m':source,'runtime-probe.m':probe}
+
 def build(work):
     out = work / 'runtime-ui'; out.mkdir(parents=True, exist_ok=True)
     sdk = Path(os.environ.get('PICASSO_UI_SDK', '/home/y/toolchains/audio-sdks/iPhoneOS16.5.sdk'))
@@ -23,9 +34,11 @@ def build(work):
         (out / (name + '.log')).write_text(p.stdout + p.stderr)
         if p.returncode: raise RuntimeError(p.stdout + p.stderr)
         return p.stdout
-    src = ROOT / SOURCES[0]
+    generated=runtime_sources()
+    for n,s in generated.items(): (out/n).write_text(s)
+    src = out / 'runtime-source.m'
     flags = [cc, '-target', 'arm64-apple-ios16.0', '-isysroot', str(sdk), '-fobjc-arc',
-             '-fblocks', '-O2', '-fno-omit-frame-pointer', '-Wall', '-Wextra', '-Werror']
+             '-I', str(ROOT/'package/picasso-springboard'), '-fblocks', '-O2', '-fno-omit-frame-pointer', '-Wall', '-Wextra', '-Werror']
     run('compile', flags + ['-c', str(src), '-o', str(out / 'runtime.o')])
     deps = run('dependencies', flags + ['-M', '-MT', 'runtime', str(src)])
     inputs = {n: sha(Path(n)) for n in [cc, ld]}
@@ -45,7 +58,8 @@ def build(work):
     if identity['code_page_bytes'] != 4096 or b'PICASSO_INPUT_CACHE' not in lib.read_bytes():
         raise ValueError('Runtime UI code signature or marker missing')
     report = dict(passed=True, runtime_qualified=False, identity=identity, commands=commands,
-                  sources={n: sha(ROOT/n) for n in SOURCES}, inputs=inputs)
+                  sources={n: sha(ROOT/n) for n in SOURCES}, inputs=inputs,
+                  generated_sources={n:sha(out/n) for n in generated})
     (out / 'build-report.json').write_text(json.dumps(report, indent=2)+'\n')
     return report
 def verify(work):
@@ -56,6 +70,9 @@ def verify(work):
         if sha(ROOT/n) != h: raise ValueError('Stale runtime UI source: '+n)
     for n,h in r['inputs'].items():
         if sha(Path(n)) != h: raise ValueError('Changed runtime UI input: '+n)
+    for n,s in runtime_sources().items():
+        if (out/n).read_text()!=s or sha(out/n)!=r['generated_sources'][n]:
+            raise ValueError('Changed runtime source: '+n)
     lib = (out/'libpicasso-sb.dylib').read_bytes()
     if library_identity(lib) != r['identity'] or r['identity']['code_page_bytes'] != 4096:
         raise ValueError('Changed signed runtime UI')

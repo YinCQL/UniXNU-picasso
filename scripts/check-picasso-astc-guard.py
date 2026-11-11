@@ -58,7 +58,7 @@ def main():
         if ran.returncode:
             raise RuntimeError(ran.stdout + ran.stderr)
         runs.append(dict(fixture=fixture.name, sanitized=sanitized, passed=True, output=ran.stdout))
-    inputs = [*fixtures, patch, probe_patch, load_patch, include / 'picasso-astc-guard-core.h', include / 'picasso-pixel-sample.h', include / 'picasso-astc-guard.m',
+    inputs = [*fixtures, patch, probe_patch, load_patch, include / 'picasso-astc-guard-core.h', include / 'picasso-astc-guard.m',
               include / 'picasso-springboard-probe.m', include / 'picasso-statusbar-metrics.m', Path(__file__)]
     (out / 'results.json').write_text(json.dumps(dict(passed=True, scope=__doc__, runs=runs,
         inputs={str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}),
