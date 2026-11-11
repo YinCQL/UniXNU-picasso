@@ -111,6 +111,7 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_VERSION                      0x1f02
 #define GL_EXTENSIONS                   0x1f03
 #define GL_TEXTURE_BINDING_2D           0x8069
+#define GL_COLOR_WRITEMASK              0x0c23
 #define GL_BGRA                         0x80e1
 #define GL_INFO_LOG_LENGTH              0x8b84
 #define GL_COMPILE_STATUS               0x8b81
@@ -361,7 +362,7 @@ struct eagl {
 	GLbitfield unclear;             /* a glClear put off until the next draw (clear_now()), and what it was to be made with */
 	GLint unclear_box[4];
 	GLfloat unclear_colour[4];
-	GLboolean unclear_boxed;
+	GLboolean unclear_boxed, unclear_write[4];
 	struct group_texture *groups;   /* CoreAnimation's textures: which are groups with a vibrant layer in them (group_draw_begin()) */
 	GLuint group_cover, group_over, group_flat;     /* ... and our programs for them */
 	bool group_failed;
@@ -1692,6 +1693,7 @@ my_glClear(void *context, GLbitfield mask)
 		e->unclear_boxed = glIsEnabled(GL_SCISSOR_TEST);
 		glGetIntegerv(GL_SCISSOR_BOX, e->unclear_box);
 		glGetFloatv(GL_COLOR_CLEAR_VALUE, e->unclear_colour);
+		glGetBooleanv(GL_COLOR_WRITEMASK, e->unclear_write);
 	} else {
 		glClear(mask);
 	}
@@ -2516,7 +2518,8 @@ vblur_level(struct eagl *e, int from)
 	GLuint picture = e->bound[0];
 	struct vblur_chain *chain;
 	GLint view[4], box[4], width = 0, height = 0, to = from + 1;
-	GLboolean scissored, blended;
+	GLboolean scissored, blended, write_mask[4];
+	GLint read_framebuffer, draw_framebuffer;
 	GLuint source;
 
 	if (from < 0 || to >= VBLUR_LEVELS || picture == 0) {
@@ -2554,6 +2557,8 @@ vblur_level(struct eagl *e, int from)
 		glActiveTexture(GL_TEXTURE0 + e->unit);
 		return;                                 /* (the level it is to be made of is not there) */
 	}
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_framebuffer);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_framebuffer);
 	if (chain->level_width[to] == 0) {
 		GLsizei w = chain->width, h = chain->height;
 
@@ -2585,6 +2590,8 @@ vblur_level(struct eagl *e, int from)
 	glViewport(0, 0, chain->level_width[to], chain->level_height[to]);
 	glDisable(GL_SCISSOR_TEST);
 	glDisable(GL_BLEND);
+	glGetBooleanv(GL_COLOR_WRITEMASK, write_mask);
+	glColorMask(1, 1, 1, 1);
 	glUseProgram(e->halve);
 	glBindTexture(GL_TEXTURE_2D, source);
 	glUniform2f(e->halve_texel, 1.0f / (float)(from == 0 ? chain->width : chain->level_width[from]),
@@ -2593,12 +2600,14 @@ vblur_level(struct eagl *e, int from)
 	chain->made = to + 1;
 	/* back as it was */
 	glBindTexture(GL_TEXTURE_2D, picture);
+	glColorMask(write_mask[0], write_mask[1], write_mask[2], write_mask[3]);
 	glUseProgram(0);
 	(blended ? glEnable : glDisable)(GL_BLEND);
 	(scissored ? glEnable : glDisable)(GL_SCISSOR_TEST);
 	glScissor(box[0], box[1], box[2], box[3]);
 	glViewport(view[0], view[1], view[2], view[3]);
-	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, read_framebuffer);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw_framebuffer);
 	glActiveTexture(GL_TEXTURE0 + e->unit);
 }
 
@@ -2609,12 +2618,30 @@ reads_what_it_writes(struct eagl *e)
 	       *(*(uint8_t **)((char *)ca_context + 0x10) + 0x10) == FUNCTION_VARIABLE_DOWNSAMPLE;
 }
 
+// The EDR pass (61) is already skipped for texture feedback. Preserve its
+// source before applying a deferred clear, as for variable-downsample (38).
+// Depth/stencil clears still execute; unrelated draws keep their own clears.
+static void
+resolve_feedback_clear(struct eagl *e, unsigned function)
+{
+	if (e->program == 0 && e->colour != 0 && e->colour == e->bound[0] &&
+	    (function == FUNCTION_VARIABLE_DOWNSAMPLE || function == 61) && (e->unclear & GL_COLOR_BUFFER_BIT)) {
+		static unsigned notes;
+		e->unclear &= ~GL_COLOR_BUFFER_BIT;
+		if (notes++ < 8) {
+			char line[128];
+			snprintf(line, sizeof(line), "eagl feedback-preserved function=%u texture=%u frame=%u", function, e->colour, e->frames);
+			nativegl_text(line);
+		}
+	}
+}
+
 static void
 clear_now(struct eagl *e)
 {
 	GLint box[4] = { 0, 0, 0, 0 };
 	GLfloat colour[4] = { 0, 0, 0, 0 };
-	GLboolean boxed;
+	GLboolean boxed, write_mask[4];
 
 	if (e->unclear == 0) {
 		return;
@@ -2622,11 +2649,14 @@ clear_now(struct eagl *e)
 	boxed = glIsEnabled(GL_SCISSOR_TEST);
 	glGetIntegerv(GL_SCISSOR_BOX, box);
 	glGetFloatv(GL_COLOR_CLEAR_VALUE, colour);
+	glGetBooleanv(GL_COLOR_WRITEMASK, write_mask);
+	glColorMask(e->unclear_write[0], e->unclear_write[1], e->unclear_write[2], e->unclear_write[3]);
 	(e->unclear_boxed ? glEnable : glDisable)(GL_SCISSOR_TEST);
 	glScissor(e->unclear_box[0], e->unclear_box[1], e->unclear_box[2], e->unclear_box[3]);
 	glClearColor(e->unclear_colour[0], e->unclear_colour[1], e->unclear_colour[2], e->unclear_colour[3]);
 	glClear(e->unclear);
 	e->unclear = 0;
+	glColorMask(write_mask[0], write_mask[1], write_mask[2], write_mask[3]);
 	(boxed ? glEnable : glDisable)(GL_SCISSOR_TEST);
 	glScissor(box[0], box[1], box[2], box[3]);
 	glClearColor(colour[0], colour[1], colour[2], colour[3]);
@@ -3299,9 +3329,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		e->line.vrb += function == FUNCTION_VARIABLE_BLUR;
 	}
 
-	if (e->unclear != 0 && reads_what_it_writes(e)) {
-		e->unclear = 0;
-	}
+	resolve_feedback_clear(e, function);
 	clear_now(e);
 	if (e->program != 0) {
 		return false;

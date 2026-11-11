@@ -22,7 +22,10 @@ enum {kDeviceVolumeScalar='volm',kDeviceVolumeDecibels='vold',
 #define kDeviceUID "Speaker"
 #define kModelUID "PicassoAudioModel"
 static const Float64 kRate=48000;
-static const UInt32 kZeroPeriod=32768;
+// One transfer quantum per clock update. The clock remains host-derived;
+// returned DMA buffers are not a measurement of speaker render position.
+static const UInt32 kZeroPeriod=1024;
+enum {kWorkerLead=2048,kSafetyFrames=4096,kPendingFrames=8192};
 static AudioServerPlugInHostRef gHost;
 static pthread_mutex_t gLock=PTHREAD_MUTEX_INITIALIZER;
 static atomic_uint gRefs=1;
@@ -42,7 +45,8 @@ static PicassoAudioTap gTap;
 static bool gTapEnabled,gTapActive=true;
 static uint64_t gTapReads,gTapMissing;
 static uint64_t gSent,gMissing,gReservedEnd;
-static uint32_t gCalls,gPropertyNotes;
+static uint32_t gCalls,gPropertyNotes,gFirstMixFrame,gPeakPending;
+static bool gFirstMixNoted;
 static bool gStreamActive=true;
 static struct {AudioObjectID object;AudioObjectPropertyAddress address;unsigned operation;OSStatus result;} gPropertySeen[128];
 static int16_t gChunk[2048];
@@ -51,8 +55,9 @@ static const Float32 kMinDb=-36;
 static Float32 toDb(Float32 v){v=v<0?0:v>1?1:v;return kMinDb*(1-v)*(1-v);}
 static Float32 toScalar(Float32 d){return d<=kMinDb?0:d>=0?1:1-sqrtf(d/kMinDb);}
 static Float32 gain(void){return gMuted||gVolume<=0?0:powf(10,toDb(gVolume)/20);}
-// Conservative scheduling lead; not a measurement of speaker render position.
-static UInt32 latencyFrames(void){return 16384;}
+// Two 4096-frame DMA slots bound the transport lead. Scheduling safety is
+// separate, and the kernel ring capacity must not become a latency target.
+static UInt32 latencyFrames(void){return kPendingFrames;}
 static kern_return_t method(unsigned s,const void *in,size_t n,void *out,size_t *z){
     return IOConnectCallStructMethod(gConnect,s,in,n,out,z);
 }
@@ -241,7 +246,7 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kAudioDevicePropertyDeviceCanBeDefaultDevice: REPLY(UInt32, a->mScope != kAudioObjectPropertyScopeInput);
         case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: REPLY(UInt32, a->mScope != kAudioObjectPropertyScopeInput);
         case kAudioDevicePropertyLatency: REPLY(UInt32, latencyFrames());
-        case kAudioDevicePropertySafetyOffset: REPLY(UInt32, latencyFrames() + 4096);
+        case kAudioDevicePropertySafetyOffset: REPLY(UInt32, kSafetyFrames);
         case kAudioDevicePropertyNominalSampleRate: REPLY(Float64, kRate);
         case kAudioDevicePropertyAvailableNominalSampleRates: REPLY(AudioValueRange, ((AudioValueRange){kRate, kRate}));
         case kAudioDevicePropertyIsHidden: REPLY(UInt32, 0);
@@ -438,7 +443,21 @@ static void *worker(void *unused){
     for(;;){
         pthread_mutex_lock(&gLock);if(gStop){pthread_mutex_unlock(&gLock);break;}
         uint64_t now=mach_absolute_time();uint64_t frame=now>gOrigin?(uint64_t)((now-gOrigin)/gHostTicksPerFrame):0;
-        if(gSent>frame+4096){pthread_mutex_unlock(&gLock);usleep(5000);continue;}
+        if(gSent>frame+kWorkerLead){pthread_mutex_unlock(&gLock);usleep(2000);continue;}
+        pthread_mutex_unlock(&gLock);
+        PicassoAudioStatus status;size_t size=sizeof status;
+        kern_return_t stateRc=method(PicassoAudioGetStatus,NULL,0,&status,&size);
+        pthread_mutex_lock(&gLock);
+        if(gStop){pthread_mutex_unlock(&gLock);break;}
+        if(stateRc || size!=sizeof status || status.version!=1 || status.state!=PicassoAudioRunning ||
+           status.returnedBytes>status.submittedBytes){
+            gFault=stateRc?(int)stateRc:(int)kIOReturnNotReady;note(4,gFault,0,0);
+            pthread_mutex_unlock(&gLock);break;
+        }
+        uint64_t pending=(status.submittedBytes-status.returnedBytes)/4;
+        if(pending>gPeakPending)gPeakPending=pending>UINT32_MAX?UINT32_MAX:(uint32_t)pending;
+        if(pending+1024>kPendingFrames){pthread_mutex_unlock(&gLock);usleep(2000);continue;}
+        if(gCalls && !gFirstMixNoted){gFirstMixNoted=true;note(3,0,1,gFirstMixFrame);}
         uint64_t missing=picasso_mix_peek(&gMix,gSent,1024,gChunk);gReservedEnd=gSent+1024;
         pthread_mutex_unlock(&gLock);
         kern_return_t rc=method(PicassoAudioWrite,gChunk,sizeof gChunk,NULL,NULL);
@@ -466,6 +485,20 @@ static kern_return_t waitIdle(void){
     }
     return kIOReturnBusy;
 }
+// Control thread only. Starting means configuration is in progress, not that
+// a speaker stream can consume PCM yet. Never seed the queue with fake audio.
+static kern_return_t waitRunning(void){
+    for(unsigned retry=0;retry<200;++retry){
+        PicassoAudioStatus status;size_t size=sizeof status;
+        kern_return_t rc=method(PicassoAudioGetStatus,NULL,0,&status,&size);
+        if(rc)return rc;
+        if(size!=sizeof status || status.version!=1)return kIOReturnBadArgument;
+        if(status.state==PicassoAudioRunning)return 0;
+        if(status.state!=PicassoAudioStarting)return kIOReturnNotReady;
+        usleep(10000);
+    }
+    return kIOReturnBusy;
+}
 static OSStatus StartIO(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 client){
     (void)d;if(o!=kDevice||client==UINT32_MAX)return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gLock);unsigned slot=32;
@@ -474,10 +507,15 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 clie
     if(!gIoUsers){
         if(connectService()){pthread_mutex_unlock(&gLock);return kAudioHardwareNotRunningError;}
         kern_return_t rc=waitIdle();
-        if(!rc)rc=method(PicassoAudioBegin,&gFormat,sizeof gFormat,NULL,NULL);
-        if(rc){note(2,(int)rc,1,0);pthread_mutex_unlock(&gLock);return kAudioHardwareNotRunningError;}
+        uint64_t start=mach_absolute_time();bool begun=false;
+        if(!rc){rc=method(PicassoAudioBegin,&gFormat,sizeof gFormat,NULL,NULL);begun=!rc;}
+        if(!rc)rc=waitRunning();
+        if(rc){if(begun)(void)method(PicassoAudioCancel,NULL,0,NULL,NULL);
+            note(2,(int)rc,1,0);pthread_mutex_unlock(&gLock);return kAudioHardwareNotRunningError;}
+        note(2,0,5,(unsigned)((mach_absolute_time()-start)/(gHostTicksPerFrame*48)));
         memset(&gTap,0,sizeof gTap);gTapReads=gTapMissing=0;
-        memset(&gMix,0,sizeof gMix);gSent=gMissing=gReservedEnd=gCalls=0;gFault=0;gOrigin=mach_absolute_time();++gSeed;
+        memset(&gMix,0,sizeof gMix);gSent=gMissing=gReservedEnd=gCalls=0;
+        gFirstMixFrame=gPeakPending=0;gFirstMixNoted=false;gFault=0;gOrigin=mach_absolute_time();++gSeed;
         int e=pthread_create(&gThread,NULL,worker,NULL);if(e){(void)method(PicassoAudioCancel,NULL,0,NULL,NULL);pthread_mutex_unlock(&gLock);return kAudioHardwareUnspecifiedError;}
         gThreadLive=true;note(2,0,1,0);
     }
@@ -489,7 +527,7 @@ static OSStatus StopIO(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 clien
     if(slot==32){pthread_mutex_unlock(&gLock);return 0;}gClients[slot]=0;--gIoUsers;
     if(gIoUsers){pthread_mutex_unlock(&gLock);return 0;}
     gStop=true;bool join=gThreadLive;pthread_mutex_unlock(&gLock);if(join)pthread_join(gThread,NULL);
-    pthread_mutex_lock(&gLock);gThreadLive=false;(void)method(PicassoAudioCancel,NULL,0,NULL,NULL);note(2,0,4,0);
+    pthread_mutex_lock(&gLock);gThreadLive=false;(void)method(PicassoAudioCancel,NULL,0,NULL,NULL);note(2,0,4,gPeakPending);
     memset(&gTap,0,sizeof gTap);
     // The device still exists after StopIO. Keep this exclusive connection;
     // closing it here would report DeviceIsAlive=0 between previews.
@@ -524,7 +562,9 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d,AudioObjectID o,Audio
         pthread_mutex_unlock(&gLock);return 0;
     }
     if(!gStreamActive){pthread_mutex_unlock(&gLock);return 0;}
-    int rc=picasso_mix_add(&gMix,gReservedEnd?gReservedEnd:gSent,(uint64_t)t,frames,main,gain());++gCalls;
+    int rc=picasso_mix_add(&gMix,gReservedEnd?gReservedEnd:gSent,(uint64_t)t,frames,main,gain());
+    if(!gCalls)gFirstMixFrame=t>UINT32_MAX?UINT32_MAX:(uint32_t)t;
+    ++gCalls;
     if(rc && gCalls<32)note(4,rc,op,frames);pthread_mutex_unlock(&gLock);
     return rc?kAudioHardwareIllegalOperationError:0;
 }

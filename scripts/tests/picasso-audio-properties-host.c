@@ -8,6 +8,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <errno.h>
+#include <unistd.h>
 #include "PicassoAudioAbi.h"
 #include "sdk-constants.h"
 typedef uint32_t UInt32,AudioObjectID,AudioClassID,AudioObjectPropertySelector,AudioObjectPropertyScope,AudioObjectPropertyElement;
@@ -33,7 +34,8 @@ struct Host;typedef const struct Host *AudioServerPlugInHostRef;
 struct Host {OSStatus (*PropertiesChanged)(AudioServerPlugInHostRef,AudioObjectID,UInt32,const AudioObjectPropertyAddress *);};
 typedef unsigned io_connect_t,io_service_t;typedef int kern_return_t;
 typedef struct {unsigned numer,denom;} mach_timebase_info_data_t;
-static uint64_t mach_absolute_time(void){return 1000;}
+static uint64_t fakeTime=1000;
+static uint64_t mach_absolute_time(void){return fakeTime;}
 static int mach_timebase_info(mach_timebase_info_data_t *t){t->numer=t->denom=1;return 0;}
 #define MACH_PORT_NULL 0
 static unsigned mach_task_self(void){return 1;}
@@ -44,8 +46,18 @@ static void IOObjectRelease(unsigned o){(void)o;}
 static int IOServiceClose(unsigned o){(void)o;return 0;}
 static unsigned notes,changed;
 static int writeResult;static bool *workerStop;static int16_t accepted[2048];
+static PicassoAudioStatus fakeStatus={.version=1,.state=PicassoAudioRunning};
+static unsigned statusCalls,sleeps,runningAfter,statusSize=sizeof(PicassoAudioStatus),writeCalls;
+static int statusResult;
+static bool stopOnSleep;
+static int fakeSleep(unsigned us){(void)us;++sleeps;if(stopOnSleep&&workerStop)*workerStop=true;return 0;}
+#define usleep fakeSleep
 static int IOConnectCallStructMethod(unsigned c,unsigned s,const void *in,size_t n,void *out,size_t *z){
-    (void)c;(void)out;(void)z;if(s==PicassoAudioWrite){assert(n==sizeof accepted);if(!writeResult)memcpy(accepted,in,n);if(workerStop)*workerStop=true;return writeResult;}if(s==PicassoAudioNote){assert(in&&n==sizeof(PicassoAudioClientNote));++notes;}return 0;
+    (void)c;(void)out;(void)z;if(s==PicassoAudioGetStatus){
+        ++statusCalls;if(runningAfter&&statusCalls>=runningAfter)fakeStatus.state=PicassoAudioRunning;
+        assert(out&&z&&*z==sizeof fakeStatus);memcpy(out,&fakeStatus,sizeof fakeStatus);*z=statusSize;return statusResult;
+    }
+    if(s==PicassoAudioWrite){++writeCalls;assert(n==sizeof accepted);if(!writeResult)memcpy(accepted,in,n);if(workerStop)*workerStop=true;return writeResult;}if(s==PicassoAudioNote){assert(in&&n==sizeof(PicassoAudioClientNote));++notes;}return 0;
 }
 #define MH_MAGIC_64 0xfeedfacfU
 #define CPU_TYPE_ARM64 0x100000c
@@ -357,8 +369,41 @@ static void routing(void){
     for(unsigned i=0;i<200;++i)routeNote(9,-1,i,0,0,0,0);assert(gRouteCount==128);
     registry(image);free(image);readableBase=readableSize=0;
 }
+static void timeline(void){
+    // Exercise the production readiness wait, including refusal and bounded timeout.
+    statusCalls=sleeps=0;runningAfter=4;fakeStatus.state=PicassoAudioStarting;
+    assert(!waitRunning()&&statusCalls==4&&sleeps==3);
+    runningAfter=0;statusCalls=sleeps=0;fakeStatus.state=PicassoAudioStarting;
+    assert(waitRunning()==kIOReturnBusy&&statusCalls==200&&sleeps==200);
+    fakeStatus.state=PicassoAudioDraining;assert(waitRunning()==kIOReturnNotReady);
+    fakeStatus.state=PicassoAudioIdle;assert(waitRunning()==kIOReturnNotReady);
+    fakeStatus.state=PicassoAudioFailed;assert(waitRunning()==kIOReturnNotReady);
+    fakeStatus.state=PicassoAudioRunning;fakeStatus.version=2;assert(waitRunning()==kIOReturnBadArgument);
+    fakeStatus.version=1;statusSize=4;assert(waitRunning()==kIOReturnBadArgument);statusSize=sizeof fakeStatus;
+    statusResult=kIOReturnNotReady;assert(waitRunning()==kIOReturnNotReady);statusResult=0;
+    // A stalled DSP cannot grow the pending queue to the ring's full capacity.
+    gStop=false;gFault=0;gSent=1024;gHostTicksPerFrame=1;gOrigin=1000;fakeTime=100000;
+    fakeStatus.submittedBytes=8192*4;fakeStatus.returnedBytes=0;
+    workerStop=&gStop;stopOnSleep=true;unsigned before=writeCalls;
+    worker(NULL);assert(writeCalls==before&&gSent==1024&&gPeakPending==8192&&!gFault);
+    gStop=false;stopOnSleep=false;fakeStatus.returnedBytes=4096*4;
+    worker(NULL);assert(writeCalls==before+1&&gSent==2048&&!gFault);
+    gStop=false;fakeStatus.returnedBytes=fakeStatus.submittedBytes+4;
+    worker(NULL);assert(gFault==kIOReturnNotReady&&writeCalls==before+1);
+    workerStop=NULL;fakeStatus.submittedBytes=fakeStatus.returnedBytes=0;gFault=0;gStop=false;
+    // Zero timestamps use the host timebase and preserve phase/seed, not DSP replies.
+    gOrigin=1000;gHostTicksPerFrame=2;gSeed=17;double sample;UInt64 host,seed;
+    fakeTime=1000+1023*2;assert(!GetZeroTimeStamp(NULL,kDevice,0,&sample,&host,&seed));
+    assert(sample==0&&host==1000&&seed==17);
+    fakeTime=1000+2050*2;assert(!GetZeroTimeStamp(NULL,kDevice,0,&sample,&host,&seed));
+    assert(sample==2048&&host==5096&&seed==17);
+    AudioObjectPropertyAddress a={kAudioDevicePropertySafetyOffset,kAudioObjectPropertyScopeOutput,0};UInt32 n,v;
+    assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&n,&v)&&v==4096);
+    a.mSelector=kAudioDevicePropertyLatency;assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&n,&v)&&v==8192);
+    a.mSelector=kAudioDevicePropertyZeroTimeStampPeriod;assert(!GetPropertyData(NULL,kDevice,0,&a,0,NULL,4,&n,&v)&&v==1024);
+}
 int main(int argc,char **argv){
-    properties();speakerReference();ownedFilters();routing();
+    properties();speakerReference();ownedFilters();routing();timeline();
     if(argc==2){
         FILE *f=fopen(argv[1],"rb");assert(f);assert(!fseek(f,0,SEEK_END));long bytes=ftell(f);assert(bytes>0x634000);rewind(f);
         unsigned char *file=malloc((size_t)bytes);assert(file);assert(fread(file,1,(size_t)bytes,f)==(size_t)bytes);fclose(f);
