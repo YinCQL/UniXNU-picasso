@@ -36,7 +36,13 @@ static void nativegl_text(const char *s){(void)s;}
 static void nativegl_mark(unsigned v){(void)v;}
 static uint64_t now_us(void){static uint64_t t;return ++t;}
 static bool compositor_claim(unsigned b,unsigned k){(void)b;(void)k;return false;}
-static void compositor_text(const char *fmt,...){(void)fmt;}
+static unsigned w30r_notes;
+static char w30r_last[256];
+static void compositor_text(const char *fmt,...){
+    if (!strncmp(fmt,"surface-w30r ",13)) {
+        va_list ap;va_start(ap,fmt);vsnprintf(w30r_last,sizeof(w30r_last),fmt,ap);va_end(ap);++w30r_notes;
+    }
+}
 static void compositor_framebuffer(struct eagl *e,const char *s){(void)e;(void)s;}
 static void summary(struct eagl *e){(void)e;}
 static void census_report(void){}

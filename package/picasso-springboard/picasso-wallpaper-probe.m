@@ -80,12 +80,13 @@ static void picasso_wallpaper_observe_surface(id image, const char *stage, unsig
     if (surface) CFRelease(surface);
     picasso_wallpaper_note(stage, ticket, state, result.width, result.height,
         result.row, result.bytes, result.element == 4 ? 32 : 0, 0, &result.pixels);
-    char line[320];
+    char line[400];
     int length = snprintf(line, sizeof(line),
-        "PICASSO_WALLPAPER_SURFACE pid=%d ticket=%u state=%s qualified=%u id=%u format=%08x element=%llu planes=%llu lock=%d unlock=%d seed=%u/%u\n",
+        "PICASSO_WALLPAPER_SURFACE pid=%d ticket=%u state=%s qualified=%u id=%u format=%08x element=%llu planes=%llu lock=%d unlock=%d seed=%u/%u w30r=%u/%u zero=%u black=%u padding=%u\n",
         getpid(), ticket, state, __atomic_load_n(&picasso_wallpaper_uikit_base, __ATOMIC_ACQUIRE) != 0, result.identifier, result.format,
         (unsigned long long)result.element, (unsigned long long)result.planes,
-        result.lock_result, result.unlock_result, result.seed, result.unlock_seed);
+        result.lock_result, result.unlock_result, result.seed, result.unlock_seed,
+        result.w30r_min, result.w30r_max, result.w30r_zero, result.w30r_black, result.w30r_padding);
     picasso_pixel_console(line, length, sizeof(line));
 }
 

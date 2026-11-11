@@ -417,6 +417,7 @@ struct eagl {
 	struct texture_definition definitions[256];
 	unsigned definition_next;
 	unsigned upload_state_reports;
+	unsigned w30r_reports;
 	struct image images[1024];
 	unsigned image_count;
 	GLuint framebuffer;             /* the one bound */
@@ -4934,6 +4935,16 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	image->width = width;
 	image->height = height;
 	texture_defined(e, (GLuint)texture, 3, 0, (GLint)internal, width, height, (GLenum)format, (GLenum)type);
+    /* Record the actual contract of this packed format before choosing a conversion. */
+    if (IOSurfaceGetPixelFormat(surface) == 'w30r' && e->w30r_reports < 8) {
+        e->w30r_reports++;
+        compositor_text("surface-w30r id=%u tex=%u size=%dx%d storage=%zux%zu row=%zu bpe=%zu p=%u i/f/t=%x/%x/%x inv=%u seed=%u frame=%u",
+            IOSurfaceGetID(surface), (unsigned)texture, width, height,
+            IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), IOSurfaceGetBytesPerRow(surface),
+            IOSurfaceGetBytesPerElement(surface), plane, image->internal, image->format, image->type,
+            image->invert, IOSurfaceGetSeed(surface), e->frames);
+    }
+
 	note_format(invert ? "IOSurface shown, inverted" : "IOSurface shown", image->internal, image->format, image->type, width,
 	    height);
 	if (shown++ < 24) {

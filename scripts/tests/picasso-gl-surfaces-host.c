@@ -411,6 +411,16 @@ static void test_cpu_upload(bool buffer_bound, bool invert, bool alpha_first, bo
     glPixelStorei(GL_UNPACK_SKIP_ROWS,0);glPixelStorei(GL_UNPACK_SKIP_PIXELS,0);
     image_forget(e,texture);glDeleteTextures(1,&texture);glDeleteFramebuffers(1,&fb);free(e);assert(!glGetError());
 }
+static void test_w30r_contract_note(void){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);unsigned char bytes[64]={0};
+    struct host_surface s={167,5,0x77333072,0,4,4,4,16,64,bytes};
+    GLuint tex;glGenTextures(1,&tex);my_glBindTexture(e,GL_TEXTURE_2D,tex);
+    for(unsigned n=0;n<20;++n)assert(my_texImageIOSurface(e,NULL,&s,GL_TEXTURE_2D,0x8059,4,4,GL_RGBA,0x8368,0,NO));
+    assert(e->w30r_reports==8&&w30r_notes==8&&s.seed==5);
+    assert(strstr(w30r_last,"id=167")&&strstr(w30r_last,"i/f/t=8059/1908/8368")&&strstr(w30r_last,"seed=5"));
+    assert(!memcmp(bytes,(unsigned char[64]){0},64)&&!glGetError());
+    image_forget(e,tex);glDeleteTextures(1,&tex);free(e);
+}
 int main(void){context();
 #ifdef EXPECT_CONTAMINATED_UPLOAD
     test_cpu_upload(false,false,false,false,4);test_cpu_upload(true,false,false,false,4);return 0;
@@ -427,6 +437,7 @@ int main(void){context();
     test_mirror(true,false);test_mirror(true,true);puts("REPRODUCED: inverted GPU mirror keeps source rows in ascending order");return 0;
 #endif
 #ifndef EXPECT_UNPUBLISHED
+    test_w30r_contract_note();
     test_cpu_upload(false,false,false,false,4);test_cpu_upload(true,false,false,false,4);
     test_cpu_upload(true,true,false,false,4);test_cpu_upload(true,true,true,false,4);test_cpu_upload(true,true,false,true,4);
     test_cpu_upload(false,false,false,false,0);
