@@ -2,6 +2,9 @@
 // Observe the qualified wallpaper snapshot boundaries without changing images.
 #import <CoreGraphics/CoreGraphics.h>
 #include <time.h>
+#import <IOSurface/IOSurfaceRef.h>
+#include "picasso-wallpaper-surface.h"
+static uintptr_t picasso_wallpaper_uikit_base;
 typedef id (*PicassoWallpaperRead)(id, SEL, id *);
 typedef id (*PicassoWallpaperSnapshot)(id, SEL);
 typedef id (*PicassoWallpaperComposite)(id, SEL, id, id);
@@ -45,6 +48,47 @@ static int picasso_wallpaper_take(unsigned kind, int present)
     return 0;
 }
 
+/* This getter returns an IOSurface-backed UIImage, whose CGImage is nil.
+ * Read only the exact qualified content class and its original getter. */
+static IOSurfaceRef picasso_wallpaper_image_surface(id image)
+{
+    uintptr_t base = __atomic_load_n(&picasso_wallpaper_uikit_base, __ATOMIC_ACQUIRE);
+    if (!base) return NULL;
+    Class image_class = objc_getClass("UIImage"), content_class = objc_getClass("_UIImageIOSurfaceContent");
+    Ivar content_ivar = image_class ? class_getInstanceVariable(image_class, "_content") : NULL;
+    if (!content_class || !content_ivar || ivar_getOffset(content_ivar) != 104 ||
+        strcmp(ivar_getTypeEncoding(content_ivar), "@\"_UIImageContent\"")) return NULL;
+    id content = object_getIvar(image, content_ivar);
+    if (!content || object_getClass(content) != content_class) return NULL;
+    SEL selector = sel_registerName("IOSurface");
+    Method method = class_getInstanceMethod(content_class, selector);
+    if (!method || method_getNumberOfArguments(method) != 2 ||
+        (uintptr_t)method_getImplementation(method) != base + 0x50af90) return NULL;
+    char *type = method_copyReturnType(method);
+    int valid = type && !strcmp(type, "^{__IOSurface=}");
+    free(type);
+    if (!valid) return NULL;
+    return ((IOSurfaceRef (*)(id, SEL))method_getImplementation(method))(content, selector);
+}
+
+static void picasso_wallpaper_observe_surface(id image, const char *stage, unsigned ticket)
+{
+    IOSurfaceRef surface = picasso_wallpaper_image_surface(image);
+    if (surface) CFRetain(surface);
+    struct picasso_wallpaper_surface_result result;
+    const char *state = picasso_wallpaper_sample_surface(surface, &result);
+    if (surface) CFRelease(surface);
+    picasso_wallpaper_note(stage, ticket, state, result.width, result.height,
+        result.row, result.bytes, result.element == 4 ? 32 : 0, 0, &result.pixels);
+    char line[320];
+    int length = snprintf(line, sizeof(line),
+        "PICASSO_WALLPAPER_SURFACE pid=%d ticket=%u state=%s qualified=%u id=%u format=%08x element=%llu planes=%llu lock=%d unlock=%d seed=%u/%u\n",
+        getpid(), ticket, state, __atomic_load_n(&picasso_wallpaper_uikit_base, __ATOMIC_ACQUIRE) != 0, result.identifier, result.format,
+        (unsigned long long)result.element, (unsigned long long)result.planes,
+        result.lock_result, result.unlock_result, result.seed, result.unlock_seed);
+    picasso_pixel_console(line, length, sizeof(line));
+}
+
 static void picasso_wallpaper_observe(id image, unsigned kind, unsigned ticket)
 {
     static const char *stages[] = {"disk", "effect-input", "effect-output", "cache", "source", "home-snapshot"};
@@ -66,7 +110,8 @@ static void picasso_wallpaper_observe(id image, unsigned kind, unsigned ticket)
                 }
                 CGImageRef cg = [(UIImage *)image CGImage];
                 if (!cg) {
-                    picasso_wallpaper_note(stage, ticket, "no-cgimage", 0, 0, 0, 0, 0, 0, NULL);
+                    if (kind == 5) picasso_wallpaper_observe_surface(image, stage, ticket);
+                    else picasso_wallpaper_note(stage, ticket, "no-cgimage", 0, 0, 0, 0, 0, 0, NULL);
                     return;
                 }
                 size_t width = CGImageGetWidth(cg), height = CGImageGetHeight(cg);
@@ -221,6 +266,9 @@ static void picasso_wallpaper_image_added(const struct mach_header *header, intp
     static const unsigned char home_uuid[16] = {
         0x22,0x03,0x4a,0xba,0x9a,0x9a,0x3b,0x94,0x93,0xa5,0xa0,0xde,0x02,0xbe,0xfd,0x2e
     };
+    static const unsigned char uikit_uuid[16] = {
+        0x12,0x42,0x97,0x8a,0x2c,0x2c,0x37,0x81,0x8d,0x6c,0x97,0x77,0xed,0xce,0x28,0x04
+    };
     if (header->magic != MH_MAGIC_64 || header->cputype != CPU_TYPE_ARM64) return;
     const struct mach_header_64 *h = (const struct mach_header_64 *)header;
     /* SpringBoard 20H392 has 224 commands. Bound their count by the
@@ -236,7 +284,7 @@ static void picasso_wallpaper_image_added(const struct mach_header *header, intp
         if (cmd->cmdsize < sizeof(*cmd) || cmd->cmdsize > (size_t)(end - p)) return;
         if (cmd->cmd == LC_UUID && cmd->cmdsize == sizeof(struct uuid_command)) {
             const unsigned char *value = ((const struct uuid_command *)cmd)->uuid;
-            matched = !memcmp(value, uuid, 16) ? 1 : !memcmp(value, home_uuid, 16) ? 2 : 0;
+            matched = !memcmp(value, uuid, 16) ? 1 : !memcmp(value, home_uuid, 16) ? 2 : !memcmp(value, uikit_uuid, 16) ? 3 : 0;
         }
         if (cmd->cmd == LC_SEGMENT_64 && cmd->cmdsize >= sizeof(struct segment_command_64)) {
             const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
@@ -247,6 +295,13 @@ static void picasso_wallpaper_image_added(const struct mach_header *header, intp
         p += cmd->cmdsize;
     }
     if (!matched || p != end || text_end < base) return;
+    if (matched == 3) {
+        if (text_end - base < 0x50afa0 ||
+            !picasso_astc_hash(base, 0x68e30, 8, "b912c6b83bf24945b90607112bab1ac8efa41fd3ca03a9deec12d14fcb287292") ||
+            !picasso_astc_hash(base, 0x50af90, 16, "d7c3981af85c5b56bb670e01b55a77a19d703f65aad40d480a049976ae011403")) return;
+        __atomic_store_n(&picasso_wallpaper_uikit_base, base, __ATOMIC_RELEASE);
+        return;
+    }
     if (matched == 2) {
         if (text_end - base < 0x45f99c ||
             !picasso_astc_hash(base, 0x45f8fc, 160, "69680a3fb99e35365f80cde8d02df4257b80896cd69a10547b11886da4962a5b")) return;

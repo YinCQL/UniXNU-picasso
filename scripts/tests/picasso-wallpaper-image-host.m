@@ -93,6 +93,22 @@ int main(void)
     assert(method_getImplementation(class_getInstanceMethod(cls,sel))==(IMP)picasso_wallpaper_home);
     for(unsigned i=0;i<100;++i)picasso_wallpaper_image_added((void *)header,slide);
     assert(queued==101 && noted==1 && picasso_wallpaper_home_original==original);
+    unsigned char *uikit=calloc(1,0x510000);assert(uikit);
+    struct mach_header_64 *uh=(void *)uikit;
+    *uh=(struct mach_header_64){.magic=MH_MAGIC_64,.cputype=CPU_TYPE_ARM64,.ncmds=2,.sizeofcmds=96};
+    struct uuid_command *uu=(void *)(uh+1);
+    *uu=(struct uuid_command){.cmd=LC_UUID,.cmdsize=24,.uuid={0x12,0x42,0x97,0x8a,0x2c,0x2c,0x37,0x81,0x8d,0x6c,0x97,0x77,0xed,0xce,0x28,0x04}};
+    struct segment_command_64 *ut=(void *)(uu+1);
+    *ut=(struct segment_command_64){.cmd=LC_SEGMENT_64,.cmdsize=72,.segname="__TEXT",.vmaddr=0x188d83000,.vmsize=0x510000};
+    const unsigned char getter_code[]={0x28,0xdc,0x29,0xd0,0x8,0x89,0x83,0xb9,0x0,0x68,0x68,0xf8,0xc0,0x3,0x5f,0xd6},cg_code[]={0x0,0x34,0x40,0xf9,0xcb,0x73,0x54,0x14};
+    memcpy(uikit+0x50af90,getter_code,sizeof(getter_code));memcpy(uikit+0x68e30,cg_code,sizeof(cg_code));
+    intptr_t us=(intptr_t)((uintptr_t)uikit-ut->vmaddr);
+    uikit[0x50af9f]^=1;picasso_wallpaper_image_added((void *)uh,us);uikit[0x50af9f]^=1;
+    uikit[0x68e37]^=1;picasso_wallpaper_image_added((void *)uh,us);uikit[0x68e37]^=1;
+    uu->uuid[0]^=1;picasso_wallpaper_image_added((void *)uh,us);uu->uuid[0]^=1;
+    assert(!picasso_wallpaper_uikit_base);
+    picasso_wallpaper_image_added((void *)uh,us);assert(picasso_wallpaper_uikit_base==(uintptr_t)uikit);
+    free(uikit);
     free(image);puts("PASS production image callback: real 224-command/24136-byte layout, command count bounds, full SHA256 including last byte, UUID, architecture, text bounds, malformed commands, install and repeated callback");
     return 0;
 }
