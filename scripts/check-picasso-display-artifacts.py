@@ -88,7 +88,7 @@ def check(tree, work, kernelcache, output):
                     any('picasso_glink_stop' in n for n in linked_names) and
                     any('picasso_smem_prepare_glink' in n for n in linked_names),
                     'Missing GLINK allocation, channel transport or session invalidation')
-    builder.require({'_picasso_power_start', '_picasso_spmi_quiesce', '_picasso_battery_observe_start'} <= linked_names, 'Missing board power backend')
+    builder.require({'_picasso_power_start', '_picasso_spmi_quiesce', '_picasso_battery_open', '_picasso_battery_read', '_picasso_battery_close'} <= linked_names, 'Missing board power backend')
     builder.require({'_picasso_backlight_start', '_picasso_backlight_power', '_picasso_backlight_level',
                      '_picasso_backlight_current', '_picasso_backlight_shutdown', '_picasso_brightness_allocate', '_picasso_brightness_is_service', '__GLOBAL__sub_I_PicassoBrightness.cpp'} <= linked_names, 'Missing physical display power backend')
     builder.require({'_picasso_audio_service_tick', '__GLOBAL__sub_I_PicassoAudioService.cpp',

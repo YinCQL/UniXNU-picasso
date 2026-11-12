@@ -18,9 +18,10 @@ struct mach_header_64 {uint32_t magic,cputype,cpusubtype,filetype,ncmds,sizeofcm
 struct load_command {uint32_t cmd,cmdsize;};
 struct uuid_command {uint32_t cmd,cmdsize;unsigned char uuid[16];};
 struct segment_command_64 {uint32_t cmd,cmdsize;char segname[16];uint64_t vmaddr,vmsize,fileoff,filesize;uint32_t maxprot,initprot,nsects,flags;};
-static unsigned installs,hashes,notes;
+static unsigned installs,shutdowns,hashes,notes;
 static bool hash_ok=true;
 static void picasso_power_install(uintptr_t base){assert(base);++installs;}
+static void picasso_shutdown_install(uintptr_t base){assert(base);++shutdowns;}
 static void picasso_power_note(const char *reason){assert(!strcmp(reason,"unavailable"));++notes;}
 // Header parsing is the subject here; byte hashes are checked against the stock
 // cache independently, and a failing hash must still block installation.
@@ -35,7 +36,7 @@ int main(int argc,char **argv){
     intptr_t slide=(intptr_t)(uintptr_t)bytes-(intptr_t)0x1c57ca000ULL;
     picasso_power_image_added((void *)bytes,slide);
     if(atoi(argv[2])){assert(!installs&&!hashes);puts("REPRODUCED stock SpringBoard 224-command header rejected before hashes/install");free(bytes);return 0;}
-    assert(installs==1&&hashes==5&&!notes);
+    assert(installs==1&&shutdowns==1&&hashes==7&&!notes);
     hash_ok=false;picasso_power_image_added((void *)bytes,slide);assert(installs==1&&notes==1);hash_ok=true;
     unsigned old=h->ncmds;h->ncmds=h->sizeofcmds/8+1;picasso_power_image_added((void *)bytes,slide);assert(installs==1);h->ncmds=old;
     struct load_command *cmd=(void *)(h+1);old=cmd->cmdsize;cmd->cmdsize=0;picasso_power_image_added((void *)bytes,slide);assert(installs==1);cmd->cmdsize=old;

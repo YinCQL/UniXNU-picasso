@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-"""Board power sequencing and bounded battery observations over host doubles."""
+"""Board power sequencing and live battery estimation over host doubles."""
 from pathlib import Path
 import argparse,hashlib,json,subprocess,re
 ROOT=Path(__file__).resolve().parents[1]
@@ -10,7 +10,7 @@ s=(ROOT/'package/PicassoPower.cpp').read_text();start=s.index('static int halt(u
 (out/'power-dispatch.inc').write_text(s[start:end]+'\n')
 assert 'PE_halt_restart=halt;' in s and 'next->previous=PE_halt_restart;' in s
 battery=(ROOT/'package/PicassoBattery.cpp').read_text()
-assert 'picasso_spmi_write8' not in battery and 'soc_live=0' in battery
+assert 'picasso_battery_read' in battery and 'picasso_battery_open' in battery
 assert 'picasso_power_start();' in (ROOT/'package/PicassoDisplay.cpp').read_text()
 smc=s[s.index('struct Reply'):s.index('struct Backend')]
 smc=re.sub(r'register uint64_t (x[0-7]) __asm__\("x[0-7]"\)',r'uint64_t \1',smc)
@@ -30,6 +30,6 @@ for name in ['PicassoPower','PicassoBattery']:
  body=(ROOT/'package'/(name+'.cpp')).read_text();body=re.sub(r'^#include <[^>]+>[^\n]*\n','',body,flags=re.M)
  (out/(name+'.cpp')).write_text('#include "picasso-input-kernel-api.h"\nextern "C" int (*PE_halt_restart)(unsigned);\nenum {kPEHaltCPU=0};\n'+body)
  run(name+'-arm64',['clang++-18','-target','arm64-apple-ios17.0','-std=c++17','-ffreestanding','-fno-exceptions','-fno-rtti','-fno-threadsafe-statics','-fno-c++-static-destructors','-mgeneral-regs-only','-Wall','-Wextra','-Werror','-I',str(ROOT/'scripts/tests'),'-I',str(ROOT/'package'),'-c',str(out/(name+'.cpp')),'-o',str(out/(name+'.o'))])
-inputs=['package/PicassoPower.cpp','package/PicassoPowerCore.h','package/PicassoBattery.cpp','package/PicassoBatteryCore.h','package/PicassoSpmi.cpp','package/PicassoSpmiCore.h','package/PicassoSpmi.h','package/PicassoDisplay.cpp','scripts/build-picasso-display.py','scripts/check-picasso-display-artifacts.py','scripts/check-picasso-power.py','scripts/tests/picasso-power-host.cpp','scripts/tests/picasso-battery-host.cpp','scripts/tests/picasso-smc-host.cpp']
+inputs=['package/PicassoPower.cpp','package/PicassoPowerCore.h','package/PicassoBattery.cpp','package/PicassoBatteryCore.h','package/PicassoBatteryProfile.h','package/PicassoBattery.h','package/PicassoSpmi.cpp','package/PicassoSpmiCore.h','package/PicassoSpmi.h','package/PicassoDisplay.cpp','scripts/build-picasso-display.py','scripts/check-picasso-display-artifacts.py','scripts/check-picasso-power.py','scripts/tests/picasso-power-host.cpp','scripts/tests/picasso-battery-host.cpp','scripts/tests/picasso-smc-host.cpp']
 (out/'results.json').write_text(json.dumps(dict(passed=True,hardware_tested=False,kernel_sdk_compiled=False,scope=__doc__,runs=runs,inputs={n:hashlib.sha256((ROOT/n).read_bytes()).hexdigest() for n in inputs}),indent=2)+'\n')
-print('PASS power sequencing, callback dispatch, QG observations and ARM64 compilation; host doubles only')
+print('PASS power sequencing, callback dispatch, QG snapshots/estimation and ARM64 compilation; host doubles only')

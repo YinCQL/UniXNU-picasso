@@ -11,7 +11,7 @@ p.add_argument('--source',type=Path)
 p.add_argument('--expect-header-rejected',action='store_true')
 a=p.parse_args();out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
 source=a.source or ROOT/'package/picasso-springboard/picasso-power-button.m'
-s=source.read_text();s=s[:s.index('static void picasso_power_image_added')]
+s=source.read_text();s=s[:s.index('// The native restart manager')]
 start=s.index('static void picasso_power_note');end=s.index('__attribute__((noinline))')
 s=s[:start]+s[end:]
 # GNU dispatch has no objc_msgSend. These two adapters do normal method lookup.
@@ -32,7 +32,7 @@ for san in [False,True]:
         runs.append(dict(sanitizer=san,stage=name,passed=True,output=q.stdout))
 if a.stock_header:
     raw=source.read_text();callback=raw[raw.index('static void picasso_power_image_added'):]
-    callback=callback.replace('dispatch_async(dispatch_get_main_queue(), ^{ picasso_power_install(base); });','picasso_power_install(base);')
+    callback=callback.replace('dispatch_async(dispatch_get_main_queue(), ^{','{').replace('    });','    }')
     (out/'power-image.inc').write_text(callback)
     fixture_image=ROOT/'scripts/tests/picasso-power-image-host.c'
     for san in [False,True]:

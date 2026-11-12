@@ -17,3 +17,57 @@
  		for (int i = 0; i < 100; i++) {
  			if (OSCompareAndSwap(0, 1, &gSleepOrShutdownPending)) {
  				break;
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6005,4 +6005,37 @@
+ PICASSO_ASTC_STATUS(picasso_astc_restore_failed, 5);
+ #undef PICASSO_ASTC_STATUS
++
++/* Only the stock SpringBoard executable can request this board operation.
++ * A read is inert. A write follows its verified, non-cancellable shutdown
++ * callback; it does not commit kernel shutdown or bypass storage teardown. */
++extern void picasso_backlight_shutdown(void) __attribute__((weak_import));
++bool
++picasso_shutdown_backlight_caller(void)
++{
++    proc_t p = current_proc();
++    char path[MAXPATHLEN];
++    int length = sizeof(path);
++    return csproc_get_platform_binary(p) && p->p_textvp &&
++        !vn_getpath(p->p_textvp, path, &length) &&
++        !strcmp(path, "/System/Library/CoreServices/SpringBoard.app/SpringBoard") &&
++        picasso_dyld_inject_target(p);
++}
++static int
++picasso_shutdown_backlight_sysctl SYSCTL_HANDLER_ARGS
++{
++    int value = 0;
++    if (!req->newptr) return SYSCTL_OUT(req, &value, sizeof(value));
++    if (!picasso_shutdown_backlight_caller()) return EPERM;
++    if (req->newlen != sizeof(value)) return EINVAL;
++    int error = SYSCTL_IN(req, &value, sizeof(value));
++    if (error) return error;
++    if (value != 1) return EINVAL;
++    if (!picasso_backlight_shutdown) return ENXIO;
++    picasso_backlight_shutdown();
++    return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, picasso_shutdown_backlight,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, picasso_shutdown_backlight_sysctl, "I", "picasso: blank after native shutdown confirmation");
+ #endif
+ 
+--- a/bsd/kern/kern_newsysctl.c
++++ b/bsd/kern/kern_newsysctl.c
+@@ -1780,4 +1780,11 @@
+ 		    req->newptr,
+ 		    req->newlen);
++        // The stock profile cannot name this board actuator. Preserve its
++        // decision except for this exact write from the platform SpringBoard.
++        extern bool picasso_shutdown_backlight_caller(void);
++        if (error && namestring &&
++            !strcmp(namestring, "kern.picasso_shutdown_backlight") &&
++            req->newptr && req->newlen == sizeof(int) &&
++            picasso_shutdown_backlight_caller()) error = 0;
+ 		if (error) {
+ 			goto dropref;

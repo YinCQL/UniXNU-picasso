@@ -32,7 +32,6 @@ void picasso_hid_start_later(void);
 void picasso_pr13_start(void);
 void picasso_backlight_start(IOService *);
 void picasso_power_start(void);
-void picasso_battery_observe_start(void);
 void native_gop_presenter_static_init(void) __asm__("__GLOBAL__sub_I_NativeGOPPresenter.cpp");
 bool native_gop_glue_start(IOService *nub);
 void picasso_hid_frame_presented(void);
@@ -325,10 +324,10 @@ static void publishAcceleratorStub(void) {
     OSSafeReleaseNULL(accel);
     IOLog("PICASSO_ACCEL published=%u\n", started);
     // Its metaclass was registered with the accelerator's above (same file). boot-arg
-    // picasso-power-source=0 leaves the fixed "full, on a charger" power source out.
+    // picasso-power-source=0 leaves the gauge service disabled.
     unsigned power = 1;
     PE_parse_boot_argn("picasso-power-source", &power, sizeof(power));
-    if (power == 1) IOLog("PICASSO_POWER fixed power source published=%u\n", picasso_power_source_publish());
+    if (power == 1) IOLog("PICASSO_POWER battery service started=%u\n", picasso_power_source_publish());
 }
 
 // IOBSD is published at this call site. Load the original software network
@@ -349,7 +348,6 @@ static void picasso_network_stack_start(void) {
 
 extern "C" void native_legacy_display_late_probe(void) {
     picasso_power_start();
-    picasso_battery_observe_start();
     picasso_network_stack_start();
     picasso_keystore_probe();
     IOService *display = pendingDisplay;

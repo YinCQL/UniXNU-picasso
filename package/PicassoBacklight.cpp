@@ -165,7 +165,7 @@ extern "C" bool picasso_backlight_current(uint32_t *level) {
     IOLockUnlock(b->lock);return ok;
 }
 
-// Called only after the root domain commits to shutdown. Keep storage, SPMI
+// Called after native shutdown confirmation or root-domain commit. Keep storage, SPMI
 // and panel scanout running for teardown; latch just the backlight off so a
 // queued brightness fade or display wake cannot relight it before power-off.
 extern "C" void picasso_backlight_shutdown(void) {

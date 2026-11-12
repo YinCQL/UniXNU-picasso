@@ -4,24 +4,64 @@
 #include <stdio.h>
 #include <initializer_list>
 #include "PicassoBatteryCore.h"
+using namespace picasso_battery;
 struct Bus {
-    unsigned reads=0,failAt=0;bool changing=false;
-    uint8_t qg[256]={},usb[256]={},chg[256]={};
-    Bus(){qg[8]=0x81;qg[0xbf]=170;qg[0xc0]=0x46;qg[0xc1]=0x50;qg[0xc2]=0x18;qg[0xc3]=0xfc;usb[0x10]=0x10;chg[6]=3;}
+    unsigned reads=0,writes=0,waits=0,failAt=0,failWrite=0;bool changing=false,timeout=false,wrongChannel=false;
+    uint8_t data[5][256]={};
+    Bus(){data[0][8]=0x81;data[0][0xbf]=239;data[0][0xc0]=0x46;data[0][0xc1]=0x50;
+        data[0][0xc2]=0x18;data[0][0xc3]=0xfc;data[1][0x10]=0x10;data[2][6]=3;data[3][0x0b]=0x11;
+        data[4][0x50]=0x72;data[4][0x51]=0x38;}
     int read(unsigned ch,uint8_t reg,uint8_t &v){
-        if(++reads==failAt)return -40;
-        assert(ch<3);assert(ch!=0||reg==8||reg==0xbf||(reg>=0xc0&&reg<=0xc3));
-        v=(ch==0?qg:ch==1?usb:chg)[reg];if(changing&&reg==0xc0 && reads%8==1)v^=1;return 0;
+        if(++reads==failAt)return -40;assert(ch<5);
+        if(ch==0)assert(reg==8||reg==0xbf||(reg>=0xc0&&reg<=0xc3));
+        v=data[ch][reg];if(changing&&ch==0&&reg==0xc0)v^=uint8_t((reads%21)>10);
+        if(wrongChannel&&ch==4&&reg==0x44)v=0;return 0;
     }
+    int write(uint8_t reg,uint8_t v){
+        if(++writes==failWrite)return -41;assert(reg>=0x42 && reg<=0x47);data[4][reg]=v;
+        if(reg==0x47)data[4][8]=2;return 0;
+    }
+    void wait(){++waits;if(!timeout)data[4][8]=1;}
 };
 int main(){
-    assert(picasso_battery::voltage_uv(0)==0&&picasso_battery::voltage_uv(20550)==3999790);
-    assert(picasso_battery::current_ua(1000,3)==152588&&picasso_battery::current_ua(64536,3)==-152588);
-    assert(picasso_battery::current_ua(1000,4)==305176&&picasso_battery::current_ua(32768,4)==-10000007);
-    for(unsigned n=1;n<=12;++n){Bus b;b.failAt=n;picasso_battery::Sample s;s.soc=19;assert(picasso_battery::sample(b,3,s)==-40&&s.soc==19);}
-    {Bus b;picasso_battery::Sample s;assert(!picasso_battery::sample(b,3,s)&&s.voltageUv==3999790&&s.currentUa==-152588&&s.soc==170&&s.usb==16&&s.charger==3);}
-    {Bus b;picasso_battery::Sample s;assert(picasso_battery::sample(b,2,s)==-20&&!b.reads);}
-    {Bus b;b.changing=true;picasso_battery::Sample s;assert(picasso_battery::sample(b,3,s)==-21&&b.reads==28);}
-    for(unsigned status:{0u,1u,128u}){Bus b;b.qg[8]=uint8_t(status);picasso_battery::Sample s;assert(picasso_battery::sample(b,3,s)==-22);}
-    puts("PASS QG signed current/voltage units, supported subtype, stable tuple, 12 transport failures and validity rejection; SOC remains raw");
+    assert(voltage_uv(20550)==3999790);
+    assert(current_ua(1000,3)==152588&&current_ua(64536,3)==-152588);
+    assert(current_ua(1000,4)==305176&&current_ua(32768,4)==-10000007);
+    for(unsigned n=1;n<=21;++n){Bus b;b.failAt=n;Sample s;s.soc=19;assert(sample(b,4,s)==-40&&s.soc==19);}
+    {Bus b;Sample s;assert(!sample(b,4,s)&&s.voltageUv==3999790&&s.currentUa==-305176&&s.soc==239);}
+    {Bus b;Sample s;assert(sample(b,2,s)==-20&&!b.reads);}
+    {Bus b;b.changing=true;Sample s;assert(sample(b,4,s)==-21&&b.reads==63);}
+    for(unsigned status:{0u,1u}){Bus b;b.data[0][8]=uint8_t(status);Sample s;assert(sample(b,4,s)==-22);}
+    {Bus b;b.data[0][8]=0x80;Sample s;assert(!sample(b,4,s));}
+    assert(temperature_deci_c(0)==-10000 && temperature_deci_c(0x70e4)==-10000);
+    assert(temperature_deci_c(0x3872)>=248 && temperature_deci_c(0x3872)<=252);
+    assert(battery_id_ohm(0x3872)==100000&&battery_id_ohm(0x70e4)==0);
+    for(unsigned c=0;c<6;++c)for(unsigned r=0;r<56;++r)
+        assert(ocv_soc(profileOcv[r][c]*100,profileTemperature[c]*10)==profileSoc[r]);
+    for(int t=-200;t<=600;t+=10){int previous=0;
+        for(int uv=2500000;uv<=4600000;uv+=1000){int soc=ocv_soc(uv,t);assert(soc>=previous&&soc<=10000);previous=soc;}}
+    for(unsigned mode=0;mode<8;++mode)for(unsigned plug=0;plug<2;++plug)for(unsigned flow=0;flow<2;++flow){
+        Estimator e;Snapshot o;Sample s;s.status=0x81;s.voltageUv=4000000;s.currentUa=flow?-500000:500000;
+        s.usb=plug?16:0;s.path=17;s.charger=uint8_t(mode);e.update(s,1000,250,true,4000000,o);
+        assert(o.charging==(plug&&flow&&mode>=1&&mode<=4));assert(o.milliamps==(flow?500:-500));assert(!o.full);
+    }
+    Sample s;s.status=0x81;s.voltageUv=3846400;s.currentUa=450000;s.charger=3;
+    Estimator e;Snapshot o;e.update(s,1000,250,true,3846400,o);assert(o.percent==50);
+    for(uint64_t ms=6000;ms<=3601000;ms+=5000)e.update(s,ms,250,true,0,o);
+    assert(o.percent==40&&o.remainingMah==1800&&o.minutes==240);
+    int64_t before=e.remainingUaMs;e.gap();e.update(s,8000000,250,true,0,o);assert(e.remainingUaMs==before);
+    s.currentUa=-450000;s.usb=16;s.path=17;
+    for(uint64_t ms=8005000;ms<=11600000;ms+=5000)e.update(s,ms,250,true,0,o);
+    assert(o.percent==50&&o.charging&&o.minutes==-1);
+    s.charger=5;s.voltageUv=4370000;s.currentUa=100000;e.update(s,11605000,250,true,0,o);assert(!o.full);
+    s.currentUa=0;e.update(s,11610000,250,true,0,o);assert(o.full&&o.percent==100);
+    s.thermal=8;e.update(s,11615000,250,true,0,o);assert(!o.full&&!o.charging);
+    s.status=0x80;e.update(s,11620000,0,false,0,o);assert(!e.ready&&!o.present);
+    for(unsigned n=1;n<=10;++n){Bus b;b.failAt=n;uint16_t out=9;assert(adc_read(b,0x4a,out)==-40&&out==9);}
+    for(unsigned n=1;n<=6;++n){Bus b;b.failWrite=n;uint16_t out=9;assert(adc_read(b,0x4a,out)==-41&&out==9);}
+    {Bus b;uint16_t v=0;assert(!adc_read(b,0x4a,v)&&v==0x3872&&b.waits==1&&b.writes==6);assert(b.data[4][0x42]==0x18&&b.data[4][0x45]==2);}
+    {Bus b;b.data[4][8]=2;uint16_t v=9;assert(adc_read(b,0x4a,v)==-31&&!b.writes&&v==9);}
+    {Bus b;b.timeout=true;uint16_t v=9;assert(adc_read(b,0x4a,v)==-34&&b.waits==10&&v==9);}
+    {Bus b;b.wrongChannel=true;uint16_t v=9;assert(adc_read(b,0x4a,v)==-32&&v==9);}
+    puts("PASS complete QG snapshots, current sign, profile interpolation, one-hour charge/discharge, gaps, charger/thermal states, ADC failures and timeout");
 }

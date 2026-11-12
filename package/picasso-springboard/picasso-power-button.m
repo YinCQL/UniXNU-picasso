@@ -76,6 +76,41 @@ static void picasso_power_install(uintptr_t base)
     picasso_power_note("installed");
 }
 
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+// The native restart manager has committed before this non-reboot callback.
+// Blank the light before its application-exit wait; leave teardown unchanged.
+typedef void (*PicassoShutdownNotice)(id,SEL,id);
+static PicassoShutdownNotice picasso_original_shutdown_notice;
+static uintptr_t picasso_shutdown_caller;
+__attribute__((noinline))
+static void picasso_shutdown_notice(id receiver,SEL selector,id manager)
+{
+    uintptr_t caller=(uintptr_t)__builtin_return_address(0);
+    if(caller==picasso_shutdown_caller && [NSThread isMainThread]){
+        int value=1;
+        int result=sysctlbyname("kern.picasso_shutdown_backlight",NULL,NULL,&value,sizeof(value));
+        picasso_power_note(result==0?"shutdown_requested":"shutdown_request_failed");
+    }
+    picasso_original_shutdown_notice(receiver,selector,manager);
+}
+static void picasso_shutdown_install(uintptr_t base)
+{
+    static BOOL installed;
+    if(installed || ![[NSProcessInfo processInfo].processName isEqualToString:@"SpringBoard"])return;
+    Class cls=objc_getClass("SpringBoard");
+    SEL sel=sel_registerName("restartManagerWillShutdown:");
+    Method method=class_getInstanceMethod(cls,sel);
+    if(!method || method_getNumberOfArguments(method)!=3 ||
+       (uintptr_t)method_getImplementation(method)!=base+0xb5bcc)return;
+    char *ret=method_copyReturnType(method),*arg=method_copyArgumentType(method,2);
+    BOOL valid=ret && !strcmp(ret,@encode(void)) && arg && !strcmp(arg,@encode(id));
+    free(ret);free(arg);if(!valid)return;
+    picasso_original_shutdown_notice=(PicassoShutdownNotice)method_getImplementation(method);
+    picasso_shutdown_caller=base+0x5c736c;
+    class_replaceMethod(cls,sel,(IMP)picasso_shutdown_notice,method_getTypeEncoding(method));
+    installed=YES;picasso_power_note("shutdown_installed");
+}
+
 static void picasso_power_image_added(const struct mach_header *header, intptr_t slide)
 {
     static const unsigned char uuid[16] = {
@@ -109,5 +144,12 @@ static void picasso_power_image_added(const struct mach_header *header, intptr_t
         !picasso_astc_hash(base, 0x5699b0, 364, "aaf6de844bd2e45c43d820ecdea7bf6d9d2327a2025ff461b3d16f9dbb4baf1f")) {
         picasso_power_note("unavailable"); return;
     }
-    dispatch_async(dispatch_get_main_queue(), ^{ picasso_power_install(base); });
+    // Independent guard: the working long-press action remains available even
+    // when this optional earlier shutdown callback does not match the image.
+    BOOL shutdownValid=text_end-base>=0x5c73f4 && picasso_astc_hash(base,0xb5bcc,56,"cdd7d5aaa4d29aa5de3e8f5149efe9ad4d3fc46993060fe98b4f1d0025b499e0") &&
+        picasso_astc_hash(base,0x5c72cc,296,"2c98a2f5f13aff22443f8d8205639af49772b11c36eda04c1b8a506269a95f2c");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        picasso_power_install(base);
+        if(shutdownValid)picasso_shutdown_install(base);
+    });
 }
