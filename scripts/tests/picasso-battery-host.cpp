@@ -124,11 +124,36 @@ int main(){
      s.raw.voltageUv=3560000;s.timeMs=6000;policy.update(s);assert(!s.warn);
      s.percent=1;s.raw.voltageUv=3370000;s.timeMs=7000;policy.update(s);assert(!s.critical);
      s.timeMs=9000;policy.update(s);assert(!s.critical);s.timeMs=10000;policy.update(s);assert(s.critical&&s.warn);
-     s.capable=true;s.timeMs=11000;policy.update(s);assert(!s.warn&&!s.critical);
-     s.capable=false;s.raw.voltageUv=3000000;s.percent=60;s.timeMs=12000;policy.update(s);assert(!s.critical);
+     s.capable=true;s.raw.currentUa=-100000;s.timeMs=11000;policy.update(s);assert(!s.warn&&!s.critical);
+     s.capable=false;s.raw.currentUa=0;s.raw.voltageUv=3000000;s.percent=60;s.timeMs=12000;policy.update(s);assert(!s.critical);
      s.timeMs=30000;policy.update(s);assert(!s.critical);s.timeMs=33000;policy.update(s);assert(s.critical);
      policy.reset();s.critical=false;s.timeMs=40000;s.temperature=-50;s.temperatureValid=true;
      policy.update(s);assert(!s.critical);s.timeMs=43000;policy.update(s);assert(!s.critical);}
+
+    // A USB SDP can be at its 500 mA input limit while the cell discharges.
+    // Keep the charging indicator independent of low-cell protection.
+    {Estimator e;Snapshot o;Sample s;s.status=0x81;s.usb=0x10;s.path=0x95;s.charger=3;
+     s.voltageUv=3370000;s.currentUa=213318;
+     e.update(s,1000,367,true,3370000,o);
+     assert(o.charging&&o.capable&&!o.netCharging&&o.warn&&!o.critical&&o.refreshMs==1000);
+     e.update(s,3000,367,true,0,o);assert(!o.critical);
+     e.update(s,4000,367,true,0,o);assert(o.critical&&o.warn&&o.charging);
+     s.currentUa=-305;s.voltageUv=3400000;e.update(s,5000,367,true,0,o);
+     assert(o.critical&&o.netCharging); // Sign noise is not established recovery.
+     s.currentUa=-100000;e.update(s,6000,367,true,0,o);
+     assert(!o.critical&&!o.warn&&o.charging&&o.refreshMs==5000);
+     s.currentUa=439758;s.voltageUv=3370000;e.update(s,7000,367,true,0,o);assert(!o.critical);
+     e.gap();e.update(s,30000,367,true,0,o);assert(!o.critical);
+     e.update(s,33000,367,true,0,o);assert(o.critical);}
+    {LowBattery policy;Snapshot s;s.present=true;s.capable=true;s.percent=30;
+     s.raw.voltageUv=3000000;s.raw.currentUa=-100000;s.netCharging=true;s.timeMs=1000;
+     policy.update(s);assert(!s.critical&&s.refreshMs==1000);
+     s.timeMs=4000;policy.update(s);assert(s.critical); // Below hard empty, even with charge.
+     s.raw.voltageUv=3110000;s.timeMs=5000;policy.update(s);assert(!s.critical&&!s.warn);
+     s.raw.voltageUv=3370000;s.raw.currentUa=200000;s.netCharging=false;s.percent=1;s.timeMs=6000;
+     policy.update(s);s.timeMs=9000;policy.update(s);assert(s.critical);
+     s.raw.voltageUv=3440000;s.percent=25;s.timeMs=10000;policy.update(s);assert(!s.critical);
+     s.present=false;s.timeMs=11000;policy.update(s);assert(!s.warn&&!s.critical);}
 
     {struct ChangingInput:Bus {int read(unsigned ch,uint8_t reg,uint8_t &v){int result=Bus::read(ch,reg,v);if(reads==6)++v;return result;}} b;
      Input out;out.icl=99;assert(input_status(b,out)==-35&&!out.statusValid&&out.icl==99);}

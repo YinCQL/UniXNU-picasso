@@ -135,17 +135,22 @@ struct LowBattery {
     void reset(){previousMs=0;lowSince=0;criticalSince=0;low=false;critical=false;}
     void update(Snapshot &s){
         s.warn=false;s.critical=false;s.refreshMs=5000;
-        if(!s.present || s.capable){reset();return;}
+        if(!s.present){reset();return;}
         if(!previousMs || s.timeMs<=previousMs || s.timeMs-previousMs>15000){lowSince=0;criticalSince=0;}
         previousMs=s.timeMs;
         const int lowUv=s.temperatureValid && s.temperature<0?3800000:3500000;
         const int emptyUv=s.temperatureValid && s.temperature<0?3000000:3100000;
         const int uv=s.raw.voltageUv;
+        // A valid USB path can still supply less than the system consumes.
+        // Clear low-battery state only on meaningful net charge, not cable
+        // presence or a near-zero current inside the gauge's rest band.
+        // A cell below the board's empty threshold still needs protection.
+        if(s.capable && s.raw.currentUa<-45000 && uv>=emptyUv){reset();return;}
         if(uv<lowUv){if(!lowSince)lowSince=s.timeMs;if(s.timeMs-lowSince>=3000)low=true;}
         else {lowSince=0;if(uv>lowUv+50000)low=false;}
         const bool nearEmpty=(s.percent<=2 && uv<3380000) || uv<emptyUv;
         if(nearEmpty){if(!criticalSince)criticalSince=s.timeMs;if(s.timeMs-criticalSince>=3000)critical=true;}
-        else {criticalSince=0;if(uv>3430000 || s.netCharging)critical=false;}
+        else {criticalSince=0;if(uv>3430000)critical=false;}
         s.warn=s.percent<=20 || low || critical;s.critical=critical;
         if(uv<lowUv || low || s.percent<=2)s.refreshMs=1000;
     }
