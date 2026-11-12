@@ -1,0 +1,19 @@
+--- a/iokit/Kernel/IOPMrootDomain.cpp
++++ b/iokit/Kernel/IOPMrootDomain.cpp
+@@ -869,11 +869,16 @@
+ 	return gWillShutdown != 0;
+ }
+ 
++// This board keeps firmware scanout alive through teardown. Blank only the
++// backlight once shutdown is committed, before waiting for user services.
++extern "C" void picasso_backlight_shutdown(void) __attribute__((weak_import));
++
+ static void
+ IOPMRootDomainWillShutdown(void)
+ {
+ 	if (OSCompareAndSwap(0, 1, &gWillShutdown)) {
+ 		IOService::willShutdown();
++		if (picasso_backlight_shutdown) picasso_backlight_shutdown();
+ 		for (int i = 0; i < 100; i++) {
+ 			if (OSCompareAndSwap(0, 1, &gSleepOrShutdownPending)) {
+ 				break;

@@ -90,7 +90,7 @@ def check(tree, work, kernelcache, output):
                     'Missing GLINK allocation, channel transport or session invalidation')
     builder.require({'_picasso_power_start', '_picasso_spmi_quiesce', '_picasso_battery_observe_start'} <= linked_names, 'Missing board power backend')
     builder.require({'_picasso_backlight_start', '_picasso_backlight_power', '_picasso_backlight_level',
-                     '_picasso_backlight_current', '_picasso_brightness_allocate', '_picasso_brightness_is_service', '__GLOBAL__sub_I_PicassoBrightness.cpp'} <= linked_names, 'Missing physical display power backend')
+                     '_picasso_backlight_current', '_picasso_backlight_shutdown', '_picasso_brightness_allocate', '_picasso_brightness_is_service', '__GLOBAL__sub_I_PicassoBrightness.cpp'} <= linked_names, 'Missing physical display power backend')
     builder.require({'_picasso_audio_service_tick', '__GLOBAL__sub_I_PicassoAudioService.cpp',
                      '__ZN12PicassoAudio10gMetaClassE', '__ZN22PicassoAudioUserClient10gMetaClassE'} <= linked_names,
                     'Missing PCM worker, audio-service initializer or client metaclasses')

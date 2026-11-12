@@ -75,7 +75,7 @@ struct TestBus {
 };
 struct Backend:TestBus {
     picasso_backlight::State state;IOLock *lock=nullptr;IOService *display=nullptr;
-    bool displayOn=true;uint32_t requested=1023;unsigned reports=0;
+    bool displayOn=true,shuttingDown=false;uint32_t requested=1023;unsigned reports=0;
     void report_error(int) {}
 
 };
@@ -197,6 +197,29 @@ int main() {
     s->stop(&display);s->release();++cases;
     reset();b.state.failed=true;s=picasso_brightness_allocate();assert(!s->start(&display));
     assert(!s->getProperty("backlight-control"));s->release();++cases;
+    // A queued fade may still fire after committed shutdown; the production
+    // backend must reject it and any subsequent display-on without bus writes.
+    reset();b.state.failed=false;s=picasso_brightness_allocate();assert(s->start(&display));
+    assert(!picasso_backlight_power(&display,true));
+    assert(!send(s,4095,65536));fire(0);assert(timers[1]->armed);
+    picasso_backlight_shutdown();assert(b.shuttingDown&&!b.state.on&&!b.displayOn);
+    ops=b.operations;unsigned writes=b.writes;
+    picasso_backlight_shutdown();assert(b.operations==ops);
+    assert(picasso_backlight_power(&display,true)==kIOReturnNotReady);
+    assert(picasso_backlight_level(4095)==kIOReturnNotReady);
+    uint32_t value=77;assert(!picasso_backlight_current(&value)&&value==77);
+    clockMs=500;fire(1);assert(b.operations==ops&&b.writes==writes&&!b.state.on);
+    assert(send(s,1023)==kIOReturnNotReady);s->stop(&display);s->release();++cases;
+    // A failed off transaction stays a failure and never admits later writers.
+    for(unsigned n=1;n<=8;++n){
+        Backend failed;failed.display=&display;failed.lock=IOLockAlloc();backend=&failed;
+        assert(!failed.state.adopt(failed));failed.fail=failed.operations+n;
+        picasso_backlight_shutdown();assert(failed.shuttingDown&&failed.state.failed&&failed.displayOn);
+        unsigned before=failed.operations;picasso_backlight_shutdown();
+        assert(picasso_backlight_level(1023)==kIOReturnNotReady&&failed.operations==before);
+        IOLockFree(failed.lock);++cases;
+    }
+    backend=nullptr;picasso_backlight_shutdown();backend=&b;
     IOLockFree(b.lock);assert(!locks);
     printf("PASS brightness: %u production service/backend, mailbox, fade, power and failure cases\n",cases);
 }
