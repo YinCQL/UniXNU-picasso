@@ -38,6 +38,7 @@ def main():
         (out/(name+'.log')).write_text(r.stdout+r.stderr, encoding='utf8', newline='\n')
         if r.returncode: raise RuntimeError(name+'\n'+r.stdout+r.stderr)
         runs.append(dict(name=name, passed=True))
+        return r.stdout
 
     for sanitized in (False, True):
         suffix = '-asan' if sanitized else ''
@@ -45,19 +46,28 @@ def main():
         for fixture in ('probe', 'abort'):
             exe = out/(fixture+suffix+('.exe' if os.name=='nt' else ''))
             run(fixture+'-compile'+suffix, [a.cxx, '-std=c++17', '-O1', '-Wall', '-Wextra', '-Werror', *flags, str(out/(fixture+'.cpp')), '-o', str(exe)])
-            cases = ['normal'] if fixture=='abort' else ['normal','disabled','bad-pages','64k-pages','bad-bank',*['alloc'+str(n) for n in range(1,4)],*['map'+str(n) for n in range(1,4)],*['zero'+str(n) for n in range(1,4)]]
-            for case in cases: run(fixture+'-'+case+suffix, [str(exe),case])
+            cases = ['normal'] if fixture=='abort' else ['normal','disabled','no-boot','bad-pages','64k-pages','bad-bank',
+                'zero-banks','too-many-banks','outside-map',*['buffer'+str(n) for n in range(1,4)],
+                *['alloc'+str(n) for n in range(1,4)],*['map'+str(n) for n in range(1,4)],*['zero'+str(n) for n in range(1,4)]]
+            for case in cases:
+                output = run(fixture+'-'+case+suffix, [str(exe),case])
+                if fixture=='probe':
+                    if case in ('disabled','bad-pages','64k-pages','bad-bank','zero-banks','too-many-banks','outside-map','zero3'):
+                        assert 'PICASSO_SMMU cbar=' not in output, case
+                    elif case=='normal':
+                        assert 'PICASSO_SMMU cbar=' in output and output.count(' ok pa=180000000 ')==3
     arm = '''#include <stdint.h>
 #include <stddef.h>
 extern "C" int printf(const char *,...) __attribute__((format(printf,1,2)));
 extern bool PE_parse_boot_argn(const char *,void *,int);
-enum {kIODirectionIn=1,kIOMapAnywhere=1,kIOMapInhibitCache=2};
-struct PE_Video {unsigned long v_width,v_height;};
-extern int PE_current_console(PE_Video *);
+using vm_size_t=uintptr_t;using IOOptionBits=uint32_t;using IOByteCount=uintptr_t;using addr64_t=uint64_t;
+enum {kIODirectionIn=1,kIODirectionInOut=3,kIOMemoryPhysicallyContiguous=0x10,kIOMapAnywhere=1,kIOMapInhibitCache=2};
 struct IOMemoryMap {uintptr_t getVirtualAddress();uint64_t getPhysicalAddress();uint64_t getLength();void release();};
 struct IOMemoryDescriptor {static IOMemoryDescriptor *withPhysicalAddress(uint64_t,uint64_t,unsigned);IOMemoryMap *map(unsigned);void release();};
+struct IOBufferMemoryDescriptor {static IOBufferMemoryDescriptor *withOptions(IOOptionBits,vm_size_t,vm_size_t);
+addr64_t getPhysicalSegment(IOByteCount,IOByteCount *,IOOptionBits);IOByteCount getLength();void release();};
 #define OSSafeReleaseNULL(p) do {if(p){p->release();p=nullptr;}}while(0)
-struct Probe { IOMemoryMap *bootMapping;
+struct Probe { IOMemoryMap *bootMapping;uint32_t panelWidth,panelHeight;
 '''+methods+'\n};\nvoid check(Probe *p){p->sdeProbe();p->sdeDiag();}\n'
     (out/'probe-arm.cpp').write_text(arm, encoding='utf8', newline='\n')
     run('probe-arm64', [a.cxx,'-target','arm64-apple-ios17.0','-std=c++17','-ffreestanding','-fno-exceptions','-fno-rtti','-Wall','-Wextra','-Werror','-c',str(out/'probe-arm.cpp'),'-o',str(out/'probe.o')])

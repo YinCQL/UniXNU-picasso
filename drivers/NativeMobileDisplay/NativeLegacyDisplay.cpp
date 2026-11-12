@@ -457,7 +457,7 @@ public:
         IOMemoryDescriptor *mdp=IOMemoryDescriptor::withPhysicalAddress(0xae00000,0x90000,kIODirectionInOut);
         IOMemoryMap *map=mdp?mdp->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
         if(mdp)mdp->release();
-        if(!map) { printf("PICASSO_SDE mdp map failed\n"); return; }
+        if(!map || !map->getVirtualAddress()) {OSSafeReleaseNULL(map);printf("PICASSO_SDE mdp map failed\n");return;}
         volatile uint32_t *m=(volatile uint32_t *)map->getVirtualAddress();
         printf("PICASSO_SDE version=%08x top",sdeRead(m,0));
         for(uint32_t o=0;o<0x40;o+=4)printf(" %x",sdeRead(m,0x1000+o));
@@ -492,13 +492,13 @@ public:
         IOMemoryDescriptor *vbif=IOMemoryDescriptor::withPhysicalAddress(0xaeb0000,0x1040,kIODirectionInOut);
         IOMemoryMap *vmap=vbif?vbif->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
         if(vbif)vbif->release();
-        if(vmap) {
+        if(vmap && vmap->getVirtualAddress()) {
             volatile uint32_t *v=(volatile uint32_t *)vmap->getVirtualAddress();
             printf("PICASSO_SDE vbif");
             for(uint32_t o=0;o<=0x40;o+=4)printf(" %x",sdeRead(v,o));
             printf("\n");
-            vmap->release();
         }
+        OSSafeReleaseNULL(vmap);
     }
     bool start(IOService *provider) override {
         if(!startDisplay(provider))return false;
@@ -1098,13 +1098,17 @@ public:
         IOMemoryDescriptor *smmu=IOMemoryDescriptor::withPhysicalAddress(0x15000000,0xd0000,kIODirectionIn);
         IOMemoryMap *map=smmu?smmu->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
         if(smmu)smmu->release();
-        if(!map) {printf("PICASSO_SMMU map failed\n");return;}
+        if(!map || !map->getVirtualAddress()) {OSSafeReleaseNULL(map);printf("PICASSO_SMMU map failed\n");return;}
         volatile uint32_t *s=(volatile uint32_t *)map->getVirtualAddress();
         const uint32_t scr0=s[0],idr0=s[0x20/4],idr1=s[0x24/4];
         const unsigned groups=(idr0&255)>128?128:(idr0&255),banks=idr1&255;
         const unsigned pages=1u<<(((idr1>>28)&7)+1);
         printf("PICASSO_SMMU scr0=%x idr0=%x idr1=%x groups=%u banks=%u pages=%u gfsr=%x\n",
             scr0,idr0,idr1,groups,banks,pages,s[0x58/4]);
+        // This probe uses 4 KiB pages and must keep every context bank inside its mapping.
+        if((idr1&0x80000000u) || !banks || banks>128 || pages>128 || (pages+banks)*4096u>0xd0000u) {
+            map->release();return;
+        }
         unsigned valid=0;
         for(unsigned i=0;i<groups;i++) {
             const uint32_t smr=s[(0x800+4*i)/4];

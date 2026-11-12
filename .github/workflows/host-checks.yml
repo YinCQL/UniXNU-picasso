@@ -3,7 +3,7 @@ name: Picasso host regressions
 on:
   workflow_dispatch:
   push:
-    branches: [feat/ios16, feat/ios16-gpu, feat/ios16-dsp, feat/fix-v1]
+    branches: [main-ios16, feat/ios16, feat/ios16-gpu, feat/ios16-dsp, feat/fix-v1]
     paths:
       - '.github/workflows/host-checks.yml'
       - 'scripts/**'
@@ -65,6 +65,11 @@ jobs:
             --output out/picasso/host-checks/linux-host
           cp out/picasso/host-checks/linux-host/results.json out/picasso/logs/linux-host-deps-host.json
 
+      - name: Check Data seed generation boundaries
+        run: |
+          python3 scripts/check-picasso-data-seed.py --tree "$UNIXNU_TREE" \
+            --output out/picasso/logs/data-seed-host.json
+
       - name: Replay UI runtime XNU changes and check errors
         run: |
           python3 scripts/check-picasso-ui-replay.py --tree "$UNIXNU_TREE" --output out/picasso/host-checks/ui-runtime
@@ -80,7 +85,7 @@ jobs:
           cp out/picasso/host-checks/ui-trust/results.json out/picasso/logs/ui-trust-host.json
 
       - name: Check PR13 GPU firmware and staged probe
-        if: github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp'
+        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp' || github.ref_name == 'feat/fix-v1'
         run: |
           python3 scripts/check-picasso-gpu-firmware.py --output out/picasso/host-checks/gpu-firmware
           cp out/picasso/host-checks/gpu-firmware/results.json out/picasso/logs/gpu-firmware-host.json
@@ -88,7 +93,7 @@ jobs:
             make -C drivers/NativeAdrenoPicasso/Test test CC=clang CXX=clang++
 
       - name: Check bounded DC ZVA fallback
-        if: github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp'
+        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp' || github.ref_name == 'feat/fix-v1'
         run: |
           python3 scripts/check-picasso-zva.py --output out/picasso/host-checks/zva
           cp out/picasso/host-checks/zva/results.json out/picasso/logs/zva-host.json
@@ -99,13 +104,13 @@ jobs:
           cp out/picasso/host-checks/astc-guard/results.json out/picasso/logs/astc-guard-host.json
 
       - name: Check PR13 WLAN firmware and handshake
-        if: github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp'
+        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp' || github.ref_name == 'feat/fix-v1'
         run: |
           python3 scripts/check-picasso-wlan.py --output out/picasso/host-checks/wlan
           cp out/picasso/host-checks/wlan/results.json out/picasso/logs/wlan-host.json
 
       - name: Check Picasso ADSP survey and firmware inputs
-        if: github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp'
+        if: github.ref_name == 'feat/ios16-dsp' || github.ref_name == 'feat/fix-v1'
         run: |
           python3 scripts/check-picasso-adsp.py --output out/picasso/host-checks/adsp
           cp out/picasso/host-checks/adsp/results.json out/picasso/logs/adsp-host.json
@@ -121,7 +126,7 @@ jobs:
           cp out/picasso/host-checks/adsp-boot/results.json out/picasso/logs/adsp-boot-host.json
 
       - name: Check GOP import and completion ownership
-        if: github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp'
+        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp' || github.ref_name == 'feat/fix-v1'
         run: |
           python3 scripts/check-picasso-gop-handoff.py --output out/picasso/host-checks/gop-handoff
           cp out/picasso/host-checks/gop-handoff/results.json out/picasso/logs/gop-handoff-host.json
@@ -218,6 +223,7 @@ jobs:
             device/out/picasso/host-checks/hid-plan/*.log
             device/out/picasso/host-checks/keystore/*.log
             device/out/picasso/host-checks/pr18/*.log
+            device/out/picasso/host-checks/pr19/*.log
             device/out/picasso/host-checks/ui-runtime/startup/*.log
             device/out/picasso/host-checks/ufs-cache/*.log
             device/out/picasso/host-checks/ufs-persistence/*.log
