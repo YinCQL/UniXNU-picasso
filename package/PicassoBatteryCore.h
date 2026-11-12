@@ -127,6 +127,8 @@ struct Snapshot {
     unsigned refreshMs=5000;
     bool inputCapVerified=false;
     int inputCapError=0,inputConfiguredMa=0;
+    bool inputControlVerified=false;
+    int inputControlError=0,inputTargetMa=0,inputSourceMa=0;
 };
 // Board low-voltage thresholds and 50 mV recovery hysteresis. Require fresh
 // observations across three seconds before escalating a voltage dip. The OS

@@ -21,7 +21,7 @@ def run(name,cmd):
  q=subprocess.run(cmd,capture_output=True,text=True,timeout=90);(out/(name+'.log')).write_text(q.stdout+q.stderr)
  if q.returncode:raise RuntimeError(q.stdout+q.stderr)
  runs.append(dict(name=name,command=list(map(str,cmd)),passed=True,output=q.stdout));return q
-for kind in ['power','battery','charger','smc']:
+for kind in ['power','battery','charger','charger-control','smc']:
  for variant,flags in [('normal',[]),('sanitized',['-fsanitize=address,undefined','-fno-sanitize-recover=all'])]:
   name=kind+'-'+variant;exe=out/name
   run(name+'-compile',['clang++-18','-std=c++17','-Wall','-Wextra','-Werror','-O1',*flags,'-I',str(ROOT/'package'),'-I',str(out),str(ROOT/'scripts/tests'/('picasso-'+kind+'-host.cpp')),'-o',str(exe)])
@@ -30,6 +30,6 @@ for name in ['PicassoPower','PicassoBattery']:
  body=(ROOT/'package'/(name+'.cpp')).read_text();body=re.sub(r'^#include <[^>]+>[^\n]*\n','',body,flags=re.M)
  (out/(name+'.cpp')).write_text('#include "picasso-input-kernel-api.h"\nextern "C" int (*PE_halt_restart)(unsigned);\nenum {kPEHaltCPU=0};\n'+body)
  run(name+'-arm64',['clang++-18','-target','arm64-apple-ios17.0','-std=c++17','-ffreestanding','-fno-exceptions','-fno-rtti','-fno-threadsafe-statics','-fno-c++-static-destructors','-mgeneral-regs-only','-Wall','-Wextra','-Werror','-I',str(ROOT/'scripts/tests'),'-I',str(ROOT/'package'),'-c',str(out/(name+'.cpp')),'-o',str(out/(name+'.o'))])
-inputs=['package/PicassoPower.cpp','package/PicassoPowerCore.h','package/PicassoBattery.cpp','package/PicassoBatteryCore.h','package/PicassoChargerCore.h','package/PicassoBatteryProfile.h','package/PicassoBattery.h','package/PicassoSpmi.cpp','package/PicassoSpmiCore.h','package/PicassoSpmi.h','package/PicassoDisplay.cpp','scripts/build-picasso-display.py','scripts/check-picasso-display-artifacts.py','scripts/check-picasso-power.py','scripts/tests/picasso-power-host.cpp','scripts/tests/picasso-battery-host.cpp','scripts/tests/picasso-charger-host.cpp','scripts/tests/picasso-smc-host.cpp']
+inputs=['package/PicassoPower.cpp','package/PicassoPowerCore.h','package/PicassoBattery.cpp','package/PicassoBatteryCore.h','package/PicassoChargerCore.h','package/PicassoBatteryProfile.h','package/PicassoBattery.h','package/PicassoSpmi.cpp','package/PicassoSpmiCore.h','package/PicassoSpmi.h','package/PicassoDisplay.cpp','scripts/build-picasso-display.py','scripts/check-picasso-display-artifacts.py','scripts/check-picasso-power.py','scripts/tests/picasso-power-host.cpp','scripts/tests/picasso-battery-host.cpp','scripts/tests/picasso-charger-host.cpp','scripts/tests/picasso-charger-control-host.cpp','scripts/tests/picasso-smc-host.cpp']
 (out/'results.json').write_text(json.dumps(dict(passed=True,hardware_tested=False,kernel_sdk_compiled=False,scope=__doc__,runs=runs,inputs={n:hashlib.sha256((ROOT/n).read_bytes()).hexdigest() for n in inputs}),indent=2)+'\n')
 print('PASS power sequencing, callback dispatch, QG snapshots/estimation and ARM64 compilation; host doubles only')

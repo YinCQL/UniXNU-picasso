@@ -143,6 +143,9 @@ void PicassoPowerSource::publish(const picasso_battery::Snapshot &s){
     setAtWarnLevel(s.warn);setAtCriticalLevel(s.critical);
     flag("PicassoNetCharging",s.netCharging);adapter(s);
     number("PicassoUSBVoltageLimitMV",5000);number("PicassoUSBCurrentLimitMA",3000);
+    flag("PicassoUSBInputControlVerified",s.inputControlVerified);
+    number("PicassoUSBInputControlError",uint32_t(s.inputControlError));
+    number("PicassoUSBTargetMA",s.inputTargetMa);number("PicassoUSBSourceMA",s.inputSourceMa);
     flag("PicassoUSBInputCapVerified",s.inputCapVerified);
     number("PicassoUSBInputCapError",uint32_t(s.inputCapError));
     if(s.inputCapVerified)number("PicassoUSBConfiguredLimitMA",s.inputConfiguredMa);
@@ -213,6 +216,7 @@ void PicassoPowerSource::refresh(){
             erase("PicassoUSBVoltageMV");erase("PicassoUSBCurrentMA");
             erase("PicassoUSBInputLimitMA");erase("PicassoInputLimited");
             flag("PicassoUSBInputCapVerified",false);erase("PicassoUSBConfiguredLimitMA");
+            flag("PicassoUSBInputControlVerified",false);erase("PicassoUSBTargetMA");erase("PicassoUSBSourceMA");
             setAtWarnLevel(false);setAtCriticalLevel(false);
             erase("Voltage");erase("Amperage");erase("InstantAmperage");erase("Temperature");
             updateStatus();

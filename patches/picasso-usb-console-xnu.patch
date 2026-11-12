@@ -14,7 +14,7 @@ diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,3235 @@
+@@ -0,0 +1,3289 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -2594,12 +2594,68 @@ new file mode 100644
 +	picasso_usb_system_reset();
 +}
 +
++/* The battery worker requests a bounded BC1.2 detection interval only
++ * without a configured data host. PHY ownership follows the DWC poll lock.
++ * The normal poller restores the PHY even if the battery worker fails. */
++static uintptr_t charger_phy,charger_eud;
++static uint32_t charger_saved[3];
++static uint64_t charger_deadline;
++static const unsigned charger_regs[3] = { 0x64, 0x3c, 0x94 };
++static const uint32_t charger_masks[3] = { 0x0c, 0x18, 0x01 };
++
++static int
++ud_charger_restore(void)
++{
++    int error = 0;
++    for (unsigned i = 3; i > 0; --i) {
++        unsigned n = i - 1;
++        uint32_t value = usb_rd(charger_phy, charger_regs[n]);
++        usb_wr(charger_phy, charger_regs[n],
++            (value & ~charger_masks[n]) | (charger_saved[n] & charger_masks[n]));
++        if ((usb_rd(charger_phy, charger_regs[n]) & charger_masks[n]) !=
++            (charger_saved[n] & charger_masks[n])) error = -54;
++    }
++    if (!error) charger_deadline = 0;
++    return error;
++}
++
++int
++picasso_usb_charger_detect(unsigned begin)
++{
++    if (!pur_live || !charger_phy || !charger_eud || ud.panic_mode) return -52;
++    if (!os_atomic_cmpxchg(&ud.poll_lock, 0, 1, acquire)) return -53;
++    int error = 0;
++    if (!begin) {
++        if (charger_deadline) error = ud_charger_restore();
++    } else if (charger_deadline || ud.configured || ud.host_open || usb_rd(charger_eud, 0)) {
++        error = -53;
++    } else {
++        for (unsigned i = 0; i < 3; ++i)
++            charger_saved[i] = usb_rd(charger_phy, charger_regs[i]);
++        clock_interval_to_deadline(2000, NSEC_PER_MSEC, &charger_deadline);
++        const uint32_t values[3] = { 0x0c, 0x08, 0x01 };
++        for (unsigned i = 0; i < 3; ++i) {
++            usb_wr(charger_phy, charger_regs[i],
++                (charger_saved[i] & ~charger_masks[i]) | values[i]);
++            if ((usb_rd(charger_phy, charger_regs[i]) & charger_masks[i]) != values[i]) {
++                error = -54;
++                (void)ud_charger_restore();
++                break;
++            }
++        }
++    }
++    os_atomic_store(&ud.poll_lock, 0, release);
++    return error;
++}
++
 +static bool
 +ud_poll_serialized(void)
 +{
 +	if (!os_atomic_cmpxchg(&ud.poll_lock, 0, 1, acquire)) {
 +		return false;
 +	}
++	if (charger_deadline && mach_absolute_time() >= charger_deadline)
++		(void)ud_charger_restore();
 +	ud_poll();
 +	/* picasso_session_s=N: a bounded test session ends in Fastboot by itself, the
 +	 * same way the reboot-fastboot console command does, so no button is needed. */
@@ -2726,17 +2782,14 @@ new file mode 100644
 +ud_thread(void *arg __unused, wait_result_t wr __unused)
 +{
 +	uint64_t polls = 0;
-+	struct ud_poller_progress progress = { 0 };
++	struct ud_poller_progress progress = { false, false, 0, 0, 0 };
 +	bool first_yield = true;
 +	const volatile uint64_t *timer_irqs = &armcpu_timer_interrupts;
 +
-+	/*
-+	 * Keep the bounded spin, then allow other runnable work to proceed.
-+	 * In this XNU, zero depresses to priority 0 without a restore timeout;
-+	 * 1 ms arms the priority-restoration timer. It is not a return deadline
-+	 * and still requires working timer IRQ delivery and scheduling.
-+	 */
-+	printf("PICASSO USB: busy poller started\n");
++	/* A priority yield stays runnable and burns a core when the device is
++	 * otherwise idle. The normal thread can block on the working timer;
++	 * early boot, panic flushing and reset retain their bounded polling. */
++	printf("PICASSO USB: sleeping poller started\n");
 +	for (;;) {
 +		ud_background_poll(&progress);
 +		polls++;
@@ -2744,17 +2797,16 @@ new file mode 100644
 +			printf("PICASSO USB: poller heartbeat polls=%llu events=%llu rx_busy=%u\n",
 +			    polls, ud.events, ud.rx_busy ? 1u : 0u);
 +		}
-+		picasso_usb_busy_wait(100);
 +		bool report_yield = first_yield && !ud.panic_mode;
 +		first_yield = false;
 +		if (report_yield) {
-+			printf("PICASSO USB: background first yield begin depress_ms=1 mono_ns=%llu timer_irqs=%llu timer_irq_valid=%u\n",
++			printf("PICASSO USB: background first sleep begin interval_ms=1 mono_ns=%llu timer_irqs=%llu timer_irq_valid=%u\n",
 +			    ud_monotonic_ns(), ud_timer_irq_snapshot(timer_irqs),
 +			    timer_irqs != NULL ? 1u : 0u);
 +		}
-+		thread_yield_internal(1);
++		ud_sleep_ms(1);
 +		if (report_yield && !ud.panic_mode) {
-+			printf("PICASSO USB: background first yield end mono_ns=%llu timer_irqs=%llu timer_irq_valid=%u\n",
++			printf("PICASSO USB: background first sleep end mono_ns=%llu timer_irqs=%llu timer_irq_valid=%u\n",
 +			    ud_monotonic_ns(), ud_timer_irq_snapshot(timer_irqs),
 +			    timer_irqs != NULL ? 1u : 0u);
 +		}
@@ -3060,6 +3112,8 @@ new file mode 100644
 +			printf("PICASSO USB: APSS watchdog retained timeout=%u ms\n",
 +			    APSS_WDT_TIMEOUT_MS);
 +		}
++		charger_phy = ml_io_map(0x088e3000, 0x1000);
++		charger_eud = ml_io_map(0x088e2000, 0x1000);
 +		kern_return_t result = kernel_thread_start(ud_thread, NULL, &thread);
 +		if (result == KERN_SUCCESS) {
 +			thread_deallocate(thread);
