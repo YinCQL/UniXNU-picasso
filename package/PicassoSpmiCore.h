@@ -14,10 +14,11 @@ template<class Bus> int completion(Bus &bus) {
     }
     return timeout;
 }
-template<class Bus> int read8(Bus &bus, uint8_t reg, uint8_t &value, unsigned &retries) {
+template<class Bus> int read8(Bus &bus, uint8_t reg, uint8_t &value, unsigned &retries, const bool *stopped=nullptr) {
     retries=0;
     for (;;) {
         auto irq=bus.lock();
+        if (stopped && __atomic_load_n(stopped,__ATOMIC_ACQUIRE)) {bus.unlock(irq);return unavailable;}
         bus.write(0,(1U<<27)|(uint32_t(reg)<<4));
         int error=completion(bus);
         if (!error) value=uint8_t(bus.read(0x18));
@@ -30,8 +31,9 @@ template<class Bus> int read8(Bus &bus, uint8_t reg, uint8_t &value, unsigned &r
         bus.delay();
     }
 }
-template<class Bus> int write8(Bus &bus, uint8_t reg, uint8_t value) {
+template<class Bus> int write8(Bus &bus, uint8_t reg, uint8_t value, const bool *stopped=nullptr) {
     auto irq=bus.lock();
+    if (stopped && __atomic_load_n(stopped,__ATOMIC_ACQUIRE)) {bus.unlock(irq);return unavailable;}
     bus.write(0x10,value);
     bus.write(0,uint32_t(reg)<<4);
     int error=completion(bus);

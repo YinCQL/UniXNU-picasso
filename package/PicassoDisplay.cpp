@@ -31,6 +31,8 @@ void picasso_keystore_probe(void);
 void picasso_hid_start_later(void);
 void picasso_pr13_start(void);
 void picasso_backlight_start(IOService *);
+void picasso_power_start(void);
+void picasso_battery_observe_start(void);
 void native_gop_presenter_static_init(void) __asm__("__GLOBAL__sub_I_NativeGOPPresenter.cpp");
 bool native_gop_glue_start(IOService *nub);
 void picasso_hid_frame_presented(void);
@@ -346,6 +348,8 @@ static void picasso_network_stack_start(void) {
 }
 
 extern "C" void native_legacy_display_late_probe(void) {
+    picasso_power_start();
+    picasso_battery_observe_start();
     picasso_network_stack_start();
     picasso_keystore_probe();
     IOService *display = pendingDisplay;

@@ -5,6 +5,7 @@
 #include "PicassoSpmiCore.h"
 namespace {
 IOSimpleLock *controllerLock;
+bool controllerStopped;
 struct Channel {
     volatile uint32_t *va;
     IOSimpleLock *mutex;
@@ -33,7 +34,7 @@ extern "C" int picasso_spmi_read8(volatile uint32_t *va,uint8_t reg,uint8_t &val
     if (!mutex || !va) return picasso_spmi::unavailable;
     Channel channel{va,mutex};
     unsigned retries=0;
-    int error=picasso_spmi::read8(channel,reg,value,retries);
+    int error=picasso_spmi::read8(channel,reg,value,retries,&controllerStopped);
     // No allocation, sleeping or logging while the IRQ-disabling lock is held.
     if (error || retries) {
         static unsigned reports;
@@ -46,5 +47,16 @@ extern "C" int picasso_spmi_write8(volatile uint32_t *va,uint8_t reg,uint8_t val
     IOSimpleLock *mutex=__atomic_load_n(&controllerLock,__ATOMIC_ACQUIRE);
     if (!mutex || !va) return picasso_spmi::unavailable;
     Channel channel{va,mutex};
-    return picasso_spmi::write8(channel,reg,value);
+    return picasso_spmi::write8(channel,reg,value,&controllerStopped);
+}
+
+// Drain the last transaction under the same lock, then refuse all later
+// commands. Used only at final power-off, before secure arbiter shutdown.
+extern "C" int picasso_spmi_quiesce() {
+    IOSimpleLock *mutex=__atomic_load_n(&controllerLock,__ATOMIC_ACQUIRE);
+    if(!mutex)return picasso_spmi::unavailable;
+    IOInterruptState irq=IOSimpleLockLockDisableInterrupt(mutex);
+    __atomic_store_n(&controllerStopped,true,__ATOMIC_RELEASE);
+    IOSimpleLockUnlockEnableInterrupt(mutex,irq);
+    return 0;
 }

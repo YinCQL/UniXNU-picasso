@@ -34,8 +34,9 @@ struct Bus {
     uint32_t statuses[3]={1,1,1},cmd=0;
     unsigned calls=0,polls=0,delays=0,doneAfter=0,data=0xab;
     bool writes=false;
+    bool *stopOnUnlock=nullptr;
     int lock(){enter(&c.mutex);assert(!c.active);c.active=1;c.owner=id;++c.locks;return 17;}
-    void unlock(int state){assert(state==17 && c.active==1 && c.owner==id);c.active=0;++c.unlocks;leave(&c.mutex);}
+    void unlock(int state){assert(state==17 && c.active==1 && c.owner==id);c.active=0;++c.unlocks;if(stopOnUnlock)__atomic_store_n(stopOnUnlock,true,__ATOMIC_RELEASE);leave(&c.mutex);}
     void write(unsigned off,uint32_t value){
         assert(c.active==1 && c.owner==id);
         if(off==0x10){assert(writes && value==0x56);return;}
@@ -92,6 +93,18 @@ int main(){
         int error=picasso_spmi::write8(b,0x53,0x56);
         assert(error==(status&1?int(status&14):-1)); // A write is never retried.
         assert(c.commands==1 && !c.dataReads && c.unlocks==1 && !c.active);++cases;
+    }
+    {
+        Controller c;Bus b{c,1};bool stopped=true;uint8_t value=0x77;unsigned retries=99;
+        assert(picasso_spmi::read8(b,0x10,value,retries,&stopped)==-4 && value==0x77);
+        b.writes=true;assert(picasso_spmi::write8(b,0x53,0x56,&stopped)==-4);
+        assert(!c.commands&&!c.dataReads&&c.locks==2&&c.unlocks==2&&!c.active);
+    }
+    {
+        Controller c;Bus b{c,1};bool stopped=false;b.stopOnUnlock=&stopped;b.statuses[0]=9;
+        uint8_t value=0x77;unsigned retries=0;
+        assert(picasso_spmi::read8(b,0x10,value,retries,&stopped)==-4 && value==0x77);
+        assert(stopped&&retries==1&&c.commands==1&&!c.dataReads&&c.locks==2&&c.unlocks==2);
     }
     // Four APIDs (buttons, WLED observer/writer) contend on one controller.
     Controller c;Work w[4]={{&c,1},{&c,2},{&c,3},{&c,4}};
