@@ -22,15 +22,15 @@ struct Window {
     ~Window(){OSSafeReleaseNULL(map);}
 };
 struct Backend {
-    Window channels[7],adcWriter,usbWriter;
-    bool chargerReady=false,chargerReported=false;
+    Window channels[7],adcWriter,usbWriter,miscWriter;
+    bool chargerReady=false,chargerReported=false,aiclReady=false;
     int lastChargerError=0,lastControlError=0;
     unsigned lastConfiguredMa=0,lastControlState=99,lastSourceMa=0;
     picasso_charger::Controller controller;
     picasso_charger::Control control;
     bool cableValid=false;
     uint8_t cableState[5]={};
-    uint8_t lastDetect[11]={};
+    uint8_t lastDetect[13]={};
     bool adapterHistory=false;
     int peakInputMa=0,bestBatteryMa=0,startPercent=0,endPercent=0;
     uint64_t adapterStart=0,adapterEnd=0;
@@ -42,6 +42,7 @@ struct Backend {
     int write(uint8_t reg,uint8_t value){return picasso_spmi_write8(adcWriter.va,reg,value);}
     int chargerRead(uint8_t reg,uint8_t &value){return read(1,reg,value);}
     int chargerWrite(uint8_t reg,uint8_t value){return picasso_spmi_write8(usbWriter.va,reg,value);}
+    int miscWrite(uint8_t reg,uint8_t value){return aiclReady?picasso_spmi_write8(miscWriter.va,reg,value):-51;}
     void restrictInput(){
         charger=chargerReady?picasso_charger::restrictInput(*this):picasso_charger::Result{};
         if(!chargerReady)charger.error=-51;
@@ -71,10 +72,10 @@ struct Backend {
         return changed?1:0;
     }
     void report(const picasso_charger::Source &src,const picasso_battery::Input &input){
-        const uint8_t detect[11]={charger.highVoltageOptions,charger.startOnCc,input.apsd,input.result,
-            src.sink,src.misc,src.machine,src.thermal,src.die,src.skin,src.connector};
+        const uint8_t detect[13]={charger.highVoltageOptions,charger.startOnCc,input.apsd,input.result,
+            src.sink,src.misc,src.machine,src.debug,src.otg,src.thermal,src.die,src.skin,src.connector};
         bool detectChanged=false;
-        for(unsigned i=0;i<11;++i)if(detect[i]!=lastDetect[i])detectChanged=true;
+        for(unsigned i=0;i<13;++i)if(detect[i]!=lastDetect[i])detectChanged=true;
         if(detectChanged || !chargerReported || charger.error!=lastChargerError || charger.writes || charger.configuredMa!=lastConfiguredMa ||
             control.state!=lastControlState || control.sourceMa!=lastSourceMa || control.error!=lastControlError){
             IOLog("PICASSO_CHARGER cap_mv=%u cap_ma=%u cfg_ma=%u verified=%u error=%d writes=%u mode=source-control\n",
@@ -82,10 +83,10 @@ struct Backend {
             IOLog("PICASSO_CHARGER source_ma=%u target_ma=%u state=%u ok=%u error=%d fallback=%d cc=%02x/%02x/%02x thermal=%02x/%02x/%02x/%02x aicl=%02x\n",
                 control.sourceMa,control.targetMa,control.state,control.verified,control.error,control.fallbackError,
                 src.sink,src.misc,src.legacy,src.thermal,src.die,src.skin,src.connector,src.aiclOptions);
-            IOLog("PICASSO_CHARGER detect options=%02x bc12=%u trigger=%02x apsd=%02x/%02x cc_state=%02x no_cc=%u thermal=%02x/%02x/%02x/%02x\n",
+            IOLog("PICASSO_CHARGER detect options=%02x bc12=%u trigger=%02x apsd=%02x/%02x cc_state=%02x no_cc=%u legacy_vbus=%u debug=%02x otg=%02x thermal=%02x/%02x/%02x/%02x\n",
                 charger.highVoltageOptions,(charger.highVoltageOptions&8)!=0,charger.startOnCc,input.apsd,input.result,
-                src.machine,picasso_charger::noCc(src),src.thermal,src.die,src.skin,src.connector);
-            for(unsigned i=0;i<11;++i)lastDetect[i]=detect[i];
+                src.machine,picasso_charger::noCc(src),picasso_charger::legacyVbus(input,src),src.debug,src.otg,src.thermal,src.die,src.skin,src.connector);
+            for(unsigned i=0;i<13;++i)lastDetect[i]=detect[i];
             chargerReported=true;lastChargerError=charger.error;lastConfiguredMa=charger.configuredMa;
             lastControlState=control.state;lastSourceMa=control.sourceMa;lastControlError=control.error;
         }
@@ -128,6 +129,7 @@ extern "C" void *picasso_battery_open(){
         if(!ok && i<4){delete b;return nullptr;}
         if(i==1)b->chargerReady=ok && b->usbWriter.open(0xc600000+unsigned(apid[i])*0x10000,0x1000);
         if(i==4)b->adcReady=ok && b->adcWriter.open(0xc600000+unsigned(apid[i])*0x10000,0x1000);
+        if(i==6)b->aiclReady=ok && b->miscWriter.open(0xc600000+unsigned(apid[i])*0x10000,0x1000);
     }
     uint8_t type=0;int error=b->read(0,4,type);
     if(!error)error=b->read(0,5,b->subtype);
