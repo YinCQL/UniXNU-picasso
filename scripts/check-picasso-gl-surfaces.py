@@ -9,6 +9,8 @@ p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--source', type=Path, default=ROOT/'drivers/NativeGL/eagl/eagl.c')
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--expect-stale-mipmap', action='store_true')
+p.add_argument('--expect-stale-upload', action='store_true')
+p.add_argument('--expect-stale-group', action='store_true')
 p.add_argument('--expect-unpublished', action='store_true')
 p.add_argument('--expect-unflipped', action='store_true')
 p.add_argument('--expect-stale-read', action='store_true')
@@ -39,7 +41,11 @@ static void ktrace(const char *fmt,...){
     }
 }
 static void eagl_trace(const char *fmt,...){(void)fmt;}
-static void nativegl_text(const char *s){(void)s;}
+static void nativegl_text(const char *s){
+    if (!strncmp(s,"target-refresh ",15)) {
+        assert(strlen(s)<sizeof(refresh_note_last));strcpy(refresh_note_last,s);++refresh_note_count;
+    }
+}
 static void nativegl_mark(unsigned v){(void)v;}
 static uint64_t now_us(void){static uint64_t t;return ++t;}
 static bool compositor_claim(unsigned b,unsigned k){(void)b;(void)k;return false;}
@@ -63,7 +69,7 @@ static GLuint shown_texture;
 static unsigned group_read_names[4],group_read_count;
 static void group_read(struct eagl *e,GLuint t){(void)e;assert(group_read_count<4);group_read_names[group_read_count++]=t;}
 static void vblur_forget(struct eagl *e,GLuint t){(void)e;(void)t;}
-static void group_forget(struct eagl *e,GLuint t){(void)e;(void)t;}
+static void group_forget(struct eagl *e,GLuint t);
 static struct group_texture *group_of(struct eagl *e,GLuint t){(void)e;(void)t;return NULL;}
 static struct eagl *context_of(id o){return o;}
 static void eagl_enter(struct eagl *e,unsigned o){(void)e;(void)o;}
@@ -74,7 +80,7 @@ static bool hakios_gl_surface_texture(struct hakios_gl *g,unsigned s);
 #define EAGL_LEAVE(e,o) eagl_leave(e,o)
 '''
 body += 'static bool image_publish(struct eagl *,struct image *,const char *);\nstatic bool surface_publish_aliases(struct eagl *,IOSurfaceRef);\n'
-names = ['texture_definition_of','texture_defined','image_of','image_new','image_forget','internal_format','bytes_a_pixel',
+names = ['texture_definition_of','texture_defined','image_of','group_forget','image_new','image_forget','internal_format','bytes_a_pixel',
          'surface_mirrored','surface_shared']
 if 'surface_render_copy(' in s: names += ['surface_render_copy']
 if 'image_render_target(' in s: names += ['image_render_target']
@@ -91,13 +97,16 @@ else:
         at=generated.index('static void\n'+name+'(')
         body += generated[at:generated.index('\n}',at)+2]+'\n'
         body += '#define '+alias+' '+name+'\n'
+body += "\nstatic unsigned stale_group_materializations;\n"
+body += "static void registration_flatten(struct eagl *e,GLuint t,struct group_texture *g){(void)e;(void)t;g->state=GROUP_NONE;++stale_group_materializations;}\n"
+body += fn('group_read').replace('group_read(', 'registration_read(').replace('group_flatten(', 'registration_flatten(')
 (out/'gl-body.inc').write_text(body)
 fixture = ROOT/'scripts/tests/picasso-gl-surfaces-host.c'
 runs = []
 for name, flags in [('normal', []), ('asan', ['-fsanitize=address,undefined','-fno-omit-frame-pointer','-fno-sanitize-recover=all'])]:
     binary = out/name
     commands = [('compile', ['clang-18','-std=c11','-O1','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable',
-                 *flags,*(['-DEXPECT_CONTAMINATED_UPLOAD'] if a.expect_contaminated_upload else []),*(['-DEXPECT_SHARED_RENDER'] if a.expect_shared_render else []),*(['-DEXPECT_STALE_READ'] if a.expect_stale_read else []),*(['-DEXPECT_UNFLIPPED'] if a.expect_unflipped else []),*(['-DEXPECT_UNPUBLISHED'] if a.expect_unpublished else []),*(['-DEXPECT_STALE_MIPMAP'] if a.expect_stale_mipmap else []),'-I',str(out),'-I',str(ROOT/'drivers/NativeGL/eagl'),
+                 *flags,*(['-DEXPECT_STALE_GROUP'] if a.expect_stale_group else []),*(['-DEXPECT_STALE_UPLOAD'] if a.expect_stale_upload else []),*(['-DEXPECT_CONTAMINATED_UPLOAD'] if a.expect_contaminated_upload else []),*(['-DEXPECT_SHARED_RENDER'] if a.expect_shared_render else []),*(['-DEXPECT_STALE_READ'] if a.expect_stale_read else []),*(['-DEXPECT_UNFLIPPED'] if a.expect_unflipped else []),*(['-DEXPECT_UNPUBLISHED'] if a.expect_unpublished else []),*(['-DEXPECT_STALE_MIPMAP'] if a.expect_stale_mipmap else []),'-I',str(out),'-I',str(ROOT/'drivers/NativeGL/eagl'),
                  str(fixture),'-Wl,-l:libGL.so.1','-Wl,-l:libEGL.so.1','-o',str(binary)]),('run',[str(binary)])]
     for step, cmd in commands:
         result = subprocess.run(cmd,capture_output=True,text=True,timeout=90,
@@ -107,6 +116,7 @@ for name, flags in [('normal', []), ('asan', ['-fsanitize=address,undefined','-f
         runs.append(dict(name=name+'-'+step,passed=True,output=result.stdout))
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
 (out/'results.json').write_text(json.dumps(dict(passed=True,hardware_tested=False,baseline=a.expect_unpublished,contaminated_upload_reproduced=a.expect_contaminated_upload,
+    stale_upload_reproduced=a.expect_stale_upload,stale_group_reproduced=a.expect_stale_group,
     source_sha256=sha(a.source),inputs={str(p.relative_to(ROOT)):sha(p) for p in (fixture,Path(__file__))},runs=runs,
-    limitation='Real Mesa GLES pixels; IOSurface allocation, locks and seeds are a host fixture. EGLImage sibling import and storage detachment use real Mesa; native IOSurface backing and Adreno execution require device verification.'),indent=2)+'\n')
+    limitation='Real Mesa GLES pixels; IOSurface allocation, locks and seeds are a host fixture. EGLImage sibling import and storage detachment use real Mesa; Group registration dispatch is production group_read with a materialization observer, not a shader pixel test. Native IOSurface backing and Adreno execution require device verification.'),indent=2)+'\n')
 print(runs[-1]['output'])

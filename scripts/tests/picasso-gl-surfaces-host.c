@@ -28,12 +28,19 @@ static size_t IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef s,unsigned p){(void)p;
 static void *IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef s,unsigned p){(void)p;return s->bytes;}
 static int host_lock_error,host_unlock_error;
 static bool host_race_after_unlock;
-static int IOSurfaceLock(IOSurfaceRef s,unsigned f,void *v){(void)s;(void)f;(void)v;return host_lock_error;}
+static bool host_replace_after_read;
+static int IOSurfaceLock(IOSurfaceRef s,unsigned f,void *v){(void)f;if(v)*(uint32_t *)v=s->seed;return host_lock_error;}
 static int IOSurfaceUnlock(IOSurfaceRef s,unsigned f,void *v){
     if(host_unlock_error)return host_unlock_error;
     if(!f)s->seed++;
     if(v)*(uint32_t *)v=s->seed;
     if(host_race_after_unlock)s->seed++;
+    if(f && host_replace_after_read){
+        for(size_t y=0;y<s->height;y++)for(size_t x=0;x<s->width;x++){
+            unsigned char *p=s->bytes+y*s->row+x*4;p[0]=160;p[1]=80;p[2]=40;p[3]=255;
+        }
+        s->seed++;host_replace_after_read=false;
+    }
     return 0;
 }
 #include "gl-body.inc"
@@ -142,14 +149,14 @@ static void test_copy(void){
     assert(my_texImageIOSurface(e,NULL,&s,GL_TEXTURE_2D,GL_RGBA,4,4,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
     glGenFramebuffers(1,&draw);my_glBindFramebuffer(e,GL_DRAW_FRAMEBUFFER,draw);
     my_glFramebufferTexture2D(e,GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,dest,0);
-    struct group_texture group={0};e->groups=&group;group_read_count=0;
+    e->groups=calloc(GROUP_TEXTURES,sizeof(*e->groups));assert(e->groups);group_read_count=0;
     my_glCopyTexSubImage2D(e,GL_TEXTURE_2D,0,0,0,0,0,4,4);
     assert(group_read_count==2&&group_read_names[0]==source&&group_read_names[1]==dest);
     frame_end(e,false);assert(s.seed==1);
     for(unsigned n=0;n<16;n++)assert(bytes[n*4]==0&&bytes[n*4+1]==255&&bytes[n*4+2]==0&&bytes[n*4+3]==255);
     expect_state(GL_READ_FRAMEBUFFER_BINDING,read);expect_state(GL_DRAW_FRAMEBUFFER_BINDING,draw);
     assert(!glGetError());image_forget(e,dest);glDeleteTextures(1,&source);glDeleteTextures(1,&dest);
-    glDeleteFramebuffers(1,&read);glDeleteFramebuffers(1,&draw);glDeleteFramebuffers(1,&e->reader);free(e);
+    glDeleteFramebuffers(1,&read);glDeleteFramebuffers(1,&draw);glDeleteFramebuffers(1,&e->reader);free(e->groups);free(e);
 }
 static void test_rejections(void){
     struct eagl *e=calloc(1,sizeof(*e));assert(e);unsigned char bytes[128]={0};
@@ -205,7 +212,7 @@ static void test_independent_reads(void){
     glGenTextures(1,&target);my_glBindTexture(e,GL_TEXTURE_2D,target);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,4,4,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
     glGenFramebuffers(1,&draw);my_glBindFramebuffer(e,GL_DRAW_FRAMEBUFFER,draw);
     my_glFramebufferTexture2D(e,GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,target,0);
-    struct group_texture group={0};e->groups=&group;group_read_count=0;unsigned char pixel[4];
+    e->groups=calloc(GROUP_TEXTURES,sizeof(*e->groups));assert(e->groups);group_read_count=0;unsigned char pixel[4];
     my_glReadPixels(e,0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
     assert(group_read_count==1&&group_read_names[0]==source&&pixel[2]==255&&pixel[3]==255);
     my_glCopyTexImage2D(e,GL_TEXTURE_2D,0,GL_RGBA,0,0,4,4,0);
@@ -757,7 +764,81 @@ static void test_mirror_handoff(bool replace, bool invert) {
     glDisable(GL_SCISSOR_TEST);damage_blits=0;free(e);assert(!glGetError());
 }
 
+static void test_upload_seed_race(bool edge) {
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);
+    unsigned char bytes[8*40];memset(bytes,0xa5,sizeof bytes);
+    struct host_surface surface={601,1,'BGRA',0,4,8,8,40,sizeof bytes,bytes};
+    for(unsigned y=0;y<8;y++)for(unsigned x=0;x<8;x++){
+        unsigned char *p=bytes+y*40+x*4;memset(p,255,4);
+    }
+    GLuint texture,fb;glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_attachImage(e,NULL,GL_TEXTURE_2D,&surface,NO));
+    glGenFramebuffers(1,&fb);my_glBindFramebuffer(e,GL_FRAMEBUFFER,fb);
+    my_glFramebufferTexture2D(e,GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0);
+    glDisable(GL_SCISSOR_TEST);glColorMask(1,1,1,1);glClearColor(1,1,1,1);
+    my_glClear(e,GL_COLOR_BUFFER_BIT);frame_end(e,false);
+    struct image *i=image_of(e,texture);assert(i->painted&&!i->drawn);
+    if(edge)for(unsigned y=0;y<8;y++)memset(bytes+y*40,0,3);
+    surface.seed++;
+    host_replace_after_read=true;my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(!host_replace_after_read);
+    unsigned uploads=e->uploads;
+    // Another producer publishes after the read lock ends. This upload contains
+    // the older white image (or its black left column), never the new pixels.
+    for(unsigned repeat=0;repeat<20;repeat++){e->in_frame=false;frame_begin(e);my_glBindTexture(e,GL_TEXTURE_2D,texture);}
+    unsigned char pixels[8*8*4];glReadPixels(0,0,8,8,GL_RGBA,GL_UNSIGNED_BYTE,pixels);assert(!glGetError());
+#ifdef EXPECT_STALE_UPLOAD
+    assert(e->uploads==uploads&&i->seed==surface.seed);
+    for(unsigned y=0;y<8;y++)for(unsigned x=0;x<8;x++){
+        unsigned char *p=pixels+(y*8+x)*4;unsigned v=edge&&x==0?0:255;
+        assert(p[0]==v&&p[1]==v&&p[2]==v&&p[3]==255);
+    }
+#else
+    assert(e->uploads==uploads+1&&i->seed==surface.seed);
+    for(unsigned n=0;n<64;n++)assert(pixels[n*4]==40&&pixels[n*4+1]==80&&pixels[n*4+2]==160&&pixels[n*4+3]==255);
+#endif
+    for(unsigned y=0;y<8;y++)for(unsigned x=32;x<40;x++)assert(bytes[y*40+x]==0xa5);
+    image_forget(e,texture);glDeleteTextures(1,&texture);glDeleteFramebuffers(1,&fb);
+    if(e->reader)glDeleteFramebuffers(1,&e->reader);free(e);glBindFramebuffer(GL_FRAMEBUFFER,0);
+}
+
+static void test_registration_group(bool attach) {
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);
+    e->groups=calloc(GROUP_TEXTURES,sizeof(*e->groups));assert(e->groups);
+    unsigned char bytes[64];memset(bytes,255,sizeof bytes);
+    struct host_surface surface={701,0,'BGRA',0,4,4,4,16,sizeof bytes,bytes};
+    GLuint texture;glGenTextures(1,&texture);assert(texture<GROUP_TEXTURES);
+    my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    struct group_texture *g=&e->groups[texture];g->state=GROUP_VIBRANT;g->colours[19]=1;
+    // Rejected registration retains the old material's state.
+    assert(!my_attachImage(e,NULL,0,&surface,NO)&&g->state==GROUP_VIBRANT);
+    if(attach)assert(my_attachImage(e,NULL,GL_TEXTURE_2D,&surface,NO));
+    else assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,4,4,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+    unsigned before=stale_group_materializations;
+    registration_read(e,texture);
+#ifdef EXPECT_STALE_GROUP
+    assert(stale_group_materializations==before+1);
+#else
+    assert(g->state==GROUP_NONE&&stale_group_materializations==before);
+#endif
+    // Legitimate ordinary groups still reach their materialization path.
+    image_forget(e,texture);g->state=GROUP_VIBRANT;before=stale_group_materializations;
+    registration_read(e,texture);assert(stale_group_materializations==before+1);
+    glDeleteTextures(1,&texture);free(e->groups);free(e);
+}
+
 int main(void){context();
+#ifdef EXPECT_STALE_UPLOAD
+    test_upload_seed_race(false);test_upload_seed_race(true);
+    puts("REPRODUCED stale white snapshot and left black column retained across 20 frames after concurrent publication");return 0;
+#endif
+    test_registration_group(false);test_registration_group(true);
+#ifdef EXPECT_STALE_GROUP
+    puts("REPRODUCED stale group materialization after both IOSurface registration routes");return 0;
+#endif
+    puts("PASS IOSurface registration clears former material state; rejection preserves it; ordinary groups still materialize");
+    test_upload_seed_race(false);test_upload_seed_race(true);
+    puts("PASS concurrent publication: white snapshot and left black column refresh, stable binds avoid reupload, row padding retained");
     for(unsigned r=0;r<2;r++)for(unsigned i=0;i<2;i++)test_mirror_handoff(r,i);
     puts("PASS real EGLImage retirement: deletion/reimport, orientation, complete left edge, failed publication retry and caller GL state");
     for(unsigned k=0;k<4;k++)for(unsigned inv=0;inv<2;inv++)test_surface_handoff(k,inv,k!=0);

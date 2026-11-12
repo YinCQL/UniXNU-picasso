@@ -596,6 +596,7 @@ static void census_report(void);
 static void compositor_framebuffer(struct eagl *e, const char *where);
 static void clear_now(struct eagl *e);
 static void group_read(struct eagl *e, GLuint texture);
+static void group_forget(struct eagl *e, GLuint texture);
 
 static void
 eagl_enter(struct eagl *e, unsigned offset)
@@ -859,6 +860,10 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 		}
 		CFRelease(previous);
 	}
+	/* Registration replaces ordinary texture contents with an IOSurface view.
+	 * Its previous material-group interpretation must not flatten over the new
+	 * image on a later read. Preserve that state if registration failed above. */
+	group_forget(e, texture);
 	return image;
 }
 
@@ -1141,11 +1146,12 @@ surface_to_texture(struct eagl *e, struct image *image)
 	GLint row_length = 0, alignment = 4, skip_rows = 0, skip_pixels = 0, unpack = 0;
 	uint8_t *base, *flipped = NULL;
 	bool alpha_first = image->alpha_first && !planar && pixel == 4;
+	uint32_t seed = image->seed;
 
 	if (image->shared) {
 		return;
 	}
-	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
+	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, &seed) != 0) {
 		e->lock_fails++;
 		say("hakios-gl: an IOSurface cannot be locked\n");
 		return;
@@ -1219,7 +1225,10 @@ surface_to_texture(struct eagl *e, struct image *image)
 	}
 	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
 	free(flipped);
-	image->seed = IOSurfaceGetSeed(surface);
+	/* The upload contains the revision observed when CPU access began. A later
+	 * producer may publish as soon as it ends; never label these older pixels
+	 * with a seed obtained after unlock or the next bind will skip its refresh. */
+	image->seed = seed;
 	e->uploads++;
 	e->upload_bytes += row * (size_t)image->height;
 }
@@ -1343,11 +1352,13 @@ image_publish(struct eagl *e, struct image *image, const char *reason)
 	target_to_surface(e, image);
 	if (e->surface_handoff_notes < 8 || image->drawn) {
 		if (e->surface_handoff_notes < 16) {
+			char line[256];
 			e->surface_handoff_notes++;
-			ktrace("surface-handoff ctx=%p s%u tex%u %ux%u seed%u>%u at=%s ok%u f%u",
+			snprintf(line, sizeof(line), "surface-handoff ctx=%p s%u tex%u %ux%u seed%u>%u at=%s ok%u f%u",
 			    (void *)e, IOSurfaceGetID(image->surface), image->texture,
 			    (unsigned)image->width, (unsigned)image->height, before, image->seed,
 			    reason, !image->drawn, e->frames);
+			nativegl_text(line);
 		}
 	}
 	return !image->drawn;
@@ -1555,11 +1566,13 @@ static void
 image_refresh_note(struct eagl *e, struct image *image, uint32_t seed, const char *at)
 {
 	if (!image->target || e->target_refresh_notes >= 8) return;
+	char line[256];
 	e->target_refresh_notes++;
-	ktrace("target-refresh ctx=%p s%u tex%u %ux%u seed%u>%u p%u m%u i%u at=%s f%u",
+	snprintf(line, sizeof(line), "target-refresh ctx=%p s%u tex%u %ux%u seed%u>%u p%u m%u i%u at=%s f%u",
 	    (void *)e, IOSurfaceGetID(image->surface), image->texture, (unsigned)image->width,
 	    (unsigned)image->height, image->seed, seed, image->painted,
 	    image->mipmapped, image->invert, at, e->frames);
+	nativegl_text(line);
 }
 
 /* An attachment may later be sampled after another renderer updates its

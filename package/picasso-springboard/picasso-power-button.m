@@ -83,7 +83,7 @@ static void picasso_power_image_added(const struct mach_header *header, intptr_t
     };
     if (header->magic != MH_MAGIC_64 || header->cputype != CPU_TYPE_ARM64) return;
     const struct mach_header_64 *h = (const struct mach_header_64 *)header;
-    if (h->sizeofcmds > 65536 || h->ncmds > 128) return;
+    if (h->sizeofcmds > 65536 || h->ncmds > h->sizeofcmds / sizeof(struct load_command)) return;
     const unsigned char *p = (const unsigned char *)(h + 1), *end = p + h->sizeofcmds;
     BOOL matched = NO;
     uintptr_t base = (uintptr_t)header, text_end = 0;
