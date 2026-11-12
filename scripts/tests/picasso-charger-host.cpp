@@ -30,7 +30,8 @@ struct Bus {
 static void preserve(const Bus &b){
     // Source overrides, USB current mode and suspend must not be touched.
     assert(b.data[0x40]==1&&b.data[0x42]==1&&b.data[0x65]==0x9f&&b.data[0x66]==0xf7);
-    assert((b.data[options]&~0x64)==(0xff&~0x64));
+    assert((b.data[options]&~0x6c)==(0xff&~0x6c));
+    assert((b.data[options]&0x6c)==8);
     assert((b.data[allowance]&0xf0)==0xf0&&(b.data[allowOverride]&0xf0)==0xa0);
 }
 int main(){
@@ -46,6 +47,19 @@ int main(){
         assert(q.verified&&!q.error&&q.configuredMa==(value>60?3000:value*50));
         preserve(b);
     }
+    // Exhaust the inherited detector configuration: BC1.2 must be enabled,
+    // QC disabled and all unrelated bits preserved without raising the ICL.
+    for(unsigned bits=0;bits<=255;++bits){
+        Bus b;b.data[options]=uint8_t(bits);b.data[currentLimit]=10;
+        auto q=restrictInput(b);assert(q.verified&&q.configuredMa==500);
+        assert((b.data[options]&0x6c)==8&&(b.data[options]&~0x6c)==(bits&~0x6c));
+        assert(b.data[0x40]==1&&b.data[0x42]==1&&b.data[0x65]==0x9f&&b.data[0x66]==0xf7);
+        auto repeat=restrictInput(b);assert(repeat.verified&&!repeat.writes);
+    }
+    {Bus recorded;recorded.data[options]=0;assert(restrictInput(recorded).verified);
+     unsigned enable=0;for(unsigned i=0;i<recorded.written.size();++i)if(recorded.written[i]==options)enable=i+1;
+     assert(enable);Bus b;b.data[options]=0;b.ignoreWrite=enable;
+     auto q=restrictInput(b);assert(q.error==-50&&!q.verified);}
     // The complete BC1.2 classification byte cannot enable a higher level.
     for(unsigned source=0;source<128;++source){
         Bus b;b.data[8]=uint8_t(source);b.data[9]=1;b.data[currentLimit]=10;

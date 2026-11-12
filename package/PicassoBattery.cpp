@@ -30,6 +30,7 @@ struct Backend {
     picasso_charger::Control control;
     bool cableValid=false;
     uint8_t cableState[5]={};
+    uint8_t lastDetect[10]={};
     bool adapterHistory=false;
     int peakInputMa=0,bestBatteryMa=0,startPercent=0,endPercent=0;
     uint64_t adapterStart=0,adapterEnd=0;
@@ -69,14 +70,22 @@ struct Backend {
         }
         return changed?1:0;
     }
-    void report(const picasso_charger::Source &src){
-        if(!chargerReported || charger.error!=lastChargerError || charger.writes || charger.configuredMa!=lastConfiguredMa ||
+    void report(const picasso_charger::Source &src,const picasso_battery::Input &input){
+        const uint8_t detect[10]={charger.highVoltageOptions,input.apsd,input.result,
+            src.sink,src.misc,src.machine,src.thermal,src.die,src.skin,src.connector};
+        bool detectChanged=false;
+        for(unsigned i=0;i<10;++i)if(detect[i]!=lastDetect[i])detectChanged=true;
+        if(detectChanged || !chargerReported || charger.error!=lastChargerError || charger.writes || charger.configuredMa!=lastConfiguredMa ||
             control.state!=lastControlState || control.sourceMa!=lastSourceMa || control.error!=lastControlError){
             IOLog("PICASSO_CHARGER cap_mv=%u cap_ma=%u cfg_ma=%u verified=%u error=%d writes=%u mode=source-control\n",
                 picasso_charger::maxInputMv,picasso_charger::maxInputMa,charger.configuredMa,charger.verified,charger.error,charger.writes);
             IOLog("PICASSO_CHARGER source_ma=%u target_ma=%u state=%u ok=%u error=%d fallback=%d cc=%02x/%02x/%02x thermal=%02x/%02x/%02x/%02x aicl=%02x\n",
                 control.sourceMa,control.targetMa,control.state,control.verified,control.error,control.fallbackError,
                 src.sink,src.misc,src.legacy,src.thermal,src.die,src.skin,src.connector,src.aiclOptions);
+            IOLog("PICASSO_CHARGER detect options=%02x bc12=%u apsd=%02x/%02x cc_state=%02x no_cc=%u thermal=%02x/%02x/%02x/%02x\n",
+                charger.highVoltageOptions,(charger.highVoltageOptions&8)!=0,input.apsd,input.result,
+                src.machine,picasso_charger::noCc(src),src.thermal,src.die,src.skin,src.connector);
+            for(unsigned i=0;i<10;++i)lastDetect[i]=detect[i];
             chargerReported=true;lastChargerError=charger.error;lastConfiguredMa=charger.configuredMa;
             lastControlState=control.state;lastSourceMa=control.sourceMa;lastControlError=control.error;
         }
@@ -163,7 +172,7 @@ extern "C" int picasso_battery_read(void *context,picasso_battery::Snapshot *out
     picasso_charger::Source source;
     picasso_charger::sourceStatus(*b,source);
     b->control=b->controller.update(*b,sample,input,source,temp,temp!=-10000,now,b->charger);
-    b->report(source);
+    b->report(source,input);
     int pon=0;
     if(!b->ponRead && (sample.status&1)){pon=b->pon();b->ponRead=true;}
     picasso_battery::Snapshot next;
