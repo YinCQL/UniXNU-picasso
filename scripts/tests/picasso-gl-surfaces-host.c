@@ -660,7 +660,108 @@ static void test_external_target_refresh(void) {
     puts("PASS externally updated target: seed refresh at bind/frame begin, full mip levels and left edge, pending local GPU preservation, own publish baseline and post-unlock race, failed publish retry, bounded notes, no unchanged upload");
 }
 
-int main(void){context();test_external_target_refresh();test_mip_refresh();
+
+static void test_surface_handoff(unsigned kind,bool invert,bool fail){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);
+    unsigned char bytes[6*40],replacement[6*40];memset(bytes,0xa5,sizeof bytes);memset(replacement,0x55,sizeof replacement);
+    for(unsigned y=0;y<6;y++)memset(bytes+y*40,0,32);
+    struct host_surface surface={517,0,'BGRA',0,4,8,6,40,sizeof bytes,bytes};
+    struct host_surface next={518,0,'BGRA',0,4,8,6,40,sizeof replacement,replacement};
+    GLuint texture,fb,alias=0;glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_attachImage(e,NULL,GL_TEXTURE_2D,&surface,invert));
+    glGenFramebuffers(1,&fb);my_glBindFramebuffer(e,GL_FRAMEBUFFER,fb);
+    my_glFramebufferTexture2D(e,GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0);
+    glViewport(0,0,8,6);glDisable(GL_SCISSOR_TEST);glColorMask(1,1,1,1);
+    glClearColor(1,0,0,1);my_glClear(e,GL_COLOR_BUFFER_BIT);clear_now(e);
+    glEnable(GL_SCISSOR_TEST);glScissor(0,0,1,6);glClearColor(0,1,0,1);my_glClear(e,GL_COLOR_BUFFER_BIT);
+    if(fail){
+        host_lock_error=1;assert(!my_attachImage(e,NULL,GL_TEXTURE_2D,&next,invert));host_lock_error=0;
+        assert(image_of(e,texture)->surface==&surface&&image_of(e,texture)->drawn&&surface.seed==0);
+    }
+    if(kind==0){
+        host_lock_error=1;my_glDeleteTextures(e,1,&texture);host_lock_error=0;
+        assert(image_of(e,texture)&&image_of(e,texture)->drawn&&glIsTexture(texture));
+        if(invert)frame_end(e,false);else my_glDeleteTextures(e,1,&texture);
+        assert(!image_of(e,texture)&&!glIsTexture(texture));
+    }
+    if(kind==1)assert(my_attachImage(e,NULL,GL_TEXTURE_2D,&surface,invert));
+    if(kind==2)assert(my_attachImage(e,NULL,GL_TEXTURE_2D,&next,invert));
+    if(kind==3){
+        glGenTextures(1,&alias);my_glBindTexture(e,GL_TEXTURE_2D,alias);
+        assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,8,6,GL_BGRA,GL_UNSIGNED_BYTE,0,invert));
+    }
+    assert(surface.seed==1);
+    for(unsigned y=0;y<6;y++){
+        for(unsigned x=0;x<8;x++){
+            unsigned char *v=bytes+y*40+x*4;assert(v[0]==0&&v[1]==(x==0?255:0)&&v[2]==(x==0?0:255)&&v[3]==255);
+        }
+        for(unsigned x=32;x<40;x++)assert(bytes[y*40+x]==0xa5);
+    }
+    if(kind==1||kind==3){
+        GLuint shown=kind==1?texture:alias;unsigned char pixel[4];read_pixel(shown,pixel);
+        assert(pixel[0]==255&&pixel[1]==0&&pixel[2]==0&&pixel[3]==255);
+    }
+    assert(e->surface_handoff_notes>=1&&e->surface_handoff_notes<=2);
+    assert(!glGetError());glDisable(GL_SCISSOR_TEST);
+    if(kind!=0){image_forget(e,texture);glDeleteTextures(1,&texture);}
+    if(alias){image_forget(e,alias);glDeleteTextures(1,&alias);}
+    glDeleteFramebuffers(1,&fb);if(e->reader)glDeleteFramebuffers(1,&e->reader);free(e);
+}
+
+static void test_mirror_handoff(bool replace, bool invert) {
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);
+    unsigned char bytes[64]={0},pixels[64];
+    struct host_surface surface={201,0,'BGRA',0,4,4,4,16,64,bytes};
+    GLuint owner,texture,fb,read,other;
+    glGenTextures(1,&owner);glBindTexture(GL_TEXTURE_2D,owner);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,4,4,0,GL_RGBA,GL_UNSIGNED_BYTE,bytes);
+    extern void *eglGetCurrentContext(void);const int attributes[]={0x30d2,1,0x3038};
+    imported_image=create_image(egl_display,eglGetCurrentContext(),0x30b1,(void *)(uintptr_t)owner,attributes);assert(imported_image);
+    glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_attachImage(e,NULL,GL_TEXTURE_2D,&surface,invert));
+    struct image *i=image_of(e,texture);assert(i->mirror&&!i->shared);
+    glGenFramebuffers(1,&fb);my_glBindFramebuffer(e,GL_FRAMEBUFFER,fb);
+    my_glFramebufferTexture2D(e,GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0);
+    glViewport(0,0,4,4);glDisable(GL_SCISSOR_TEST);glColorMask(1,1,1,1);
+    glClearColor(1,0,0,1);my_glClear(e,GL_COLOR_BUFFER_BIT);clear_now(e);
+    glEnable(GL_SCISSOR_TEST);glScissor(0,0,1,1);glClearColor(0,1,0,1);my_glClear(e,GL_COLOR_BUFFER_BIT);
+    glGenFramebuffers(1,&read);glBindFramebuffer(GL_READ_FRAMEBUFFER,read);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,owner,0);
+    glGenTextures(1,&other);my_glBindTexture(e,GL_TEXTURE_2D,other);
+    damage_blits=1;host_lock_error=1;
+    assert(!image_publish(e,i,"test"));host_lock_error=0;
+    assert(i->drawn&&surface.seed==0);
+    expect_state(GL_READ_FRAMEBUFFER_BINDING,read);expect_state(GL_DRAW_FRAMEBUFFER_BINDING,fb);
+    expect_state(GL_TEXTURE_BINDING_2D,other);assert(glIsEnabled(GL_SCISSOR_TEST));
+    if(replace){
+        my_glBindTexture(e,GL_TEXTURE_2D,texture);
+        assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,4,4,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+        assert(image_of(e,texture)->shared);
+    }else{
+        my_glDeleteTextures(e,1,&texture);assert(!image_of(e,texture)&&!glIsTexture(texture));
+        expect_state(GL_TEXTURE_BINDING_2D,other);
+    }
+    expect_state(GL_READ_FRAMEBUFFER_BINDING,read);expect_state(GL_DRAW_FRAMEBUFFER_BINDING,fb);
+    assert(surface.seed==1&&glIsEnabled(GL_SCISSOR_TEST));
+    glReadPixels(0,0,4,4,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    for(unsigned y=0;y<4;y++)for(unsigned x=0;x<4;x++){
+        bool green=x==0&&y==(invert?3:0);unsigned char *v=pixels+4*(4*y+x);
+        assert(v[0]==(green?0:255)&&v[1]==(green?255:0)&&v[2]==0&&v[3]==255);
+    }
+    // The fake CPU allocation is intentionally disjoint from the EGLImage.
+    for(unsigned n=0;n<sizeof bytes;n++)assert(bytes[n]==0);
+    if(replace){image_forget(e,texture);glDeleteTextures(1,&texture);}
+    assert(destroy_image(egl_display,imported_image));imported_image=NULL;
+    glDeleteTextures(1,&owner);glDeleteTextures(1,&other);glDeleteFramebuffers(1,&fb);glDeleteFramebuffers(1,&read);
+    if(e->reader)glDeleteFramebuffers(1,&e->reader);if(e->writer)glDeleteFramebuffers(1,&e->writer);
+    glDisable(GL_SCISSOR_TEST);damage_blits=0;free(e);assert(!glGetError());
+}
+
+int main(void){context();
+    for(unsigned r=0;r<2;r++)for(unsigned i=0;i<2;i++)test_mirror_handoff(r,i);
+    puts("PASS real EGLImage retirement: deletion/reimport, orientation, complete left edge, failed publication retry and caller GL state");
+    for(unsigned k=0;k<4;k++)for(unsigned inv=0;inv<2;inv++)test_surface_handoff(k,inv,k!=0);
+    puts("PASS publication before delete, same/different surface registration, and alias import; deferred full/left-edge clear, lock failure preservation, orientation and padding");test_external_target_refresh();test_mip_refresh();
 #ifndef EXPECT_STALE_MIPMAP
     test_shared_mip();
 #endif

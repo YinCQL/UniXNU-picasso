@@ -387,6 +387,7 @@ struct image {
 	IOSurfaceRef surface;
 	bool target;                    /* attached explicitly or subsequently used as a render target */
 	bool invert, drawn;
+	bool retiring;                  /* a deletion awaiting successful surface publication */
 	bool mip_pending;               /* level zero was drawn after generation */
 	bool mipmapped;                 /* generated levels must follow subsequent IOSurface uploads */
 	bool shared;                    /* the texture is the surface's memory: nothing to copy */
@@ -424,6 +425,7 @@ struct eagl {
 	struct image images[1024];
 	unsigned image_count;
 	unsigned target_refresh_notes;  /* bounded external target ownership observations */
+	unsigned surface_handoff_notes;
 	bool mip_pending;
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
@@ -772,6 +774,9 @@ image_of(struct eagl *e, GLuint texture)
 	return NULL;
 }
 
+static bool image_publish(struct eagl *e, struct image *image, const char *reason);
+static bool surface_publish_aliases(struct eagl *e, IOSurfaceRef surface);
+
 static struct image *
 image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 {
@@ -782,6 +787,9 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 	bool mipmapped = false;
 
 	e->image_news++;
+	/* A new view of a surface must see earlier GPU writes in this context. */
+	if (!surface_publish_aliases(e, surface) ||
+	    (image != NULL && !image_publish(e, image, "replace"))) return NULL;
 	if (image == NULL) {
 		if (e->image_count == sizeof(e->images) / sizeof(e->images[0])) {
 			/*
@@ -1216,7 +1224,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 	e->upload_bytes += row * (size_t)image->height;
 }
 
-/* Queue a mirror copy without publishing its IOSurface until frame_end waits. */
+/* Queue a mirror copy; publication follows the GPU completion wait. */
 static bool
 mirror_to_surface(struct eagl *e, struct image *image)
 {
@@ -1274,7 +1282,7 @@ target_to_surface(struct eagl *e, struct image *image)
 
 	uint32_t seed = image->seed;
 	if (image->shared || image->mirror != 0) {
-		/* Publish only after frame_end has completed the GPU writes. Keep GPU
+		/* Publish only after the caller has completed the GPU writes. Keep GPU
 		 * ownership on failure; use the returned seed of this publication. */
 		if (IOSurfaceLock(surface, 0, NULL) == 0 && IOSurfaceUnlock(surface, 0, &seed) == 0) {
 			image->seed = seed;
@@ -1317,6 +1325,44 @@ target_to_surface(struct eagl *e, struct image *image)
 		image->seed = seed;
 		image->drawn = false;
 	}
+}
+
+/* An IOSurface outlives the GL name used to draw it. CoreAnimation may delete
+ * that name, register it again, or create another view before its next flush.
+ * Complete and publish those writes before relinquishing the local owner. */
+static bool
+image_publish(struct eagl *e, struct image *image, const char *reason)
+{
+	uint32_t before;
+	if (!image->target || !image->drawn) return true;
+	clear_now(e);
+	if (e->groups != NULL) group_read(e, image->texture);
+	before = image->seed;
+	if (image->mirror != 0 && !mirror_to_surface(e, image)) return false;
+	if (image->shared || image->mirror != 0) glFinish();
+	target_to_surface(e, image);
+	if (e->surface_handoff_notes < 8 || image->drawn) {
+		if (e->surface_handoff_notes < 16) {
+			e->surface_handoff_notes++;
+			ktrace("surface-handoff ctx=%p s%u tex%u %ux%u seed%u>%u at=%s ok%u f%u",
+			    (void *)e, IOSurfaceGetID(image->surface), image->texture,
+			    (unsigned)image->width, (unsigned)image->height, before, image->seed,
+			    reason, !image->drawn, e->frames);
+		}
+	}
+	return !image->drawn;
+}
+
+static bool
+surface_publish_aliases(struct eagl *e, IOSurfaceRef surface)
+{
+	uint32_t identity = IOSurfaceGetID(surface);
+	for (unsigned i = 0; i < e->image_count; i++) {
+		struct image *image = &e->images[i];
+		if (image->drawn && IOSurfaceGetID(image->surface) == identity &&
+		    !image_publish(e, image, "register")) return false;
+	}
+	return true;
 }
 
 /*
@@ -1590,6 +1636,7 @@ frame_begin(struct eagl *e)
  * library has been waited for already.
  */
 static void frame_functions(struct eagl *e);
+static void my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures);
 static void
 frame_end(struct eagl *e, bool finished)
 {
@@ -1655,6 +1702,14 @@ frame_end(struct eagl *e, bool finished)
 				show_texture(e, &e->images[i]);
 			}
 		}
+	}
+	/* A failed delete retained its GPU pixels. Reclaim it after a later flush
+	 * publishes successfully, even when the caller never repeats deletion. */
+	for (unsigned i = 0; i < e->image_count;) {
+		if (e->images[i].retiring && !e->images[i].drawn) {
+			GLuint texture = e->images[i].texture;
+			my_glDeleteTextures(e, 1, &texture);
+		} else i++;
 	}
 	if (!e->in_frame) {
 		return;
@@ -4178,20 +4233,31 @@ static void
 my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
 {
 	struct eagl *e = context;
+	bool blocked = false;
 
 	EAGL_ENTER(e, 0x1e0);
 	clear_now(e);
 	for (GLsizei i = 0; i < n; i++) {
+		struct image *image = image_of(e, textures[i]);
+		if (image != NULL && !image_publish(e, image, "delete")) {
+			image->retiring = true;
+			blocked = true;
+		}
+	}
+	for (GLsizei i = 0; i < n; i++) {
+		struct image *image = image_of(e, textures[i]);
+		/* A failed publication still owns pixels. Retain this name for retry;
+		 * unrelated names in the same deletion request can be released. */
+		if (image != NULL && image->drawn) continue;
 		struct texture_definition *d = compositor_diagnostics ? texture_definition_of(e, textures[i]) : NULL;
 		if (d != NULL) d->texture = 0;
 		image_forget(e, textures[i]);
 		vblur_forget(e, textures[i]);
 		group_forget(e, textures[i]);
-		if (textures[i] == e->colour) {
-			e->colour = 0;          /* (a texture that is deleted leaves the framebuffer bound) */
-		}
+		if (textures[i] == e->colour) e->colour = 0;
+		if (blocked) glDeleteTextures(1, &textures[i]);
 	}
-	glDeleteTextures(n, textures);
+	if (!blocked) glDeleteTextures(n, textures);
 	EAGL_LEAVE(e, 0x1e0);
 }
 

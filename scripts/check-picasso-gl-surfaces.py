@@ -54,6 +54,7 @@ static void compositor_framebuffer(struct eagl *e,const char *s){(void)e;(void)s
 static void summary(struct eagl *e){(void)e;}
 static void census_report(void){}
 static void frame_functions(struct eagl *e){(void)e;}
+static void my_glDeleteTextures(void *,GLsizei,const GLuint *);
 static const char *census_name(unsigned f){(void)f;return "test";}
 static const char *eagl_slot_name(unsigned o){(void)o;return "test";}
 static void clear_now(struct eagl *e);
@@ -61,6 +62,7 @@ static void show_texture(struct eagl *e,struct image *i){(void)e;(void)i;}
 static GLuint shown_texture;
 static unsigned group_read_names[4],group_read_count;
 static void group_read(struct eagl *e,GLuint t){(void)e;assert(group_read_count<4);group_read_names[group_read_count++]=t;}
+static void vblur_forget(struct eagl *e,GLuint t){(void)e;(void)t;}
 static void group_forget(struct eagl *e,GLuint t){(void)e;(void)t;}
 static struct group_texture *group_of(struct eagl *e,GLuint t){(void)e;(void)t;return NULL;}
 static struct eagl *context_of(id o){return o;}
@@ -71,13 +73,14 @@ static bool hakios_gl_surface_texture(struct hakios_gl *g,unsigned s);
 #define EAGL_ENTER(e,o) eagl_enter(e,o)
 #define EAGL_LEAVE(e,o) eagl_leave(e,o)
 '''
+body += 'static bool image_publish(struct eagl *,struct image *,const char *);\nstatic bool surface_publish_aliases(struct eagl *,IOSurfaceRef);\n'
 names = ['texture_definition_of','texture_defined','image_of','image_new','image_forget','internal_format','bytes_a_pixel',
          'surface_mirrored','surface_shared']
 if 'surface_render_copy(' in s: names += ['surface_render_copy']
 if 'image_render_target(' in s: names += ['image_render_target']
 if 'mipmaps_ready(' in s: names += ['mipmaps_ready']
 names += ['surface_changed','surface_to_texture','mirror_to_surface','target_to_surface','image_refresh_note','image_needs_upload','frame_begin','frame_end','drawing',
-          'my_glCopyTexSubImage2D','my_glBindTexture','my_glClear','clear_now','my_glFramebufferTexture2D','my_glBindFramebuffer','my_texImageIOSurface','my_attachImage']
+          'image_publish','surface_publish_aliases','my_glDeleteTextures','my_glCopyTexSubImage2D','my_glBindTexture','my_glClear','clear_now','my_glFramebufferTexture2D','my_glBindFramebuffer','my_texImageIOSurface','my_attachImage']
 if 'my_glGenerateMipmap(' in s: names += ['my_glGenerateMipmap']
 for name in names: body += fn(name)
 if 'framebuffer_read_texture(' in s:
