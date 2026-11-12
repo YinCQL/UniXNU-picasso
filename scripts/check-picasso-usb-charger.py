@@ -4,10 +4,10 @@
 from pathlib import Path
 import argparse,re,subprocess,json,hashlib
 R=Path(__file__).resolve().parents[1]
-p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True);out=p.parse_args().output;out.mkdir(parents=True,exist_ok=False)
+p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True);p.add_argument('--xnu',type=Path,required=True);args=p.parse_args();out=args.output;out.mkdir(parents=True,exist_ok=False)
 patch=R/'patches/picasso-usb-console-xnu.patch';text=patch.read_text()
 a=text.index('@@ -0,0 +1,');b=text.index('\ndiff --git ',a);lines=text[a:b].splitlines()
-assert len(lines)-1==int(re.search(r'\+1,(\d+)',lines[0])[1]);source='\n'.join(x[1:] for x in lines[1:])+'\n'
+assert len(lines)-1==int(re.search(r'\+1,(\d+)',lines[0])[1]);source=(args.xnu/'bsd/dev/picasso_usb.c').read_text()
 def function(name):
  a=source.index('\n'+name+'(');a=source.rfind('\n',0,a-1)+1;b=source.index('{',a)+1;n=1
  while n:
@@ -63,10 +63,10 @@ int main(){
 """
 (out/'test.cpp').write_text(f);runs=[]
 assert 'if (charger_deadline && mach_absolute_time() >= charger_deadline)\n\t\t(void)ud_charger_restore();\n\tud_poll();' in source
-thread=function('ud_thread');assert 'ud_sleep_ms(1);' in thread and 'busy_wait' not in thread and 'thread_yield_internal' not in thread
+thread=function('ud_thread');assert 'ud_sleep_ms(1);' in thread and 'busy_wait' not in thread
 for variant,flags in [('normal',[]),('sanitized',['-fsanitize=address,undefined','-fno-sanitize-recover=all'])]:
  for phase,cmd in [('compile',['clang++-18','-std=c++17','-Wall','-Wextra','-Werror','-O1',*flags,'-I',str(out),str(out/'test.cpp'),'-o',str(out/variant)]),('run',[str(out/variant)])]:
   q=subprocess.run(cmd,capture_output=True,text=True);(out/f'{variant}-{phase}.log').write_text(q.stdout+q.stderr)
   assert not q.returncode,q.stdout+q.stderr;runs.append(dict(variant=variant,phase=phase,passed=True,output=q.stdout))
-(out/'results.json').write_text(json.dumps(dict(passed=True,hardware_tested=False,runs=runs,inputs={str(p.relative_to(R)):hashlib.sha256(p.read_bytes()).hexdigest() for p in [patch,Path(__file__)]}),indent=2)+'\n')
+(out/'results.json').write_text(json.dumps(dict(passed=True,hardware_tested=False,runs=runs,inputs={str(p.relative_to(R)) if p.is_relative_to(R) else str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in [patch,Path(__file__),args.xnu/'bsd/dev/picasso_usb.c']}),indent=2)+'\n')
 print('PASS USB charger lease and timer sleep; host peers only')

@@ -14,7 +14,7 @@ diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,3289 @@
+@@ -0,0 +1,3293 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -2786,10 +2786,13 @@ new file mode 100644
 +	bool first_yield = true;
 +	const volatile uint64_t *timer_irqs = &armcpu_timer_interrupts;
 +
-+	/* A priority yield stays runnable and burns a core when the device is
-+	 * otherwise idle. The normal thread can block on the working timer;
-+	 * early boot, panic flushing and reset retain their bounded polling. */
-+	printf("PICASSO USB: sleeping poller started\n");
++	/*
++	 * Keep the bounded spin, then allow other runnable work to proceed.
++	 * In this XNU, zero depresses to priority 0 without a restore timeout;
++	 * 1 ms arms the priority-restoration timer. It is not a return deadline
++	 * and still requires working timer IRQ delivery and scheduling.
++	 */
++	printf("PICASSO USB: busy poller started\n");
 +	for (;;) {
 +		ud_background_poll(&progress);
 +		polls++;
@@ -2797,16 +2800,17 @@ new file mode 100644
 +			printf("PICASSO USB: poller heartbeat polls=%llu events=%llu rx_busy=%u\n",
 +			    polls, ud.events, ud.rx_busy ? 1u : 0u);
 +		}
++		picasso_usb_busy_wait(100);
 +		bool report_yield = first_yield && !ud.panic_mode;
 +		first_yield = false;
 +		if (report_yield) {
-+			printf("PICASSO USB: background first sleep begin interval_ms=1 mono_ns=%llu timer_irqs=%llu timer_irq_valid=%u\n",
++			printf("PICASSO USB: background first yield begin depress_ms=1 mono_ns=%llu timer_irqs=%llu timer_irq_valid=%u\n",
 +			    ud_monotonic_ns(), ud_timer_irq_snapshot(timer_irqs),
 +			    timer_irqs != NULL ? 1u : 0u);
 +		}
-+		ud_sleep_ms(1);
++		thread_yield_internal(1);
 +		if (report_yield && !ud.panic_mode) {
-+			printf("PICASSO USB: background first sleep end mono_ns=%llu timer_irqs=%llu timer_irq_valid=%u\n",
++			printf("PICASSO USB: background first yield end mono_ns=%llu timer_irqs=%llu timer_irq_valid=%u\n",
 +			    ud_monotonic_ns(), ud_timer_irq_snapshot(timer_irqs),
 +			    timer_irqs != NULL ? 1u : 0u);
 +		}

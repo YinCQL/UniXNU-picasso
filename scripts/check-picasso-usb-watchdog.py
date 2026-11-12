@@ -102,7 +102,8 @@ static void absolutetime_to_nanoseconds(uint64_t value, uint64_t *ns) { *ns = va
 static void ud_finish_reboot(void) { assert(ud.poll_lock == 0); ++reboot_calls; }
 static void ud_finish_hang(void) { assert(ud.poll_lock == 0); ++hang_calls; }
 static void panic(const char *) { assert(ud.poll_lock == 0); ++panic_calls; ud.panic_mode = true; }
-static void ud_sleep_ms(unsigned value) {
+static void picasso_usb_busy_wait(unsigned value) { assert(value == 100); ++wait_calls; }
+static void thread_yield_internal(int value) {
     assert(value == 1 && !in_poll && ud.poll_lock == 0);
     ++yield_calls;
     sequence.emplace_back("yield");
@@ -175,28 +176,28 @@ int main(void) {
 
     reset();
     run_thread(7);
-    assert(pet_calls == 7 && poll_calls == 7 && wait_calls == 0 && yield_calls == 7);
+    assert(pet_calls == 7 && poll_calls == 7 && wait_calls == 7 && yield_calls == 7);
     assert(containing("watchdog pet") == UD_WATCHDOG_INITIAL_REPORTS);
     assert(containing("heartbeat") == 0);
-    assert(containing("first sleep begin interval_ms=1 mono_ns=5000000000 timer_irqs=0 timer_irq_valid=1") == 1);
-    assert(containing("first sleep end mono_ns=5001000000 timer_irqs=1 timer_irq_valid=1") == 1);
-    assert(logs.size() == 9); // Startup + first-poll pair + four pets + first-sleep pair.
+    assert(containing("first yield begin depress_ms=1 mono_ns=5000000000 timer_irqs=0 timer_irq_valid=1") == 1);
+    assert(containing("first yield end mono_ns=5001000000 timer_irqs=1 timer_irq_valid=1") == 1);
+    assert(logs.size() == 9); // Startup + first-poll pair + four pets + first-yield pair.
     unsigned pending_pet = 0;
     for (const auto &entry : sequence) {
         if (entry == "pet") ++pending_pet;
         if (entry == "yield") { assert(pending_pet == 1); pending_pet = 0; }
     }
-    passed("production thread pets before each timer sleep and reports only the first yield pair");
+    passed("production thread pets before each finite-depression yield and reports only the first yield pair");
 
     reset();
     run_thread(1); // The mock never returns from its first yield.
-    assert(pet_calls == 1 && containing("first sleep begin") == 1 && containing("first sleep end") == 0);
+    assert(pet_calls == 1 && containing("first yield begin") == 1 && containing("first yield end") == 0);
     passed("an unreturned yield leaves an unmatched begin marker without claiming scheduling progress");
 
     reset();
     panic_on_yield = true;
     run_thread(7);
-    assert(pet_calls == 1 && containing("first sleep begin") == 1 && containing("first sleep end") == 0);
+    assert(pet_calls == 1 && containing("first yield begin") == 1 && containing("first yield end") == 0);
     passed("panic observed after yielding suppresses the end diagnostic and subsequent normal pets");
 
     reset();
@@ -305,7 +306,7 @@ int main(void) {
     yield_step = UD_WATCHDOG_LATE_NS;
     run_thread(100);
     assert(pet_calls == 100 && containing("watchdog pet") == 12);
-    assert(containing("first sleep begin") == 1 && containing("first sleep end") == 1);
+    assert(containing("first yield begin") == 1 && containing("first yield end") == 1);
     assert(logs.size() == 17); // Existing startup + at most 16 new diagnostics.
     passed("full production thread caps poll/yield diagnostics while continuing long-gap pets");
 
