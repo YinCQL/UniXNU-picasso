@@ -15,8 +15,19 @@ typedef int BOOL;
 #define kIOSurfaceLockReadOnly 1
 struct host_surface {unsigned id,seed,format,planes,bpe;size_t width,height,row,size;unsigned char *bytes;};
 typedef struct host_surface *IOSurfaceRef;
-static void *CFRetain(void *p){return p;}
-static void CFRelease(void *p){(void)p;}
+static IOSurfaceRef tracked_surface;
+static int tracked_refs,tracked_uses,tracked_min_uses;
+static void *CFRetain(void *p){if(p==tracked_surface)tracked_refs++;return p;}
+static void CFRelease(void *p){if(p==tracked_surface){assert(tracked_refs>0);tracked_refs--;}}
+static void IOSurfaceIncrementUseCount(IOSurfaceRef s){if(s==tracked_surface)tracked_uses++;}
+static void IOSurfaceDecrementUseCount(IOSurfaceRef s){
+    if(s==tracked_surface){assert(tracked_uses>0);tracked_uses--;if(tracked_uses<tracked_min_uses)tracked_min_uses=tracked_uses;}
+}
+static bool host_pool_recycle(IOSurfaceRef s){
+    assert(s==tracked_surface);
+    if(tracked_uses)return false;
+    memset(s->bytes,255,s->size);s->seed++;return true;
+}
 #define GETTER(name,field) static size_t IOSurfaceGet##name(IOSurfaceRef s){return s->field;}
 GETTER(Width,width) GETTER(Height,height) GETTER(BytesPerRow,row) GETTER(BytesPerElement,bpe)
 GETTER(PlaneCount,planes) GETTER(AllocSize,size)
@@ -827,7 +838,135 @@ static void test_registration_group(bool attach) {
     glDeleteTextures(1,&texture);free(e->groups);free(e);
 }
 
+/* A CF reference keeps the object alive but does not reserve its pool slot.
+ * After the producer returns to its pool, the consumer must keep the pixels. */
+#if defined(EAGL_POOL_USES) || defined(EXPECT_RECYCLED_SURFACE)
+static void test_pool_lifetime(void){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);
+    unsigned char bytes[8*40];memset(bytes,0xa5,sizeof bytes);
+    for(unsigned y=0;y<8;y++)for(unsigned x=0;x<8;x++){
+        unsigned char *p=bytes+y*40+x*4;p[0]=160;p[1]=80;p[2]=40;p[3]=255;
+    }
+    struct host_surface surface={801,1,'BGRA',0,4,8,8,40,sizeof bytes,bytes};
+    tracked_surface=&surface;tracked_refs=tracked_uses=0;tracked_min_uses=100;
+    GLuint texture,alias,fb;glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,8,8,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+    assert(tracked_refs==1);bool recycled=host_pool_recycle(&surface);
+    e->frames++;my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    glGenFramebuffers(1,&fb);glBindFramebuffer(GL_READ_FRAMEBUFFER,fb);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0);
+    unsigned char pixels[8*8*4];glReadPixels(0,0,8,8,GL_RGBA,GL_UNSIGNED_BYTE,pixels);assert(!glGetError());
+#ifdef EXPECT_RECYCLED_SURFACE
+    assert(recycled&&tracked_uses==0);
+    for(unsigned i=0;i<sizeof pixels;i++)assert(pixels[i]==255);
+    puts("REPRODUCED: retained IOSurface recycled by pool; next texture refresh becomes all white");
+#else
+    assert(!recycled&&tracked_uses==1);
+    for(unsigned i=0;i<sizeof pixels;i+=4)assert(pixels[i]==40&&pixels[i+1]==80&&pixels[i+2]==160&&pixels[i+3]==255);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,8,8,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+    assert(tracked_refs==1&&tracked_uses==1&&tracked_min_uses==1);
+    glGenTextures(1,&alias);my_glBindTexture(e,GL_TEXTURE_2D,alias);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,8,8,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+    assert(tracked_refs==2&&tracked_uses==2);
+    my_glDeleteTextures(e,1,&texture);assert(tracked_refs==1&&tracked_uses==1&&!host_pool_recycle(&surface));
+    my_glDeleteTextures(e,1,&alias);assert(!tracked_refs&&!tracked_uses&&host_pool_recycle(&surface));
+    // Teardown has to return all pool reservations, including undeleted names.
+    glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,8,8,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+    images_release(e);assert(!e->image_count&&!tracked_refs&&!tracked_uses);
+    // Replacement failure retains the old pool reservation for a retry.
+    glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_attachImage(e,NULL,GL_TEXTURE_2D,&surface,NO));
+    struct image *im=image_of(e,texture);im->drawn=true;
+    host_lock_error=1;assert(!image_new(e,texture,&surface));host_lock_error=0;
+    assert(tracked_refs==1&&tracked_uses==1&&im->drawn);
+    im->drawn=false;images_release(e);assert(!tracked_refs&&!tracked_uses);
+    // The bounded image table returns the evicted pool reservation.
+    e->image_count=sizeof(e->images)/sizeof(e->images[0]);
+    memset(e->images,0,sizeof e->images);
+    for(unsigned k=0;k<e->image_count;k++)e->images[k].target=true;
+    e->images[0].target=false;e->images[0].texture=texture;e->images[0].surface=&surface;
+    CFRetain(&surface);IOSurfaceIncrementUseCount(&surface);
+    memset(e->bound,0,sizeof e->bound);
+    // Alias publication reads identities for every live entry.
+    for(unsigned k=1;k<e->image_count;k++)e->images[k].surface=&surface;
+    tracked_min_uses=1;
+    assert(image_new(e,texture+10000,&surface));
+    assert(e->image_evicted==1&&tracked_refs==1&&tracked_uses==1&&tracked_min_uses==1);
+    e->image_count=1;images_release(e);assert(!tracked_refs&&!tracked_uses);
+    puts("PASS pool lifetime: pixels including left edge survive producer release; balanced alias/re-registration/delete/context cleanup/failure/eviction");
+#endif
+    glDeleteFramebuffers(1,&fb);glDeleteTextures(1,&texture);free(e);tracked_surface=NULL;
+}
+
+#endif
+
+/* Partial texture uploads also write an IOSurface view. A later snapshot
+ * consumer and generated mip levels must both see the updated left column. */
+static void test_subimage_publication(bool invert,bool buffered){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);
+    unsigned char bytes[8*40];memset(bytes,0xa5,sizeof bytes);
+    for(unsigned y=0;y<8;y++)for(unsigned x=0;x<8;x++){
+        unsigned char *p=bytes+y*40+x*4;p[0]=p[1]=p[2]=x?255:0;p[3]=255;
+    }
+    struct host_surface surface={802,1,'BGRA',0,4,8,8,40,sizeof bytes,bytes};
+    GLuint texture,fb;glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,8,8,GL_BGRA,GL_UNSIGNED_BYTE,0,invert));
+    my_glGenerateMipmap(e,GL_TEXTURE_2D);
+    unsigned char column[8*4];memset(column,255,sizeof column);
+    glPixelStorei(GL_UNPACK_ALIGNMENT,1);
+    GLuint unpack=0;const void *input=column;
+    if(buffered){
+        unsigned char data[128];memset(data,0,sizeof data);memcpy(data+32,column,sizeof column);
+        glGenBuffers(1,&unpack);glBindBuffer(GL_PIXEL_UNPACK_BUFFER,unpack);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER,sizeof data,data,0x88e8);input=(void *)32;
+    }
+    glEnable(GL_SCISSOR_TEST);glScissor(3,3,1,1);
+    my_glTexSubImage2D(e,GL_TEXTURE_2D,0,0,0,1,8,GL_RGBA,GL_UNSIGNED_BYTE,input);
+    expect_state(GL_PIXEL_UNPACK_BUFFER_BINDING,(GLint)unpack);
+    assert(glIsEnabled(GL_SCISSOR_TEST));glDisable(GL_SCISSOR_TEST);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER,0);if(unpack)glDeleteBuffers(1,&unpack);
+    assert(!glGetError());
+    frame_end(e,false);mipmaps_ready(e);
+    glGenFramebuffers(1,&fb);glBindFramebuffer(GL_READ_FRAMEBUFFER,fb);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,1);
+    unsigned char pixel[4];glReadPixels(0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);assert(!glGetError());
+#ifdef EXPECT_UNPUBLISHED_SUBIMAGE
+    assert(surface.seed==1&&bytes[0]==0&&pixel[0]<200);
+    puts("REPRODUCED: partial upload leaves persisted left column black and generated mip level stale");
+#else
+    assert(surface.seed==2&&pixel[0]==255&&pixel[1]==255&&pixel[2]==255&&pixel[3]==255);
+    for(unsigned y=0;y<8;y++){
+        for(unsigned x=0;x<8*4;x++)assert(bytes[y*40+x]==255);
+        for(unsigned x=8*4;x<40;x++)assert(bytes[y*40+x]==0xa5);
+    }
+    puts("PASS partial upload publishes corrected left edge and refreshes generated mip levels without touching row padding");
+#endif
+#ifndef EXPECT_UNPUBLISHED_SUBIMAGE
+    // An invalid upload and a manually supplied mip level do not publish level zero.
+    struct image *im=image_of(e,texture);assert(!im->drawn);
+    my_glTexSubImage2D(e,GL_TEXTURE_2D,0,-1,0,1,8,GL_RGBA,GL_UNSIGNED_BYTE,column);
+    assert(glGetError()!=0&&!im->drawn);frame_end(e,false);assert(surface.seed==2);
+    my_glTexSubImage2D(e,GL_TEXTURE_2D,1,0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,column);
+    assert(!glGetError()&&!im->drawn);frame_end(e,false);assert(surface.seed==2);
+#endif
+    my_glDeleteTextures(e,1,&texture);glDeleteFramebuffers(1,&fb);free(e);
+}
+
 int main(void){context();
+#ifdef EXPECT_RECYCLED_SURFACE
+    test_pool_lifetime();return 0;
+#endif
+#if defined(EAGL_SUBIMAGE_PUBLISH) || defined(EXPECT_UNPUBLISHED_SUBIMAGE)
+    test_subimage_publication(false,false);
+#ifdef EXPECT_UNPUBLISHED_SUBIMAGE
+    return 0;
+#endif
+    test_subimage_publication(true,false);test_subimage_publication(false,true);test_subimage_publication(true,true);
+#endif
+#ifdef EAGL_POOL_USES
+    test_pool_lifetime();
+#endif
 #ifdef EXPECT_STALE_UPLOAD
     test_upload_seed_race(false);test_upload_seed_race(true);
     puts("REPRODUCED stale white snapshot and left black column retained across 20 frames after concurrent publication");return 0;

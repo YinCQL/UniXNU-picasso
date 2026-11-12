@@ -826,15 +826,17 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 				return NULL;
 			}
 			e->image_evicted++;
+			if ((oldest->shared || oldest->mirror != 0) && IOSurfaceGetID(oldest->surface) != IOSurfaceGetID(surface)) glFinish();
 			if (oldest->mirror != 0) {
 				glDeleteTextures(1, &oldest->mirror);
 			}
-			CFRelease(oldest->surface);
+			previous = oldest->surface;
 			image = oldest;
 		} else {
 			image = &e->images[e->image_count++];
 		}
 	} else {
+		if ((image->shared || image->mirror != 0) && IOSurfaceGetID(image->surface) != IOSurfaceGetID(surface)) glFinish();
 		if (image->mirror != 0) {
 			glDeleteTextures(1, &image->mirror);
 		}
@@ -852,12 +854,17 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 	image->texture = texture;
 	image->mipmapped = mipmapped;
 	image->surface = (IOSurfaceRef)CFRetain(surface);
+	/* A CF reference retains the object, not its reservation in a producer's
+	 * reusable surface pool. Reserve before returning the old view so reusing
+	 * the same surface never briefly advertises it as available. */
+	IOSurfaceIncrementUseCount(surface);
 	if (previous != NULL) {
 		if (IOSurfaceGetID(previous) == IOSurfaceGetID(surface)) {
 			image->sum = sum;
 			image->quiet = quiet;
 			image->next_check = next_check;
 		}
+		IOSurfaceDecrementUseCount(previous);
 		CFRelease(previous);
 	}
 	/* Registration replaces ordinary texture contents with an IOSurface view.
@@ -873,12 +880,28 @@ image_forget(struct eagl *e, GLuint texture)
 	struct image *image = image_of(e, texture);
 
 	if (image != NULL) {
+		/* Imported storage may still be read by an earlier draw. Retire that
+		 * access before its pool reservation is returned to another producer. */
+		if (image->shared || image->mirror != 0) glFinish();
 		if (image->mirror != 0) {
 			glDeleteTextures(1, &image->mirror);
 		}
+		IOSurfaceDecrementUseCount(image->surface);
 		CFRelease(image->surface);
 		*image = e->images[--e->image_count];
 	}
+}
+
+/* Called after the GL context has retired and destroyed all of its resources.
+ * Context teardown also releases views whose texture names were never deleted. */
+static void
+images_release(struct eagl *e)
+{
+	for (unsigned i = 0; i < e->image_count; i++) {
+		IOSurfaceDecrementUseCount(e->images[i].surface);
+		CFRelease(e->images[i].surface);
+	}
+	e->image_count = 0;
 }
 
 /* Apple's OpenGL ES takes blue-first pixels into a texture called GL_RGBA; everybody else's calls the texture so too. */
@@ -4405,18 +4428,34 @@ my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y, 
     GLenum type, const void *pixels)
 {
 	struct eagl *e = context;
+	struct image *image = NULL;
+	GLint texture = 0;
 
 	EAGL_ENTER(e, 0x9a0);
 	if (eagl_tracing) {
 		eagl_trace("glTexSubImage2D(%#x, %d, %d, %d, %d, %d, %#x, %#x, %p)\n", target, level, x, y, width, height, format, type,
 		    pixels);
 	}
+	frame_begin(e);
 	clear_now(e);
+	if (target == GL_TEXTURE_2D && level == 0 && width > 0 && height > 0) {
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+		image = image_of(e, (GLuint)texture);
+		if (image != NULL && (x < 0 || y < 0 || width > image->width || height > image->height ||
+		    x > image->width - width || y > image->height - height || !image_render_target(e, image))) image = NULL;
+	}
 	if (target == GL_TEXTURE_2D && e->unit < 8 && e->groups != NULL) {
 		group_read(e, e->bound[e->unit]);
 		group_forget(e, e->bound[e->unit]);
 	}
 	glTexSubImage2D(target, level, x, y, width, height, format, type, pixels);
+	if (image != NULL) {
+		/* Uploads change the surface view just as render/copy writes do. A
+		 * snapshot consumer and minification must see those updated pixels. */
+		image->drawn = image->painted = true;
+		if (image->mipmapped) image->mip_pending = e->mip_pending = true;
+		image->damaged = false;  /* uploads ignore the drawing scissor */
+	}
 	if (check_errors) {
 		GLenum error = glGetError();
 		static unsigned texture_errors;
@@ -5239,11 +5278,22 @@ my_dealloc(id self, SEL selector)
 				contexts[i] = NULL;
 			}
 		}
-		if (current == e) {
-			hakios_gl_make_current(NULL);
-			current = NULL;
+		struct eagl *previous = current;
+		bool active = current == e || hakios_gl_make_current(e->gl);
+		if (active) {
+			current = e;
+			frame_end(e, false);
+			glFinish();
+			if (previous != NULL && previous != e && hakios_gl_make_current(previous->gl)) {
+				current = previous;
+			} else {
+				hakios_gl_make_current(NULL);
+				current = NULL;
+			}
 		}
 		hakios_gl_destroy(e->gl);
+		images_release(e);
+		free(e->groups);
 		free(e);
 	}
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
