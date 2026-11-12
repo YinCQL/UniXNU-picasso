@@ -31,7 +31,13 @@ globals_ = s[s.index('static unsigned trace_first'):s.index('#define GL_SCISSOR_
 body = header+'\n'+decl+'\n'+metadata+'\n'+globals_+'''
 static int eagl_tracing,frame_lines,latency_lines,compositor_diagnostics;
 static void say(const char *fmt,...){(void)fmt;}
-static void ktrace(const char *fmt,...){(void)fmt;}
+static unsigned refresh_note_count;
+static char refresh_note_last[256];
+static void ktrace(const char *fmt,...){
+    if (!strncmp(fmt,"target-refresh ",15)) {
+        va_list ap;va_start(ap,fmt);vsnprintf(refresh_note_last,sizeof(refresh_note_last),fmt,ap);va_end(ap);++refresh_note_count;
+    }
+}
 static void eagl_trace(const char *fmt,...){(void)fmt;}
 static void nativegl_text(const char *s){(void)s;}
 static void nativegl_mark(unsigned v){(void)v;}
@@ -70,7 +76,7 @@ names = ['texture_definition_of','texture_defined','image_of','image_new','image
 if 'surface_render_copy(' in s: names += ['surface_render_copy']
 if 'image_render_target(' in s: names += ['image_render_target']
 if 'mipmaps_ready(' in s: names += ['mipmaps_ready']
-names += ['surface_changed','surface_to_texture','mirror_to_surface','target_to_surface','frame_begin','frame_end','drawing',
+names += ['surface_changed','surface_to_texture','mirror_to_surface','target_to_surface','image_refresh_note','image_needs_upload','frame_begin','frame_end','drawing',
           'my_glCopyTexSubImage2D','my_glBindTexture','my_glClear','clear_now','my_glFramebufferTexture2D','my_glBindFramebuffer','my_texImageIOSurface','my_attachImage']
 if 'my_glGenerateMipmap(' in s: names += ['my_glGenerateMipmap']
 for name in names: body += fn(name)

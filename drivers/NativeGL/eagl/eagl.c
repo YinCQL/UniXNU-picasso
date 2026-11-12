@@ -423,6 +423,7 @@ struct eagl {
 	unsigned definition_next;
 	struct image images[1024];
 	unsigned image_count;
+	unsigned target_refresh_notes;  /* bounded external target ownership observations */
 	bool mip_pending;
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
@@ -1271,11 +1272,13 @@ target_to_surface(struct eagl *e, struct image *image)
 	GLint read = 0, row_length = 0, alignment = 4, skip_rows = 0, skip_pixels = 0, buffer = 0;
 	uint8_t *base;
 
-	image->drawn = false;
+	uint32_t seed = image->seed;
 	if (image->shared || image->mirror != 0) {
-		/* Publish only after frame_end has completed the GPU writes. */
-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
-			IOSurfaceUnlock(surface, 0, NULL);
+		/* Publish only after frame_end has completed the GPU writes. Keep GPU
+		 * ownership on failure; use the returned seed of this publication. */
+		if (IOSurfaceLock(surface, 0, NULL) == 0 && IOSurfaceUnlock(surface, 0, &seed) == 0) {
+			image->seed = seed;
+			image->drawn = false;
 		}
 		return;
 	}
@@ -1310,7 +1313,10 @@ target_to_surface(struct eagl *e, struct image *image)
 		glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)buffer);
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 	}
-	IOSurfaceUnlock(surface, 0, NULL);
+	if (IOSurfaceUnlock(surface, 0, &seed) == 0 && base != NULL) {
+		image->seed = seed;
+		image->drawn = false;
+	}
 }
 
 /*
@@ -1497,6 +1503,35 @@ mipmaps_ready(struct eagl *e)
 	e->mip_pending = pending;
 }
 
+/* Record only external target updates: no GL query, clock or pixel readback,
+ * and at most eight short records per context over its entire lifetime. */
+static void
+image_refresh_note(struct eagl *e, struct image *image, uint32_t seed, const char *at)
+{
+	if (!image->target || e->target_refresh_notes >= 8) return;
+	e->target_refresh_notes++;
+	ktrace("target-refresh ctx=%p s%u tex%u %ux%u seed%u>%u p%u m%u i%u at=%s f%u",
+	    (void *)e, IOSurfaceGetID(image->surface), image->texture, (unsigned)image->width,
+	    (unsigned)image->height, image->seed, seed, image->painted,
+	    image->mipmapped, image->invert, at, e->frames);
+}
+
+/* An attachment may later be sampled after another renderer updates its
+ * IOSurface. Only unpublished local drawing owns level zero; after publication,
+ * an external seed must refresh targets as well as sampling-only textures. */
+static bool
+image_needs_upload(struct eagl *e, struct image *image)
+{
+	uint32_t seed;
+	if (image->shared || image->drawn) return false;
+	seed = IOSurfaceGetSeed(image->surface);
+	if (seed != image->seed) {
+		image_refresh_note(e, image, seed, "bind");
+		return true;
+	}
+	return (!image->target || !image->painted) && surface_changed(e, image);
+}
+
 /* Before the first drawing of a frame: the textures whose IOSurfaces somebody has written to since. */
 static void
 frame_begin(struct eagl *e)
@@ -1533,9 +1568,11 @@ frame_begin(struct eagl *e)
 	for (unsigned i = 0; i < e->image_count; i++) {
 		struct image *image = &e->images[i];
 
-		if (image->target || image->shared || IOSurfaceGetSeed(image->surface) == image->seed) {
-			continue;
-		}
+		uint32_t seed;
+		if (image->shared || image->drawn) continue;
+		seed = IOSurfaceGetSeed(image->surface);
+		if (seed == image->seed) continue;
+		image_refresh_note(e, image, seed, "begin");
 		if (!rebound) {
 			glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
 			rebound = true;
@@ -1953,9 +1990,8 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
 	if (target == GL_TEXTURE_2D && e->unit < 8) {
 		e->bound[e->unit] = texture;
 	}
-	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && !image->shared &&
-	    (!image->target ? IOSurfaceGetSeed(image->surface) != image->seed || surface_changed(e, image) :
-	    image->wrapped && !image->painted && surface_changed(e, image))) {
+	if (target == GL_TEXTURE_2D && texture != 0 && e->image_count != 0 &&
+	    (image = image_of(e, texture)) != NULL && image_needs_upload(e, image)) {
 		surface_to_texture(e, image);
 	}
 	EAGL_LEAVE(e, 0x30);

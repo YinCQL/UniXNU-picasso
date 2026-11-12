@@ -26,8 +26,16 @@ static unsigned IOSurfaceGetPixelFormat(IOSurfaceRef s){return s->format;}
 static void *IOSurfaceGetBaseAddress(IOSurfaceRef s){return s->bytes;}
 static size_t IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef s,unsigned p){(void)p;return s->row;}
 static void *IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef s,unsigned p){(void)p;return s->bytes;}
-static int IOSurfaceLock(IOSurfaceRef s,unsigned f,void *v){(void)s;(void)f;(void)v;return 0;}
-static int IOSurfaceUnlock(IOSurfaceRef s,unsigned f,void *v){(void)v;if(!f)s->seed++;return 0;}
+static int host_lock_error,host_unlock_error;
+static bool host_race_after_unlock;
+static int IOSurfaceLock(IOSurfaceRef s,unsigned f,void *v){(void)s;(void)f;(void)v;return host_lock_error;}
+static int IOSurfaceUnlock(IOSurfaceRef s,unsigned f,void *v){
+    if(host_unlock_error)return host_unlock_error;
+    if(!f)s->seed++;
+    if(v)*(uint32_t *)v=s->seed;
+    if(host_race_after_unlock)s->seed++;
+    return 0;
+}
 #include "gl-body.inc"
 #ifndef GL_UNPACK_SKIP_ROWS
 #define GL_UNPACK_SKIP_ROWS 0x0cf3
@@ -573,7 +581,86 @@ static void test_shared_mip(void) {
     puts("PASS shared mip generation: preserved GPU pixels, independent storage, refreshed levels, repeated import");
 }
 #endif
-int main(void){context();test_mip_refresh();
+
+static void test_external_target_refresh(void) {
+    for (unsigned start=0;start<3;start++) {
+        struct eagl *e=calloc(1,sizeof(*e));assert(e);
+        unsigned char bytes[8*40];memset(bytes,0,sizeof bytes);
+        struct host_surface s={301+start,1,'BGRA',0,4,8,8,40,sizeof bytes,bytes};
+        GLuint tex;glGenTextures(1,&tex);my_glBindTexture(e,GL_TEXTURE_2D,tex);
+        assert(my_attachImage(e,NULL,GL_TEXTURE_2D,&s,0));
+        struct image *i=image_of(e,tex);assert(i&&i->target&&!i->shared&&!i->drawn);
+        if(start==1) {
+            for(unsigned y=0;y<8;y++)for(unsigned x=0;x<8;x++) {
+                unsigned char *p=bytes+y*40+x*4;
+                p[0]=x?160:0;p[1]=x?80:0;p[2]=x?40:0;p[3]=255;
+            }
+            ++s.seed;surface_to_texture(e,i);
+        }
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,0x2703);
+        my_glGenerateMipmap(e,GL_TEXTURE_2D);
+        GLuint fb;glGenFramebuffers(1,&fb);glBindFramebuffer(GL_READ_FRAMEBUFFER,fb);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,tex,0);
+        if(start==2) {
+            my_glBindFramebuffer(e,GL_DRAW_FRAMEBUFFER,fb);
+            glViewport(0,0,8,8);glDisable(GL_SCISSOR_TEST);glColorMask(1,1,1,1);
+            glClearColor(1,0,0,1);my_glClear(e,GL_COLOR_BUFFER_BIT);clear_now(e);
+            assert(i->drawn);++s.seed;
+            my_glBindTexture(e,GL_TEXTURE_2D,tex);frame_begin(e);
+            unsigned char local[4];glReadPixels(3,3,1,1,GL_RGBA,GL_UNSIGNED_BYTE,local);
+            assert(local[0]==255&&local[1]==0&&local[2]==0);
+            uint32_t old_seed=i->seed;
+            host_lock_error=1;target_to_surface(e,i);host_lock_error=0;
+            assert(i->drawn&&i->seed==old_seed);
+            host_unlock_error=1;target_to_surface(e,i);host_unlock_error=0;
+            assert(i->drawn&&i->seed==old_seed);
+            host_race_after_unlock=true;target_to_surface(e,i);host_race_after_unlock=false;
+            assert(!i->drawn&&i->seed+1==s.seed);
+            // Another producer changing seed immediately after unlock must be noticed.
+            unsigned uploads=e->uploads;my_glBindTexture(e,GL_TEXTURE_2D,tex);
+            assert(e->uploads==uploads+1&&i->seed==s.seed);
+            // Shared publication has the same retry and returned-seed contract.
+            i->shared=true;i->drawn=true;old_seed=i->seed;
+            host_lock_error=1;target_to_surface(e,i);host_lock_error=0;
+            assert(i->drawn&&i->seed==old_seed);
+            host_unlock_error=1;target_to_surface(e,i);host_unlock_error=0;
+            assert(i->drawn&&i->seed==old_seed);
+            host_race_after_unlock=true;target_to_surface(e,i);host_race_after_unlock=false;
+            assert(!i->drawn&&i->seed+1==s.seed);i->shared=false;
+            my_glBindTexture(e,GL_TEXTURE_2D,tex);frame_end(e,false);
+            assert(i->seed==s.seed);
+            uploads=e->uploads;
+            my_glBindTexture(e,GL_TEXTURE_2D,tex);assert(e->uploads==uploads);
+        }
+        for(unsigned y=0;y<8;y++)for(unsigned x=0;x<8;x++) {
+            unsigned char *p=bytes+y*40+x*4;p[0]=160;p[1]=80;p[2]=40;p[3]=255;
+        }
+        ++s.seed;
+        if(start==0) frame_begin(e); else my_glBindTexture(e,GL_TEXTURE_2D,tex);
+        assert(i->seed==s.seed);
+        for(int level=0;level<3;level++) {
+            glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,tex,level);
+            unsigned char pixels[8*8*4];int width=8>>level;
+            glReadPixels(0,0,width,width,GL_RGBA,GL_UNSIGNED_BYTE,pixels);assert(!glGetError());
+            for(int j=0;j<width*width;j++)assert(pixels[j*4]==40&&pixels[j*4+1]==80&&pixels[j*4+2]==160&&pixels[j*4+3]==255);
+        }
+        unsigned uploads=e->uploads;my_glBindTexture(e,GL_TEXTURE_2D,tex);assert(e->uploads==uploads);
+        // Only external target updates emit records, with a strict context limit.
+        unsigned notes=refresh_note_count;
+        for(unsigned repeat=0;repeat<20;repeat++){++s.seed;my_glBindTexture(e,GL_TEXTURE_2D,tex);}
+        assert(e->target_refresh_notes==8&&refresh_note_count-notes<=8);
+        assert(strstr(refresh_note_last,"at=bind")&&strlen(refresh_note_last)<200);
+        notes=refresh_note_count;uploads=e->uploads;
+        i->painted=true;
+        for(unsigned repeat=0;repeat<10000;repeat++)my_glBindTexture(e,GL_TEXTURE_2D,tex);
+        assert(refresh_note_count==notes&&e->uploads==uploads);
+        image_forget(e,tex);glDeleteTextures(1,&tex);glDeleteFramebuffers(1,&fb);free(e);
+        glBindFramebuffer(GL_FRAMEBUFFER,0);
+    }
+    puts("PASS externally updated target: seed refresh at bind/frame begin, full mip levels and left edge, pending local GPU preservation, own publish baseline and post-unlock race, failed publish retry, bounded notes, no unchanged upload");
+}
+
+int main(void){context();test_external_target_refresh();test_mip_refresh();
 #ifndef EXPECT_STALE_MIPMAP
     test_shared_mip();
 #endif
