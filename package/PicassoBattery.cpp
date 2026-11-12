@@ -8,8 +8,6 @@
 #include "PicassoSpmi.h"
 #include "PicassoBattery.h"
 #include "PicassoChargerCore.h"
-extern "C" int picasso_usb_charger_detect(unsigned);
-extern "C" int picasso_usb_vbus_update(unsigned);
 namespace {
 struct Window {
     IOMemoryMap *map=nullptr;
@@ -30,10 +28,8 @@ struct Backend {
     unsigned lastConfiguredMa=0,lastControlState=99,lastSourceMa=0;
     picasso_charger::Controller controller;
     picasso_charger::Control control;
-    uint64_t lastDetect=0;
-    unsigned detectAttempts=0;
-    bool pendingDetach=false,vbusKnown=false,vbusPresent=false;
-    int lastDetectError=0,lastVbusError=0;
+    bool cableValid=false;
+    uint8_t cableState[5]={};
     bool adapterHistory=false;
     int peakInputMa=0,bestBatteryMa=0,startPercent=0,endPercent=0;
     uint64_t adapterStart=0,adapterEnd=0;
@@ -53,45 +49,25 @@ struct Backend {
         control=picasso_charger::Control{};control.state=4;
         control.error=controller.fallback(*this,charger);
     }
-    int syncVbus(bool present){
-        if(vbusKnown && vbusPresent==present && !pendingDetach && !lastVbusError)return 0;
-        if(!present)pendingDetach=true;
-        int error=0;
-        if(pendingDetach){
-            error=picasso_usb_vbus_update(0);
-            if(!error){pendingDetach=false;vbusKnown=true;vbusPresent=false;lastDetect=0;detectAttempts=0;}
-        }
-        if(!error && present)error=picasso_usb_vbus_update(1);
-        if(!error){vbusKnown=true;vbusPresent=present;}
-        if(error!=lastVbusError){
-            IOLog("PICASSO_CHARGER vbus present=%u pending_detach=%u error=%d\n",present,pendingDetach,error);
-            lastVbusError=error;
-        }
-        return error;
+    void rememberCable(const picasso_battery::Sample &s){
+        cableState[0]=s.usb;cableState[1]=s.path;cableState[2]=s.charger;
+        cableState[3]=s.thermal;cableState[4]=s.chargeError;cableValid=true;
     }
-    void detect(const picasso_battery::Sample &s,const picasso_battery::Input &in,uint64_t now){
-        if(!(s.usb&0x10)){lastDetect=0;detectAttempts=0;return;}
-        // SDP/unknown may be stale after switching a cable without a sampled
-        // unplug. The USB owner rejects requests while a host is configured.
-        if(in.statusValid && (in.apsd&1) && in.result!=0 && in.result!=1 && in.result!=0x10)return;
-        if((lastDetect && now-lastDetect<3000) || detectAttempts>=3)return;
-        lastDetect=now;
-        int error=picasso_usb_charger_detect(1);
-        if(error!=lastDetectError){
-            IOLog("PICASSO_CHARGER detection_owner error=%d apsd=%02x/%02x\n",error,in.apsd,in.result);
-            lastDetectError=error;
+    int cableChanged(){
+        // Read-only state polling avoids running ADC conversions every tick.
+        // It does not touch USB controller/PHY ownership or endpoint state.
+        if(!cableValid)return 1;
+        const unsigned channel[5]={1,3,2,2,2};
+        const uint8_t reg[5]={0x10,0x0b,6,0x0d,7};
+        uint8_t first[5]={},again=0;
+        for(unsigned i=0;i<5;++i){int e=read(channel[i],reg[i],first[i]);if(e)return e;}
+        bool changed=false;
+        for(unsigned i=0;i<5;++i){
+            int e=read(channel[i],reg[i],again);if(e)return e;
+            if(again!=first[i])return -37;
+            if(first[i]!=cableState[i])changed=true;
         }
-        if(error)return;
-        ++detectAttempts;
-        error=controller.fallback(*this,charger);
-        if(!error)error=picasso_charger::masked(*this,0x62,8,8,charger);
-        if(!error)error=chargerWrite(0x41,1);
-        // APSD completion from before the command cannot authorize a new source.
-        // Discard this read's classification; the next timer observes it afresh.
-        if(!error)IOSleep(1500);
-        int restore=picasso_usb_charger_detect(0);
-        if(!error)error=restore;
-        IOLog("PICASSO_CHARGER detection attempt=%u error=%d restore=%d\n",detectAttempts,error,restore);
+        return changed?1:0;
     }
     void report(const picasso_charger::Source &src){
         if(!chargerReported || charger.error!=lastChargerError || charger.writes || charger.configuredMa!=lastConfiguredMa ||
@@ -186,9 +162,7 @@ extern "C" int picasso_battery_read(void *context,picasso_battery::Snapshot *out
     const uint64_t now=ns/1000000;
     picasso_charger::Source source;
     picasso_charger::sourceStatus(*b,source);
-    const int vbusError=b->syncVbus((sample.usb&0x10)!=0);
-    if(vbusError){b->failed();b->control.fallbackError=b->control.error;b->control.error=vbusError;}
-    else b->control=b->controller.update(*b,sample,input,source,temp,temp!=-10000,now,b->charger);
+    b->control=b->controller.update(*b,sample,input,source,temp,temp!=-10000,now,b->charger);
     b->report(source);
     int pon=0;
     if(!b->ponRead && (sample.status&1)){pon=b->pon();b->ponRead=true;}
@@ -200,8 +174,12 @@ extern "C" int picasso_battery_read(void *context,picasso_battery::Snapshot *out
     next.inputControlVerified=b->control.verified;
     next.inputControlError=b->control.error;next.inputTargetMa=int(b->control.targetMa);
     next.inputSourceMa=int(b->control.sourceMa);
-    if(next.external || b->pendingDetach || vbusError)next.refreshMs=1000;
+    if(next.external)next.refreshMs=1000;
     b->history(next);
-    if(!vbusError)b->detect(sample,input,now);
+    b->rememberCable(sample);
     *out=next;return 0;
+}
+extern "C" int picasso_battery_changed(void *context){
+    Backend *b=static_cast<Backend *>(context);
+    return b?b->cableChanged():-1;
 }

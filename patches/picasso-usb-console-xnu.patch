@@ -14,7 +14,7 @@ diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,3371 @@
+@@ -0,0 +1,3293 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -95,8 +95,6 @@ new file mode 100644
 +static uint64_t _Atomic pur_dropped;
 +static uint64_t pup_pos;
 +static uint32_t _Atomic pup_flush_lock;
-+static bool pmic_vbus_present = true;
-+static bool pmic_detach_pending;
 +static bool pur_live;                   /* set once the TX thread streams */
 +static bool pu_panic_active;
 +
@@ -1883,7 +1881,6 @@ new file mode 100644
 +static void
 +ud_poll(void)
 +{
-+	if (!pmic_vbus_present) return;
 +	ud_poll_events();
 +	ud_tx_pump();
 +}
@@ -2622,75 +2619,6 @@ new file mode 100644
 +    return error;
 +}
 +
-+/* PMIC presence is sampled twice by the battery worker. The wrapper's
-+ * software VBUS override otherwise hides physical unplug from DWC3. */
-+int
-+picasso_usb_vbus_update(unsigned present)
-+{
-+    if (!pur_live || !ud.dwc || ud.panic_mode) return -52;
-+    if (!os_atomic_cmpxchg(&ud.poll_lock, 0, 1, acquire)) return -53;
-+    int error = 0;
-+    uintptr_t qs = ud.dwc + QSCRATCH_OFFSET;
-+    if (!present) {
-+        if (pmic_vbus_present) pmic_detach_pending = true;
-+        pmic_vbus_present = false;
-+        uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
-+        usb_wr(qs, QSCRATCH_HS_PHY_CTRL, hs & ~UTMI_OTG_VBUS_VALID);
-+        if (usb_rd(qs, QSCRATCH_HS_PHY_CTRL) & UTMI_OTG_VBUS_VALID) error = -54;
-+        /* Stop software producers before ending DMA. Preserve a resource on
-+         * command failure; a later sample retries before any buffer reuse. */
-+        ud.configured = false;
-+        ud.host_open = false;
-+        ud.cmd_len = 0;
-+        ud.cmd_pending = false;
-+        if (!error && charger_deadline) error = ud_charger_restore();
-+        if (!error && pmic_detach_pending) {
-+            const unsigned endpoints[] = { 0, 1, EP_RX, EP_TX, EP_NOTIFY };
-+            for (unsigned i = 0; i < sizeof(endpoints)/sizeof(endpoints[0]); ++i) {
-+                unsigned ep = endpoints[i];
-+                if (!ud.resource[ep]) continue;
-+                uint32_t cmd = DEPCMD_ENDTRANSFER | DEPCMD_FORCE_RM |
-+                    DEPCMD_CMDIOC | (ud.resource[ep] << 16);
-+                int rc = ud_epcmd(ep, cmd, 0, 0, 0);
-+                if (rc && rc != UD_EPCMD_NO_RESOURCE) { error = -59; break; }
-+                ud.resource[ep] = 0;
-+            }
-+            if (!error) {
-+                ud.tx_busy = ud.rx_busy = ud.notify_busy = false;
-+                ud.rx_transfer_started = false;
-+                ud.ep0_busy = ud.ep0_ready = false;
-+                ud.ep0_active_ep = 0;
-+                pmic_detach_pending = false;
-+                printf("PICASSO USB: PMIC VBUS detached; data session released\n");
-+            }
-+        }
-+    } else if (pmic_detach_pending) {
-+        error = -59;
-+    } else if (!pmic_vbus_present) {
-+        /* Terminated transfers can leave completion events. Retire them
-+         * before rebuilding EP0, without consuming stale RX/commands. */
-+        uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
-+        ud.evt_pos = (ud.evt_pos + count) % UD_EVT_SIZE;
-+        dwc_wr(GEVNTCOUNT, count);
-+        if (ud_ep0_rebuild("PMIC attach") != 0) error = -60;
-+        if (!error) {
-+            ud_start_setup();
-+            if (!ud.ep0_busy) error = -60;
-+        }
-+        if (!error) {
-+            uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
-+            usb_wr(qs, QSCRATCH_HS_PHY_CTRL, hs | UTMI_OTG_VBUS_VALID);
-+            if (!(usb_rd(qs, QSCRATCH_HS_PHY_CTRL) & UTMI_OTG_VBUS_VALID)) error = -54;
-+        }
-+        if (!error) {
-+            pmic_vbus_present = true;
-+            printf("PICASSO USB: PMIC VBUS attached; EP0 ready\n");
-+        }
-+    }
-+    os_atomic_store(&ud.poll_lock, 0, release);
-+    return error;
-+}
-+
 +int
 +picasso_usb_charger_detect(unsigned begin)
 +{
@@ -2699,14 +2627,8 @@ new file mode 100644
 +    int error = 0;
 +    if (!begin) {
 +        if (charger_deadline) error = ud_charger_restore();
-+    } else if (!pmic_vbus_present || pmic_detach_pending) {
-+        error = -58;
-+    } else if (charger_deadline) {
-+        error = -57;
-+    } else if (ud.configured || ud.host_open) {
-+        error = -55;
-+    } else if (usb_rd(charger_eud, 0)) {
-+        error = -56;
++    } else if (charger_deadline || ud.configured || ud.host_open || usb_rd(charger_eud, 0)) {
++        error = -53;
 +    } else {
 +        for (unsigned i = 0; i < 3; ++i)
 +            charger_saved[i] = usb_rd(charger_phy, charger_regs[i]);
@@ -3386,7 +3308,6 @@ new file mode 100644
 +	}
 +	picasso_usb_park(hold);
 +}
-
 diff --git a/osfmk/kern/printf.c b/osfmk/kern/printf.c
 index aeac9d3..7700994 100644
 --- a/osfmk/kern/printf.c

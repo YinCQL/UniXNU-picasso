@@ -88,7 +88,7 @@ private:
     IOTimerEventSource *timer=nullptr;
     void *gauge=nullptr;
     bool published=false;
-    uint64_t lastGoodMs=0;
+    uint64_t lastGoodMs=0,nextReadMs=0;
     unsigned samples=0,failures=0;
     static void tick(OSObject *owner,IOTimerEventSource *);
     void refresh();
@@ -189,10 +189,14 @@ void PicassoPowerSource::tick(OSObject *owner,IOTimerEventSource *){
 }
 void PicassoPowerSource::refresh(){
     if(!gauge)gauge=picasso_battery_open();
+    uint64_t tickNs=0;absolutetime_to_nanoseconds(mach_absolute_time(),&tickNs);
+    if(gauge && tickNs/1000000<nextReadMs && picasso_battery_changed(gauge)==0){
+        timer->setTimeoutMS(500);return;
+    }
     picasso_battery::Snapshot s;
     int error=gauge?picasso_battery_read(gauge,&s):-1;
     if(!error){
-        lastGoodMs=s.timeMs;failures=0;publish(s);
+        lastGoodMs=s.timeMs;nextReadMs=s.timeMs+s.refreshMs;failures=0;publish(s);
         if(samples<12 || samples%12==0){
             // The serial console truncates oversized lines, including newline.
             // Separate records share a sample ID and fit its 256-byte buffer.
@@ -206,7 +210,7 @@ void PicassoPowerSource::refresh(){
         }
         ++samples;
     }else{
-        ++failures;uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+        nextReadMs=0;++failures;uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
         if(failures<=3 || failures%12==0)IOLog("PICASSO_BATTERY refresh failed=%d count=%u published=%u\n",error,failures,published);
         if(published && ns/1000000-lastGoodMs>=15000){
             flag("PicassoBatteryDataStale",true);flag("PicassoTemperatureValid",false);
@@ -222,7 +226,9 @@ void PicassoPowerSource::refresh(){
             updateStatus();
         }
     }
-    timer->setTimeoutMS(!error?s.refreshMs:1000);
+    // Cable changes are visible within the next light poll; full measurements
+    // retain their one/five-second cadence and their original validity checks.
+    timer->setTimeoutMS(!error?500:1000);
 }
 void PicassoPowerSource::stop(IOService *provider){
     if(timer){timer->cancelTimeout();timer->disable();}
