@@ -6,12 +6,12 @@
 namespace picasso_charger {
 constexpr unsigned maxInputMv=5000,maxInputMa=3000;
 // USBIN configuration, from the matching SMB5 controller register interface.
-constexpr uint8_t command=0x43,allowOverride=0x44,pulses=0x5b;
+constexpr uint8_t command=0x43,allowOverride=0x44,detectTrigger=0x58,pulses=0x5b;
 constexpr uint8_t allowance=0x60,options=0x62,currentLimit=0x70;
 struct Result {
     int error=0;
     unsigned writes=0,configuredMa=0;
-    uint8_t highVoltageOptions=0,allowed=0,overrideValue=0,qcPulses=0;
+    uint8_t highVoltageOptions=0,startOnCc=0,allowed=0,overrideValue=0,qcPulses=0;
     bool verified=false;
 };
 // Keep unrelated bits and every lower current limit. In particular, this
@@ -50,17 +50,21 @@ template<class Bus> Result restrictInput(Bus &bus){
     // Enable BC1.2 explicitly, as required at SMB5 initialization and detach.
     // Disable QC detection/authentication without borrowing USB PHY ownership.
     r.error=masked(bus,options,0x6c,8,r);if(r.error)return r;
+    // The matching Type-C initialization starts BC1.2 from VBUS, allowing
+    // A-to-C sources to be detected when no CC partner is reported.
+    r.error=masked(bus,detectTrigger,0x80,0,r);if(r.error)return r;
     r.error=masked(bus,pulses,0xff,0,r);if(r.error)return r;
     r.error=masked(bus,allowance,0x0f,0,r);if(r.error)return r;
     r.error=masked(bus,allowOverride,0x0f,1,r);if(r.error)return r;
     // Verify all restrictions together. A failed readback is not success.
     r.error=bus.chargerRead(currentLimit,cfg);if(r.error)return r;
     r.error=bus.chargerRead(options,r.highVoltageOptions);if(r.error)return r;
+    r.error=bus.chargerRead(detectTrigger,r.startOnCc);if(r.error)return r;
     r.error=bus.chargerRead(allowance,r.allowed);if(r.error)return r;
     r.error=bus.chargerRead(allowOverride,r.overrideValue);if(r.error)return r;
     r.error=bus.chargerRead(pulses,r.qcPulses);if(r.error)return r;
     r.configuredMa=unsigned(cfg)*50;
-    r.verified=cfg<=maxInputMa/50 && (r.highVoltageOptions&0x6c)==8 &&
+    r.verified=cfg<=maxInputMa/50 && (r.highVoltageOptions&0x6c)==8 && !(r.startOnCc&0x80) &&
         !(r.allowed&15) && (r.overrideValue&15)==1 && !r.qcPulses;
     if(!r.verified)r.error=-50;
     return r;

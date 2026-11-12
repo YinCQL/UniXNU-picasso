@@ -9,7 +9,7 @@ struct Bus {
     uint8_t data[256]={};
     unsigned reads=0,writes=0,failRead=0,failWrite=0,ignoreWrite=0;
     std::vector<unsigned> written;
-    Bus(){data[currentLimit]=100;data[options]=0xff;data[pulses]=0xff;
+    Bus(){data[currentLimit]=100;data[options]=0xff;data[detectTrigger]=0xff;data[pulses]=0xff;
         data[allowance]=0xf7;data[allowOverride]=0xa8;
         data[0x40]=1;data[0x42]=1;data[0x65]=0x9f;data[0x66]=0xf7;}
     int chargerRead(uint8_t reg,uint8_t &value){
@@ -18,7 +18,7 @@ struct Bus {
     }
     int chargerWrite(uint8_t reg,uint8_t value){
         if(++writes==failWrite)return -71;
-        assert(reg==command||reg==allowOverride||reg==pulses||reg==allowance||reg==options||reg==currentLimit);
+        assert(reg==command||reg==allowOverride||reg==pulses||reg==allowance||reg==options||reg==detectTrigger||reg==currentLimit);
         written.push_back(reg);
         if(writes!=ignoreWrite){
             if(reg==command){assert(value==8);data[9]=1;} // Command is self-clearing.
@@ -32,6 +32,7 @@ static void preserve(const Bus &b){
     assert(b.data[0x40]==1&&b.data[0x42]==1&&b.data[0x65]==0x9f&&b.data[0x66]==0xf7);
     assert((b.data[options]&~0x6c)==(0xff&~0x6c));
     assert((b.data[options]&0x6c)==8);
+    assert(b.data[detectTrigger]==0x7f);
     assert((b.data[allowance]&0xf0)==0xf0&&(b.data[allowOverride]&0xf0)==0xa0);
 }
 int main(){
@@ -60,6 +61,13 @@ int main(){
      unsigned enable=0;for(unsigned i=0;i<recorded.written.size();++i)if(recorded.written[i]==options)enable=i+1;
      assert(enable);Bus b;b.data[options]=0;b.ignoreWrite=enable;
      auto q=restrictInput(b);assert(q.error==-50&&!q.verified);}
+    // VBUS triggers detection even with no CC; preserve all other trigger bits.
+    for(unsigned bits=0;bits<=255;++bits){
+        Bus b;b.data[detectTrigger]=uint8_t(bits);b.data[currentLimit]=10;
+        auto q=restrictInput(b);assert(q.verified&&q.configuredMa==500);
+        assert(b.data[detectTrigger]==(bits&0x7f));
+        auto again=restrictInput(b);assert(again.verified&&!again.writes);
+    }
     // The complete BC1.2 classification byte cannot enable a higher level.
     for(unsigned source=0;source<128;++source){
         Bus b;b.data[8]=uint8_t(source);b.data[9]=1;b.data[currentLimit]=10;
