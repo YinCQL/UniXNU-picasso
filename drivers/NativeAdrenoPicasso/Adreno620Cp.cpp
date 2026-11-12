@@ -865,8 +865,9 @@ struct CmdDbBcm {
 };
 
 static unsigned rpmhGate, rpmhPoisoned;
-static bool rpmhEnter() {
-    for (unsigned i = 0; i < 100; ++i) {
+static bool rpmhEnter(unsigned timeoutMs = 100) {
+    for (unsigned i = 0; i < timeoutMs; ++i) {
+        if (__atomic_load_n(&rpmhPoisoned, __ATOMIC_ACQUIRE)) return false;
         if (!__atomic_exchange_n(&rpmhGate, 1U, __ATOMIC_ACQ_REL)) {
             if (!__atomic_load_n(&rpmhPoisoned, __ATOMIC_ACQUIRE)) return true;
             __atomic_store_n(&rpmhGate, 0U, __ATOMIC_RELEASE); return false;
@@ -931,7 +932,9 @@ CmdDbBcm cmdDbBcmLookup(const Mapping &db, const char *name)
  * boot, and the PAS result is what the caller measures. */
 unsigned rpmhVoteCryptoPath()
 {
-    if (!rpmhEnter()) { printf("PICASSO_GPU rpmh: shared owner busy or quarantined\n"); return 0; }
+    // Firmware authentication must wait for a legitimate RSC owner. A busy
+    // owner is not a failed vote; quarantine still refuses immediately.
+    if (!rpmhEnter(30000)) { printf("PICASSO_GPU rpmh: shared owner busy or quarantined\n"); return 0; }
     Mapping rsc = {};
     Mapping db = {};
     if (!mapPhysical(kAppsRscDrv2Base, kAppsRscBytes, rsc)) {
@@ -1119,8 +1122,10 @@ void heartbeatThread(void *, wait_result_t)
  * SMC transport: qcom_scm-smc.c fills x0=CALL_VAL(type, SMC_64, OWNER_SIP,
  * fnid), x1=arginfo, x2..=args; PAS runs as STD_CALL, and x0==1 means
  * QCOM_SCM_INTERRUPTED (retry), as __scm_smc_do_quirk does. */
+static bool zapLoaded;
 bool loadZap()
 {
+    if (zapLoaded) return true; // Successful authentication and its region stay live.
     if (picasso_pas_acquire()) return false;
     struct Lease { bool uncertain = false; ~Lease() { picasso_pas_release(uncertain); } } lease;
     /* wf116: vote the crypto engine's NoC path before TZ runs PAS, the way
@@ -1558,6 +1563,7 @@ bool loadZap()
     metadataMap->release();
     metadata->complete();
     metadata->release();
+    zapLoaded = ok;
     printf("PICASSO_GPU zap: loaded=%d\n", int(ok));
     return ok;
 }
@@ -1643,6 +1649,26 @@ bool waitFence(uint32_t fence, unsigned timeoutUs, bool verbose)
     }
 }
 
+/* A successful no-op fence does not qualify rendering while the GPU remains
+ * secure. Both cold startup and recovery require the same authenticated path. */
+static bool initializeSecureMode()
+{
+    uint32_t enabled = 1;
+    if (PE_parse_boot_argn("sheng-gpu-zap", &enabled, sizeof enabled) && !enabled) {
+        printf("PICASSO_GPU zap: disabled by boot arg\n");
+        return true;
+    }
+    if (!loadZap()) {
+        printf("PICASSO_GPU zap: authentication failed; CP unavailable\n");
+        return false;
+    }
+    if (!leaveSecureMode()) {
+        printf("PICASSO_GPU zap: secure-mode exit failed; CP unavailable\n");
+        return false;
+    }
+    return true;
+}
+
 /* Probe the restarted CP without touching the fence page's numbering: one CP_NOP IB and a CACHE_FLUSH_TS
  * event write to the scratch BO's second word. The production ring's replay then still starts at
  * completed+1, exactly as recover() expects. */
@@ -1679,53 +1705,75 @@ static bool restartProbe()
     return false;
 }
 
-/* The board restart hook NativeAdrenoSubmit::recover installs (NativeAdrenoSubmit.h:22): stop the CP,
- * drain the bus, optionally cold-boot the GMU when GX is off, re-run hw_init/SQE/ring programming, call
- * ring->restart(completed) between the reset and CP init as the contract requires, then bring the CP up,
- * leave secure mode if it was left before, and probe it. Only a completed probe reports success; recover
- * poisons the ring on any error. Runs under the publish lock (publishGpu installs it before the hangcheck
- * starts), so no extra lock. */
+/* Recovery runs under the publish lock. Hold GX, halt the SQE and drain GBIF
+ * before resetting hardware or reusing the ring. A620's reset register is
+ * RBBM_SW_RESET_CMD (0x43, a6xx.xml); a6xx_gpu_sw_reset requires a readback and
+ * at least 100 us asserted. Reprogramming CP bases alone leaves a stalled
+ * draw/IB active and can consume the new ME_INIT without updating its shadow.
+ * Only the scratch event probe permits replay and release of the lost job. */
 extern "C" IOReturn native_adreno620_cp_restart(void *cookie, NativeAdrenoRing *ring, uint32_t completed)
 {
     (void)cookie;
     if (!gState || !ring) return kIOReturnNotReady;
     CpState &s = *gState;
-    printf("PICASSO_GPU restart: begin completed=%u gx=%08x\n", completed, gmuRead(kGmuGxPwrStatus));
-    uint32_t ack[2] = {};
-    (void)ring->drainBus(ack);
-    (void)ring->busHalt(false, 2000);
-    gpuWrite(A620_CP_SQE_CNTL, 0);
-    barrier();
     const bool cold = (gmuRead(kGmuGxPwrStatus) & kGxOffBits) != 0;
+    printf("PICASSO_GPU restart: begin completed=%u cold=%u\n", completed, unsigned(cold));
+    /* Never access the GX register window while the domain is off. The cold
+     * path's HFI handshake acquires GPU_SET; the warm path must acquire it too. */
     if (cold) {
         if (native_adreno620_gmu_restart()) return kIOReturnIOError;
-        if (gmuRead(kGmuGxPwrStatus) & kGxOffBits) return kIOReturnIOError;
+    } else if (native_adreno620_gmu_acquire_gpu_set()) return kIOReturnIOError;
+    struct Hold {
+        bool ready = false;
+        ~Hold() {
+            if (!ready && !(gmuRead(kGmuGxPwrStatus) & kGxOffBits)) {
+                gpuWrite(A620_CP_SQE_CNTL, 3); // SQE_HALT, as a6xx_recover.
+                barrier();
+            }
+            native_adreno620_gmu_release_gpu_set();
+        }
+    } hold;
+    if (gmuRead(kGmuGxPwrStatus) & kGxOffBits) return kIOReturnIOError;
+    gpuWrite(A620_RBBM_INT_0_MASK, 0);
+    gpuWrite(A620_CP_SQE_CNTL, 3);
+    (void)gpuRead(A620_CP_SQE_CNTL);
+    barrier();
+    IOReturn status = ring->busHalt(false, 20000);
+    if (status) {
+        printf("PICASSO_GPU restart: bus halt failed status=%x\n", unsigned(status));
+        return status;
     }
+    constexpr uint32_t reset = 0x43; // A6XX RBBM_SW_RESET_CMD, dword offset.
+    gpuWrite(reset, 1);
+    (void)gpuRead(reset);
+    IODelay(101);
+    gpuWrite(reset, 0);
+    (void)gpuRead(reset);
+    IODelay(1);
+    barrier();
+    /* The reset stopped every GPU master; restore the kernel table before
+     * initialization rather than leaving the last client's table installed. */
+    NativeAdrenoGpuContext *context = NativeAdrenoGpuContextObject();
+    if (!context || !context->vm()) return kIOReturnNotReady;
+    status = context->writeTtbr0(context->vm()->ttbr0());
+    if (status) return status;
     if (!hardwareInit() || !uploadSqe() || !programCp()) return kIOReturnIOError;
-    /* Contract point: the ring is reset between the GPU reset and the CP init. */
-    IOReturn status = ring->restart(completed);
+    status = ring->restart(completed);
     if (status) return status;
     s.next = 0;
     s.sequence = completed;
     gpuWrite(A620_CP_SQE_CNTL, 1);
     barrier();
     if (!cpInit()) return kIOReturnIOError;
-    uint32_t zap = 1;
-    if (!(PE_parse_boot_argn("sheng-gpu-zap", &zap, static_cast<int>(sizeof zap)) && !zap)) {
-        /* The probe below is the authority: a CP that is already non-secure may still refuse/ignore the
-         * packet, while a secure-only CP answers the probe and renders protected-only (the pre-existing
-         * bring-up limitation, reported by the secure-mode line rather than failing the restart). */
-        if (!leaveSecureMode()) printf("PICASSO_GPU restart: secure-mode packet failed; probing anyway\n");
-    }
+    if (!initializeSecureMode()) return kIOReturnIOError;
     if (!restartProbe()) return kIOReturnTimeout;
-    /* The CP consumed the init/probe words; resync leaves the ring's next write at its read pointer
-     * without wiping the fence page, so clients can submit immediately after the replay. */
+    /* Preserve fence numbering and start replay after the consumed probe. */
     status = ring->resync(completed);
     if (status) return status;
     s.next = ring->writePointer();
     s.sequence = completed;
-    if (cold) native_adreno620_gmu_release_gpu_set();
-    printf("PICASSO_GPU restart: ok completed=%u next=%u\n", completed, s.next);
+    hold.ready = true;
+    printf("PICASSO_GPU restart: ok completed=%u next=%u reset=1 probe=1\n", completed, s.next);
     return kIOReturnSuccess;
 }
 
@@ -2294,7 +2342,9 @@ extern "C" int picasso_rpmh_active_write(uint32_t address, uint32_t value)
 extern "C" int picasso_rpmh_adsp_resources(PicassoArcResource rails[3])
 {
     if (!rails) return -22;
-    if (!rpmhEnter()) return -16;
+    // Command DB is immutable firmware data. Snapshot and verify it without
+    // holding the physical RSC transaction gate across allocation and reads.
+    // Otherwise this read-only plan can time out GPU authentication at boot.
     Mapping db = {};
     auto *copy = static_cast<uint8_t *>(IOMalloc(kRpmhCmdDbBytes));
     int error = -12;
@@ -2331,7 +2381,6 @@ extern "C" int picasso_rpmh_adsp_resources(PicassoArcResource rails[3])
     }
     if (db.keep) db.keep->release();
     if (copy) IOFree(copy, kRpmhCmdDbBytes);
-    rpmhLeave();
     printf("PICASSO_ADSP rpmh stage=plan error=%d vote_sent=0 pending=pas-lifecycle\n", error);
     return error;
 }
@@ -2476,26 +2525,7 @@ extern "C" int native_adreno620_cp_start(void)
     }
 
     if (!cpInit()) return -1;
-    /* mainline hw_init(): load the zap through TZ, then switch the CP out of
-     * secure mode. The GPU powers on in secure mode and there "can only render
-     * to protected buffers" (freedreno zap documentation) — the measured
-     * signature of every submit so far. wf100 sent CP_SET_SECURE_MODE(0)
-     * without a zap and the SQE answered CP_OPCODE_ERROR, so the packet is only
-     * sent once the zap has authenticated. sheng-gpu-zap=0 keeps the old path
-     * for a controlled comparison. */
-    uint32_t zapEnabled = 1;
-    if (PE_parse_boot_argn("sheng-gpu-zap", &zapEnabled,
-            static_cast<int>(sizeof zapEnabled)) && !zapEnabled) {
-        printf("PICASSO_GPU zap: disabled by boot arg\n");
-    } else if (!loadZap()) {
-        printf("PICASSO_GPU zap: not loaded; keeping secure mode\n");
-    } else {
-        const uint32_t trustBefore = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
-        const bool left = leaveSecureMode();
-        const uint32_t trustAfter = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
-        printf("PICASSO_GPU cp: secure mode left=%d trust %08x -> %08x\n",
-            int(left), trustBefore, trustAfter);
-    }
+    if (!initializeSecureMode()) return -1;
     /* wf125: the CP was started in secure mode and its RBBM interrupt sources
      * are enabled by hw_init (RBBM_INT_0_MASK). After the zap the GPU is the
      * only block whose state changed, and an asserted line this kernel has no

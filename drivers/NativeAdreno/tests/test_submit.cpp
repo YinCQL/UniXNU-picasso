@@ -298,6 +298,25 @@ int main()
         CHECK(p.submit.recover([](void *,NativeAdrenoRing *,uint32_t)->IOReturn {return kIOReturnIOError;},nullptr,&ringclock,&result)==kIOReturnIOError);
         CHECK(p.submit.poisoned());
     }
+    // A620 uses unframed CACHE_FLUSH_TS submissions. Recovery must keep that
+    // profile and every later fence, without releasing DMA buffers on failure.
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        p.ring.setA6xxFence(true);p.submit.setA6xxPlain(true);
+        NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};uint32_t fence=0;
+        for(uint32_t n=1;n<=3;++n)CHECK(!p.submit.submit(&buffer,1,0,&fence) && fence==n);
+        const uint32_t refs=p.object.deviceReferences();
+        auto restart=[](void *,NativeAdrenoRing *ring,uint32_t completed)->IOReturn {return ring->restart(completed);};
+        NativeAdrenoRecovery result{};
+        CHECK(!p.submit.recover(restart,nullptr,&ringclock,&result));
+        CHECK(result.fence==1 && result.replayed==2 && fencemem[1]==1 && p.ring.lastSubmitted()==3);
+        CHECK(p.object.deviceReferences()==refs-1 && p.submit.outstanding()==2);
+        fencemem[1]=3;CHECK(!p.submit.wait(3,&ringclock,1000));
+        CHECK(!p.submit.submit(&buffer,1,0,&fence) && fence==4);
+        const uint32_t held=p.object.deviceReferences();
+        CHECK(p.submit.recover([](void *,NativeAdrenoRing *,uint32_t)->IOReturn {return kIOReturnIOError;},nullptr,&ringclock,&result)!=0);
+        CHECK(p.submit.poisoned() && p.submit.outstanding()==1 && p.object.deviceReferences()==held);
+    }
     // Device-clock hang detection must ignore CP prefetch movement and reset on a real fence.
     {
         Path p;CHECK(exposed(p)==kIOReturnSuccess);

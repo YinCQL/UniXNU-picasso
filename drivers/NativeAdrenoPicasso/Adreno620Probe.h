@@ -50,6 +50,9 @@ int native_adreno620_zap_firmware(const uint8_t **mdt, size_t *mdt_bytes,
 /* Releases the GMU GPU_SET out-of-band request (HOST2GMU_INTR_SET bit 31) once the CP is running, the last
  * step of mainline hw_init after the CP ring has been initialized. No-op before the GMU has been booted. */
 void native_adreno620_gmu_release_gpu_set(void);
+/* Takes a fresh GPU_SET request and verifies its ACK and GX power before recovery
+ * touches GPU registers. A failed request is cleared; success needs release. */
+int native_adreno620_gmu_acquire_gpu_set(void);
 
 /* Strong entry point; safe to call once from the boot monitor. Without
  * sheng-gpu=<1..5> it returns without doing anything. */

@@ -9,6 +9,8 @@ static uint32_t regs[0x10000/4], db[0x20000/4];
 static unsigned maps,unmaps,allocs,frees,sleeps,delays,writes,commands,failMap,zeroMap,failCommand;
 static unsigned ticks,triggerAt,active,dbReads;
 static bool noMemory,unstable,reenter,entered;
+static unsigned releaseAt;
+static void releaseOwner();
 static uint32_t addresses[32],values[32];
 void IOMemoryMap::release(){++unmaps;}
 bool mapPhysical(uint64_t base,uint64_t bytes,Mapping &m) {
@@ -36,7 +38,7 @@ void write32(const Mapping &m,uint64_t at,uint32_t value) {
     }
 }
 void barrier(){}
-void IOSleep(unsigned ms){assert(ms==1);++sleeps;}
+void IOSleep(unsigned ms){assert(ms==1);++sleeps;if(releaseAt && sleeps==releaseAt)releaseOwner();}
 void IODelay(unsigned us) {
     ++delays;ticks+=us;
     if(reenter && !entered) {entered=true;assert(picasso_rpmh_active_write(0x30000,3)==-16);}
@@ -45,12 +47,13 @@ void IODelay(unsigned us) {
 void *IOMalloc(size_t n){assert(n==sizeof db);++allocs;return noMemory?nullptr:malloc(n);}
 void IOFree(void *p,size_t n){assert(n==sizeof db);++frees;free(p);}
 #include "PicassoRpmh-owner-body.inc"
+static void releaseOwner(){rpmhLeave();}
 static void p16(unsigned at,unsigned v){auto *p=reinterpret_cast<uint8_t *>(db)+at;p[0]=uint8_t(v);p[1]=uint8_t(v>>8);}
 static void p32(unsigned at,unsigned v){p16(at,v);p16(at+2,v>>16);}
 static void setup() {
     memset(regs,0,sizeof regs);memset(db,0,sizeof db);
     maps=unmaps=allocs=frees=sleeps=delays=writes=commands=failMap=zeroMap=failCommand=ticks=dbReads=0;
-    noMemory=unstable=reenter=entered=false;rpmhGate=rpmhPoisoned=0;
+    noMemory=unstable=reenter=entered=false;rpmhGate=rpmhPoisoned=releaseAt=0;
     regs[0]=0x20005;regs[0xd00/4]=0xa5;regs[(0xd00+0x18)/4]=regs[(0xd00+672+0x18)/4]=1;
     p32(0,1);p32(4,0x0c0330db);p16(8,5);p16(10,0);p16(12,240);p16(14,7);
     const char *bcm[]={"CE0","SN6","SN0","SH0","MC0","ACV","CN0"};
@@ -88,5 +91,17 @@ int main() {
     setup();failMap=1;assert(picasso_rpmh_adsp_plan()==-12 && frees==1 && !unmaps && !rpmhGate);
     setup();zeroMap=1;assert(picasso_rpmh_adsp_plan()==-12 && frees==1 && unmaps==1 && !rpmhGate);
     setup();p32(488+16,0x30000);assert(picasso_rpmh_adsp_plan()==-22 && !writes && maps==unmaps && allocs==frees);
+    // Reproduce the old 100 ms boot race: another owner finishes at 150 ms.
+    setup();rpmhGate=1;releaseAt=150;
+    assert(rpmhVoteCryptoPath()==7 && sleeps==150 && commands==7 && !rpmhGate);
+    setup();rpmhGate=1;releaseAt=29999;
+    assert(rpmhVoteCryptoPath()==7 && sleeps==29999 && !rpmhGate);
+    setup();rpmhGate=1;
+    assert(rpmhVoteCryptoPath()==0 && sleeps==30000 && !maps && !writes && rpmhGate);
+    setup();rpmhGate=1;rpmhPoisoned=1;
+    assert(rpmhVoteCryptoPath()==0 && !sleeps && !maps && !writes && rpmhGate);
+    // The independent read-only plan must neither take nor release an RSC owner.
+    setup();rpmhGate=1;
+    assert(!picasso_rpmh_adsp_plan() && !sleeps && !writes && rpmhGate==1);
     puts("PASS production RPMh GPU votes/values, serialized re-entry, quarantine at all seven commands, mapping/allocator cleanup, stable ARC plan without writes");
 }
