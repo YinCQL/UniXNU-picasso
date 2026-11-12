@@ -7,6 +7,7 @@
 #pragma once
 #include <stdint.h>
 namespace picasso_battery {
+static constexpr int profileCutoffUv=3400000,profileFullSoc=9900;
 static const int profileTemperature[] = {-10,0,10,25,40,50};
 static const int profileSoc[] = {10000,9800,9600,9400,9200,9000,8800,8600,8400,8200,8000,7800,7600,7400,7200,7000,6800,6600,6400,6200,6000,5800,5600,5400,5200,5000,4800,4600,4400,4200,4000,3800,3600,3400,3200,3000,2800,2600,2400,2200,2000,1800,1600,1400,1200,1000,900,800,700,600,500,400,300,200,100,0};
 static const uint16_t profileOcv[][6] = {

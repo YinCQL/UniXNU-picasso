@@ -40,6 +40,32 @@ int main(){
         assert(ocv_soc(profileOcv[r][c]*100,profileTemperature[c]*10)==profileSoc[r]);
     for(int t=-200;t<=600;t+=10){int previous=0;
         for(int uv=2500000;uv<=4600000;uv+=1000){int soc=ocv_soc(uv,t);assert(soc>=previous&&soc<=10000);previous=soc;}}
+    // A fixed voltage has independently inverted SOC in each temperature
+    // column. Mixing voltages first shifts the estimate on curved segments.
+    {int sum=ocv_soc(3846400,100)+ocv_soc(3846400,250);
+     int middle=ocv_soc(3846400,175);assert(middle==sum/2 || middle==(sum+1)/2);}
+    for(int t=-200;t<=600;t+=5){
+        assert(usable_ocv_soc(3400000,t)==0&&usable_ocv_soc(4400000,t)==10000);
+        int previous=0;
+        for(int uv=3000000;uv<=4500000;uv+=1000){
+            int soc=usable_ocv_soc(uv,t);assert(soc>=previous&&soc<=10000);previous=soc;
+        }
+    }
+    {Estimator e;Snapshot o;Sample s;s.status=0x81;s.voltageUv=3400000;
+     e.update(s,1000,250,true,3400000,o);assert(o.percent==0&&o.remainingMah==0);}
+    {Estimator e;Snapshot o;Sample s;s.status=0x81;s.voltageUv=4400000;
+     e.update(s,1000,250,true,4400000,o);assert(o.percent==99&&!o.full);}
+    // Rest correction must use the same usable-capacity scale as boot, and
+    // never carry a rest window across a missing sample or high load.
+    {Estimator e;Snapshot o;Sample s;s.status=0x81;s.voltageUv=3846400;
+     e.update(s,1000,250,true,3846400,o);const auto initial=e.remainingUaMs;
+     for(uint64_t ms=6000;ms<=246000;ms+=5000)e.update(s,ms,250,true,0,o);
+     assert(e.remainingUaMs==initial);
+     s.voltageUv=4200000;e.gap();e.update(s,300000,250,true,0,o);
+     for(uint64_t ms=305000;ms<425000;ms+=5000)e.update(s,ms,250,true,0,o);
+     assert(e.remainingUaMs==initial);e.update(s,425000,250,true,0,o);
+     assert(e.remainingUaMs==initial+Estimator::fullUaMs/100);
+     s.currentUa=45001;e.update(s,430000,250,true,0,o);assert(!e.restMs);}
     for(unsigned mode=0;mode<8;++mode)for(unsigned plug=0;plug<2;++plug)for(unsigned flow=0;flow<2;++flow){
         Estimator e;Snapshot o;Sample s;s.status=0x81;s.voltageUv=4000000;s.currentUa=flow?-500000:500000;
         s.usb=plug?16:0;s.path=17;s.charger=uint8_t(mode);e.update(s,1000,250,true,4000000,o);
@@ -47,12 +73,15 @@ int main(){
     }
     Sample s;s.status=0x81;s.voltageUv=3846400;s.currentUa=450000;s.charger=3;
     Estimator e;Snapshot o;e.update(s,1000,250,true,3846400,o);assert(o.percent==50);
+    const int64_t initial=e.remainingUaMs;
     for(uint64_t ms=6000;ms<=3601000;ms+=5000)e.update(s,ms,250,true,0,o);
-    assert(o.percent==40&&o.remainingMah==1800&&o.minutes==240);
+    assert(e.remainingUaMs==initial-450000LL*3600000);
+    assert(o.percent==40&&o.remainingMah>=1780&&o.remainingMah<=1800&&o.minutes>=237&&o.minutes<=240);
     int64_t before=e.remainingUaMs;e.gap();e.update(s,8000000,250,true,0,o);assert(e.remainingUaMs==before);
     s.currentUa=-450000;s.usb=16;s.path=17;
     for(uint64_t ms=8005000;ms<=11600000;ms+=5000)e.update(s,ms,250,true,0,o);
-    assert(o.percent==50&&o.charging&&o.minutes==-1);
+    // The first interval crosses from discharge to charge and averages zero.
+    assert(e.remainingUaMs==initial-450000LL*5000&&o.percent==50&&o.charging&&o.minutes==-1);
     s.charger=5;s.voltageUv=4370000;s.currentUa=100000;e.update(s,11605000,250,true,0,o);assert(!o.full);
     s.currentUa=0;e.update(s,11610000,250,true,0,o);assert(o.full&&o.percent==100);
     s.thermal=8;e.update(s,11615000,250,true,0,o);assert(!o.full&&!o.charging);

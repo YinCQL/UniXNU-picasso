@@ -56,22 +56,35 @@ inline int battery_id_ohm(uint16_t code){
     if(!code || code>=0x70e4)return 0;
     return int(uint64_t(code)*100000/(0x70e4-code));
 }
-inline int ocv_soc(int uv,int temperature){
-    unsigned col=0;int tc=temperature;
-    if(tc<profileTemperature[0]*10)tc=profileTemperature[0]*10;
-    if(tc>profileTemperature[5]*10)tc=profileTemperature[5]*10;
-    while(col<4 && tc>profileTemperature[col+1]*10)++col;
-    int previous=0;
+inline int ocv_soc_column(int uv,unsigned col){
     for(unsigned row=0;row<sizeof(profileSoc)/sizeof(profileSoc[0]);++row){
-        int voltage=interpolate(tc,profileTemperature[col]*10,profileTemperature[col+1]*10,
-            profileOcv[row][col]*100,profileOcv[row][col+1]*100);
+        int voltage=profileOcv[row][col]*100;
         if(uv>=voltage){
             if(!row)return 10000;
-            return interpolate(uv,previous,voltage,profileSoc[row-1],profileSoc[row]);
+            return interpolate(uv,profileOcv[row-1][col]*100,voltage,
+                profileSoc[row-1],profileSoc[row]);
         }
-        previous=voltage;
     }
     return 0;
+}
+inline int ocv_soc(int uv,int temperature){
+    if(temperature<=profileTemperature[0]*10)return ocv_soc_column(uv,0);
+    if(temperature>=profileTemperature[5]*10)return ocv_soc_column(uv,5);
+    unsigned col=0;
+    while(col<4 && temperature>profileTemperature[col+1]*10)++col;
+    // Invert each voltage curve before interpolating SOC across temperature.
+    return interpolate(temperature,profileTemperature[col]*10,profileTemperature[col+1]*10,
+        ocv_soc_column(uv,col),ocv_soc_column(uv,col+1));
+}
+inline int usable_ocv_soc(int uv,int temperature){
+    // Board cutoff is 3.4 V. The default charging curve reaches 100% below
+    // the 4.4 V float limit at every temperature; the boot model caps that
+    // endpoint at 99%. Keep hundredth-percent precision for both endpoints.
+    const int empty=ocv_soc(profileCutoffUv,temperature);
+    const int raw=ocv_soc(uv,temperature);
+    if(raw<=empty)return 0;
+    if(raw>=profileFullSoc)return 10000;
+    return int(int64_t(raw-empty)*10000/(profileFullSoc-empty));
 }
 // APSD and settled input limits are reported by SMB5, not negotiated here.
 struct Input {
@@ -167,7 +180,7 @@ struct Estimator {
             // S7 is a boot measurement, used once. Reject implausible values;
             // live voltage is an explicitly approximate initialization fallback.
             int initial=ponUv>=3000000 && ponUv<=4500000?ponUv:s.voltageUv;
-            remainingUaMs=fullUaMs*ocv_soc(initial,tempValid?temp:250)/10000;
+            remainingUaMs=fullUaMs*usable_ocv_soc(initial,tempValid?temp:250)/10000;
             ready=true;
         }else if(dt){
             remainingUaMs-=int64_t(lastCurrent+s.currentUa)*int64_t(dt)/2;
@@ -179,7 +192,7 @@ struct Estimator {
             if(!restMs){restMs=now;restVoltage=s.voltageUv;correctionMs=now;}
             restVoltage=(restVoltage*7+s.voltageUv)/8;
             if(now-restMs>=120000 && now-correctionMs>=60000 && tempValid){
-                int64_t target=fullUaMs*ocv_soc(restVoltage,temp)/10000;
+                int64_t target=fullUaMs*usable_ocv_soc(restVoltage,temp)/10000;
                 int64_t change=target-remainingUaMs,limit=fullUaMs/100;
                 if(change>limit)change=limit;if(change<-limit)change=-limit;
                 remainingUaMs+=change;correctionMs=now;
