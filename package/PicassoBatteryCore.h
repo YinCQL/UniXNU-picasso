@@ -73,12 +73,69 @@ inline int ocv_soc(int uv,int temperature){
     }
     return 0;
 }
+// APSD and settled input limits are reported by SMB5, not negotiated here.
+struct Input {
+    uint8_t apsd=0,result=0,icl=0,aicl=0;
+    int millivolts=0,milliamps=0;
+    bool statusValid=false,voltageValid=false,currentValid=false;
+};
+inline uint32_t adapter_family(const Input &s,bool external){
+    if(!external)return 0;
+    if(!s.statusValid || !(s.apsd&1))return 0xe0004007u;
+    switch(s.result&0x7f){
+        case 1:return 0xe0004000u;
+        case 4:return 0xe0004005u;
+        case 2:case 8:case 0x28:case 0x48:return 0xe0004004u;
+        default:return 0xe0004007u;
+    }
+}
+template<class Bus> int input_status(Bus &bus,Input &out){
+    Input next;uint8_t again[4]={};
+    const unsigned channel[4]={1,1,3,3};
+    const uint8_t reg[4]={7,8,8,0x0a};
+    uint8_t *first[4]={&next.apsd,&next.result,&next.icl,&next.aicl};
+    for(unsigned i=0;i<4;++i){int e=bus.read(channel[i],reg[i],*first[i]);if(e)return e;}
+    for(unsigned i=0;i<4;++i){int e=bus.read(channel[i],reg[i],again[i]);if(e)return e;
+        if(again[i]!=*first[i])return -35;}
+    if(next.icl>100)return -36;
+    next.statusValid=true;out=next;return 0;
+}
+inline int adc_voltage_uv(uint16_t code,unsigned scale){
+    return int((uint64_t(code)*1875000/0x70e4)*scale);
+}
 struct Snapshot {
     Sample raw;
+    Input input;
     uint64_t timeMs=0;
     int percent=0,remainingMah=0,millivolts=0,milliamps=0,temperature=0,idOhm=0,minutes=-1;
     bool present=false,external=false,capable=false,charging=false,full=false;
     bool temperatureValid=false,idValid=false,estimated=true;
+    bool netCharging=false,warn=false,critical=false;
+    unsigned refreshMs=5000;
+};
+// Board low-voltage thresholds and 50 mV recovery hysteresis. Require fresh
+// observations across three seconds before escalating a voltage dip. The OS
+// receives standard warning/critical properties and owns orderly shutdown.
+struct LowBattery {
+    uint64_t previousMs=0,lowSince=0,criticalSince=0;
+    bool low=false,critical=false;
+    void reset(){previousMs=0;lowSince=0;criticalSince=0;low=false;critical=false;}
+    void update(Snapshot &s){
+        s.warn=false;s.critical=false;s.refreshMs=5000;
+        if(!s.present || s.capable){reset();return;}
+        if(!previousMs || s.timeMs<=previousMs || s.timeMs-previousMs>15000){lowSince=0;criticalSince=0;}
+        previousMs=s.timeMs;
+        const int lowUv=s.temperatureValid && s.temperature<0?3800000:3500000;
+        const int emptyUv=s.temperatureValid && s.temperature<0?3000000:3100000;
+        const int uv=s.raw.voltageUv;
+        if(uv<lowUv){if(!lowSince)lowSince=s.timeMs;if(s.timeMs-lowSince>=3000)low=true;}
+        else {lowSince=0;if(uv>lowUv+50000)low=false;}
+        const bool nearEmpty=(s.percent<=2 && uv<3380000) || uv<emptyUv;
+        if(nearEmpty){if(!criticalSince)criticalSince=s.timeMs;if(s.timeMs-criticalSince>=3000)critical=true;}
+        else {criticalSince=0;if(uv>3430000 || s.netCharging)critical=false;}
+        s.warn=s.percent<=20 || low || critical;s.critical=critical;
+        if(uv<lowUv || low || s.percent<=2)s.refreshMs=1000;
+    }
 };
 // 4500 mAh is nominal, not a learned health measurement. Integrate only
 // adjacent observations; an unread interval is never filled with old current.
@@ -87,17 +144,22 @@ struct Estimator {
     uint64_t lastMs=0,restMs=0,correctionMs=0;
     int lastCurrent=0,restVoltage=0;
     int64_t remainingUaMs=0;
+    LowBattery lowBattery;
     static constexpr int64_t fullUaMs=4500LL*1000*3600000;
-    void gap(){lastMs=0;restMs=0;correctionMs=0;}
+    void gap(){lastMs=0;restMs=0;correctionMs=0;lowBattery.reset();}
     void update(const Sample &s,uint64_t now,int temp,bool tempValid,int ponUv,Snapshot &out){
         out=Snapshot{};out.raw=s;out.timeMs=now;out.present=(s.status&1)!=0;
         out.external=(s.usb&0x10)!=0;
-        out.capable=out.external && (s.path&0x11)==0x11 && !(s.path&0x40);
+        out.capable=out.external && (s.path&0x11)==0x11 && !(s.path&0x40) && !(s.usb&0x0f);
         out.millivolts=s.voltageUv/1000;out.milliamps=-s.currentUa/1000;
         out.temperature=temp;out.temperatureValid=tempValid;
         unsigned mode=s.charger&7;
         bool fault=(s.thermal&0x0f) || (s.chargeError&2);
-        out.charging=out.present && out.capable && !fault && mode>=1 && mode<=4 && s.currentUa<0;
+        // The charger state describes its active charging cycle. A system load
+        // can temporarily draw more than the input supplies; preserve that net
+        // discharge in Amperage and capacity integration without hiding the cycle.
+        out.charging=out.present && out.capable && !fault && mode>=1 && mode<=4;
+        out.netCharging=out.present && s.currentUa<0;
         out.full=out.present && out.capable && !fault && mode==5 && s.voltageUv>=4300000 && s.currentUa>=-45000 && s.currentUa<=45000;
         if(!out.present){ready=false;gap();return;}
         uint64_t dt=lastMs && now>lastMs && now-lastMs<=15000?now-lastMs:0;
@@ -128,22 +190,25 @@ struct Estimator {
         out.percent=int((remainingUaMs*100+fullUaMs/2)/fullUaMs);
         if(!out.full && out.percent==100)out.percent=99;
         out.remainingMah=int(remainingUaMs/3600000000LL);
-        if(!out.charging && s.currentUa>45000)
+        if(!out.capable && s.currentUa>45000)
             out.minutes=int(remainingUaMs/(int64_t(s.currentUa)*60000));
         // Charging time depends on taper and negotiated limits; leave unknown.
+        lowBattery.update(out);
         lastMs=now;lastCurrent=s.currentUa;
     }
 };
 // ADC5 application conversion, separate from QG/charger configuration. One
 // owner calls this under its work-loop gate; all bus transactions share SPMI.
 template<class Bus> int adc_read(Bus &bus,uint8_t channel,uint16_t &out){
-    if(channel!=0x4a && channel!=0x4b)return -30;
+    const bool thermal=channel==0x4a || channel==0x4b;
+    if(!thermal && channel!=7 && channel!=8)return -30;
     uint8_t status=0;int error=bus.read(4,8,status);
     if(error)return error;if(status&2)return -31;
     uint8_t cfg[5]={};
     for(unsigned i=0;i<5;++i)if((error=bus.read(4,uint8_t(0x42+i),cfg[i])))return error;
-    cfg[0]=uint8_t((cfg[0]&~0x7c)|0x18); // timer, ratiometric, 840 decimation
-    cfg[1]&=uint8_t(~7);cfg[2]=channel;cfg[3]=uint8_t((cfg[3]&~15)|2);cfg[4]|=0x80;
+    // Thermistor/ID use ratiometric calibration; USB uses absolute calibration.
+    cfg[0]=uint8_t((cfg[0]&~0x7c)|(thermal?0x18:0x28));
+    cfg[1]&=uint8_t(~7);cfg[2]=channel;cfg[3]=uint8_t((cfg[3]&~15)|(thermal?2:0));cfg[4]|=0x80;
     for(unsigned i=0;i<5;++i)if((error=bus.write(uint8_t(0x42+i),cfg[i])))return error;
     if((error=bus.write(0x47,0x80)))return error;
     for(unsigned i=0;i<10;++i){
@@ -154,7 +219,7 @@ template<class Bus> int adc_read(Bus &bus,uint8_t channel,uint16_t &out){
         if((error=bus.read(4,0x44,selected)) || (error=bus.read(4,0x50,lo)) || (error=bus.read(4,0x51,hi)))return error;
         if(selected!=channel)return -32;
         uint16_t code=uint16_t(lo|unsigned(hi)<<8);
-        if(!code || code>=0x70e4)return -33;
+        if((thermal && !code) || code>=0x70e4)return -33;
         out=code;return 0;
     }
     return -34;

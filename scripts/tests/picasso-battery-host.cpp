@@ -43,7 +43,7 @@ int main(){
     for(unsigned mode=0;mode<8;++mode)for(unsigned plug=0;plug<2;++plug)for(unsigned flow=0;flow<2;++flow){
         Estimator e;Snapshot o;Sample s;s.status=0x81;s.voltageUv=4000000;s.currentUa=flow?-500000:500000;
         s.usb=plug?16:0;s.path=17;s.charger=uint8_t(mode);e.update(s,1000,250,true,4000000,o);
-        assert(o.charging==(plug&&flow&&mode>=1&&mode<=4));assert(o.milliamps==(flow?500:-500));assert(!o.full);
+        assert(o.charging==(plug&&mode>=1&&mode<=4));assert(o.milliamps==(flow?500:-500));assert(!o.full);
     }
     Sample s;s.status=0x81;s.voltageUv=3846400;s.currentUa=450000;s.charger=3;
     Estimator e;Snapshot o;e.update(s,1000,250,true,3846400,o);assert(o.percent==50);
@@ -63,5 +63,50 @@ int main(){
     {Bus b;b.data[4][8]=2;uint16_t v=9;assert(adc_read(b,0x4a,v)==-31&&!b.writes&&v==9);}
     {Bus b;b.timeout=true;uint16_t v=9;assert(adc_read(b,0x4a,v)==-34&&b.waits==10&&v==9);}
     {Bus b;b.wrongChannel=true;uint16_t v=9;assert(adc_read(b,0x4a,v)==-32&&v==9);}
+
+    // Reproduce the observed USB=10/path=95/CHGR=03 with net discharge.
+    {Estimator e;Snapshot o;Sample s;s.status=0x81;s.usb=0x10;s.path=0x95;s.charger=3;
+     s.voltageUv=4127277;s.currentUa=90637;e.update(s,1000,300,true,4127277,o);
+     assert(o.external&&o.capable&&o.charging&&!o.netCharging&&o.milliamps==-90&&o.minutes==-1);
+     const auto remaining=e.remainingUaMs;e.update(s,6000,300,true,0,o);
+     assert(e.remainingUaMs<remaining&&o.charging);
+     for(unsigned bit:{1u,2u,4u,8u}){s.usb=uint8_t(0x10|bit);e.update(s,11000,300,true,0,o);assert(!o.capable&&!o.charging);}
+     s.usb=0x10;s.path=0xd5;e.update(s,16000,300,true,0,o);assert(!o.charging);
+     s.usb=0;s.path=0;e.update(s,21000,300,true,0,o);assert(!o.external&&!o.charging&&o.minutes>0);}
+    {Bus b;Input i;b.data[1][7]=1;b.data[1][8]=1;b.data[3][8]=10;b.data[3][0x0a]=0x41;
+     assert(!input_status(b,i)&&i.statusValid&&i.icl==10&&adapter_family(i,true)==0xe0004000u);
+     for(unsigned n=1;n<=8;++n){Bus f;Input unchanged;unchanged.icl=99;f.failAt=n;
+         assert(input_status(f,unchanged)==-40&&unchanged.icl==99&&!unchanged.statusValid);}
+     b.data[3][8]=101;assert(input_status(b,i)==-36);}
+    {Input i;i.statusValid=true;i.apsd=1;
+     for(unsigned result:{2u,8u,0x28u,0x48u}){i.result=uint8_t(result);assert(adapter_family(i,true)==0xe0004004u);}
+     i.result=4;assert(adapter_family(i,true)==0xe0004005u);i.result=3;assert(adapter_family(i,true)==0xe0004007u);
+     i.apsd=0;assert(adapter_family(i,true)==0xe0004007u&&adapter_family(i,false)==0);}
+    assert(adc_voltage_uv(0x3872,16)==15000000&&adc_voltage_uv(0x3872,5)==4687500);
+    for(unsigned channel:{7u,8u}){Bus b;uint16_t value=77;
+     assert(!adc_read(b,uint8_t(channel),value)&&b.data[4][0x42]==0x28&&b.data[4][0x45]==0);
+     b.data[4][0x50]=0;b.data[4][0x51]=0;assert(!adc_read(b,uint8_t(channel),value)&&value==0);}
+    {Bus b;uint16_t v=17;assert(adc_read(b,9,v)==-30&&!b.reads&&!b.writes);}
+    // Warning hysteresis, fresh-observation persistence and recovery; no direct halt.
+    {LowBattery policy;Snapshot s;s.present=true;s.percent=30;s.raw.voltageUv=3490000;s.timeMs=1000;
+     policy.update(s);assert(!s.warn&&!s.critical&&s.refreshMs==1000);
+     s.timeMs=3000;policy.update(s);assert(!s.warn);s.timeMs=4000;policy.update(s);assert(s.warn&&!s.critical);
+     s.raw.voltageUv=3530000;s.timeMs=5000;policy.update(s);assert(s.warn);
+     s.raw.voltageUv=3560000;s.timeMs=6000;policy.update(s);assert(!s.warn);
+     s.percent=1;s.raw.voltageUv=3370000;s.timeMs=7000;policy.update(s);assert(!s.critical);
+     s.timeMs=9000;policy.update(s);assert(!s.critical);s.timeMs=10000;policy.update(s);assert(s.critical&&s.warn);
+     s.capable=true;s.timeMs=11000;policy.update(s);assert(!s.warn&&!s.critical);
+     s.capable=false;s.raw.voltageUv=3000000;s.percent=60;s.timeMs=12000;policy.update(s);assert(!s.critical);
+     s.timeMs=30000;policy.update(s);assert(!s.critical);s.timeMs=33000;policy.update(s);assert(s.critical);
+     policy.reset();s.critical=false;s.timeMs=40000;s.temperature=-50;s.temperatureValid=true;
+     policy.update(s);assert(!s.critical);s.timeMs=43000;policy.update(s);assert(!s.critical);}
+
+    {struct ChangingInput:Bus {int read(unsigned ch,uint8_t reg,uint8_t &v){int result=Bus::read(ch,reg,v);if(reads==6)++v;return result;}} b;
+     Input out;out.icl=99;assert(input_status(b,out)==-35&&!out.statusValid&&out.icl==99);}
+    for(unsigned channel:{7u,8u}){
+        for(unsigned n=1;n<=10;++n){Bus b;b.failAt=n;uint16_t value=99;assert(adc_read(b,uint8_t(channel),value)==-40&&value==99);}
+        for(unsigned n=1;n<=6;++n){Bus b;b.failWrite=n;uint16_t value=99;assert(adc_read(b,uint8_t(channel),value)==-41&&value==99);}
+        Bus b;b.timeout=true;uint16_t value=99;assert(adc_read(b,uint8_t(channel),value)==-34&&value==99);
+    }
     puts("PASS complete QG snapshots, current sign, profile interpolation, one-hour charge/discharge, gaps, charger/thermal states, ADC failures and timeout");
 }

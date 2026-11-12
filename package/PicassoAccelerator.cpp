@@ -97,6 +97,7 @@ private:
     void text(const char *key,const char *value);
     void erase(const char *key);
     void publish(const picasso_battery::Snapshot &s);
+    void adapter(const picasso_battery::Snapshot &s);
 };
 OSDefineMetaClassAndStructors(PicassoPowerSource, IOPMPowerSource);
 void PicassoPowerSource::number(const char *key,unsigned long long value){
@@ -120,9 +121,35 @@ void PicassoPowerSource::erase(const char *key){
         properties->removeObject(key);removeProperty(key);settingsChangedSinceUpdate=true;
     }
 }
+void PicassoPowerSource::adapter(const picasso_battery::Snapshot &s){
+    OSDictionary *details=OSDictionary::withCapacity(3);
+    if(!details)return;
+    auto put=[&](const char *key,unsigned value){
+        OSNumber *n=OSNumber::withNumber(value,32);
+        if(n){details->setObject(key,n);n->release();}
+    };
+    put(kIOPMPSAdapterDetailsFamilyKey,picasso_battery::adapter_family(s.input,s.external));
+    if(s.external && s.input.voltageValid)put(kIOPMPSAdapterDetailsVoltage,s.input.millivolts);
+    if(s.external && s.input.statusValid && s.capable)
+        put(kIOPMPSAdapterDetailsAmperageKey,unsigned(s.input.icl)*50);
+    // Effective input limit is not a power brick's rated wattage.
+    const OSSymbol *key=OSSymbol::withCString(kIOPMPSAdapterDetailsKey);
+    if(key)setPSProperty(key,details);
+    OSSafeReleaseNULL(key);details->release();
+}
 void PicassoPowerSource::publish(const picasso_battery::Snapshot &s){
     setBatteryInstalled(s.present);setExternalConnected(s.external);
     setExternalChargeCapable(s.capable);setIsCharging(s.charging);
+    setAtWarnLevel(s.warn);setAtCriticalLevel(s.critical);
+    flag("PicassoNetCharging",s.netCharging);adapter(s);
+    if(s.external && s.input.voltageValid)number("PicassoUSBVoltageMV",s.input.millivolts);
+    else erase("PicassoUSBVoltageMV");
+    if(s.external && s.input.currentValid)number("PicassoUSBCurrentMA",s.input.milliamps);
+    else erase("PicassoUSBCurrentMA");
+    if(s.external && s.input.statusValid){
+        number("PicassoUSBInputLimitMA",unsigned(s.input.icl)*50);
+        flag("PicassoInputLimited",(s.input.aicl&0x40)!=0);
+    }else{erase("PicassoUSBInputLimitMA");erase("PicassoInputLimited");}
     flag("FullyCharged",s.full);flag("PicassoBatteryDataStale",false);
     flag("CapacityEstimated",true);flag("PicassoCapacityEstimated",true);flag("PicassoTemperatureValid",s.temperatureValid);
     text("PicassoCapacityMethod","default-profile-ocv-current-integration");
@@ -159,9 +186,11 @@ void PicassoPowerSource::refresh(){
     if(!error){
         lastGoodMs=s.timeMs;failures=0;publish(s);
         if(samples<12 || samples%12==0)
-            IOLog("PICASSO_BATTERY published sample=%u percent=%d estimated=1 uv=%d ua=%d os_ma=%d temp_dc=%d temp_valid=%u usb=%02x path=%02x chg=%02x charging=%u full=%u id=%d\n",
+            IOLog("PICASSO_BATTERY published sample=%u percent=%d estimated=1 uv=%d ua=%d os_ma=%d temp_dc=%d temp_valid=%u usb=%02x path=%02x chg=%02x charging=%u full=%u id=%d net_charging=%u warn=%u critical=%u input_valid=%u apsd=%02x/%02x icl_ma=%u input_limited=%u usb_mv=%d usb_ma=%d usb_valid=%u/%u\n",
                 samples,s.percent,s.raw.voltageUv,s.raw.currentUa,s.milliamps,s.temperature,s.temperatureValid,
-                s.raw.usb,s.raw.path,s.raw.charger,s.charging,s.full,s.idOhm);
+                s.raw.usb,s.raw.path,s.raw.charger,s.charging,s.full,s.idOhm,s.netCharging,s.warn,s.critical,
+                s.input.statusValid,s.input.apsd,s.input.result,unsigned(s.input.icl)*50,(s.input.aicl&0x40)!=0,
+                s.input.millivolts,s.input.milliamps,s.input.voltageValid,s.input.currentValid);
         ++samples;
     }else{
         ++failures;uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
@@ -170,12 +199,15 @@ void PicassoPowerSource::refresh(){
             flag("PicassoBatteryDataStale",true);flag("PicassoTemperatureValid",false);
             text("ErrorCondition","BatteryReadFailed");setIsCharging(false);flag("FullyCharged",false);
             setExternalChargeCapable(false);setTimeRemaining(0xffff);
-            erase("ExternalConnected");
+            erase("ExternalConnected");erase("AdapterDetails");erase("PicassoNetCharging");
+            erase("PicassoUSBVoltageMV");erase("PicassoUSBCurrentMA");
+            erase("PicassoUSBInputLimitMA");erase("PicassoInputLimited");
+            setAtWarnLevel(false);setAtCriticalLevel(false);
             erase("Voltage");erase("Amperage");erase("InstantAmperage");erase("Temperature");
             updateStatus();
         }
     }
-    timer->setTimeoutMS(5000);
+    timer->setTimeoutMS(!error?s.refreshMs:1000);
 }
 void PicassoPowerSource::stop(IOService *provider){
     if(timer){timer->cancelTimeout();timer->disable();}

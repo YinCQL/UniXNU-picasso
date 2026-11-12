@@ -63,16 +63,34 @@ extern "C" int picasso_battery_read(void *context,picasso_battery::Snapshot *out
     picasso_battery::Sample sample;
     int error=picasso_battery::sample(*b,b->subtype,sample);
     if(error){b->estimator.gap();return error;}
+    picasso_battery::Input input;
+    if(sample.usb&0x10)picasso_battery::input_status(*b,input);
     uint16_t tempRaw=0,idRaw=0;int temp=-10000,id=0;
     if(b->adcReady && (sample.status&1)){
         if(!picasso_battery::adc_read(*b,0x4a,tempRaw))temp=picasso_battery::temperature_deci_c(tempRaw);
         if(!picasso_battery::adc_read(*b,0x4b,idRaw))id=picasso_battery::battery_id_ohm(idRaw);
     }
+    if(b->adcReady && (sample.usb&0x10) && (sample.path&0x11)==0x11){
+        uint16_t code=0;
+        if(!picasso_battery::adc_read(*b,8,code)){
+            input.millivolts=picasso_battery::adc_voltage_uv(code,16)/1000;
+            input.voltageValid=input.millivolts>=2500 && input.millivolts<=22000;
+        }
+        if(!picasso_battery::adc_read(*b,7,code)){
+            // PM7250B USB sense is 0.2 V/A in buck mode.
+            input.milliamps=picasso_battery::adc_voltage_uv(code,5)/1000;
+            input.currentValid=input.milliamps<=5000;
+        }
+    }
+    // Do not combine ADC conversions from before an unplug with a new source.
+    uint8_t usb=0,path=0;
+    error=b->read(1,0x10,usb);if(!error)error=b->read(3,0x0b,path);
+    if(error || usb!=sample.usb || path!=sample.path){b->estimator.gap();return error?error:-37;}
     uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
     int pon=0;
     if(!b->ponRead && (sample.status&1)){pon=b->pon();b->ponRead=true;}
     picasso_battery::Snapshot next;
     b->estimator.update(sample,ns/1000000,temp,temp!=-10000,pon,next);
-    next.idOhm=id;next.idValid=id>0;
+    next.idOhm=id;next.idValid=id>0;next.input=input;
     *out=next;return 0;
 }
