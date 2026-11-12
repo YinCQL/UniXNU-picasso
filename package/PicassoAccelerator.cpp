@@ -139,6 +139,9 @@ void PicassoPowerSource::adapter(const picasso_battery::Snapshot &s){
 }
 void PicassoPowerSource::publish(const picasso_battery::Snapshot &s){
     setBatteryInstalled(s.present);setExternalConnected(s.external);
+    // iOS uses physical input presence to permit percentage increases.
+    // ExternalConnected alone updates the charging UI but not this policy.
+    flag("AppleRawExternalConnected",s.external);
     setExternalChargeCapable(s.capable);setIsCharging(s.charging);
     setAtWarnLevel(s.warn);setAtCriticalLevel(s.critical);
     flag("PicassoNetCharging",s.netCharging);adapter(s);
@@ -216,7 +219,8 @@ void PicassoPowerSource::refresh(){
             flag("PicassoBatteryDataStale",true);flag("PicassoTemperatureValid",false);
             text("ErrorCondition","BatteryReadFailed");setIsCharging(false);flag("FullyCharged",false);
             setExternalChargeCapable(false);setTimeRemaining(0xffff);
-            erase("ExternalConnected");erase("AdapterDetails");erase("PicassoNetCharging");
+            erase("ExternalConnected");erase("AppleRawExternalConnected");
+            erase("AdapterDetails");erase("PicassoNetCharging");
             erase("PicassoUSBVoltageMV");erase("PicassoUSBCurrentMA");
             erase("PicassoUSBInputLimitMA");erase("PicassoInputLimited");
             flag("PicassoUSBInputCapVerified",false);erase("PicassoUSBConfiguredLimitMA");
