@@ -3,7 +3,7 @@ name: Picasso host regressions
 on:
   workflow_dispatch:
   push:
-    branches: [feat/ios16, feat/ios16-gpu, feat/ios16-dsp]
+    branches: [feat/ios16, feat/ios16-gpu, feat/ios16-dsp, feat/fix-v1]
     paths:
       - '.github/workflows/host-checks.yml'
       - 'scripts/**'
