@@ -228,7 +228,7 @@ jobs:
         run: |
           sudo env PATH="$PATH" PICASSO_LINUX_INPUTS="${PICASSO_LINUX_INPUTS:-}" \
             "$(command -v python3)" -B scripts/picasso_media_payload.py check \
-            --tree "$UNIXNU_TREE" --work out/picasso --output out/picasso/logs/data-artifacts.json
+            --tree out/picasso/tree --work out/picasso --output out/picasso/logs/data-artifacts.json
 
       - name: Check runtime memory and swap boundaries
         if: ${{ !inputs.fast }}
@@ -315,7 +315,7 @@ jobs:
       - name: Export audited iOS16 inputs for Linux builds
         run: |
           sudo env PATH="$PATH" PICASSO_LINUX_INPUTS="${PICASSO_LINUX_INPUTS:-}" \
-            "$(command -v python3)" -B scripts/export-picasso-media-inputs.py --tree "$UNIXNU_TREE" \
+            "$(command -v python3)" -B scripts/export-picasso-media-inputs.py --tree out/picasso/tree \
             --work out/picasso --output out/picasso/linux-inputs
 
       - name: Compose boot image (BootShim + repo FD + payload as ramdisk)
