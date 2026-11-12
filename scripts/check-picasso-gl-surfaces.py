@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--source', type=Path, default=ROOT/'drivers/NativeGL/eagl/eagl.c')
 p.add_argument('--output', type=Path, required=True)
+p.add_argument('--expect-stale-mipmap', action='store_true')
 p.add_argument('--expect-unpublished', action='store_true')
 p.add_argument('--expect-unflipped', action='store_true')
 p.add_argument('--expect-stale-read', action='store_true')
@@ -28,7 +29,7 @@ decl = (ROOT/'out/picasso/nativegl/eagl_gen.h').read_text().split('#ifdef EAGL_G
 metadata = s[s.index('#define SLOTS'):s.index('static unsigned trace_first')]
 globals_ = s[s.index('static unsigned trace_first'):s.index('#define GL_SCISSOR_TEST')]
 body = header+'\n'+decl+'\n'+metadata+'\n'+globals_+'''
-static int eagl_tracing,frame_lines,latency_lines;
+static int eagl_tracing,frame_lines,latency_lines,compositor_diagnostics;
 static void say(const char *fmt,...){(void)fmt;}
 static void ktrace(const char *fmt,...){(void)fmt;}
 static void eagl_trace(const char *fmt,...){(void)fmt;}
@@ -68,8 +69,10 @@ names = ['texture_definition_of','texture_defined','image_of','image_new','image
          'surface_mirrored','surface_shared']
 if 'surface_render_copy(' in s: names += ['surface_render_copy']
 if 'image_render_target(' in s: names += ['image_render_target']
+if 'mipmaps_ready(' in s: names += ['mipmaps_ready']
 names += ['surface_changed','surface_to_texture','mirror_to_surface','target_to_surface','frame_begin','frame_end','drawing',
           'my_glCopyTexSubImage2D','my_glBindTexture','my_glClear','clear_now','my_glFramebufferTexture2D','my_glBindFramebuffer','my_texImageIOSurface','my_attachImage']
+if 'my_glGenerateMipmap(' in s: names += ['my_glGenerateMipmap']
 for name in names: body += fn(name)
 if 'framebuffer_read_texture(' in s:
     for name in ['framebuffer_read_texture','my_glCopyTexImage2D','my_glReadPixels']: body += fn(name)
@@ -85,7 +88,7 @@ runs = []
 for name, flags in [('normal', []), ('asan', ['-fsanitize=address,undefined','-fno-omit-frame-pointer','-fno-sanitize-recover=all'])]:
     binary = out/name
     commands = [('compile', ['clang-18','-std=c11','-O1','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable',
-                 *flags,*(['-DEXPECT_CONTAMINATED_UPLOAD'] if a.expect_contaminated_upload else []),*(['-DEXPECT_SHARED_RENDER'] if a.expect_shared_render else []),*(['-DEXPECT_STALE_READ'] if a.expect_stale_read else []),*(['-DEXPECT_UNFLIPPED'] if a.expect_unflipped else []),*(['-DEXPECT_UNPUBLISHED'] if a.expect_unpublished else []),'-I',str(out),'-I',str(ROOT/'drivers/NativeGL/eagl'),
+                 *flags,*(['-DEXPECT_CONTAMINATED_UPLOAD'] if a.expect_contaminated_upload else []),*(['-DEXPECT_SHARED_RENDER'] if a.expect_shared_render else []),*(['-DEXPECT_STALE_READ'] if a.expect_stale_read else []),*(['-DEXPECT_UNFLIPPED'] if a.expect_unflipped else []),*(['-DEXPECT_UNPUBLISHED'] if a.expect_unpublished else []),*(['-DEXPECT_STALE_MIPMAP'] if a.expect_stale_mipmap else []),'-I',str(out),'-I',str(ROOT/'drivers/NativeGL/eagl'),
                  str(fixture),'-Wl,-l:libGL.so.1','-Wl,-l:libEGL.so.1','-o',str(binary)]),('run',[str(binary)])]
     for step, cmd in commands:
         result = subprocess.run(cmd,capture_output=True,text=True,timeout=90,

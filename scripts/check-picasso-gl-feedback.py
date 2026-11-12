@@ -28,7 +28,7 @@ static void say(const char *fmt,...){(void)fmt;}
 static void nativegl_text(const char *s){puts(s);}
 static void compositor_program(unsigned p,int good,const char *what){(void)p;(void)good;(void)what;}
 static void clear_now(struct eagl *e);
-static int eagl_tracing;
+static int eagl_tracing,compositor_diagnostics;
 static void eagl_trace(const char *s,...){(void)s;}
 #define EAGL_ENTER(e,o) ((void)(e),(void)(o))
 #define EAGL_LEAVE(e,o) ((void)(e),(void)(o))

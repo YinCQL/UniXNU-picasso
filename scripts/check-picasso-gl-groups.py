@@ -24,6 +24,7 @@ struct texture_definition definitions[256];unsigned definition_next;struct image
 bool group_failed;unsigned frames,draw_function;
 GLint group_cover_matrix,group_cover_texmat,group_over_matrix,group_over_texmat,group_over_colours,group_flat_matrix,group_flat_colour;
 struct {const void *pointer;GLsizei stride;GLint size;GLenum type;} arrays[8];};
+static int compositor_diagnostics;
 static unsigned group_flattened,captured_lines;
 static char captured[200], all_captured[4096];
 static bool compositor_claim(unsigned b,unsigned k){(void)b;(void)k;return false;}

@@ -29,6 +29,10 @@ template<class T, class U> static T __atomic_fetch_add(T *p, U amount, int) {
 }
 #endif
 static unsigned snapshots, calls, locks;
+static bool PE_parse_boot_argn(const char *name,void *value,unsigned size) {
+    assert(!strcmp(name,"gldiag") && size==sizeof(unsigned));
+    *static_cast<unsigned *>(value)=0;return false;
+}
 static std::unordered_map<void *, size_t> allocations;
 static int diagnostic(const char *, ...) { return 0; }
 #define printf diagnostic
@@ -178,6 +182,6 @@ int main() {
     IOUserClient2022 modern; modern.uc2022 = true;
     handler = [](uint32_t s, auto *) { assert(s == 99); return 6; };
     assert(modern.callExternalMethod(99, &args) == 6); ++scenarios;
-    assert(allocations.empty() && !locks && calls > 0 && snapshots == 1);
+    assert(allocations.empty() && !locks && calls > 0 && snapshots == 0);
     std::printf("PASS iOS16 ABI: %u scenarios\n", scenarios);
 }

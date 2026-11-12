@@ -38,6 +38,17 @@ static void *claim_many(void *arg) {
 int main(void) {
     const unsigned limits[] = {32, 16, 16, 8, 8, 16, 8, 8};
     reset();
+    struct eagl disabled = {.frames=1};
+    compositor_lock = 1;
+    for (unsigned i=0; i<100000; ++i) {
+        assert(!compositor_claim(0,i));
+        compositor_draw(&disabled,45,3);
+        compositor_program(1,1,"disabled");
+        compositor_text("disabled");
+    }
+    assert(!get_calls && !text_calls && compositor_lock==1 && !compositor_counts[0]);
+    compositor_diagnostics=1;
+    reset();
     assert(!compositor_claim(8, 1) && !compositor_claim(UINT32_MAX, 1));
     compositor_lock = 1;
     assert(!compositor_claim(0, 1));

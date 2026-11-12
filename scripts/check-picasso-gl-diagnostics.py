@@ -18,7 +18,7 @@ out.mkdir(parents=True, exist_ok=False)
 source = ROOT / 'drivers/NativeGL/eagl/eagl.c'
 fixture = ROOT / 'scripts/tests/picasso-gl-diagnostics-host.c'
 s = source.read_text()
-body = s[s.index('static unsigned compositor_keys'):s.index('static void\neagl_trace(const char *format, ...)\n{')]
+body = s[s.index('static int compositor_diagnostics'):s.index('static void\neagl_trace(const char *format, ...)\n{')]
 m = re.search(r'static void\ncompositor_draw\(', s)
 assert m
 body += s[m.start():s.index('\n}', m.start()) + 2] + '\n'

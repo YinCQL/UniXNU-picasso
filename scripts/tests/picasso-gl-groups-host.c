@@ -78,6 +78,7 @@ int main(void) {
     caller_state(read,fb,e.group_over,second,mask);group_flatten(&e,tex,&group);
     verify_state(read,fb,e.group_over,second,mask);
     /* Error observations query the active target without consuming an existing GL error. */
+    assert(!captured_lines);compositor_diagnostics=1;
     e.frames=336;e.draw_function=45;captured_lines=0;
     compositor_framebuffer(&e,"fixture");
     assert(captured_lines==2&&strstr(captured,"attachment=8ce0 type=1702"));

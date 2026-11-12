@@ -8,7 +8,7 @@ FILE = 'ui/libpicasso-sb.dylib'
 SOURCES = ['package/picasso-springboard/' + n for n in
            ['picasso-ui-runtime.m', 'picasso-input-cache.m', 'picasso-springboard-probe.m',
             'picasso-statusbar-metrics.m', 'picasso-astc-guard.m', 'picasso-astc-guard-core.h',
-            'picasso-pixel-sample.h', 'picasso-wallpaper-surface.h', 'picasso-wallpaper-probe.m', 'picasso-astc-runtime.m']]
+            'picasso-astc-runtime.m']]
 SOURCES += ['scripts/picasso_runtime_ui.py']
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
 def runtime_sources():

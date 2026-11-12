@@ -266,9 +266,11 @@ static void nativeAdrenoHangcheck(void *,wait_result_t)
         if(!IOLockTryLock(g.lock)) {native_adreno_hangcheck[5]=native_adreno_hangcheck[5]+1;IOLockLock(g.lock);}
         const uint64_t poll_now=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
         native_adreno_hangcheck[7]=uint32_t(poll_now);
+        static int diagnostics=-1;
+        if(diagnostics<0) {uint32_t on=0;PE_parse_boot_argn("gldiag",&on,sizeof on);diagnostics=on==1;}
         /* Sampling RBBM_STATUS every poll says whether the frames' cost is GPU execution or a late completion:
          * an idle ring reports kIOReturnSuccess, a busy one kIOReturnTimeout (a non-empty queue also counts busy). */
-        {
+        if(diagnostics) {
             static uint64_t busy_samples,busy_hits;
             static uint32_t busy_report;
             if(g.ring && g.clock.now_us) {
@@ -376,7 +378,7 @@ static void nativeAdrenoHangcheck(void *,wait_result_t)
         {
             const uint32_t f=native_adreno_hangcheck[2];
             const uint32_t second=poll_now?uint32_t(poll_now/1000000):native_adreno_hangcheck[0]/2;
-            if(!hung && f && f==printed_fence && second!=printed_second) {
+            if(diagnostics && !hung && f && f==printed_fence && second!=printed_second) {
                 printed_second=second;
                 printf("PICASSO_GPU hangcheck: polls=%u fence=%u hang_fence=%u retries=%u state=%x trylock=%u same=%u\n",
                     native_adreno_hangcheck[0],f,native_adreno_hangcheck[1],native_adreno_hangcheck[3],

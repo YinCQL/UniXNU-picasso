@@ -31,7 +31,9 @@ def main():
         raise ValueError('Expected one dispatch function')
     method = re.sub(r'/\* PICASSO_FB_METHOD_HOOK_BEGIN \*/.*?/\* PICASSO_FB_METHOD_HOOK_END \*/\n', '', methods[0], flags=re.S)
     start = source.rfind('#if DEVELOPMENT || DEBUG', 0, source.index('/* Picasso runs iOS 16 IOMobileFramebuffer'))
-    helpers = source[start:source.index(methods[0])]
+    diagnostic_start = source.index('static bool\npicasso_render_diagnostics(')
+    diagnostic_end = source.index('\n}', diagnostic_start) + 2
+    helpers = source[diagnostic_start:diagnostic_end] + '\n' + source[start:source.index(methods[0])]
     # The host uses a function-pointer fixture; only Mach-O symbol linkage is modeled.
     method = method.replace(' __asm__("_picasso_backlight_power") __attribute__((weak_import))', '')
     method = method.replace('extern IOReturn picasso_backlight_power(IOService *, bool);', '')

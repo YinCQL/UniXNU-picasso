@@ -1,0 +1,66 @@
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -6806,6 +6806,18 @@
+ 
+ /* PICASSO_FB_METHOD_TRACE_BEGIN */
+ #if DEVELOPMENT || DEBUG
++static bool
++picasso_render_diagnostics(void)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		uint32_t on = 0;
++		PE_parse_boot_argn("gldiag", &on, sizeof(on));
++		enabled = on == 1;
++	}
++	return enabled == 1;
++}
++
+ struct picasso_fb_method_trace {
+ 	unsigned ticket, selector;
+ 	int pid;
+@@ -6817,7 +6829,7 @@
+     const IOExternalMethodArguments *args)
+ {
+ 	picasso_fb_method_trace trace = {};
+-	if (!client || !args || !client->metaCast("IOMobileFramebufferUserClient")) return trace;
++	if (!picasso_render_diagnostics() || !client || !args || !client->metaCast("IOMobileFramebufferUserClient")) return trace;
+ 	unsigned operation;
+ 	if (selector == 4) operation = 0;
+ 	else if (selector == 5) operation = 1;
+@@ -7011,7 +7023,7 @@
+ 		}
+ 	}
+ 	if (!strncmp(getMetaClass()->getClassName(), "IOMobileFramebuffer", 19)) {
+-		unsigned value = __atomic_fetch_add(&picassoFbCalls, 1, __ATOMIC_RELAXED);
++		unsigned value = picasso_render_diagnostics() ? __atomic_fetch_add(&picassoFbCalls, 1, __ATOMIC_RELAXED) : 160;
+ 		if (value == 0) {
+ 			picasso_notifyd_snapshot_later();
+ 		}
+@@ -7029,7 +7041,7 @@
+ 			picassoSavedInput = args->structureInput;
+ 			args->structureInput = picassoSwap;
+ 			args->structureInputSize = PICASSO_IPADOS17_SWAP_BYTES;
+-			if (__atomic_fetch_add(&picassoSwapNotes, 1, __ATOMIC_RELAXED) < 4) {
++			if (picasso_render_diagnostics() && __atomic_fetch_add(&picassoSwapNotes, 1, __ATOMIC_RELAXED) < 4) {
+ 				printf("PICASSO_FBUC swap record re-laid 0x%x -> 0x%x\n",
+ 				    PICASSO_IOS16_SWAP_BYTES, PICASSO_IPADOS17_SWAP_BYTES);
+ 				/* Diagnostic: the nonzero iOS 16 words show which layers and surfaces were sent. */
+@@ -7083,7 +7095,7 @@
+ 			if (picassoSurfaceSize == PICASSO_IPADOS17_LIMITS) {
+ 				picasso_ios16_limits((uint8_t *)picassoSurfaceUser, (const uint8_t *)picassoSurfaceOut);
+ 				static unsigned picassoLimitsNotes;
+-				if (__atomic_fetch_add(&picassoLimitsNotes, 1, __ATOMIC_RELAXED) < 8) {
++				if (picasso_render_diagnostics() && __atomic_fetch_add(&picassoLimitsNotes, 1, __ATOMIC_RELAXED) < 8) {
+ 					uint32_t values[3];
+ 					memcpy(values, (const uint8_t *)picassoSurfaceUser + 8, sizeof(values));
+ 					printf("PICASSO_SURF limits row=%u width=%u height=%u\n", values[0], values[1], values[2]);
+@@ -7096,7 +7108,7 @@
+ 		args->structureOutputSize = picassoSurfaceUserSize;
+ 		IOFreeData(picassoSurfaceOut, picassoSurfaceSize);
+ 	}
+-	if (picassoSurface && ret && __atomic_fetch_add(&picassoSurfaceFailures, 1, __ATOMIC_RELAXED) < 200) {
++	if (picasso_render_diagnostics() && picassoSurface && ret && __atomic_fetch_add(&picassoSurfaceFailures, 1, __ATOMIC_RELAXED) < 16) {
+ 		char name[32] = "?";
+ 		proc_name(proc_selfpid(), name, sizeof(name));
+ 		printf("PICASSO_SURF name=%s selector=%u sin=%u sout=%u in=%u out=%u ret=%x\n", name, selector,

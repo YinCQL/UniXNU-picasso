@@ -62,9 +62,15 @@ static unsigned takeReport(unsigned *counter) {
     return 0;
 }
 
+static bool displayDiagnostics(void) {
+    static int enabled=-1;
+    if(enabled<0) {unsigned on=0;PE_parse_boot_argn("gldiag",&on,sizeof on);enabled=on==1;}
+    return enabled==1;
+}
+
 // Bounded per-event output, including failures, without logging every frame.
 static void report(unsigned event, uint64_t a, uint64_t b, uint64_t c, bool failed = false) {
-    if (event >= 12) return;
+    if (event >= 12 || (!failed && !displayDiagnostics())) return;
     unsigned sample = takeReport(&reportCounts[event][failed ? 1 : 0]);
     if (!sample) return;
     IOLog("PICASSO_DISPLAY event=%u sample=%u a=%llx b=%llx c=%llx failure=%u\n",
@@ -133,11 +139,12 @@ extern "C" void native_legacy_retirement_observed(IOService *) { report(9, 1, 0,
 extern "C" void native_legacy_swap_geometry_observed(const uint32_t *a, const uint32_t *b, uint32_t o0, uint32_t o1,
     uint32_t o2, uint32_t w, uint32_t h) {
     static unsigned count;
-    if (takeReport(&count)) IOLog("PICASSO_DISPLAY geometry rect0=%u,%u,%u,%u rect1=%u,%u,%u,%u options=%x,%x,%x size=%ux%u\n",
+    if (displayDiagnostics() && takeReport(&count)) IOLog("PICASSO_DISPLAY geometry rect0=%u,%u,%u,%u rect1=%u,%u,%u,%u options=%x,%x,%x size=%ux%u\n",
         a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], o0, o1, o2, w, h);
 }
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t bytes) {
     report(10, ticks, bytes, 0);
+    if(!displayDiagnostics()) return;
     static unsigned count;
     unsigned sample=__atomic_add_fetch(&count,1,__ATOMIC_RELAXED);
     if(sample<=4 || sample%64==0) {
@@ -151,6 +158,7 @@ extern "C" void native_legacy_frame_observed(unsigned kind, uint64_t pixels, uin
     // A substantial rendered UI, not the centered logo or a blank, ends boot input.
     if(kind==0 && pixels!=UINT64_MAX && pixels>=1080ULL*2400/8)
         picasso_hid_content_presented();
+    if(!displayDiagnostics()) return;
     static unsigned count, frames;
     // Count every completed copy/blank/held request; unscanned pixels are unknown.
     unsigned frame = __atomic_add_fetch(&frames, 1, __ATOMIC_RELAXED);

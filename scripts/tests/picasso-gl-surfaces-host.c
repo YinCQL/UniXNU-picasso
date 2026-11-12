@@ -224,7 +224,7 @@ static void test_read_boundaries(bool copy){
     assert(pixel[0]==255&&pixel[1]==0&&pixel[2]==0&&pixel[3]==255);
 #else
     assert(pixel[0]==0&&pixel[1]==255&&pixel[2]==0&&pixel[3]==255&&e->unclear==0);
-    if(copy){struct texture_definition *d=texture_definition_of(e,dst);assert(d&&d->source==5&&d->width==4&&d->height==4);}
+    if(copy) assert(texture_definition_of(e,dst)==NULL); /* Default path retains no diagnostic history. */
 #endif
     glDeleteTextures(1,&src);glDeleteTextures(1,&dst);glDeleteFramebuffers(1,&fb);free(e);
 }
@@ -301,7 +301,7 @@ static void test_shared_render(bool mirror,bool copy){
     puts("REPRODUCED: promoted render texture still aliases imported EGLImage backing");
 #else
     assert(!i->shared&&!!i->mirror==mirror&&pixel[0]==255&&pixel[1]==0);
-    struct texture_definition *definition=texture_definition_of(e,texture);assert(definition&&definition->source==6);
+    assert(texture_definition_of(e,texture)==NULL);
     assert(surface.seed==0);frame_end(e,false);assert(surface.seed==1);
     glBindFramebuffer(GL_READ_FRAMEBUFFER,draw);unsigned char actual[64];
     glReadPixels(0,0,4,4,GL_RGBA,GL_UNSIGNED_BYTE,actual);
@@ -411,17 +411,23 @@ static void test_cpu_upload(bool buffer_bound, bool invert, bool alpha_first, bo
     glPixelStorei(GL_UNPACK_SKIP_ROWS,0);glPixelStorei(GL_UNPACK_SKIP_PIXELS,0);
     image_forget(e,texture);glDeleteTextures(1,&texture);glDeleteFramebuffers(1,&fb);free(e);assert(!glGetError());
 }
-static void test_w30r_contract_note(void){
-    struct eagl *e=calloc(1,sizeof(*e));assert(e);unsigned char bytes[64]={0};
-    struct host_surface s={167,5,0x77333072,0,4,4,4,16,64,bytes};
-    GLuint tex;glGenTextures(1,&tex);my_glBindTexture(e,GL_TEXTURE_2D,tex);
-    for(unsigned n=0;n<20;++n)assert(my_texImageIOSurface(e,NULL,&s,GL_TEXTURE_2D,0x8059,4,4,GL_RGBA,0x8368,0,NO));
-    assert(e->w30r_reports==8&&w30r_notes==8&&s.seed==5);
-    assert(strstr(w30r_last,"id=167")&&strstr(w30r_last,"i/f/t=8059/1908/8368")&&strstr(w30r_last,"seed=5"));
-    assert(!memcmp(bytes,(unsigned char[64]){0},64)&&!glGetError());
-    image_forget(e,tex);glDeleteTextures(1,&tex);free(e);
+/* An application can write CPU pixels without moving the IOSurface seed.
+ * The change detector must refresh those bytes, including the last pixel. */
+static void test_unseeded_refresh(void){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);
+    unsigned char bytes[12]={0},pixels[12];
+    struct host_surface surface={302,7,'BGRA',0,4,3,1,12,12,bytes};
+    GLuint texture,fb;glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,3,1,GL_BGRA,GL_UNSIGNED_BYTE,0,false));
+    glGenFramebuffers(1,&fb);glBindFramebuffer(GL_FRAMEBUFFER,fb);
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0);
+    bytes[8]=47;bytes[9]=83;bytes[10]=149;bytes[11]=255;
+    e->frames++;my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    glReadPixels(0,0,3,1,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    assert(!glGetError()&&surface.seed==7&&e->uploads==2);
+    assert(pixels[8]==149&&pixels[9]==83&&pixels[10]==47&&pixels[11]==255);
+    image_forget(e,texture);glDeleteTextures(1,&texture);glDeleteFramebuffers(1,&fb);free(e);
 }
-
 static void test_snapshot_attachment(bool invert){
     struct eagl *e=calloc(1,sizeof(*e));assert(e);
     const unsigned width=270,height=600,row=1088;size_t size=row*height;
@@ -460,7 +466,118 @@ static void test_snapshot_attachment(bool invert){
     puts("PASS: 270x600 BGRA snapshot attachment, colored GPU rendering and published pixels, orientation, padding and seed");
 }
 
-int main(void){context();
+static GLuint sample_program(void) {
+    const char *vs="#version 300 es\nprecision highp float;out vec2 uv;void main(){vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));uv=p;gl_Position=vec4(p*2.-1.,0.,1.);}";
+    const char *fs="#version 300 es\nprecision highp float;uniform sampler2D t;in vec2 uv;out vec4 c;void main(){c=texture(t,uv);}";
+    GLuint v=glCreateShader(GL_VERTEX_SHADER),f=glCreateShader(GL_FRAGMENT_SHADER),p=glCreateProgram();
+    glShaderSource(v,1,&vs,NULL);glCompileShader(v);glShaderSource(f,1,&fs,NULL);glCompileShader(f);
+    glAttachShader(p,v);glAttachShader(p,f);glLinkProgram(p);GLint ok;glGetProgramiv(p,GL_LINK_STATUS,&ok);assert(ok);
+    glDeleteShader(v);glDeleteShader(f);return p;
+}
+static void scaled_pixel(struct eagl *e,GLuint input,GLuint fb,int scale,unsigned char *p) {
+    my_glBindTexture(e,GL_TEXTURE_2D,input);
+#ifndef EXPECT_STALE_MIPMAP
+    mipmaps_ready(e);
+#endif
+    glBindFramebuffer(GL_FRAMEBUFFER,fb);glViewport(0,0,scale,scale);
+    glDrawArrays(GL_TRIANGLES,0,3);glReadPixels(scale/2,scale/2,1,1,GL_RGBA,GL_UNSIGNED_BYTE,p);assert(!glGetError());
+}
+
+static void test_mip_refresh(void) {
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);enum{W=64,ROW=W*4+16};
+    unsigned char bytes[W*ROW];memset(bytes,0xa5,sizeof bytes);
+    for(int y=0;y<W;y++)for(int x=0;x<W;x++){unsigned char *p=bytes+y*ROW+x*4;p[0]=p[1]=p[2]=0;p[3]=255;}
+    struct host_surface surface={301,1,'BGRA',0,4,W,W,ROW,sizeof bytes,bytes};
+    GLuint input,output,fb;glGenTextures(1,&input);my_glBindTexture(e,GL_TEXTURE_2D,input);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,W,W,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+    glTexParameteri(GL_TEXTURE_2D,0x2801,0x2703);glTexParameteri(GL_TEXTURE_2D,0x2800,0x2601);
+    glTexParameteri(GL_TEXTURE_2D,0x2802,0x812f);glTexParameteri(GL_TEXTURE_2D,0x2803,0x812f);
+#ifdef EXPECT_STALE_MIPMAP
+    glGenerateMipmap(GL_TEXTURE_2D);
+#else
+    my_glGenerateMipmap(e,GL_TEXTURE_2D);assert(image_of(e,input)->mipmapped);
+#endif
+    glGenTextures(1,&output);glBindTexture(GL_TEXTURE_2D,output);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,W,W,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+    glGenFramebuffers(1,&fb);glBindFramebuffer(GL_FRAMEBUFFER,fb);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,output,0);
+    assert(glCheckFramebufferStatus(GL_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE);
+    GLuint program=sample_program();glUseProgram(program);unsigned char full[4],small[4];
+    for(int pass=0;pass<4;pass++) {
+        for(int y=0;y<W;y++)for(int x=0;x<W;x++){unsigned char *p=bytes+y*ROW+x*4;p[0]=160;p[1]=80;p[2]=40+pass*10;p[3]=255;}
+        e->frames+=16; // Include an unannounced CPU write as well as a seed change.
+        if(pass!=1)surface.seed++;
+        if(pass==2||pass==3) {
+            if(pass==3)surface.id++; // The same texture can move to another surface.
+            my_glBindTexture(e,GL_TEXTURE_2D,input);
+            assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,W,W,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+        }
+        scaled_pixel(e,input,fb,W,full);scaled_pixel(e,input,fb,W/4,small);
+        assert(full[0]==40+pass*10&&full[1]==80&&full[2]==160&&full[3]==255);
+#ifdef EXPECT_STALE_MIPMAP
+        assert(!small[0]&&!small[1]&&!small[2]&&small[3]==255);
+        if(pass==0){puts("REPRODUCED production refresh: full-size content is colored; scaled content remains black");break;}
+#else
+        assert(!memcmp(full,small,4));
+        unsigned char edge[W*4];glReadPixels(0,0,1,W/4,GL_RGBA,GL_UNSIGNED_BYTE,edge);
+        for(int y=0;y<W/4;y++)assert(!memcmp(edge+y*4,full,4));
+        GLint filter;glGetTexParameteriv(GL_TEXTURE_2D,0x2801,&filter);assert(filter==0x2703);
+        for(int y=0;y<W;y++)for(int at=W*4;at<ROW;at++)assert(bytes[y*ROW+at]==0xa5);
+#endif
+    }
+#ifndef EXPECT_STALE_MIPMAP
+    my_glBindFramebuffer(e,GL_DRAW_FRAMEBUFFER,fb);
+    my_glFramebufferTexture2D(e,GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,input,0);
+    glUseProgram(0);glClearColor(.75,.5,.25,1);my_glClear(e,GL_COLOR_BUFFER_BIT);clear_now(e);
+    assert(image_of(e,input)->mip_pending&&e->mip_pending);
+    frame_end(e,false);
+    my_glFramebufferTexture2D(e,GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,output,0);
+    glUseProgram(program);scaled_pixel(e,input,fb,W/4,small);
+    assert(small[0]==191&&small[1]==128&&small[2]==64&&small[3]==255&&!image_of(e,input)->mip_pending);
+#endif
+    glUseProgram(0);glDeleteProgram(program);image_forget(e,input);glDeleteTextures(1,&input);glDeleteTextures(1,&output);glDeleteFramebuffers(1,&fb);free(e);
+#ifndef EXPECT_STALE_MIPMAP
+    puts("PASS scaled surface pixels and left edge: seed/hash refresh, repeated registration, replacement surface, padding, original filter");
+#endif
+}
+
+
+#ifndef EXPECT_STALE_MIPMAP
+static void test_shared_mip(void) {
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);GLuint owner,texture,output,fb;
+    unsigned char bytes[64*64*4]={0};struct host_surface surface={201,0,'BGRA',0,4,64,64,256,sizeof bytes,bytes};
+    glGenTextures(1,&owner);glBindTexture(GL_TEXTURE_2D,owner);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,64,64,0,GL_RGBA,GL_UNSIGNED_BYTE,bytes);
+    glGenFramebuffers(1,&fb);glBindFramebuffer(GL_FRAMEBUFFER,fb);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,owner,0);
+    glViewport(0,0,64,64);glClearColor(.25,.5,.75,1);glClear(GL_COLOR_BUFFER_BIT);
+    extern void *eglGetCurrentContext(void);const int attributes[]={0x30d2,1,0x3038};
+    imported_image=create_image(egl_display,eglGetCurrentContext(),0x30b1,(void *)(uintptr_t)owner,attributes);assert(imported_image);
+    glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,64,64,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+    assert(image_of(e,texture)->shared);
+    glTexParameteri(GL_TEXTURE_2D,0x2801,0x2703);glTexParameteri(GL_TEXTURE_2D,0x2800,0x2601);
+    glTexParameteri(GL_TEXTURE_2D,0x2802,0x812f);glTexParameteri(GL_TEXTURE_2D,0x2803,0x812f);
+    my_glGenerateMipmap(e,GL_TEXTURE_2D);assert(!image_of(e,texture)->shared&&image_of(e,texture)->mipmapped&&!glGetError());
+    glGenTextures(1,&output);glBindTexture(GL_TEXTURE_2D,output);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,64,64,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,output,0);
+    GLuint program=sample_program();glUseProgram(program);unsigned char full[4],small[4];
+    scaled_pixel(e,texture,fb,64,full);scaled_pixel(e,texture,fb,16,small);
+    // Initial CPU memory is zero: this must be the preserved GPU image.
+    assert(full[0]==64&&full[1]==128&&full[2]==191&&full[3]==255&&!memcmp(full,small,4));
+    for(int i=0;i<64*64;i++){bytes[i*4]=160;bytes[i*4+1]=80;bytes[i*4+2]=40;bytes[i*4+3]=255;}++surface.seed;
+    scaled_pixel(e,texture,fb,64,full);scaled_pixel(e,texture,fb,16,small);
+    assert(full[0]==40&&full[1]==80&&full[2]==160&&full[3]==255&&!memcmp(full,small,4));
+    my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,64,64,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+    assert(!image_of(e,texture)->shared&&image_of(e,texture)->mipmapped);
+    scaled_pixel(e,texture,fb,16,small);assert(!memcmp(full,small,4));
+    glUseProgram(0);glDeleteProgram(program);image_forget(e,texture);glDeleteTextures(1,&texture);glDeleteTextures(1,&owner);glDeleteTextures(1,&output);glDeleteFramebuffers(1,&fb);
+    assert(destroy_image(egl_display,imported_image));imported_image=NULL;free(e);
+    puts("PASS shared mip generation: preserved GPU pixels, independent storage, refreshed levels, repeated import");
+}
+#endif
+int main(void){context();test_mip_refresh();
+#ifndef EXPECT_STALE_MIPMAP
+    test_shared_mip();
+#endif
+
 #ifdef EXPECT_CONTAMINATED_UPLOAD
     test_cpu_upload(false,false,false,false,4);test_cpu_upload(true,false,false,false,4);return 0;
 #endif
@@ -476,8 +593,7 @@ int main(void){context();
     test_mirror(true,false);test_mirror(true,true);puts("REPRODUCED: inverted GPU mirror keeps source rows in ascending order");return 0;
 #endif
 #ifndef EXPECT_UNPUBLISHED
-    test_snapshot_attachment(false);test_snapshot_attachment(true);
-    test_w30r_contract_note();
+    test_unseeded_refresh();test_snapshot_attachment(false);test_snapshot_attachment(true);
     test_cpu_upload(false,false,false,false,4);test_cpu_upload(true,false,false,false,4);
     test_cpu_upload(true,true,false,false,4);test_cpu_upload(true,true,true,false,4);test_cpu_upload(true,true,false,true,4);
     test_cpu_upload(false,false,false,false,0);
