@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// PM7250B QG/SMB5 measurement backend; the charger policy remains untouched.
+// PM7250B measurements and conservative input restrictions; source selection
+// and battery-side charging remain owned by the existing controller.
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -7,6 +8,7 @@
 #include "PicassoButtonsCore.h"
 #include "PicassoSpmi.h"
 #include "PicassoBattery.h"
+#include "PicassoChargerCore.h"
 namespace {
 struct Window {
     IOMemoryMap *map=nullptr;
@@ -21,12 +23,27 @@ struct Window {
     ~Window(){OSSafeReleaseNULL(map);}
 };
 struct Backend {
-    Window channels[5],adcWriter;
+    Window channels[5],adcWriter,usbWriter;
+    bool chargerReady=false,chargerReported=false;
+    int lastChargerError=0;
+    unsigned lastConfiguredMa=0;
+    picasso_charger::Result charger;
     uint8_t subtype=0;
     bool adcReady=false,ponRead=false;
     picasso_battery::Estimator estimator;
     int read(unsigned channel,uint8_t reg,uint8_t &value){return picasso_spmi_read8(channels[channel].va,reg,value);}
     int write(uint8_t reg,uint8_t value){return picasso_spmi_write8(adcWriter.va,reg,value);}
+    int chargerRead(uint8_t reg,uint8_t &value){return read(1,reg,value);}
+    int chargerWrite(uint8_t reg,uint8_t value){return picasso_spmi_write8(usbWriter.va,reg,value);}
+    void restrictInput(){
+        charger=chargerReady?picasso_charger::restrictInput(*this):picasso_charger::Result{};
+        if(!chargerReady)charger.error=-51;
+        if(!chargerReported || charger.error!=lastChargerError || charger.writes || charger.configuredMa!=lastConfiguredMa){
+            IOLog("PICASSO_CHARGER cap_mv=%u cap_ma=%u cfg_ma=%u verified=%u error=%d writes=%u mode=limit-only\n",
+                picasso_charger::maxInputMv,picasso_charger::maxInputMa,charger.configuredMa,charger.verified,charger.error,charger.writes);
+            chargerReported=true;lastChargerError=charger.error;lastConfiguredMa=charger.configuredMa;
+        }
+    }
     void wait(){IOSleep(10);}
     int pon(){
         uint8_t a=0,b=0,c=0,d=0;
@@ -48,6 +65,7 @@ extern "C" void *picasso_battery_open(){
         apid[i]=picasso_buttons::find_apid(lookup,ppid[i]);
         bool ok=apid[i]>=0 && b->channels[i].open(0xe600000+unsigned(apid[i])*0x80,0x80);
         if(!ok && i<4){delete b;return nullptr;}
+        if(i==1)b->chargerReady=ok && b->usbWriter.open(0xc600000+unsigned(apid[i])*0x10000,0x1000);
         if(i==4)b->adcReady=ok && b->adcWriter.open(0xc600000+unsigned(apid[i])*0x10000,0x1000);
     }
     uint8_t type=0;int error=b->read(0,4,type);
@@ -55,11 +73,13 @@ extern "C" void *picasso_battery_open(){
     IOLog("PICASSO_BATTERY probe qg=%d usb=%d charger=%d path=%d adc=%d type=%02x subtype=%02x error=%d\n",
         apid[0],apid[1],apid[2],apid[3],apid[4],type,b->subtype,error);
     if(error || type!=0x0d || (b->subtype!=3 && b->subtype!=4)){delete b;return nullptr;}
+    b->restrictInput();
     return b;
 }
 extern "C" void picasso_battery_close(void *context){delete static_cast<Backend *>(context);}
 extern "C" int picasso_battery_read(void *context,picasso_battery::Snapshot *out){
     Backend *b=static_cast<Backend *>(context);if(!b || !out)return -1;
+    b->restrictInput();
     picasso_battery::Sample sample;
     int error=picasso_battery::sample(*b,b->subtype,sample);
     if(error){b->estimator.gap();return error;}
@@ -92,5 +112,7 @@ extern "C" int picasso_battery_read(void *context,picasso_battery::Snapshot *out
     picasso_battery::Snapshot next;
     b->estimator.update(sample,ns/1000000,temp,temp!=-10000,pon,next);
     next.idOhm=id;next.idValid=id>0;next.input=input;
+    next.inputCapVerified=b->charger.verified;next.inputCapError=b->charger.error;
+    next.inputConfiguredMa=int(b->charger.configuredMa);
     *out=next;return 0;
 }

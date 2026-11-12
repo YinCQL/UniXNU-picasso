@@ -287,7 +287,7 @@ def main():
     sources += [ROOT / 'drivers/NativeNovatekTouch/TouchPublish.h']
     sources += [ROOT / 'kits/picasso/PicassoAudioAbi.h', ROOT / 'kits/picasso/PicassoAudioQueue.h']
     sources += [ROOT / 'kits/picasso/PicassoBacklightCore.h', ROOT / 'kits/picasso/PicassoButtonsCore.h',
-                ROOT / 'kits/picasso/PicassoSpmi.h', ROOT / 'kits/picasso/PicassoSpmiCore.h', ROOT / 'kits/picasso/PicassoPowerCore.h', ROOT / 'kits/picasso/PicassoBatteryCore.h', ROOT / 'kits/picasso/PicassoBatteryProfile.h', ROOT / 'kits/picasso/PicassoBattery.h',
+                ROOT / 'kits/picasso/PicassoSpmi.h', ROOT / 'kits/picasso/PicassoSpmiCore.h', ROOT / 'kits/picasso/PicassoPowerCore.h', ROOT / 'kits/picasso/PicassoBatteryCore.h', ROOT / 'kits/picasso/PicassoChargerCore.h', ROOT / 'kits/picasso/PicassoBatteryProfile.h', ROOT / 'kits/picasso/PicassoBattery.h',
                 ROOT / 'kits/picasso/PicassoAdsp.h', ROOT / 'drivers/NativeWlan/WlanSmem.h',
                 ROOT / 'kits/picasso/PicassoFat.h', ROOT / 'kits/picasso/PicassoAdspFirmwareProfile.h',
                 ROOT / 'kits/picasso/PicassoAdspLoadPlan.h', ROOT / 'kits/picasso/PicassoAdspBoot.h',
