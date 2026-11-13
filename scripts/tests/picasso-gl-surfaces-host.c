@@ -953,7 +953,97 @@ static void test_subimage_publication(bool invert,bool buffered){
     my_glDeleteTextures(e,1,&texture);glDeleteFramebuffers(1,&fb);free(e);
 }
 
+
+static void test_storage_replacement(unsigned method,bool black_edge){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);
+    unsigned char backing[8*40],replacement[8*8*4];memset(backing,255,sizeof backing);
+    if(black_edge)for(unsigned y=0;y<8;y++){unsigned char *v=backing+y*40;v[0]=v[1]=v[2]=0;}
+    for(unsigned n=0;n<64;n++){replacement[4*n]=40;replacement[4*n+1]=80;replacement[4*n+2]=160;replacement[4*n+3]=255;}
+    struct host_surface surface={903,1,'BGRA',0,4,8,8,40,sizeof backing,backing};
+    GLuint texture,fb,source=0;glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,8,8,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+    glGenFramebuffers(1,&fb);glBindFramebuffer(GL_READ_FRAMEBUFFER,fb);
+    if(method==0)my_glTexImage2D(e,GL_TEXTURE_2D,0,GL_RGBA,8,8,0,GL_RGBA,GL_UNSIGNED_BYTE,replacement);
+    else if(method==1){
+        glGenTextures(1,&source);glBindTexture(GL_TEXTURE_2D,source);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,8,8,0,GL_RGBA,GL_UNSIGNED_BYTE,replacement);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,source,0);
+        glBindTexture(GL_TEXTURE_2D,texture);my_glCopyTexImage2D(e,GL_TEXTURE_2D,0,GL_RGBA,0,0,8,8,0);
+    }else{
+        my_glTexStorage2D(e,GL_TEXTURE_2D,1,0x8058,8,8);
+        glTexSubImage2D(GL_TEXTURE_2D,0,0,0,8,8,GL_RGBA,GL_UNSIGNED_BYTE,replacement);
+    }
+    assert(!glGetError());glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0);
+    unsigned char pixel[4];glReadPixels(0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);assert(pixel[0]==40);
+    surface.seed++; // The former surface producer publishes while this name now has ordinary storage.
+    frame_end(e,false);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    glReadPixels(0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
+#ifdef EXPECT_STALE_STORAGE
+    if(method!=2){assert(pixel[0]==(black_edge?0:255));puts("REPRODUCED former IOSurface refresh overwrites replacement texture with white or black edge");}
+    else {assert(glGetError()!=0);puts("REPRODUCED former IOSurface refresh attempts illegal write into immutable storage");}
+#else
+    assert(!glGetError()&&pixel[0]==40&&pixel[1]==80&&pixel[2]==160&&pixel[3]==255);
+    assert(image_of(e,texture)==NULL);puts("PASS storage replacement cannot refresh from its retired IOSurface");
+#endif
+    image_forget(e,texture);glDeleteTextures(1,&texture);if(source)glDeleteTextures(1,&source);
+    glDeleteFramebuffers(1,&fb);free(e);
+}
+
+
+#ifdef EAGL_STORAGE_OWNERSHIP
+static void test_storage_failures_and_publish(void){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);unsigned char bytes[64]={0},fresh[64];memset(fresh,255,sizeof fresh);
+    struct host_surface surface={904,1,'BGRA',0,4,4,4,16,64,bytes};
+    GLuint texture,fb;glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,4,4,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+    int errors=check_errors;check_errors=0;
+    my_glTexImage2D(e,GL_TEXTURE_2D,0,GL_RGBA,-1,4,0,GL_RGBA,GL_UNSIGNED_BYTE,fresh);
+    assert(image_of(e,texture)&&my_glGetError(e)==0x501&&!my_glGetError(e));
+    my_glTexImage2D(e,GL_TEXTURE_2D,1,GL_RGBA,2,2,0,GL_RGBA,GL_UNSIGNED_BYTE,fresh);
+    assert(image_of(e,texture)&&!my_glGetError(e));
+    glGenFramebuffers(1,&fb);my_glBindFramebuffer(e,GL_FRAMEBUFFER,fb);
+    my_glFramebufferTexture2D(e,GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0);
+    glDisable(GL_SCISSOR_TEST);glColorMask(1,1,1,1);glClearColor(1,0,0,1);my_glClear(e,GL_COLOR_BUFFER_BIT);
+    host_lock_error=1;
+    my_glTexImage2D(e,GL_TEXTURE_2D,0,GL_RGBA,4,4,0,GL_RGBA,GL_UNSIGNED_BYTE,fresh);
+    assert(image_of(e,texture)&&image_of(e,texture)->drawn&&my_glGetError(e)==0x502);host_lock_error=0;
+    glEnable(0xffffffffu); // An unrelated earlier error must survive a successful definition.
+    my_glTexImage2D(e,GL_TEXTURE_2D,0,GL_RGBA,4,4,0,GL_RGBA,GL_UNSIGNED_BYTE,fresh);
+    assert(!image_of(e,texture)&&my_glGetError(e)==0x500&&!my_glGetError(e));
+    for(unsigned n=0;n<16;n++)assert(bytes[4*n]==0&&bytes[4*n+1]==0&&bytes[4*n+2]==255&&bytes[4*n+3]==255);
+    assert(surface.seed==2);check_errors=errors;
+    glDeleteTextures(1,&texture);glDeleteFramebuffers(1,&fb);if(e->reader)glDeleteFramebuffers(1,&e->reader);free(e);
+    puts("PASS rejected storage/mip definition retain ownership; failed publication retries; old pixels publish before replacement; prior errors remain visible");
+}
+static void test_shared_storage_replacement(void){
+    struct eagl *e=calloc(1,sizeof(*e));assert(e);unsigned char bytes[64]={0},fresh[64];memset(fresh,255,sizeof fresh);
+    struct host_surface surface={201,0,'BGRA',0,4,4,4,16,64,bytes};
+    GLuint owner,texture;glGenTextures(1,&owner);glBindTexture(GL_TEXTURE_2D,owner);
+    unsigned char red[64];for(unsigned n=0;n<16;n++){red[4*n]=255;red[4*n+1]=red[4*n+2]=0;red[4*n+3]=255;}
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,4,4,0,GL_RGBA,GL_UNSIGNED_BYTE,red);
+    extern void *eglGetCurrentContext(void);const int attrs[]={0x30d2,1,0x3038};
+    imported_image=create_image(egl_display,eglGetCurrentContext(),0x30b1,(void *)(uintptr_t)owner,attrs);assert(imported_image);
+    glGenTextures(1,&texture);my_glBindTexture(e,GL_TEXTURE_2D,texture);
+    assert(my_texImageIOSurface(e,NULL,&surface,GL_TEXTURE_2D,GL_RGBA,4,4,GL_BGRA,GL_UNSIGNED_BYTE,0,NO));
+    assert(image_of(e,texture)->shared);my_glTexImage2D(e,GL_TEXTURE_2D,0,GL_RGBA,4,4,0,GL_RGBA,GL_UNSIGNED_BYTE,fresh);
+    assert(!image_of(e,texture)&&!my_glGetError(e));unsigned char pixel[4];read_pixel(owner,pixel);
+    assert(pixel[0]==255&&pixel[1]==0&&pixel[2]==0&&pixel[3]==255);
+    assert(destroy_image(egl_display,imported_image));imported_image=NULL;
+    glDeleteTextures(1,&owner);glDeleteTextures(1,&texture);free(e);
+    puts("PASS same-size storage replacement leaves imported EGLImage owner pixels unchanged");
+}
+#endif
+
 int main(void){context();
+#ifdef EAGL_STORAGE_OWNERSHIP
+    test_storage_failures_and_publish();test_shared_storage_replacement();
+#endif
+#if defined(EAGL_STORAGE_OWNERSHIP) || defined(EXPECT_STALE_STORAGE)
+    for(unsigned m=0;m<3;m++)for(unsigned b=0;b<2;b++)test_storage_replacement(m,b);
+#endif
+#ifdef EXPECT_STALE_STORAGE
+    return 0;
+#endif
 #ifdef EXPECT_RECYCLED_SURFACE
     test_pool_lifetime();return 0;
 #endif

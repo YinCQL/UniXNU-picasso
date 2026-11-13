@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--source', type=Path, default=ROOT/'drivers/NativeGL/eagl/eagl.c')
 p.add_argument('--output', type=Path, required=True)
+p.add_argument('--expect-stale-storage', action='store_true')
 p.add_argument('--expect-unpublished-subimage', action='store_true')
 p.add_argument('--expect-recycled-surface', action='store_true')
 p.add_argument('--expect-stale-mipmap', action='store_true')
@@ -34,6 +35,7 @@ metadata = s[s.index('#define SLOTS'):s.index('static unsigned trace_first')]
 globals_ = s[s.index('static unsigned trace_first'):s.index('#define GL_SCISSOR_TEST')]
 body = header+'\n'+decl+'\n'+metadata+'\n'+globals_+'''
 static int eagl_tracing,frame_lines,latency_lines,compositor_diagnostics;
+static unsigned long long slow_calls_us;
 static void say(const char *fmt,...){(void)fmt;}
 static unsigned refresh_note_count;
 static char refresh_note_last[256];
@@ -91,6 +93,9 @@ if 'mipmaps_ready(' in s: names += ['mipmaps_ready']
 names += ['surface_changed','surface_to_texture','mirror_to_surface','target_to_surface','image_refresh_note','image_needs_upload','frame_begin','frame_end','drawing',
           'image_publish','surface_publish_aliases','my_glDeleteTextures','my_glTexSubImage2D','my_glCopyTexSubImage2D','my_glBindTexture','my_glClear','clear_now','my_glFramebufferTexture2D','my_glBindFramebuffer','my_texImageIOSurface','my_attachImage']
 if 'my_glGenerateMipmap(' in s: names += ['my_glGenerateMipmap']
+names += ['my_glTexImage2D','my_glTexStorage2D']
+if 'image_storage_begin(' in s: names += ['storage_error_save','my_glGetError','image_storage_begin','image_storage_end']
+body += 'static bool image_storage_begin(struct eagl *,GLenum,GLint,GLuint *);\nstatic void image_storage_end(struct eagl *,GLuint);\n' if 'image_storage_begin(' in s else ''
 for name in names: body += fn(name)
 if 'framebuffer_read_texture(' in s:
     for name in ['framebuffer_read_texture','my_glCopyTexImage2D','my_glReadPixels']: body += fn(name)
@@ -105,12 +110,12 @@ body += "static void registration_flatten(struct eagl *e,GLuint t,struct group_t
 body += fn('group_read').replace('group_read(', 'registration_read(').replace('group_flatten(', 'registration_flatten(')
 (out/'gl-body.inc').write_text(body)
 fixture = ROOT/'scripts/tests/picasso-gl-surfaces-host.c'
-features = ([] if 'IOSurfaceIncrementUseCount' not in s else ['-DEAGL_POOL_USES']) + ([] if 'image->drawn' not in fn('my_glTexSubImage2D') else ['-DEAGL_SUBIMAGE_PUBLISH'])
+features = ([] if 'image_storage_begin(' not in s else ['-DEAGL_STORAGE_OWNERSHIP']) + ([] if 'IOSurfaceIncrementUseCount' not in s else ['-DEAGL_POOL_USES']) + ([] if 'image->drawn' not in fn('my_glTexSubImage2D') else ['-DEAGL_SUBIMAGE_PUBLISH'])
 runs = []
 for name, flags in [('normal', []), ('asan', ['-fsanitize=address,undefined','-fno-omit-frame-pointer','-fno-sanitize-recover=all'])]:
     binary = out/name
     commands = [('compile', ['clang-18','-std=c11','-O1','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable',
-                 *flags,*features,*(['-DEXPECT_UNPUBLISHED_SUBIMAGE'] if a.expect_unpublished_subimage else []),*(['-DEXPECT_RECYCLED_SURFACE'] if a.expect_recycled_surface else []),*(['-DEXPECT_STALE_GROUP'] if a.expect_stale_group else []),*(['-DEXPECT_STALE_UPLOAD'] if a.expect_stale_upload else []),*(['-DEXPECT_CONTAMINATED_UPLOAD'] if a.expect_contaminated_upload else []),*(['-DEXPECT_SHARED_RENDER'] if a.expect_shared_render else []),*(['-DEXPECT_STALE_READ'] if a.expect_stale_read else []),*(['-DEXPECT_UNFLIPPED'] if a.expect_unflipped else []),*(['-DEXPECT_UNPUBLISHED'] if a.expect_unpublished else []),*(['-DEXPECT_STALE_MIPMAP'] if a.expect_stale_mipmap else []),'-I',str(out),'-I',str(ROOT/'drivers/NativeGL/eagl'),
+                 *flags,*features,*(['-DEXPECT_STALE_STORAGE'] if a.expect_stale_storage else []),*(['-DEXPECT_UNPUBLISHED_SUBIMAGE'] if a.expect_unpublished_subimage else []),*(['-DEXPECT_RECYCLED_SURFACE'] if a.expect_recycled_surface else []),*(['-DEXPECT_STALE_GROUP'] if a.expect_stale_group else []),*(['-DEXPECT_STALE_UPLOAD'] if a.expect_stale_upload else []),*(['-DEXPECT_CONTAMINATED_UPLOAD'] if a.expect_contaminated_upload else []),*(['-DEXPECT_SHARED_RENDER'] if a.expect_shared_render else []),*(['-DEXPECT_STALE_READ'] if a.expect_stale_read else []),*(['-DEXPECT_UNFLIPPED'] if a.expect_unflipped else []),*(['-DEXPECT_UNPUBLISHED'] if a.expect_unpublished else []),*(['-DEXPECT_STALE_MIPMAP'] if a.expect_stale_mipmap else []),'-I',str(out),'-I',str(ROOT/'drivers/NativeGL/eagl'),
                  str(fixture),'-Wl,-l:libGL.so.1','-Wl,-l:libEGL.so.1','-o',str(binary)]),('run',[str(binary)])]
     for step, cmd in commands:
         result = subprocess.run(cmd,capture_output=True,text=True,timeout=90,
@@ -120,7 +125,7 @@ for name, flags in [('normal', []), ('asan', ['-fsanitize=address,undefined','-f
         runs.append(dict(name=name+'-'+step,passed=True,output=result.stdout))
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
 (out/'results.json').write_text(json.dumps(dict(passed=True,hardware_tested=False,baseline=a.expect_unpublished,contaminated_upload_reproduced=a.expect_contaminated_upload,
-    stale_upload_reproduced=a.expect_stale_upload,stale_group_reproduced=a.expect_stale_group,
+    stale_storage_reproduced=a.expect_stale_storage,stale_upload_reproduced=a.expect_stale_upload,stale_group_reproduced=a.expect_stale_group,
     unpublished_subimage_reproduced=a.expect_unpublished_subimage,recycled_surface_reproduced=a.expect_recycled_surface,source_sha256=sha(a.source),inputs={str(p.relative_to(ROOT)):sha(p) for p in (fixture,Path(__file__))},runs=runs,
     limitation='Real Mesa GLES pixels; IOSurface allocation, locks and seeds are a host fixture. EGLImage sibling import and storage detachment use real Mesa; Group registration dispatch is production group_read with a materialization observer, not a shader pixel test. Native IOSurface backing and Adreno execution require device verification.'),indent=2)+'\n')
 print(runs[-1]['output'])

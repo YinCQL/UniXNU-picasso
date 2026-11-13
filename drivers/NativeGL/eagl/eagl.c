@@ -425,6 +425,7 @@ struct eagl {
 	struct image images[1024];
 	unsigned image_count;
 	unsigned target_refresh_notes;  /* bounded external target ownership observations */
+	unsigned preserved_errors;     /* errors observed by storage ownership checks */
 	unsigned surface_handoff_notes;
 	bool mip_pending;
 	GLuint framebuffer;             /* the one bound */
@@ -775,6 +776,7 @@ image_of(struct eagl *e, GLuint texture)
 	return NULL;
 }
 
+static void vblur_forget(struct eagl *e, GLuint texture);
 static bool image_publish(struct eagl *e, struct image *image, const char *reason);
 static bool surface_publish_aliases(struct eagl *e, IOSurfaceRef surface);
 
@@ -1397,6 +1399,78 @@ surface_publish_aliases(struct eagl *e, IOSurfaceRef surface)
 		    !image_publish(e, image, "register")) return false;
 	}
 	return true;
+}
+
+
+/* Ownership checks must observe the result of a storage call without stealing
+ * errors from the application's glGetError. GL permits one flag per error. */
+static void
+storage_error_save(struct eagl *e, GLenum error)
+{
+	if (error >= 0x500 && error <= 0x507) e->preserved_errors |= 1u << (error - 0x500);
+}
+
+static GLenum
+my_glGetError(void *context)
+{
+	struct eagl *e = context;
+	GLenum error;
+	EAGL_ENTER(e, 0x338);
+	if (e->preserved_errors) {
+		unsigned bit = (unsigned)__builtin_ctz(e->preserved_errors);
+		e->preserved_errors &= ~(1u << bit);
+		error = 0x500 + bit;
+	} else error = glGetError();
+	EAGL_LEAVE(e, 0x338);
+	return error;
+}
+
+/* A successful level-zero storage definition ends the IOSurface view. First
+ * publish its old pixels, then keep the association until GL accepts the call.
+ * Calls on ordinary textures and nonzero mip levels retain their normal path. */
+static bool
+image_storage_begin(struct eagl *e, GLenum target, GLint level, GLuint *texture)
+{
+	GLint bound = 0;
+	*texture = 0;
+	if (target != GL_TEXTURE_2D || level != 0 || !e->image_count) return true;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	struct image *image = image_of(e, (GLuint)bound);
+	if (image == NULL) return true;
+	GLenum error;
+	while ((error = glGetError()) != 0) storage_error_save(e, error);
+	if (!image_publish(e, image, "storage")) {
+		storage_error_save(e, 0x502);
+		return false;
+	}
+	if (image->shared) {
+		/* Same-size TexImage may retain an EGLImage sibling in Mesa. Preserve
+		 * its contents in independent storage before any replacement writes. */
+		bool mipmapped = image->mipmapped;
+		image->mipmapped = true;
+		bool copied = surface_render_copy(e, image);
+		image->mipmapped = mipmapped;
+		if (!copied) { storage_error_save(e, 0x502); return false; }
+	}
+	*texture = (GLuint)bound;
+	return true;
+}
+
+static void
+image_storage_end(struct eagl *e, GLuint texture)
+{
+	if (!texture) return;
+	bool failed = false;
+	GLenum error;
+	while ((error = glGetError()) != 0) {
+		storage_error_save(e, error);
+		failed = true;
+	}
+	if (!failed) {
+		image_forget(e, texture);
+		group_forget(e, texture);
+		vblur_forget(e, texture);
+	}
 }
 
 /*
@@ -4386,7 +4460,10 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 		glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
 		texture_defined(e, (GLuint)texture, 1, level, internal, width, height, format, type);
 	}
+	GLuint replaced = 0;
+	if (!image_storage_begin(e, target, level, &replaced)) { EAGL_LEAVE(e, 0x970); return; }
 	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
+	image_storage_end(e, replaced);
 	if (check_errors) {
 		/* A texture CoreAnimation made that the library refused: what it asked for, so a format
 		 * the driver does not take (the glyph masks) can be told from one it does. */
@@ -4413,12 +4490,16 @@ my_glTexStorage2D(void *context, GLenum target, GLsizei levels, GLenum internal,
 	struct eagl *e = context;
 
 	EAGL_ENTER(e, 0x2040);
+	clear_now(e);
 	if (compositor_diagnostics && target == GL_TEXTURE_2D) {
 		GLint texture = 0;
 		glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
 		texture_defined(e, (GLuint)texture, 2, 0, (GLint)internal, width, height, 0, 0);
 	}
+	GLuint replaced = 0;
+	if (!image_storage_begin(e, target, 0, &replaced)) { EAGL_LEAVE(e, 0x2040); return; }
 	glTexStorage2D(target, levels, internal, width, height);
+	image_storage_end(e, replaced);
 	EAGL_LEAVE(e, 0x2040);
 }
 
@@ -4502,7 +4583,10 @@ my_glCopyTexImage2D(void *context, GLenum target, GLint level, GLenum internal, 
 		group_forget(e, (GLuint)texture);
 		texture_defined(e, (GLuint)texture, 5, level, (GLint)internal, width, height, 0, 0);
 	}
+	GLuint replaced = 0;
+	if (!image_storage_begin(e, target, level, &replaced)) { EAGL_LEAVE(e, 0x1b8); return; }
 	glCopyTexImage2D(target, level, internal, x, y, width, height, border);
+	image_storage_end(e, replaced);
 	if (compositor_claim(7, 0x10000000u | (GLuint)texture)) {
 		compositor_text("copy-image src=%u dst=%d level=%d size=%dx%d internal=%x frame=%u",
 		    source, texture, level, width, height, internal, e->frames);
@@ -4662,13 +4746,17 @@ my_glCompressedTexImage2D(void *context, GLenum target, GLint level, GLenum inte
 	static unsigned told;
 
 	EAGL_ENTER(e, 0xbe8);
+	clear_now(e);
 	if (level == 0) {
 		note_format("compressed", internal, 0, 0, width, height);
 	}
 	if (compositor_diagnostics && told < 40) {
 		(void)glGetError();             /* so that what is left behind is this call's own */
 	}
+	GLuint replaced = 0;
+	if (!image_storage_begin(e, target, level, &replaced)) { EAGL_LEAVE(e, 0xbe8); return; }
 	glCompressedTexImage2D(target, level, internal, width, height, border, size, data);
+	image_storage_end(e, replaced);
 	/*
 	 * A format the driver has not got is refused here, and then the texture stays undefined and
 	 * is read as whatever the driver leaves in it -- magenta, with some. The first of these are
