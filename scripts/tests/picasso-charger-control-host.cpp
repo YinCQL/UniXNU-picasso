@@ -92,6 +92,25 @@ int main(){
     for(unsigned result=0;result<128;++result){Fixture f;f.in.result=uint8_t(result);f.bus.data[1][8]=uint8_t(result);
         f.step();auto out=f.step(2000);unsigned want=result==1?500:result==4?1500:(result==2||result==8||result==0x28||result==0x48)?1600:0;
         assert(out.sourceMa==want);assert(f.bus.data[1][0x70]<= (want>500?want/50:10));}
+    // Compare all encoded attached Rp values against the controller's
+    // one-hot source levels; mixed/absent bits cannot borrow the DCP path.
+    for(unsigned sink=0;sink<256;++sink){Fixture f;f.src.sink=uint8_t(sink);
+        f.step();auto out=f.step(2000);
+        const unsigned expected=sink==2?3000:sink==4?1500:sink==8?1600:0;
+        assert(out.sourceMa==expected);
+        if(!expected)f.safe();
+    }
+    // A protection or another owner can lower ICL after our first update.
+    // Repeated observations must preserve the new limit, then requalify
+    // when the external owner restores the normal USB baseline.
+    for(unsigned cfg=0;cfg<10;++cfg){Fixture f;f.active();f.bus.data[1][0x70]=uint8_t(cfg);
+        f.bus.written.clear();auto out=f.step(3000);
+        assert(out.verified&&out.targetMa==cfg*50&&f.r.configuredMa==cfg*50&&!f.c.owned);
+        assert(f.bus.written.empty()&&f.bus.data[1][0x70]==cfg);
+        out=f.step(4000);assert(out.targetMa==cfg*50&&f.bus.written.empty());
+        f.bus.data[1][0x70]=10;assert(f.step(5000).state==1);
+        assert(f.step(6000).targetMa==1600);
+    }
     for(unsigned rp:{2u,4u}){Fixture f;f.src.sink=uint8_t(rp);f.step();auto out=f.step(2000);
         assert(out.verified&&out.targetMa==(rp==2?3000:1500));}
     {Fixture f;f.src.sink=2;f.src.legacy=2;f.active();}

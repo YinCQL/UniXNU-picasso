@@ -161,6 +161,31 @@ struct LowBattery {
         if(uv<lowUv || low || s.percent<=2)s.refreshMs=1000;
     }
 };
+// The SMB5 terminate state is independent of net cell current under load.
+// Confirm it across fresh samples and calibrate only once per charge cycle.
+// An observation gap clears qualification, not the already used calibration.
+struct ChargeTermination {
+    uint64_t previousMs=0,sinceMs=0;
+    bool qualified=false,calibrated=false;
+    void gap(){previousMs=0;sinceMs=0;qualified=false;}
+    void reset(){gap();calibrated=false;}
+    bool update(const Sample &s,uint64_t now,int temp,bool valid,bool capable,bool blocked){
+        const unsigned mode=s.charger&7;
+        if(!(s.status&1) || !(s.usb&0x10)){reset();return false;}
+        const bool healthy=capable && valid && temp>=100 && temp<450 &&
+            !(s.thermal&0x3f) && !(s.chargeError&2) && !blocked;
+        if(healthy && mode>=1 && mode<=4)calibrated=false;
+        if(!healthy || mode!=5 || s.voltageUv<4300000 || s.voltageUv>4450000 || s.currentUa<-45000){
+            gap();return false;
+        }
+        if(!previousMs || now<=previousMs || now-previousMs>15000){sinceMs=now;qualified=false;}
+        previousMs=now;
+        if(now-sinceMs>=3000)qualified=true;
+        const bool calibrate=qualified && !calibrated;
+        if(calibrate)calibrated=true;
+        return calibrate;
+    }
+};
 // 4500 mAh is nominal, not a learned health measurement. Integrate only
 // adjacent observations; an unread interval is never filled with old current.
 struct Estimator {
@@ -169,22 +194,23 @@ struct Estimator {
     int lastCurrent=0,restVoltage=0;
     int64_t remainingUaMs=0;
     LowBattery lowBattery;
+    ChargeTermination termination;
     static constexpr int64_t fullUaMs=4500LL*1000*3600000;
-    void gap(){lastMs=0;restMs=0;correctionMs=0;lowBattery.reset();}
-    void update(const Sample &s,uint64_t now,int temp,bool tempValid,int ponUv,Snapshot &out){
+    void gap(){lastMs=0;restMs=0;correctionMs=0;lowBattery.reset();termination.gap();}
+    void update(const Sample &s,uint64_t now,int temp,bool tempValid,int ponUv,Snapshot &out,bool chargeBlocked=false){
         out=Snapshot{};out.raw=s;out.timeMs=now;out.present=(s.status&1)!=0;
         out.external=(s.usb&0x10)!=0;
         out.capable=out.external && (s.path&0x11)==0x11 && !(s.path&0x40) && !(s.usb&0x0f);
         out.millivolts=s.voltageUv/1000;out.milliamps=-s.currentUa/1000;
         out.temperature=temp;out.temperatureValid=tempValid;
         unsigned mode=s.charger&7;
-        bool fault=(s.thermal&0x0f) || (s.chargeError&2);
+        bool fault=(s.thermal&0x3f) || (s.chargeError&2) || chargeBlocked || !tempValid || temp<100 || temp>=450;
         // The charger state describes its active charging cycle. A system load
         // can temporarily draw more than the input supplies; preserve that net
         // discharge in Amperage and capacity integration without hiding the cycle.
         out.charging=out.present && out.capable && !fault && mode>=1 && mode<=4;
         out.netCharging=out.present && s.currentUa<0;
-        out.full=out.present && out.capable && !fault && mode==5 && s.voltageUv>=4300000 && s.currentUa>=-45000 && s.currentUa<=45000;
+        const bool calibrateFull=termination.update(s,now,temp,tempValid,out.capable,chargeBlocked);
         if(!out.present){ready=false;gap();return;}
         uint64_t dt=lastMs && now>lastMs && now-lastMs<=15000?now-lastMs:0;
         if(!ready){
@@ -196,10 +222,10 @@ struct Estimator {
         }else if(dt){
             remainingUaMs-=int64_t(lastCurrent+s.currentUa)*int64_t(dt)/2;
         }
-        if(out.full)remainingUaMs=fullUaMs;
+        if(calibrateFull)remainingUaMs=fullUaMs;
         // A resting cell can slowly correct integration drift. Load-induced
         // voltage dips must not make the reported capacity jump down and up.
-        if(dt && s.currentUa>=-45000 && s.currentUa<=45000){
+        if(dt && !termination.qualified && s.currentUa>=-45000 && s.currentUa<=45000){
             if(!restMs){restMs=now;restVoltage=s.voltageUv;correctionMs=now;}
             restVoltage=(restVoltage*7+s.voltageUv)/8;
             if(now-restMs>=120000 && now-correctionMs>=60000 && tempValid){
@@ -211,7 +237,11 @@ struct Estimator {
         }else{restMs=0;correctionMs=0;}
         if(remainingUaMs<0)remainingUaMs=0;
         if(remainingUaMs>fullUaMs)remainingUaMs=fullUaMs;
-        out.percent=int((remainingUaMs*100+fullUaMs/2)/fullUaMs);
+        // Keep integrating real discharge after termination. A full indicator
+        // may hold through the first percent, but cannot reset capacity on
+        // every sample or request a recharge behind the hardware controller.
+        out.full=termination.qualified && remainingUaMs>=fullUaMs*99/100;
+        out.percent=out.full?100:int((remainingUaMs*100+fullUaMs/2)/fullUaMs);
         if(!out.full && out.percent==100)out.percent=99;
         out.remainingMah=int(remainingUaMs/3600000000LL);
         if(!out.capable && s.currentUa>45000)

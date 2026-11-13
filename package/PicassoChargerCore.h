@@ -94,8 +94,11 @@ inline bool noCc(const Source &s){
         !(s.sink&0x7f) && !(s.debug&1) && !(s.legacy&1);
 }
 inline bool linkSafe(const Source &s){
+    // SMB5 reports exactly one Rp level. Conflicting bits or an attached
+    // partner with no Rp must not fall through to a BC1.2 high-current mode.
+    const unsigned rp=s.sink&15;
     return (noCc(s) && !(s.misc&0x10)) || (s.valid && (s.machine&0x20) && (s.misc&0xd9)==9 &&
-        !(s.legacy&1) && !(s.sink&0x71) && !(s.debug&1));
+        !(s.legacy&1) && !(s.sink&0xf0) && (rp==2 || rp==4 || rp==8) && !(s.debug&1));
 }
 // Matching SMB5 selects NO_CC current control for a known BC1.2 source.
 // In this narrow debounced, unattached OCP/DCP case, qualify VBUS through
@@ -225,7 +228,12 @@ struct Controller {
         if(c.error){c.state=4;c.fallbackError=fallback(bus,r);return c;}
         // Do not override a pre-existing limit below the normal USB baseline.
         // That can represent another owner or a protection condition.
-        if(unsigned(cfg)*50<500 && !owned){c.state=3;c.targetMa=unsigned(cfg)*50;c.verified=true;return c;}
+        if(unsigned(cfg)*50<500){
+            // This controller never programs below 500 mA. A later lower
+            // setting revokes our ownership just as an inherited one does.
+            reset();owned=false;c.state=3;c.targetMa=unsigned(cfg)*50;
+            r.configuredMa=c.targetMa;c.verified=true;return c;
+        }
         if(target>500 && stable<2){
             c.state=1;c.targetMa=500;
             if(cfg>10)c.error=masked(bus,currentLimit,0xff,10,r);

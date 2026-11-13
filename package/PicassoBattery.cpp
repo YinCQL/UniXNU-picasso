@@ -193,7 +193,8 @@ extern "C" int picasso_battery_read(void *context,picasso_battery::Snapshot *out
     int pon=0;
     if(!b->ponRead && (sample.status&1)){pon=b->pon();b->ponRead=true;}
     picasso_battery::Snapshot next;
-    b->estimator.update(sample,ns/1000000,temp,temp!=-10000,pon,next);
+    b->estimator.update(sample,ns/1000000,temp,temp!=-10000,pon,next,
+        b->thermalControl.inhibited || b->thermalControl.error);
     next.thermalInhibited=b->thermalControl.inhibited;next.thermalError=b->thermalControl.error;
     if(next.thermalInhibited || next.thermalError)next.charging=false;
     next.idOhm=id;next.idValid=id>0;next.input=input;

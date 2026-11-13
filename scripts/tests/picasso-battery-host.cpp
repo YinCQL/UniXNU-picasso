@@ -86,6 +86,51 @@ int main(){
     s.currentUa=0;e.update(s,11610000,250,true,0,o);assert(o.full&&o.percent==100);
     s.thermal=8;e.update(s,11615000,250,true,0,o);assert(!o.full&&!o.charging);
     s.status=0x80;e.update(s,11620000,0,false,0,o);assert(!e.ready&&!o.present);
+    // Hardware TERMINATE_CHARGE is distinct from a quiet QG current.
+    // Qualify full across three seconds, then calibrate only once while
+    // the load continues consuming the stored capacity.
+    for(int ua:{-45000,0,100000,500000}){Estimator f;Snapshot v;Sample a;
+        a.status=0x81;a.usb=16;a.path=0x95;a.charger=5;a.voltageUv=4370000;a.currentUa=ua;
+        for(unsigned ms:{1000u,2000u,3000u}){f.update(a,ms,250,true,4370000,v);assert(!v.full);}
+        f.update(a,4000,250,true,0,v);assert(v.full&&v.percent==100&&f.remainingUaMs==Estimator::fullUaMs);
+        f.update(a,5000,250,true,0,v);
+        assert(f.remainingUaMs==Estimator::fullUaMs-(ua>0?int64_t(ua)*1000:0));
+    }
+    {Estimator f;Snapshot v;Sample a;a.status=0x81;a.usb=16;a.path=0x95;a.charger=5;
+     a.voltageUv=4370000;a.currentUa=1000000;
+     f.update(a,1000,250,true,4370000,v);f.update(a,4000,250,true,0,v);assert(v.full);
+     for(unsigned ms=9000;ms<=184000;ms+=5000)f.update(a,ms,250,true,0,v);
+     assert(f.remainingUaMs==Estimator::fullUaMs-180000000000LL&&!v.full&&v.percent==99);
+     const auto remaining=f.remainingUaMs;f.gap();
+     f.update(a,200000,250,true,0,v);f.update(a,203000,250,true,0,v);
+     assert(!v.full&&f.remainingUaMs==remaining-3000000000LL);
+     a.charger=4;f.update(a,204000,250,true,0,v);assert(!v.full);
+     a.charger=5;f.update(a,205000,250,true,0,v);f.update(a,208000,250,true,0,v);
+     assert(v.full&&f.remainingUaMs==Estimator::fullUaMs);}
+    // Every invalid temperature, software inhibit/error, USB fault and
+    // non-termination mode rejects the full calibration. Inhibit mode zero
+    // is not a substitute for an observed charge completion.
+    for(unsigned kind=0;kind<20;++kind){Estimator f;Snapshot v;Sample a;
+        a.status=0x81;a.usb=16;a.path=0x95;a.charger=5;a.voltageUv=4370000;
+        int temp=250;bool valid=true,blocked=false;
+        switch(kind){case 0:temp=99;break;case 1:temp=450;break;case 2:valid=false;break;
+         case 3:blocked=true;break;case 4:a.thermal=0x20;break;case 5:a.thermal=0x10;break;
+         case 6:a.thermal=8;break;case 7:a.chargeError=2;break;case 8:a.usb=0;break;
+         case 9:a.path=0xd5;break;case 10:a.usb=0x11;break;case 11:a.currentUa=-45001;break;
+         case 12:a.voltageUv=4299999;break;case 13:a.voltageUv=4450001;break;
+         case 14:a.status=0x80;break;case 15:a.charger=0;break;case 16:a.charger=3;break;
+         case 17:a.charger=4;break;case 18:a.charger=6;break;case 19:a.charger=7;break;}
+        for(unsigned ms=1000;ms<=5000;ms+=1000){f.update(a,ms,temp,valid,4100000,v,blocked);assert(!v.full);}
+        assert(f.remainingUaMs<Estimator::fullUaMs);
+    }
+    {ChargeTermination f;Sample a;a.status=0x81;a.usb=16;a.charger=5;a.voltageUv=4370000;
+     assert(!f.update(a,1000,250,true,true,false));assert(!f.update(a,30000,250,true,true,false));
+     assert(!f.update(a,32000,250,true,true,false));assert(f.update(a,33000,250,true,true,false));
+     assert(!f.update(a,34000,250,true,true,false));f.gap();
+     assert(!f.update(a,40000,250,true,true,false));assert(!f.update(a,43000,250,true,true,false));
+     assert(f.qualified&&f.calibrated);a.usb=0;f.update(a,44000,250,true,false,false);
+     assert(!f.qualified&&!f.calibrated);a.usb=16;
+     f.update(a,45000,250,true,true,false);assert(f.update(a,48000,250,true,true,false));}
     for(unsigned n=1;n<=10;++n){Bus b;b.failAt=n;uint16_t out=9;assert(adc_read(b,0x4a,out)==-40&&out==9);}
     for(unsigned n=1;n<=6;++n){Bus b;b.failWrite=n;uint16_t out=9;assert(adc_read(b,0x4a,out)==-41&&out==9);}
     {Bus b;uint16_t v=0;assert(!adc_read(b,0x4a,v)&&v==0x3872&&b.waits==1&&b.writes==6);assert(b.data[4][0x42]==0x18&&b.data[4][0x45]==2);}
