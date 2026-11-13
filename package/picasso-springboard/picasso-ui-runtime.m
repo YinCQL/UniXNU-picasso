@@ -4,6 +4,7 @@
 #include "picasso-springboard-probe.m"
 #include "picasso-input-cache.m"
 #include "picasso-power-button.m"
+#include "picasso-snapshot-resample.m"
 
 __attribute__((constructor))
 static void picasso_input_start(void)
