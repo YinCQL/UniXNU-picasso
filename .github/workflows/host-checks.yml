@@ -92,6 +92,11 @@ jobs:
           ADRENO620_VENDOR_DIR="$PWD/out/picasso/host-checks/gpu-firmware/firmware" \
             make -C drivers/NativeAdrenoPicasso/Test test CC=clang CXX=clang++
 
+      - name: Check GPU maintenance wakeups and fallback activation
+        run: |
+          python3 scripts/check-picasso-gpu-maintenance.py --output out/picasso/host-checks/gpu-maintenance
+          cp out/picasso/host-checks/gpu-maintenance/results.json out/picasso/logs/gpu-maintenance-host.json
+
       - name: Check bounded DC ZVA fallback
         if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp' || github.ref_name == 'feat/fix-v1'
         run: |

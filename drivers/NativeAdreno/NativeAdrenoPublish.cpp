@@ -96,7 +96,7 @@ enum : UInt32 {NativeAdrenoMailboxType=0xC0DE,NativeAdrenoMailboxMagic=0x4d41494
 namespace {
 IOBufferMemoryDescriptor *gMailbox=nullptr;
 volatile uint32_t *gMailboxWords=nullptr;
-volatile bool gPollerStarted=false;
+bool gPollerStarted=false;   /* protected by g.lock */
 }
 class AGXDeviceUserClient;
 /* The render server's connection serves the mailbox; it is retained while set (under g.lock), so the poller never runs on a freed object. */
@@ -231,35 +231,42 @@ extern "C" void native_adreno_set_restart(NativeAdrenoRestart restart,void *cook
     g.restart=restart;g.restart_cookie=cookie;
     if(g.lock)IOLockUnlock(g.lock);
 }
-/* The first time the CP's fence word was seen at each of the last 64 fence numbers, sampled by the hangcheck thread every
- * millisecond: [i&63][0] the fence, [i&63][1] the time the word first read at or above it (us). A job's retire can then be the
- * moment the CP really wrote its fence, not the moment a client's next wait happened to look: the two are far apart when the
- * frames crawl, and only the first is the GPU's own latency. */
+/* Optional diagnostic timestamps, sampled only while the job timeline has storage.
+ * Normal completion and hang recovery read their own fences and do not use this table. */
 extern "C" {volatile uint64_t native_adreno_fence_done[64][2];}
-/* msm's hangcheck timer: every DRM_MSM_HANGCHECK_DEFAULT_PERIOD (500 ms, msm_gpu.h) the ring is checked for progress; a hang restarts the
- * GPU through the board's hook and replays the other submissions (recover_worker). Without a hook a hang is only counted. */
+extern "C" {extern volatile uint32_t native_adreno_tl_cap;}
+static void nativeAdrenoHangcheckWait()
+{
+    if(!native_adreno_tl_cap) {
+        IOSleep(500);
+        return;
+    }
+    /* Keep millisecond resolution for an explicitly enabled job timeline. */
+    for(unsigned tick=0;tick<500;++tick) {
+        IOSleep(1);
+        uint32_t value=0;
+        static uint32_t last_value;
+        if(g.published && g.ring && !g.ring->fenceValue(&value) && (int32_t)(value-last_value)>0) {
+            const uint64_t seen=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
+            uint32_t new_fences=value-last_value;
+            if(new_fences>64)new_fences=64;
+            for(uint32_t i=1;i<=new_fences;++i) {
+                const uint32_t f=last_value+i;
+                native_adreno_fence_done[f&63][0]=f;
+                native_adreno_fence_done[f&63][1]=seen;
+            }
+            last_value=value;
+        }
+    }
+}
+/* Keep msm's 500 ms hangcheck period, including when diagnostic sampling is off. */
 static void nativeAdrenoHangcheck(void *,wait_result_t)
 {
     uint32_t printed_fence=~0u,printed_second=~0u;
+    printf("PICASSO_GPU maintenance hang_ms=500 fence_sample_ms=%u mailbox=on-demand\n",
+        native_adreno_tl_cap?1u:0u);
     for(;;) {
-        /* Sample the fence word every millisecond for the 500 ms period. The CP's write is the frame's real completion; the
-         * timeline's retire uses the first sighting, so its age separates GPU execution from the wait after it. */
-        for(unsigned tick=0;tick<500;++tick) {
-            IOSleep(1);
-            uint32_t value=0;
-            static uint32_t last_value;
-            if(g.published && g.ring && !g.ring->fenceValue(&value) && (int32_t)(value-last_value)>0) {
-                const uint64_t seen=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
-                uint32_t new_fences=value-last_value;
-                if(new_fences>64)new_fences=64;
-                for(uint32_t i=1;i<=new_fences;++i) {
-                    const uint32_t f=last_value+i;
-                    native_adreno_fence_done[f&63][0]=f;
-                    native_adreno_fence_done[f&63][1]=seen;
-                }
-                last_value=value;
-            }
-        }
+        nativeAdrenoHangcheckWait();
         native_adreno_hangcheck[0]=native_adreno_hangcheck[0]+1;
         /* A plain IOLockLock hides whether the 500 ms thread is starved of g.lock by the wait/stall path;
          * count the polls that had to wait instead. */
@@ -422,6 +429,7 @@ class AGXDeviceUserClient : public IOUserClient {
     View *views_=nullptr;   /* on the heap, grown to the highest token (growViews) */
     size_t view_capacity_=0;
     bool growViews(uint32_t token);
+    IOReturn mailboxMemory(IOOptionBits *options,IOMemoryDescriptor **memory);
     void dropViews(uint32_t token);
     static IOReturn action(OSObject *target,void *reference,IOExternalMethodArguments *arguments);
     IOReturn run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
@@ -530,7 +538,7 @@ bool AGXDeviceUserClient::mount(bool kernel)
     }
     /* Not used by any core (a failed open or scope): nothing of it reached the GPU. */
     if(space && g.context->destroyVm(space)) {}
-    /* The mailbox page and its poller serve the render server's connection only. */
+    /* Prepare the fallback channel for the render server; mapping it starts its poller. */
     if(ok && server && row_==0) {
         if(!gMailbox) {
             gMailbox=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,kIODirectionInOut,4096,4096);
@@ -539,10 +547,6 @@ bool AGXDeviceUserClient::mount(bool kernel)
         if(gMailboxWords) {
             memset(const_cast<uint32_t *>(gMailboxWords),0,4096);
             gMailboxWords[0]=NativeAdrenoMailboxMagic;
-            if(!gPollerStarted) {
-                thread_t thread=nullptr;
-                if(kernel_thread_start(nativeAdrenoMailboxPoller,nullptr,&thread)==KERN_SUCCESS) {thread_deallocate(thread);gPollerStarted=true;}
-            }
         }
         if(gMailboxOwner)gMailboxOwner->release();
         retain();gMailboxOwner=this;
@@ -620,6 +624,33 @@ void AGXDeviceUserClient::free()
     if(core_ && !live_) {delete core_;core_=nullptr;}
     IOUserClient::free();
 }
+/* Called with validated output pointers. Start the fallback poller only when its
+ * page is requested, not whenever the render server opens an ordinary GPU client.
+ * The lock serializes concurrent map requests and the owner's close path. */
+IOReturn AGXDeviceUserClient::mailboxMemory(IOOptionBits *options,IOMemoryDescriptor **memory)
+{
+    IOLockLock(g.lock);
+    IOReturn status=kIOReturnNotReady;
+    if(live_ && gMailbox && gMailboxOwner==this) {
+        if(!gPollerStarted) {
+            thread_t thread=nullptr;
+            if(kernel_thread_start(nativeAdrenoMailboxPoller,nullptr,&thread)!=KERN_SUCCESS) {
+                IOLockUnlock(g.lock);
+                return kIOReturnNoResources;
+            }
+            thread_deallocate(thread);
+            gPollerStarted=true;
+            printf("PICASSO_GPU mailbox poller started on mapping\n");
+        }
+        gMailbox->retain();
+        *memory=gMailbox;
+        *options=kIOMapAnywhere;   /* coherent CPU-to-CPU shared memory */
+        native_adreno_metal_diag.mb_maps=native_adreno_metal_diag.mb_maps+1;
+        status=kIOReturnSuccess;
+    }
+    IOLockUnlock(g.lock);
+    return status;
+}
 IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory)
 {
     if(memory)*memory=nullptr;
@@ -633,16 +664,7 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
         *options=kIOMapAnywhere|kIOMapWriteCombineCache; /* same noncached scanout attributes as the display */
         return kIOReturnSuccess;
     }
-    if(type==NativeAdrenoMailboxType) {
-        if(live_ && gMailbox && gMailboxOwner==this) {
-            gMailbox->retain();
-            *memory=gMailbox;
-            *options=kIOMapAnywhere;   /* ordinary cached memory: both sides are CPUs, so it is coherent */
-            native_adreno_metal_diag.mb_maps=native_adreno_metal_diag.mb_maps+1;
-            return kIOReturnSuccess;
-        }
-        return kIOReturnNotReady;
-    }
+    if(type==NativeAdrenoMailboxType)return mailboxMemory(options,memory);
     native_adreno_view_diag[0]=native_adreno_view_diag[0]+1;
     /* [5]: threads inside this function right now (a thread stuck here, on the gate or in a mapping, shows as a non-zero count that stays). */
     struct Inside {Inside() {__atomic_fetch_add(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);} ~Inside() {__atomic_fetch_sub(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);}} inside;
