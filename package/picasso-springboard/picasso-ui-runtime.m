@@ -3,6 +3,7 @@
 // build includes its status-bar/ASTC behavior plus the input cache and power-button corrections.
 #include "picasso-springboard-probe.m"
 #include "picasso-input-cache.m"
+#include "picasso-keyboard-size.m"
 #include "picasso-power-button.m"
 #include "picasso-snapshot-resample.m"
 #include "picasso-snapshot-store.m"

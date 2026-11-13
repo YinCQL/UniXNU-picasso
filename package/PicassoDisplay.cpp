@@ -199,6 +199,15 @@ static bool matchWord(IORegistryEntry *entry, const char *key, uint32_t value, b
     return ok;
 }
 
+// The native framebuffer selector expects a uint32 OSData containing pixels
+// per inch. The 1080 x 2400 G7A panel is about 69.5 x 154.4 mm: 395 PPI.
+// MobileGestalt forwards this to UIKit's physical dock-button sizing.
+static bool publishPanelPitch(IORegistryEntry *entry, uint32_t width, uint32_t height) {
+    if (!entry || width != 1080 || height != 2400) return false;
+    bool added = false;
+    return matchWord(entry, "dot-pitch", 395, added);
+}
+
 // Honor the ADT's iPhone scale while keeping the existing 2x default when no
 // scale is supplied. Reject malformed or unsupported properties unchanged.
 static bool matchDisplayScale(IORegistryEntry *entry, uint32_t &scale, bool &added) {
@@ -374,7 +383,8 @@ extern "C" void native_legacy_display_late_probe(void) {
     const char type[] = "display-subsystem";
     OSData *typeData = OSData::withBytes(type, sizeof(type));
     bool nubAttached = false, nubStarted = false, dtAttached = false, attached = false, started = false;
-    if (nub && memory && ranges && treeParent && typeData && parent && nub->init() && ranges->setObject(memory)) {
+    if (nub && memory && ranges && treeParent && typeData && parent && nub->init() &&
+        publishPanelPitch(nub, (uint32_t)video.v_width, (uint32_t)video.v_height) && ranges->setObject(memory)) {
         nub->setDeviceMemory(ranges); nub->setName("NativeGOPFramebuffer");
         nubAttached = nub->attach(parent);
         if (nubAttached) nubStarted = nub->start(parent);
@@ -391,6 +401,7 @@ extern "C" void native_legacy_display_late_probe(void) {
     finishDisplayPolicy(started);
     OSSafeReleaseNULL(typeData); OSSafeReleaseNULL(ranges); OSSafeReleaseNULL(memory);
     if (started) {
+        IOLog("PICASSO_DISPLAY panel pitch=395 ppi\n");
         publishDisplayModes(display, (uint32_t)video.v_width, (uint32_t)video.v_height);
         publishAcceleratorStub();
         picasso_hid_start_later();

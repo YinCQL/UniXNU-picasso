@@ -6,7 +6,7 @@ from picasso_ui_trust import library_identity, make_bundle
 ROOT = Path(__file__).resolve().parents[1]
 FILE = 'ui/libpicasso-sb.dylib'
 SOURCES = ['package/picasso-springboard/' + n for n in
-           ['picasso-ui-runtime.m', 'picasso-input-cache.m', 'picasso-power-button.m', 'picasso-springboard-probe.m',
+           ['picasso-ui-runtime.m', 'picasso-input-cache.m', 'picasso-keyboard-size.m', 'picasso-power-button.m', 'picasso-springboard-probe.m',
             'picasso-statusbar-metrics.m', 'picasso-astc-guard.m', 'picasso-astc-guard-core.h',
             'picasso-astc-runtime.m', 'picasso-snapshot-resample.m',
             'picasso-snapshot-resample-core.h', 'picasso-snapshot-surface.h',

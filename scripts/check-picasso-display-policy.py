@@ -54,6 +54,7 @@ def main():
     markers = ['static void finishDisplayPolicy(', 'static bool matchWord(']
     if 'static bool matchDisplayScale(' in source:
         markers.append('static bool matchDisplayScale(')
+    markers.append('static bool publishPanelPitch(')
     markers.append('extern "C" bool native_legacy_gop_mapping_observed(')
     actual = '\n\n'.join(extract(source, marker) for marker in markers) + '\n'
     (out / 'display-policy.inc').write_text(actual, encoding='utf-8', newline='\n')
@@ -81,7 +82,7 @@ def main():
                 command = [compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror', '-O0', '-g',
                            '-I', str(out), str(fixture), '-o', str(out / exe)]
                 if asan:
-                    command.insert(1, '-fsanitize=address')
+                    command.insert(1, '-fsanitize=address,undefined')
                 with compile_log.open('w', encoding='utf-8') as log:
                     result = subprocess.run(command, cwd=out, stdout=log, stderr=subprocess.STDOUT)
             run = {'asan': asan, 'compile_exit': result.returncode, 'compile_log': str(compile_log)}
