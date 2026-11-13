@@ -9,7 +9,8 @@ SOURCES = ['package/picasso-springboard/' + n for n in
            ['picasso-ui-runtime.m', 'picasso-input-cache.m', 'picasso-power-button.m', 'picasso-springboard-probe.m',
             'picasso-statusbar-metrics.m', 'picasso-astc-guard.m', 'picasso-astc-guard-core.h',
             'picasso-astc-runtime.m', 'picasso-snapshot-resample.m',
-            'picasso-snapshot-resample-core.h', 'picasso-snapshot-surface.h']]
+            'picasso-snapshot-resample-core.h', 'picasso-snapshot-surface.h',
+            'picasso-snapshot-store.m', 'picasso-snapshot-store-core.h']]
 SOURCES += ['scripts/picasso_runtime_ui.py']
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
 def runtime_sources():
