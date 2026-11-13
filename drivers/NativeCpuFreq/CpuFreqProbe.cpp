@@ -228,7 +228,7 @@ void setLevel(unsigned d, unsigned at) {
 void governorThread(void *, wait_result_t) {
     uint64_t lastIdle[kCpus] = {}, lastT = mach_absolute_time();
     for (unsigned c = 0; c < kCpus; ++c) lastIdle[c] = sheng_cpu_idle_mach((int)c);
-    unsigned cur[3] = {}, down[3] = {}, quiet[3] = {};
+    unsigned cur[3] = {}, down[3] = {};
     bool ready[3] = {};
     uint64_t boostAbs = 0, boostEnd = 0;
     nanoseconds_to_absolutetime((uint64_t)gBoostMs * 1000000, &boostAbs);
@@ -303,12 +303,10 @@ void governorThread(void *, wait_result_t) {
             }
             if (framing)
                 while (want + 1 < l.count && (uint64_t)l.khz[want] * 100 < (uint64_t)l.khz[l.count - 1] * gFramePct) ++want;
-            if (d > 0) {
-                quiet[d] = busy[d] < 100 ? quiet[d] + 1 : 0;
-                if (boost) want = l.count - 1;
-                else if (quiet[d] < 12)
-                    while (want + 1 < l.count && l.khz[want] * 2 < l.khz[l.count - 1]) ++want;
-            }
+            // Background timer work can exceed 10% in a single 16 ms window.
+            // Let measured demand select its OPP; only explicit interaction
+            // keeps a P domain boosted. The frame floor above remains active.
+            if (d > 0 && boost) want = l.count - 1;
             if (want > cur[d]) {
                 cur[d] = want; down[d] = 0; setLevel(d, want); ++changes[d];
             } else if (want < cur[d]) {
@@ -443,7 +441,7 @@ extern "C" void sheng_cpufreq_probe(void) {
     for (unsigned d = 0; d < 3; ++d) gUsable[d] = gDomain[d].va && domainUsable(d);
     for (unsigned c = 0; c < kCpus; ++c) native_cpufreq_usage[c] = UINT32_MAX;
     gMode = mode;
-    printf("PICASSO_CPUFREQ probe mode=%u caps=%u min=%u boost=%u/%u frame=%u/%u maps=%u%u%u\n",
+    printf("PICASSO_CPUFREQ probe mode=%u caps=%u min=%u boost=%u/%u frame=%u/%u maps=%u%u%u policy=load\n",
            mode, gCapKHz, gFloorKHz, gBoostMs, gFrameMs, gFramePct, gFrameMs,
            gDomain[0].va != 0, gDomain[1].va != 0, gDomain[2].va != 0);
     // The scheduler's view of the CPU clusters: one line is enough to tell a flat eight-core topology from an E/P one.
