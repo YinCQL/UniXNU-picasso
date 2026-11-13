@@ -125,6 +125,8 @@ struct Snapshot {
     bool temperatureValid=false,idValid=false,estimated=true;
     bool netCharging=false,warn=false,critical=false;
     unsigned refreshMs=5000;
+    bool thermalInhibited=false;
+    int thermalError=0;
     bool inputCapVerified=false;
     int inputCapError=0,inputConfiguredMa=0;
     bool inputControlVerified=false;

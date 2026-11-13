@@ -22,7 +22,10 @@ struct Window {
     ~Window(){OSSafeReleaseNULL(map);}
 };
 struct Backend {
-    Window channels[7],adcWriter,usbWriter,miscWriter;
+    Window channels[7],adcWriter,usbWriter,miscWriter,chargeWriter;
+    bool chargeReady=false;
+    picasso_charger::ThermalControl thermalControl;
+    bool thermalReported=false,lastInhibited=false;int lastThermalError=0;
     bool chargerReady=false,chargerReported=false,aiclReady=false;
     int lastChargerError=0,lastControlError=0;
     unsigned lastConfiguredMa=0,lastControlState=99,lastSourceMa=0;
@@ -43,6 +46,16 @@ struct Backend {
     int chargerRead(uint8_t reg,uint8_t &value){return read(1,reg,value);}
     int chargerWrite(uint8_t reg,uint8_t value){return picasso_spmi_write8(usbWriter.va,reg,value);}
     int miscWrite(uint8_t reg,uint8_t value){return aiclReady?picasso_spmi_write8(miscWriter.va,reg,value):-51;}
+    int chargeRead(uint8_t reg,uint8_t &value){return read(2,reg,value);}
+    int chargeWrite(uint8_t reg,uint8_t value){return chargeReady?picasso_spmi_write8(chargeWriter.va,reg,value):-58;}
+    void thermal(bool present,int temp,bool valid,bool fault,uint64_t now){
+        thermalControl.update(*this,present,temp,valid,fault,now);
+        if(!thermalReported || lastInhibited!=thermalControl.inhibited || lastThermalError!=thermalControl.error){
+            IOLog("PICASSO_CHARGER thermal inhibited=%u owned=%u temp_dc=%d valid=%u error=%d\n",
+                thermalControl.inhibited,thermalControl.owned,temp,valid,thermalControl.error);
+            thermalReported=true;lastInhibited=thermalControl.inhibited;lastThermalError=thermalControl.error;
+        }
+    }
     void restrictInput(){
         charger=chargerReady?picasso_charger::restrictInput(*this):picasso_charger::Result{};
         if(!chargerReady)charger.error=-51;
@@ -128,6 +141,7 @@ extern "C" void *picasso_battery_open(){
         bool ok=apid[i]>=0 && b->channels[i].open(0xe600000+unsigned(apid[i])*0x80,0x80);
         if(!ok && i<4){delete b;return nullptr;}
         if(i==1)b->chargerReady=ok && b->usbWriter.open(0xc600000+unsigned(apid[i])*0x10000,0x1000);
+        if(i==2)b->chargeReady=ok && b->chargeWriter.open(0xc600000+unsigned(apid[i])*0x10000,0x1000);
         if(i==4)b->adcReady=ok && b->adcWriter.open(0xc600000+unsigned(apid[i])*0x10000,0x1000);
         if(i==6)b->aiclReady=ok && b->miscWriter.open(0xc600000+unsigned(apid[i])*0x10000,0x1000);
     }
@@ -142,10 +156,12 @@ extern "C" void *picasso_battery_open(){
 extern "C" void picasso_battery_close(void *context){delete static_cast<Backend *>(context);}
 extern "C" int picasso_battery_read(void *context,picasso_battery::Snapshot *out){
     Backend *b=static_cast<Backend *>(context);if(!b || !out)return -1;
+    uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+    const uint64_t now=ns/1000000;
     b->restrictInput();
     picasso_battery::Sample sample;
     int error=picasso_battery::sample(*b,b->subtype,sample);
-    if(error){b->failed();b->estimator.gap();return error;}
+    if(error){b->thermal(true,0,false,true,now);b->failed();b->estimator.gap();return error;}
     picasso_battery::Input input;
     if(sample.usb&0x10)picasso_battery::input_status(*b,input);
     uint16_t tempRaw=0,idRaw=0;int temp=-10000,id=0;
@@ -168,17 +184,18 @@ extern "C" int picasso_battery_read(void *context,picasso_battery::Snapshot *out
     // Do not combine ADC conversions from before an unplug with a new source.
     uint8_t usb=0,path=0;
     error=b->read(1,0x10,usb);if(!error)error=b->read(3,0x0b,path);
-    if(error || usb!=sample.usb || path!=sample.path){b->failed();b->estimator.gap();return error?error:-37;}
-    uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
-    const uint64_t now=ns/1000000;
+    if(error || usb!=sample.usb || path!=sample.path){b->thermal(true,0,false,true,now);b->failed();b->estimator.gap();return error?error:-37;}
     picasso_charger::Source source;
     picasso_charger::sourceStatus(*b,source);
     b->control=b->controller.update(*b,sample,input,source,temp,temp!=-10000,now,b->charger);
+    b->thermal((sample.status&1)!=0,temp,temp!=-10000,(sample.thermal&0x3f)!=0 || (sample.chargeError&2)!=0,now);
     b->report(source,input);
     int pon=0;
     if(!b->ponRead && (sample.status&1)){pon=b->pon();b->ponRead=true;}
     picasso_battery::Snapshot next;
     b->estimator.update(sample,ns/1000000,temp,temp!=-10000,pon,next);
+    next.thermalInhibited=b->thermalControl.inhibited;next.thermalError=b->thermalControl.error;
+    if(next.thermalInhibited || next.thermalError)next.charging=false;
     next.idOhm=id;next.idValid=id>0;next.input=input;
     next.inputCapVerified=b->charger.verified;next.inputCapError=b->charger.error;
     next.inputConfiguredMa=int(b->charger.configuredMa);

@@ -117,6 +117,56 @@ struct Control {
     // 0 detached, 1 qualifying, 2 source control, 3 safety limit, 4 fault.
     unsigned state=0;
 };
+// SMB5 CHGR + 0x42 bit 0 is the battery charging command, independent of
+// USBIN's identically numbered input-current override register. Only restore
+// a command this instance successfully disabled. Existing disables stay owned
+// by their original controller. Hardware JEITA and termination remain active.
+struct ThermalControl {
+    bool inhibited=false,owned=false,disablePending=false;
+    unsigned recovery=0;
+    uint64_t lastMs=0;
+    int error=0;
+    int failed(int value){recovery=0;return error=value;}
+    template<class Bus> int update(Bus &bus,bool present,int temp,bool valid,bool fault,uint64_t now){
+        bool unsafe=!present || !valid || temp<100 || temp>=450 || fault;
+        bool recover=present && valid && temp>=120 && temp<=420 && !fault;
+        if(unsafe){inhibited=true;recovery=0;}
+        else if(inhibited){
+            if(!recover || !lastMs || now<=lastMs || now-lastMs>15000)recovery=0;
+            else if(recovery<3)++recovery;
+        }
+        lastMs=now;error=0;
+        uint8_t before=0,after=0;
+        error=bus.chargeRead(0x42,before);if(error)return failed(error);
+        // An acknowledged disable with a failed readback is confirmed by the
+        // next command read. A failed write never authorizes a later enable.
+        if(disablePending){owned=!(before&1);disablePending=false;}
+        if(inhibited && !(recover && recovery>=3)){
+            if(before&1){
+                error=bus.chargeWrite(0x42,uint8_t(before&~1));if(error)return failed(error);
+                disablePending=true;
+                error=bus.chargeRead(0x42,after);if(error)return failed(error);
+                disablePending=false;
+                if(after&1)return failed(-57);
+                owned=true;
+            }
+        }else if(inhibited){
+            if(owned && !(before&1)){
+                // Recheck hardware protection immediately before restoring.
+                uint8_t chargeError=0,thermal=0;
+                error=bus.chargeRead(0x07,chargeError);if(error)return failed(error);
+                error=bus.chargeRead(0x0d,thermal);if(error)return failed(error);
+                if((chargeError&2) || (thermal&0x3f)){recovery=0;return 0;}
+                error=bus.chargeWrite(0x42,uint8_t(before|1));if(error)return failed(error);
+                error=bus.chargeRead(0x42,after);if(error)return failed(error);
+                if(!(after&1))return failed(-57);
+            }
+            inhibited=false;owned=false;recovery=0;
+        }
+        return 0;
+    }
+};
+
 struct Controller {
     unsigned candidate=0,stable=0,sourceKey=0;
     uint64_t lastMs=0;

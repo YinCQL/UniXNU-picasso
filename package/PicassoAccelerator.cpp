@@ -145,6 +145,8 @@ void PicassoPowerSource::publish(const picasso_battery::Snapshot &s){
     setExternalChargeCapable(s.capable);setIsCharging(s.charging);
     setAtWarnLevel(s.warn);setAtCriticalLevel(s.critical);
     flag("PicassoNetCharging",s.netCharging);adapter(s);
+    flag("PicassoThermalChargeInhibited",s.thermalInhibited);
+    number("PicassoThermalControlError",uint32_t(s.thermalError));
     number("PicassoUSBVoltageLimitMV",5000);number("PicassoUSBCurrentLimitMA",3000);
     flag("PicassoUSBInputControlVerified",s.inputControlVerified);
     number("PicassoUSBInputControlError",uint32_t(s.inputControlError));

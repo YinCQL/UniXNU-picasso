@@ -38,7 +38,55 @@ struct Fixture {
     void active(){assert(step().state==1);auto out=step(2000);assert(out.verified&&out.targetMa==1600&&bus.data[1][0x70]==32);}
     void safe(){assert(bus.data[1][0x70]<=10&&(bus.data[1][0x66]&7)==2&&(bus.data[1][0x42]&1)&&!(bus.data[1][0x65]&16));}
 };
+
+struct ThermalBus {
+    uint8_t command=0xa1,chargeError=0,thermal=0;unsigned calls=0,fail=0,writes=0;bool ignore=false;
+    int chargeRead(uint8_t reg,uint8_t &out){assert(reg==0x42||reg==7||reg==0x0d);if(++calls==fail)return -1;
+        out=reg==7?chargeError:reg==0x0d?thermal:command;return 0;}
+    int chargeWrite(uint8_t reg,uint8_t value){assert(reg==0x42&&(value&~1)==0xa0);if(++calls==fail)return -2;++writes;if(!ignore)command=value;return 0;}
+};
+static void test_thermal(){
+    for(unsigned reason=0;reason<5;reason++){
+        ThermalBus bus;ThermalControl t;int temp=reason==0?99:reason==1?450:250;
+        assert(!t.update(bus,reason!=2,temp,reason!=3,reason==4,1000));
+        assert(t.inhibited&&t.owned&&bus.command==0xa0&&bus.writes==1);
+        assert(!t.update(bus,true,430,true,false,2000)&&t.inhibited&&bus.writes==1);
+        for(unsigned n=3;n<=5;n++)assert(!t.update(bus,true,250,true,false,n*1000));
+        assert(!t.inhibited&&!t.owned&&bus.command==0xa1&&bus.writes==2);
+    }
+    {ThermalBus b;b.command=0xa0;ThermalControl t;
+     t.update(b,true,450,true,false,1000);for(unsigned n=2;n<=4;n++)t.update(b,true,250,true,false,n*1000);
+     assert(!t.inhibited&&!t.owned&&!b.writes&&b.command==0xa0);}
+    {ThermalBus b;ThermalControl t;t.update(b,true,450,true,false,1000);
+     t.update(b,true,250,true,false,2000);t.update(b,true,250,true,false,30000);assert(t.inhibited&&!t.recovery);
+     t.update(b,true,119,true,false,31000);assert(t.inhibited&&!t.recovery);}
+    for(unsigned op=1;op<=3;op++){ThermalBus b;ThermalControl t;b.fail=op;
+     assert(t.update(b,true,450,true,false,1000)&&t.inhibited&&!t.owned);}
+    {ThermalBus b;ThermalControl t;b.ignore=true;assert(t.update(b,true,450,true,false,1000)==-57&&t.inhibited&&!t.owned);}
+    {ThermalBus b;ThermalControl t;assert(!t.update(b,true,250,true,false,1000)&&!t.inhibited&&!b.writes);}
+    // A completed write remains recoverable when its first readback fails.
+    {ThermalBus b;ThermalControl t;b.fail=3;
+     assert(t.update(b,true,450,true,false,1000)&&t.disablePending&&!t.owned&&b.command==0xa0);
+     for(unsigned n=2;n<=4;n++)assert(!t.update(b,true,250,true,false,n*1000));
+     assert(!t.inhibited&&!t.owned&&!t.disablePending&&b.command==0xa1);}
+    // Each failed restore I/O resets the three-observation recovery window.
+    for(unsigned op=1;op<=5;op++){ThermalBus b;ThermalControl t;
+     t.update(b,true,450,true,false,1000);t.update(b,true,250,true,false,2000);t.update(b,true,250,true,false,3000);
+     b.calls=0;b.fail=op;assert(t.update(b,true,250,true,false,4000)&&t.inhibited&&!t.recovery);
+     b.fail=0;for(unsigned n=5;n<=7;n++)assert(!t.update(b,true,250,true,false,n*1000));
+     assert(!t.inhibited&&b.command==0xa1);}
+    {ThermalBus b;ThermalControl t;t.update(b,true,450,true,false,1000);b.ignore=true;
+     t.update(b,true,250,true,false,2000);t.update(b,true,250,true,false,3000);
+     assert(t.update(b,true,250,true,false,4000)==-57&&t.inhibited&&t.owned&&b.command==0xa0);}
+    for(unsigned kind=0;kind<2;kind++){ThermalBus b;ThermalControl t;
+     t.update(b,true,450,true,false,1000);t.update(b,true,250,true,false,2000);t.update(b,true,250,true,false,3000);
+     if(kind)b.thermal=0x20;else b.chargeError=2;
+     assert(!t.update(b,true,250,true,false,4000)&&t.inhibited&&!t.recovery&&b.command==0xa0&&b.writes==1);}
+    puts("PASS thermal stop/recovery, hysteresis, prior disable ownership, unrelated bits, stale sample gap and every I/O failure");
+}
+
 int main(){
+    test_thermal();
     {Fixture f;f.active();assert((f.bus.data[1][0x66]&7)==1&&!(f.bus.data[1][0x42]&1)&&(f.bus.data[1][0x65]&16));
      f.bus.written.clear();auto out=f.step(3000);assert(out.verified&&f.bus.written.empty());}
     for(unsigned result=0;result<128;++result){Fixture f;f.in.result=uint8_t(result);f.bus.data[1][8]=uint8_t(result);
