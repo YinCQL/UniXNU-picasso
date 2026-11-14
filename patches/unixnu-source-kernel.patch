@@ -6020,11 +6020,11 @@ diff --git a/patches/xnu/zzzzzz-picasso-ios16-framebuffer-swap.patch b/patches/x
 new file mode 100644
 --- /dev/null
 +++ b/patches/xnu/zzzzzz-picasso-ios16-framebuffer-swap.patch
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,236 @@
 +diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
 +--- a/iokit/Kernel/IOUserClient.cpp
 ++++ b/iokit/Kernel/IOUserClient.cpp
-+@@ -6731,6 +6731,98 @@
++@@ -6731,6 +6731,101 @@
 + #endif
 + /* PICASSO_FB_METHOD_TRACE_END */
 +
@@ -6059,8 +6059,8 @@ new file mode 100644
 ++}
 ++/* The iOS 16 IOSurface client and the retained iPadOS 17 IOSurfaceRootUserClient
 ++ * agree on selector numbers but not on two output structures. The limits query
-++ * (selector 13) grew from 0x18 to 0x28 bytes: iPadOS 17 inserts a root field after
-++ * the first eight bytes and widens the trailing byte and flag. The surface lock
+++ * (selector 13) grew from 0x18 to 0x28 bytes: its two alignment masks remain
+++ * 32-bit, while maximum row bytes, width and height widen to 64-bit. The surface lock
 ++ * result (create and lookup: selectors 0, 2, 4, 6, 7, 34 and their copies at +54)
 ++ * grew from 0xa68 to 0xc68 bytes: the header from 0x68 to 0x88 (0x18 bytes before
 ++ * the pixel format, 8 more before the plane count) and each of the 20 planes from
@@ -6078,14 +6078,6 @@ new file mode 100644
 ++	default: return false;
 ++	}
 ++}
-++static void
-++picasso_ios16_limits(uint8_t *out, const uint8_t *in)
-++{
-++	bzero(out, PICASSO_IOS16_LIMITS);
-++	memcpy(out, in, 0x14);
-++	out[0x14] = in[0x20];
-++	memcpy(out + 0x16, in + 0x22, 2);
-++}
 ++/* Copy a 64-bit iPadOS 17 field into its 32-bit iOS 16 slot. */
 ++static void
 ++picasso_narrow(uint8_t *out, unsigned to, const uint8_t *in, unsigned from)
@@ -6094,6 +6086,17 @@ new file mode 100644
 ++	memcpy(&wide, in + from, sizeof(wide));
 ++	uint32_t narrow = wide > UINT32_MAX ? UINT32_MAX : (uint32_t)wide;
 ++	memcpy(out + to, &narrow, sizeof(narrow));
+++}
+++static void
+++picasso_ios16_limits(uint8_t *out, const uint8_t *in)
+++{
+++	bzero(out, PICASSO_IOS16_LIMITS);
+++	memcpy(out, in, 0x08);
+++	picasso_narrow(out, 0x08, in, 0x08);
+++	picasso_narrow(out, 0x0c, in, 0x10);
+++	picasso_narrow(out, 0x10, in, 0x18);
+++	out[0x14] = in[0x20];
+++	memcpy(out + 0x16, in + 0x22, 2);
 ++}
 ++static void
 ++picasso_ios16_lock(uint8_t *out, const uint8_t *in)
@@ -6190,7 +6193,7 @@ new file mode 100644
 +
 + 	ipcEnter(defaultLocking ? (defaultLockingSingleThreadExternalMethod ? kIPCLockWrite : kIPCLockRead) : kIPCLockNone);
 + 	if (uc2022) {
-+@@ -6748,12 +6900,56 @@
++@@ -6748,12 +6900,62 @@
 + 		ret = externalMethod(selector, args);
 + 	}
 + 	ipcExit(defaultLocking ? (defaultLockingSingleThreadExternalMethod ? kIPCLockWrite : kIPCLockRead) : kIPCLockNone);
@@ -6222,6 +6225,12 @@ new file mode 100644
 ++		if (ret == kIOReturnSuccess) {
 ++			if (picassoSurfaceSize == PICASSO_IPADOS17_LIMITS) {
 ++				picasso_ios16_limits((uint8_t *)picassoSurfaceUser, (const uint8_t *)picassoSurfaceOut);
+++				static unsigned picassoLimitsNotes;
+++				if (__atomic_fetch_add(&picassoLimitsNotes, 1, __ATOMIC_RELAXED) < 8) {
+++					uint32_t values[3];
+++					memcpy(values, (const uint8_t *)picassoSurfaceUser + 8, sizeof(values));
+++					printf("PICASSO_SURF limits row=%u width=%u height=%u\n", values[0], values[1], values[2]);
+++				}
 ++			} else {
 ++				picasso_ios16_lock((uint8_t *)picassoSurfaceUser, (const uint8_t *)picassoSurfaceOut);
 ++			}

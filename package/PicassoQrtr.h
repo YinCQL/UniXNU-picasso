@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+// Picasso stock net/qrtr/qrtr.c wire format. Discovery and read-only QMI probe.
+#ifndef PICASSO_QRTR_H
+#define PICASSO_QRTR_H
+#include <stdint.h>
+#include "PicassoQmi.h"
+#include "PicassoServloc.h"
+#include "PicassoTftp.h"
+enum { PicassoQrtrServices = 64, PicassoQrtrQueue = 8, PicassoQrtrWords = (32+PicassoTftpBytes+3)/4 };
+static constexpr uint32_t PicassoQrtrControl = 0xfffffffeU;
+struct PicassoQrtrService { uint32_t service, instance, node, port; bool used; };
+struct PicassoQrtr {
+    PicassoQrtrService services[PicassoQrtrServices];
+    uint32_t queue[PicassoQrtrQueue][PicassoQrtrWords];
+    uint32_t queueBytes[PicassoQrtrQueue];
+    uint8_t replyScratch[PicassoTftpBytes];
+    uint32_t head, count, peer, received, malformed, ignored, events, overflow;
+    uint32_t lastType, lastService, lastInstance, lastNode, lastPort, data, resumes;
+    uint32_t wireVersion, wireBytes, sourceNode, sourcePort, destNode, destPort, payloadBytes;
+    uint32_t payloadWords[4];
+    PicassoQmi qmi;
+    PicassoServloc locator;
+    PicassoTftp tftp;
+    bool helloSent, helloReceived, intentAsked, intentGranted;
+    int error;
+};
+inline uint32_t picasso_qrtr_u32(const uint8_t *p) {
+    return uint32_t(p[0]) | (uint32_t(p[1])<<8) | (uint32_t(p[2])<<16) | (uint32_t(p[3])<<24);
+}
+inline uint32_t picasso_qrtr_u16(const uint8_t *p) { return p[0] | (uint32_t(p[1])<<8); }
+inline void picasso_qrtr_control(uint32_t *w, uint32_t type, uint32_t sn, uint32_t sp,
+                                uint32_t dn, uint32_t dp, uint32_t a=0, uint32_t b=0) {
+    w[0]=1; w[1]=type; w[2]=sn; w[3]=sp; w[4]=0; w[5]=20; w[6]=dn; w[7]=dp;
+    w[8]=type; w[9]=a; w[10]=b; w[11]=0; w[12]=0;
+}
+inline void picasso_qrtr_reply(PicassoQrtr *q,uint32_t from,uint32_t node,uint32_t port,
+                               const uint8_t *data,unsigned size) {
+    unsigned index=(q->head+q->count)%PicassoQrtrQueue;auto *w=q->queue[index];
+    unsigned bytes=32+((size+3)&~3U);q->queueBytes[index]=bytes;
+    for(unsigned n=0;n<bytes/4;++n)w[n]=0;
+    w[0]=1;w[1]=1;w[2]=1;w[3]=from;w[5]=size;w[6]=node;w[7]=port;
+    auto *body=reinterpret_cast<uint8_t *>(w+8);
+    for(unsigned n=0;n<size;++n)body[n]=data[n];
+    ++q->count;
+}
+inline void picasso_qrtr_invalidate(PicassoQrtr *q, int error) {
+    picasso_qmi_lost(&q->qmi);
+    q->helloReceived=false; q->helloSent=false; q->count=0; q->error=error;
+    q->locator.announced=false;picasso_tftp_invalidate(&q->tftp);
+    for (auto &s:q->services) s.used=false;
+}
+// -11 retains the complete GLINK receive buffer for retry, without consuming
+// a packet twice. RESUME_TX acknowledges transport receipt, never QMI success.
+inline int picasso_qrtr_receive(PicassoQrtr *q, const uint8_t *p, uint32_t n) {
+    uint32_t type=0,sn=0,sp=0,dn=0,dp=0,size=0,header=0; bool confirm=false;
+    bool valid=n>=16 && !(n&3);
+    if (valid && p[0]==1 && n>=32 && picasso_qrtr_u32(p)==1) {
+        header=32; type=picasso_qrtr_u32(p+4); sn=picasso_qrtr_u32(p+8); sp=picasso_qrtr_u32(p+12);
+        confirm=picasso_qrtr_u32(p+16)!=0; size=picasso_qrtr_u32(p+20);
+        dn=picasso_qrtr_u32(p+24); dp=picasso_qrtr_u32(p+28);
+    } else if (valid && p[0]==3) {
+        header=16+p[3]; type=p[1]; confirm=(p[2]&1)!=0; size=picasso_qrtr_u32(p+4);
+        sn=picasso_qrtr_u16(p+8); sp=picasso_qrtr_u16(p+10);
+        dn=picasso_qrtr_u16(p+12); dp=picasso_qrtr_u16(p+14);
+        if (sp==0xfffe) sp=PicassoQrtrControl;
+        if (dp==0xfffe) dp=PicassoQrtrControl;
+    } else valid=false;
+    if (dp==0xffff) dp=PicassoQrtrControl;
+    q->wireVersion=n?p[0]:0; q->wireBytes=n; q->sourceNode=sn; q->sourcePort=sp;
+    q->destNode=dn; q->destPort=dp; q->payloadBytes=size;
+    for (unsigned i=0;i<4;++i) q->payloadWords[i]=
+        header && header<=n && i*4+4<=n-header && i*4+4<=size ? picasso_qrtr_u32(p+header+i*4):0;
+    valid=valid && header<=n && size && size<=n-header && ((size+3)&~3U)==n-header &&
+        (type==1 || type==7 || dp==PicassoQrtrControl);
+    if (valid && type!=1) valid=size>=20 && picasso_qrtr_u32(p+header)==type;
+    if (!valid) { ++q->received; ++q->malformed; return 0; }
+    if (dn!=1 && dn!=0xffffffffU && !(p[0]==3 && dn==0xffff)) {
+        ++q->received; ++q->ignored; return 0; // no forwarding route is installed
+    }
+    PicassoServlocRequest request={};unsigned answer=0;
+    bool locator=type==1 && dp==PicassoServlocPort && dn==1 && q->helloReceived &&
+        q->locator.announced && sn==q->peer && sp!=PicassoQrtrControl && sp!=0xffffffffU;
+    bool tftp=type==1 && dn==1 && q->helloReceived && q->tftp.announced && sn==q->peer &&
+        sp!=PicassoQrtrControl && sp!=0xffffffffU && dp>=PicassoTftpPort &&
+        dp<=PicassoTftpPort+q->tftp.nextPort;
+    if(locator) answer=picasso_servloc_answer(p+header,size,q->replyScratch,&request);
+    // Reserve all replies atomically before consuming the packet or changing
+    // counters. A full queue leaves its GLINK intent owned by the receiver.
+    if (type==1 && q->count+unsigned(confirm)+unsigned(answer!=0 || tftp)>PicassoQrtrQueue) return -11;
+    ++q->received; q->lastType=type;
+    const uint8_t *payload=p+header;
+    if (type==2) {
+        if(q->helloReceived && q->peer!=sn) {
+            q->count=0;for(auto &s:q->services)s.used=false;
+            picasso_tftp_invalidate(&q->tftp);
+        }
+        if(q->qmi.bound && q->qmi.node!=sn) picasso_qmi_lost(&q->qmi);
+        q->locator.announced=false;
+        q->peer=sn; q->helloReceived=true; ++q->events;
+    } else if (type==4 || type==5) {
+        uint32_t service=picasso_qrtr_u32(payload+4), instance=picasso_qrtr_u32(payload+8);
+        uint32_t node=picasso_qrtr_u32(payload+12), port=picasso_qrtr_u32(payload+16);
+        q->lastService=service; q->lastInstance=instance; q->lastNode=node; q->lastPort=port;
+        PicassoQrtrService *slot=nullptr;
+        for (auto &s:q->services) {
+            if (s.used && s.node==node && s.port==port) { slot=&s; break; }
+            if (!s.used && !slot) slot=&s;
+        }
+        if (type==4) {
+            if(q->qmi.bound && ((node==q->qmi.node && port==q->qmi.port && (service!=0x42 || instance!=0x4a01)) ||
+                (service==0x42 && instance==0x4a01 && (node!=q->qmi.node || port!=q->qmi.port))))
+                picasso_qmi_lost(&q->qmi);
+            if (slot) *slot={service,instance,node,port,true}; else ++q->overflow;
+            if (service==0x42 && instance==0x4a01 && q->helloReceived && node==q->peer &&
+                !q->qmi.bound && !q->qmi.lost) {
+                q->qmi.node=node;q->qmi.port=port;q->qmi.bound=true;++q->qmi.events;
+            }
+        } else {
+            for (auto &s:q->services) if (s.used && s.node==node && s.port==port &&
+                s.service==service && s.instance==instance) s.used=false;
+            if(service==0x42 && instance==0x4a01 && q->qmi.bound && node==q->qmi.node && port==q->qmi.port)
+                picasso_qmi_lost(&q->qmi);
+        }
+        ++q->events;
+    } else if (type==3 || type==13) {
+        uint32_t node=type==3 ? sn : picasso_qrtr_u32(payload+8);
+        for (auto &s:q->services) if (s.used && s.node==node) s.used=false;
+        if(q->qmi.bound && q->qmi.node==node) picasso_qmi_lost(&q->qmi);
+        if (node==q->peer) { q->helloReceived=false;q->locator.announced=false;q->count=0;picasso_tftp_invalidate(&q->tftp); }
+        ++q->events;
+    } else if (type==1) {
+        ++q->data;
+        if (confirm) {
+            unsigned index=(q->head+q->count)%PicassoQrtrQueue;auto *w=q->queue[index];
+            picasso_qrtr_control(w,7,dn,dp,sn,sp,dn,dp);q->queueBytes[index]=52;++q->count;
+        }
+        if(locator) {
+            auto &l=q->locator;++l.requests;++l.events;
+            l.lastNode=sn;l.lastPort=sp;l.lastMessage=request.message;l.lastTransaction=request.transaction;
+            l.lastOffset=request.offset;l.lastTotal=request.total;l.lastError=request.error;
+            for(unsigned n=0;n<65;++n)l.lastName[n]=request.name[n];
+            if(!answer || request.error==1)++l.malformed;
+            else if(request.error)++l.unsupported;
+            if(request.registration)++l.registrations;
+            if(answer) {
+                unsigned index=(q->head+q->count)%PicassoQrtrQueue;auto *w=q->queue[index];
+                unsigned bytes=32+((answer+3)&~3U);q->queueBytes[index]=bytes;
+                for(unsigned n=0;n<bytes/4;++n)w[n]=0;
+                w[0]=1;w[1]=1;w[2]=1;w[3]=PicassoServlocPort;w[5]=answer;w[6]=sn;w[7]=sp;
+                auto *body=reinterpret_cast<uint8_t *>(w+8);
+                for(unsigned n=0;n<answer;++n)body[n]=q->replyScratch[n];
+                ++q->count;
+            }
+        } else if(tftp) {
+            uint32_t from=dp;
+            answer=picasso_tftp_receive(&q->tftp,sn,sp,dp,payload,size,q->replyScratch,&from);
+            if(answer) picasso_qrtr_reply(q,from,sn,sp,q->replyScratch,answer);
+        } else if(!picasso_qmi_receive(&q->qmi,sn,sp,dp,payload,size)) ++q->ignored;
+    } else ++q->ignored;
+    // HELLO and announcements may be interleaved by the transport. Bind only
+    // a real matching announcement on the peer learned from HELLO.
+    if(q->helloReceived && !q->qmi.bound && !q->qmi.lost) for(const auto &s:q->services)
+        if(s.used && s.service==0x42 && s.instance==0x4a01 && s.node==q->peer) {
+            q->qmi.node=s.node;q->qmi.port=s.port;q->qmi.bound=true;++q->qmi.events;break;
+        }
+    return 0;
+}
+#endif

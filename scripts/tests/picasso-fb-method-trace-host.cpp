@@ -36,10 +36,15 @@ struct IOExternalMethodArguments {
     uint32_t structureInputSize, scalarInputCount, structureOutputSize, scalarOutputCount;
     const void *structureInput;
 };
+static unsigned diagnosticOption=1, processLookups;
+static bool PE_parse_boot_argn(const char *name,void *value,unsigned size) {
+    assert(!strcmp(name,"gldiag") && size==sizeof(unsigned));
+    *static_cast<unsigned *>(value)=diagnosticOption;return diagnosticOption==1;
+}
 static thread_local const char *processName = "backboardd";
 static thread_local uint64_t threadId = 42;
 static int proc_selfpid() { return 57; }
-static void proc_name(int pid, char *name, int size) { assert(pid == 57); snprintf(name, size, "%s", processName); }
+static void proc_name(int pid, char *name, int size) { assert(pid == 57); ++processLookups; snprintf(name, size, "%s", processName); }
 static void *current_thread() { return &threadId; }
 static uint64_t thread_tid(void *p) { return *static_cast<uint64_t *>(p); }
 static std::mutex outputLock;
@@ -61,7 +66,14 @@ int main(int argc, char **argv) {
     uint8_t input[1132] = {};
     input[0] = input[17] = input[1023] = input[1024] = input[1131] = 0xa5;
     IOExternalMethodArguments args{nullptr, 1132, 0, 0, 0, input};
-    if (scenario == 0) {
+    if (scenario == 6) {
+        diagnosticOption=0;
+        for(unsigned i=0;i<100000;i++) {
+            auto t=picasso_fb_method_begin(&display,5,&args);
+            assert(!t.ticket);picasso_fb_method_end(t,&args,0);
+        }
+        assert(!lines && !processLookups && args.structureInput==input);
+    } else if (scenario == 0) {
         auto t = picasso_fb_method_begin(&display, 5, &args);
         assert(t.ticket == 1); picasso_fb_method_end(t, &args, 0xe00002c2U);
         assert(lines == 3 && args.structureInputSize == 1132);

@@ -4,7 +4,9 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,23 +63,37 @@ def main():
         shadow_methods = '\n'.join(extract(driver, marker) for marker in
                                    ('void resetCopyShadow(', 'uint64_t copySurface('))
         stream.write('struct CopyFixture {\nvoid *copyShadow=nullptr;' + shadow_fields + shadow_methods + '\n};\n')
-    report = dict(scope='MSVC host tests of production helpers; original ABI static audit; no Apple SDK or phone execution',
+    report = dict(scope='Host tests of production helpers; original ABI static audit; no Apple SDK or phone execution',
                   original_sha256=hashlib.sha256(original).hexdigest(), virtual_slots=len(slots), aliases=aliases, runs=[])
     host = load(ROOT / 'scripts/check-picasso-user-fault.py')
-    vcvars = host.find_vcvars()
-    if not vcvars:
-        raise RuntimeError('MSVC developer environment missing')
+    vcvars = host.find_vcvars() if os.name == 'nt' else None
+    compiler = shutil.which('clang++') or shutil.which('g++')
     fixture = ROOT / 'scripts/tests/picasso-display-host.cpp'
     for asan in (False, True):
         label = 'display-asan' if asan else 'display'
-        flags = '/std:c++17 /EHsc /W4 /WX /Od' + (' /fsanitize=address /Zi' if asan else '')
-        command = f'cl /nologo {flags} /I"{source_dir}" /I"{out}" /Fd:{label}.pdb /Fo:{label}.obj /Fe:{label}.exe "{fixture}"'
-        if asan:
-            command += ' /link /INCREMENTAL:NO'
-        result = host.batch_run(out, label + '-compile', command + f' > {label}-compile.log 2>&1\nexit /b %errorlevel%\n', vcvars)
+        exe = out / (label + ('.exe' if os.name == 'nt' else ''))
+        if vcvars:
+            flags = '/std:c++17 /EHsc /W4 /WX /Od' + (' /fsanitize=address /Zi' if asan else '')
+            command = f'cl /nologo {flags} /I"{source_dir}" /I"{out}" /Fd:{label}.pdb /Fo:{label}.obj /Fe:{exe.name} "{fixture}"'
+            if asan:
+                command += ' /link /INCREMENTAL:NO'
+            result = host.batch_run(out, label + '-compile', command + f' > {label}-compile.log 2>&1\nexit /b %errorlevel%\n', vcvars)
+        else:
+            if not compiler:
+                raise RuntimeError('C++ compiler missing')
+            command = [compiler, '-std=c++17', '-O2', '-g', '-Wall', '-Wextra', '-Werror',
+                       '-I', str(source_dir), '-I', str(out), str(fixture), '-o', str(exe)]
+            if asan:
+                command += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-fno-sanitize-recover=all']
+            result = subprocess.run(command, capture_output=True, text=True)
+            (out / (label + '-compile.log')).write_text(result.stdout + result.stderr)
         if result.returncode:
             raise RuntimeError((out / (label + '-compile.log')).read_text(errors='replace'))
-        result = host.batch_run(out, label + '-run', f'{label}.exe > {label}.log 2>&1\nexit /b %errorlevel%\n', vcvars)
+        if vcvars:
+            result = host.batch_run(out, label + '-run', f'{exe.name} > {label}.log 2>&1\nexit /b %errorlevel%\n', vcvars)
+        else:
+            result = subprocess.run([str(exe)], capture_output=True, text=True)
+            (out / (label + '.log')).write_text(result.stdout + result.stderr)
         log = (out / (label + '.log')).read_text(errors='replace')
         report['runs'].append(dict(label=label, command=command, exit=result.returncode, log=log))
         if result.returncode:
@@ -93,7 +109,8 @@ def main():
         'const void *src,uint64_t sb,uint64_t ss,uint32_t w,uint32_t h,void *shadow,int valid) {\n'
         'uint64_t stored=native_legacy_copy_diff(dst,db,ds,src,sb,ss,w,h,shadow,valid);\n'
         'if(stored!=UINT64_MAX)__asm__ volatile("dsb sy" ::: "memory");return stored;}\n')
-    command = ['C:/Program Files/LLVM/bin/clang++.exe', '--target=arm64-apple-ios17.0', '-std=c++17',
+    arm_compiler = shutil.which('clang++') or 'C:/Program Files/LLVM/bin/clang++.exe'
+    command = [arm_compiler, '--target=arm64-apple-ios17.0', '-std=c++17',
         '-ffreestanding', '-fno-builtin', '-mgeneral-regs-only', '-O2', '-Wall', '-Wextra', '-Werror',
         '-I', str(source_dir), '-c', str(arm), '-o', str(out / 'pixels.o')]
     result = subprocess.run(command, capture_output=True, text=True)

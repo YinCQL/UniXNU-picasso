@@ -25,6 +25,8 @@
 #include "Adreno620Firmware.h"
 #include "Adreno620Probe.h"
 #include "Adreno620ProbeCore.h"
+#include "PicassoRpmh.h"
+#include "PicassoPas.h"
 #include "NativeAdrenoABI.h"
 #include "NativeAdrenoA620HwInit.h"
 #include "NativeAdrenoGpuContext.h"
@@ -434,8 +436,8 @@ ScmReply scmSipCall(uint32_t function, uint32_t arginfo, uint64_t arg0,
     register uint64_t x6 __asm__("x6") = arg6;
     register uint64_t x7 __asm__("x7") = 0;
     __asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3),
-        "+r"(x6), "+r"(x7)
-        : "r"(x4), "r"(x5)
+        "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
+        :
         : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16",
           "x17", "memory");
     return ScmReply{uint32_t(x0), uint32_t(x1), uint32_t(x2), uint32_t(x3), x6};
@@ -443,6 +445,18 @@ ScmReply scmSipCall(uint32_t function, uint32_t arginfo, uint64_t arg0,
 
 void scmProbe()
 {
+    if (picasso_pas_acquire()) return;
+    struct Lease { bool uncertain=false; ~Lease(){picasso_pas_release(uncertain);} } lease;
+    auto probeCall=[&lease](uint32_t fn,uint32_t info,uint64_t arg) {
+        if(lease.uncertain)return ScmReply{1,0,0,0,0};
+        auto reply=scmSipCall(fn,info,arg);
+        for(unsigned i=0;reply.a0==1 && i<64;++i) {
+            IOSleep(1);
+            reply=scmSipCall(1,info,arg,0,0,0,reply.a6);
+        }
+        if(reply.a0==1)lease.uncertain=true;
+        return reply;
+    };
     constexpr uint32_t kSipOwner = 2u;              /* ARM_SMCCC_OWNER_SIP */
     constexpr uint32_t kOwnerShift = 24;
     constexpr uint32_t kFastCall = 1u << 31;        /* ARM_SMCCC_FAST_CALL */
@@ -454,13 +468,13 @@ void scmProbe()
         (kSvcInfo << 8) | kIsCallAvail);
     const uint64_t selector = (uint64_t(kSipOwner) << kOwnerShift) |
         uint64_t((kSvcPil << 8) | kPasInitImage);
-    const ScmReply init = scmSipCall(avail, 1, selector);
+    const ScmReply init = probeCall(avail, 1, selector);
     const uint64_t setupSelector = (uint64_t(kSipOwner) << kOwnerShift) |
         uint64_t((kSvcPil << 8) | kPasMemSetup);
-    const ScmReply setup = scmSipCall(avail, 1, setupSelector);
+    const ScmReply setup = probeCall(avail, 1, setupSelector);
     const uint64_t resetSelector = (uint64_t(kSipOwner) << kOwnerShift) |
         uint64_t((kSvcPil << 8) | kPasAuthAndReset);
-    const ScmReply reset = scmSipCall(avail, 1, resetSelector);
+    const ScmReply reset = probeCall(avail, 1, resetSelector);
     printf("PICASSO_GPU scm: is-call-avail init a0=%08x a1=%08x a2=%08x a3=%08x\n",
         init.a0, init.a1, init.a2, init.a3);
     printf("PICASSO_GPU scm: is-call-avail memsetup a0=%08x a1=%08x; auth %08x/%08x\n",
@@ -473,22 +487,22 @@ void scmProbe()
     const uint32_t availStd = (kSmc64 | (kSipOwner << kOwnerShift) |
         (kSvcInfo << 8) | kIsCallAvail);
     printf("PICASSO_GPU scm: calling std is-call-avail\n");
-    const ScmReply stdInfo = scmSipCall(availStd, 1, selector);
+    const ScmReply stdInfo = probeCall(availStd, 1, selector);
     printf("PICASSO_GPU scm: std is-call-avail a0=%08x a1=%08x\n",
         stdInfo.a0, stdInfo.a1);
     /* wf110: does the PIL service answer at all for this platform? PAS_IS_SUPPORTED (SVC_PIL 0x02,
      * cmd 0x07, ARGS(1) = pas id) reads no memory and touches no GPU state. If it answers for the
      * GPU's pas id 0x0d, the PIL service is live and the wf106-wf109 hang is specific to
      * PAS_INIT_IMAGE's metadata handling; if it hangs too, the PIL service is not usable from this
-     * boot environment at all. Pas id 1 (modem on this platform) is the control. */
+     * boot environment at all. Pas id 1 is ADSP on this platform. */
     {
         constexpr uint32_t kStdSipSmc64 = 0x40000000u | 0x02000000u;
         printf("PICASSO_GPU scm: calling pas-supported(13)\n");
-        const ScmReply gpu = scmSipCall(kStdSipSmc64 | (0x02u << 8) | 0x07u,
+        const ScmReply gpu = probeCall(kStdSipSmc64 | (0x02u << 8) | 0x07u,
             0x01u, 0x0du);
         printf("PICASSO_GPU scm: pas-supported(13) a0=%08x a1=%08x\n", gpu.a0, gpu.a1);
         printf("PICASSO_GPU scm: calling pas-supported(1)\n");
-        const ScmReply modem = scmSipCall(kStdSipSmc64 | (0x02u << 8) | 0x07u,
+        const ScmReply modem = probeCall(kStdSipSmc64 | (0x02u << 8) | 0x07u,
             0x01u, 0x01u);
         printf("PICASSO_GPU scm: pas-supported(1) a0=%08x a1=%08x\n", modem.a0, modem.a1);
     }
@@ -816,10 +830,6 @@ constexpr uint64_t kAppsRscBytes = 0x10000u;
 constexpr uint64_t kRscTcsOffset = 0xd00u;           /* DT qcom,tcs-offset */
 constexpr uint64_t kRpmhCmdDbBase = 0x80860000u;     /* DT cmd-db memory region */
 constexpr uint64_t kRpmhCmdDbBytes = 0x20000u;
-constexpr uint32_t kRscAmcModeEnable = 1u << 16;
-constexpr uint32_t kRscAmcModeTrigger = 1u << 24;
-constexpr uint32_t kRscCmdMsgidWrite = 8u | (1u << 8) | (1u << 16);  /* LEN|RESP|WRITE */
-constexpr uint32_t kRscCmdStatusCompl = 1u << 16;
 constexpr uint32_t kBcmVoteMax = 0x3fffu;            /* BCM_TCS_CMD_VOTE_MASK */
 constexpr uint32_t kBcmAcvApps = 0x8;                /* BCM_TCS_CMD_ACV_APPS */
 
@@ -853,6 +863,33 @@ struct CmdDbBcm {
     uint8_t vcd;
     bool found;
 };
+
+static unsigned rpmhGate, rpmhPoisoned;
+static bool rpmhEnter(unsigned timeoutMs = 100) {
+    for (unsigned i = 0; i < timeoutMs; ++i) {
+        if (__atomic_load_n(&rpmhPoisoned, __ATOMIC_ACQUIRE)) return false;
+        if (!__atomic_exchange_n(&rpmhGate, 1U, __ATOMIC_ACQ_REL)) {
+            if (!__atomic_load_n(&rpmhPoisoned, __ATOMIC_ACQUIRE)) return true;
+            __atomic_store_n(&rpmhGate, 0U, __ATOMIC_RELEASE); return false;
+        }
+        IOSleep(1);
+    }
+    return false;
+}
+static void rpmhLeave() { __atomic_store_n(&rpmhGate, 0U, __ATOMIC_RELEASE); }
+static uint32_t rscRead(void *ctx, uint32_t at) { return read32(*static_cast<Mapping *>(ctx), at); }
+static void rscWrite(void *ctx, uint32_t at, uint32_t v) { write32(*static_cast<Mapping *>(ctx), at, v); }
+static void rscBarrier(void *) { barrier(); }
+static void rscDelay(void *, unsigned us) { IODelay(us); }
+static int rscSend(Mapping &rsc, unsigned tcs, uint32_t address, uint32_t value) {
+    PicassoRscIo io = {&rsc, rscRead, rscWrite, rscBarrier, rscDelay};
+    PicassoRscResult result;
+    int error = picasso_rsc_send(&io, tcs, address, value, &result);
+    if (result.poisoned) __atomic_store_n(&rpmhPoisoned, 1U, __ATOMIC_RELEASE);
+    printf("PICASSO_RPMH tcs=%u address=%x data=%x error=%d irq=%x status=%x command=%x initial_control=%x initial_enable=%x spins=%u poisoned=%u\n",
+        tcs, address, value, error, result.irq, result.status, result.command, result.control, result.enabled, result.spins, result.poisoned);
+    return error;
+}
 
 /* cmd_db_read_addr() + cmd_db_read_aux_data(struct bcm_db). */
 CmdDbBcm cmdDbBcmLookup(const Mapping &db, const char *name)
@@ -895,11 +932,16 @@ CmdDbBcm cmdDbBcmLookup(const Mapping &db, const char *name)
  * boot, and the PAS result is what the caller measures. */
 unsigned rpmhVoteCryptoPath()
 {
+    // Firmware authentication must wait for a legitimate RSC owner. A busy
+    // owner is not a failed vote; quarantine still refuses immediately.
+    if (!rpmhEnter(30000)) { printf("PICASSO_GPU rpmh: shared owner busy or quarantined\n"); return 0; }
     Mapping rsc = {};
     Mapping db = {};
     if (!mapPhysical(kAppsRscDrv2Base, kAppsRscBytes, rsc)) {
         printf("PICASSO_GPU rpmh: RSC at %08x did not map\n",
             uint32_t(kAppsRscDrv2Base));
+        if (rsc.keep) rsc.keep->release();
+        rpmhLeave();
         return 0;
     }
     const bool dbMapped = mapPhysical(kRpmhCmdDbBase, kRpmhCmdDbBytes, db);
@@ -914,12 +956,6 @@ unsigned rpmhVoteCryptoPath()
     printf("PICASSO_GPU rpmh: drv-id=%08x tcs-stride=%u cmd-stride=%u irq-enable=%08x\n",
         drvId, layout.tcsStride, layout.cmdStride, irqEnable);
 
-    /* The TX-done line is a GIC SPI this kernel has no handler for. Mask only
-     * the two TCSs this vote uses for the duration of the vote and restore the
-     * register afterwards; IRQ_STATUS still records completion. */
-    write32(rsc, tcsBase + 0x00, irqEnable & ~3u);
-    barrier();
-
     struct Vote {
         const char *name;
         bool acv;
@@ -929,61 +965,8 @@ unsigned rpmhVoteCryptoPath()
         {"MC0", false}, {"ACV", true}, {"CN0", false},
     };
 
-    auto waitIdle = [&](uint64_t tcsAt) {
-        uint32_t status = 0;
-        for (unsigned spin = 0; spin < 200; ++spin) {
-            status = read32(rsc, tcsAt + layout.status);
-            if (status) break;
-            IODelay(10);
-        }
-        return status;
-    };
-
     auto sendBcm = [&](unsigned tcs, uint32_t address, uint32_t data) {
-        const uint64_t tcsAt = tcsBase + uint64_t(layout.tcsStride) * tcs;
-        waitIdle(tcsAt);
-        /* __tcs_set_trigger(false): clear the AMC trigger, then the mode. */
-        uint32_t control = read32(rsc, tcsAt + layout.control);
-        control &= ~kRscAmcModeTrigger;
-        write32(rsc, tcsAt + layout.control, control);
-        control &= ~kRscAmcModeEnable;
-        write32(rsc, tcsAt + layout.control, control);
-        write32(rsc, tcsAt + layout.cmdEnable, 0);
-        barrier();
-        write32(rsc, tcsAt + layout.cmdMsgid, kRscCmdMsgidWrite);
-        write32(rsc, tcsAt + layout.cmdAddr, address);
-        write32(rsc, tcsAt + layout.cmdData, data);
-        write32(rsc, tcsAt + layout.cmdEnable, 1u);
-        barrier();
-        /* __tcs_set_trigger(true), with the synchronous readbacks rpmh-rsc.c
-         * relies on between the mode enable and the trigger. */
-        write32(rsc, tcsAt + layout.control, kRscAmcModeEnable);
-        (void)read32(rsc, tcsAt + layout.control);
-        write32(rsc, tcsAt + layout.control, kRscAmcModeEnable | kRscAmcModeTrigger);
-        (void)read32(rsc, tcsAt + layout.control);
-        uint32_t irqStatus = 0, status = 0, cmdStatus = 0;
-        unsigned spins = 0;
-        for (; spins < 500; ++spins) {
-            irqStatus = read32(rsc, tcsBase + layout.irqStatus);
-            status = read32(rsc, tcsAt + layout.status);
-            cmdStatus = read32(rsc, tcsAt + layout.cmdStatus);
-            if ((irqStatus & (1u << tcs)) || (cmdStatus & kRscCmdStatusCompl))
-                break;
-            IODelay(10);
-        }
-        write32(rsc, tcsBase + layout.irqClear, 1u << tcs);
-        write32(rsc, tcsAt + layout.cmdEnable, 0);
-        control = read32(rsc, tcsAt + layout.control);
-        control &= ~kRscAmcModeTrigger;
-        write32(rsc, tcsAt + layout.control, control);
-        control &= ~kRscAmcModeEnable;
-        write32(rsc, tcsAt + layout.control, control);
-        barrier();
-        const bool done = (irqStatus & (1u << tcs)) ||
-            (cmdStatus & kRscCmdStatusCompl);
-        printf("PICASSO_GPU rpmh: tcs=%u irq=%08x status=%08x cmd-status=%08x "
-               "spins=%u\n", tcs, irqStatus, status, cmdStatus, spins);
-        return done;
+        return rscSend(rsc, tcs, address, data) == 0;
     };
 
     unsigned voted = 0;
@@ -1003,14 +986,14 @@ unsigned rpmhVoteCryptoPath()
         printf("PICASSO_GPU rpmh: %s addr=%x unit=%u width=%u vcd=%u data=%08x tcs=%u done=%d\n",
             votes[index].name, bcm.address, bcm.unit, unsigned(bcm.width),
             unsigned(bcm.vcd), data, tcs, int(done));
+        if (!done) break;
         ++voted;
     }
-    write32(rsc, tcsBase + 0x00, irqEnable);
-    barrier();
-    if (dbMapped && db.keep) db.keep->release();
+    if (db.keep) db.keep->release();
     if (rsc.keep) rsc.keep->release();
     printf("PICASSO_GPU rpmh: crypto path voted %u/%u\n", voted,
         unsigned(sizeof(votes) / sizeof(votes[0])));
+    rpmhLeave();
     return voted;
 }
 
@@ -1139,11 +1122,15 @@ void heartbeatThread(void *, wait_result_t)
  * SMC transport: qcom_scm-smc.c fills x0=CALL_VAL(type, SMC_64, OWNER_SIP,
  * fnid), x1=arginfo, x2..=args; PAS runs as STD_CALL, and x0==1 means
  * QCOM_SCM_INTERRUPTED (retry), as __scm_smc_do_quirk does. */
+static bool zapLoaded;
 bool loadZap()
 {
+    if (zapLoaded) return true; // Successful authentication and its region stay live.
+    if (picasso_pas_acquire()) return false;
+    struct Lease { bool uncertain = false; ~Lease() { picasso_pas_release(uncertain); } } lease;
     /* wf116: vote the crypto engine's NoC path before TZ runs PAS, the way
      * subsys-pil-tz.c's scm_pas_enable_bw() does around every PAS call. */
-    rpmhVoteCryptoPath();
+    if (rpmhVoteCryptoPath() != 7) return false;
 
     /* wf117: the interrupted-SMC quirk requires the normal world to take the
      * interrupt that ended the secure call before the session is resumed.
@@ -1433,7 +1420,7 @@ bool loadZap()
             read32(gic, 0x120), read32(gic, 0x1a0), read32(gic, 0xc44));
         if (gic.keep) gic.keep->release();
     };
-    auto pasCall = [&dumpGic](uint32_t function, uint32_t arginfo, uint64_t arg0,
+    auto pasCall = [&dumpGic, &lease](uint32_t function, uint32_t arginfo, uint64_t arg0,
         uint64_t arg1, uint64_t arg2, bool maskFirst) {
         uint64_t begin = 0, end = 0;
         uint64_t pmr = 0, daif = 0;
@@ -1465,8 +1452,10 @@ bool loadZap()
                 uint32_t(reply.a6), uint32_t(reply.a6 >> 32), attempt);
             if (attempt == 1)
                 dumpGic();
-            reply = scmSipCall(1u, arginfo, arg0, arg1, arg2, reply.a6);
+            IOSleep(1);
+            reply = scmSipCall(1u, arginfo, arg0, arg1, arg2, 0, reply.a6);
         }
+        if (reply.a0 == 1) lease.uncertain = true;
         return reply;
     };
     /* wf119: dump the TZ log from another core while this thread sits in EL3. */
@@ -1540,6 +1529,15 @@ bool loadZap()
             auth.a0, auth.a1);
         ok = auth.a0 == 0 && auth.a1 == 0;
     }
+    // ADSP can use the same reserved metadata slot next. A failed GPU PIL
+    // transaction must be shut down before that slot can be overwritten.
+    if (!ok && altMap && !lease.uncertain) {
+        const auto stopped = pasCall(kScmSipStd | (kPasSvc << 8) | 6u,
+            1u, kGpuPasId, 0, 0, true);
+        if (stopped.a0 || stopped.a1) lease.uncertain = true;
+        printf("PICASSO_GPU zap: failed transaction shutdown=%x/%x quarantined=%u\n",
+            stopped.a0,stopped.a1,unsigned(lease.uncertain));
+    }
 
     /* wf125: the vendor never returns the relocatable region to the allocator
      * — pil_alloc_region() caches priv->region and only pil_release_region() /
@@ -1553,7 +1551,7 @@ bool loadZap()
     uint32_t keepRegion = 1;
     const bool retainRegion = !PE_parse_boot_argn("sheng-gpu-keep-region",
         &keepRegion, static_cast<int>(sizeof keepRegion)) || keepRegion;
-    if (retainRegion) {
+    if (retainRegion || lease.uncertain) {
         printf("PICASSO_GPU zap: region retained phys=%08x span=%x\n",
             uint32_t(regionPhys), uint32_t(regionBytes));
     } else {
@@ -1561,10 +1559,11 @@ bool loadZap()
         regionBuffer->complete();
         regionBuffer->release();
     }
-    if (altMap) altMap->release();
+    if (altMap && !lease.uncertain) altMap->release();
     metadataMap->release();
     metadata->complete();
     metadata->release();
+    zapLoaded = ok;
     printf("PICASSO_GPU zap: loaded=%d\n", int(ok));
     return ok;
 }
@@ -1650,6 +1649,26 @@ bool waitFence(uint32_t fence, unsigned timeoutUs, bool verbose)
     }
 }
 
+/* A successful no-op fence does not qualify rendering while the GPU remains
+ * secure. Both cold startup and recovery require the same authenticated path. */
+static bool initializeSecureMode()
+{
+    uint32_t enabled = 1;
+    if (PE_parse_boot_argn("sheng-gpu-zap", &enabled, sizeof enabled) && !enabled) {
+        printf("PICASSO_GPU zap: disabled by boot arg\n");
+        return true;
+    }
+    if (!loadZap()) {
+        printf("PICASSO_GPU zap: authentication failed; CP unavailable\n");
+        return false;
+    }
+    if (!leaveSecureMode()) {
+        printf("PICASSO_GPU zap: secure-mode exit failed; CP unavailable\n");
+        return false;
+    }
+    return true;
+}
+
 /* Probe the restarted CP without touching the fence page's numbering: one CP_NOP IB and a CACHE_FLUSH_TS
  * event write to the scratch BO's second word. The production ring's replay then still starts at
  * completed+1, exactly as recover() expects. */
@@ -1686,53 +1705,75 @@ static bool restartProbe()
     return false;
 }
 
-/* The board restart hook NativeAdrenoSubmit::recover installs (NativeAdrenoSubmit.h:22): stop the CP,
- * drain the bus, optionally cold-boot the GMU when GX is off, re-run hw_init/SQE/ring programming, call
- * ring->restart(completed) between the reset and CP init as the contract requires, then bring the CP up,
- * leave secure mode if it was left before, and probe it. Only a completed probe reports success; recover
- * poisons the ring on any error. Runs under the publish lock (publishGpu installs it before the hangcheck
- * starts), so no extra lock. */
+/* Recovery runs under the publish lock. Hold GX, halt the SQE and drain GBIF
+ * before resetting hardware or reusing the ring. A620's reset register is
+ * RBBM_SW_RESET_CMD (0x43, a6xx.xml); a6xx_gpu_sw_reset requires a readback and
+ * at least 100 us asserted. Reprogramming CP bases alone leaves a stalled
+ * draw/IB active and can consume the new ME_INIT without updating its shadow.
+ * Only the scratch event probe permits replay and release of the lost job. */
 extern "C" IOReturn native_adreno620_cp_restart(void *cookie, NativeAdrenoRing *ring, uint32_t completed)
 {
     (void)cookie;
     if (!gState || !ring) return kIOReturnNotReady;
     CpState &s = *gState;
-    printf("PICASSO_GPU restart: begin completed=%u gx=%08x\n", completed, gmuRead(kGmuGxPwrStatus));
-    uint32_t ack[2] = {};
-    (void)ring->drainBus(ack);
-    (void)ring->busHalt(false, 2000);
-    gpuWrite(A620_CP_SQE_CNTL, 0);
-    barrier();
     const bool cold = (gmuRead(kGmuGxPwrStatus) & kGxOffBits) != 0;
+    printf("PICASSO_GPU restart: begin completed=%u cold=%u\n", completed, unsigned(cold));
+    /* Never access the GX register window while the domain is off. The cold
+     * path's HFI handshake acquires GPU_SET; the warm path must acquire it too. */
     if (cold) {
         if (native_adreno620_gmu_restart()) return kIOReturnIOError;
-        if (gmuRead(kGmuGxPwrStatus) & kGxOffBits) return kIOReturnIOError;
+    } else if (native_adreno620_gmu_acquire_gpu_set()) return kIOReturnIOError;
+    struct Hold {
+        bool ready = false;
+        ~Hold() {
+            if (!ready && !(gmuRead(kGmuGxPwrStatus) & kGxOffBits)) {
+                gpuWrite(A620_CP_SQE_CNTL, 3); // SQE_HALT, as a6xx_recover.
+                barrier();
+            }
+            native_adreno620_gmu_release_gpu_set();
+        }
+    } hold;
+    if (gmuRead(kGmuGxPwrStatus) & kGxOffBits) return kIOReturnIOError;
+    gpuWrite(A620_RBBM_INT_0_MASK, 0);
+    gpuWrite(A620_CP_SQE_CNTL, 3);
+    (void)gpuRead(A620_CP_SQE_CNTL);
+    barrier();
+    IOReturn status = ring->busHalt(false, 20000);
+    if (status) {
+        printf("PICASSO_GPU restart: bus halt failed status=%x\n", unsigned(status));
+        return status;
     }
+    constexpr uint32_t reset = 0x43; // A6XX RBBM_SW_RESET_CMD, dword offset.
+    gpuWrite(reset, 1);
+    (void)gpuRead(reset);
+    IODelay(101);
+    gpuWrite(reset, 0);
+    (void)gpuRead(reset);
+    IODelay(1);
+    barrier();
+    /* The reset stopped every GPU master; restore the kernel table before
+     * initialization rather than leaving the last client's table installed. */
+    NativeAdrenoGpuContext *context = NativeAdrenoGpuContextObject();
+    if (!context || !context->vm()) return kIOReturnNotReady;
+    status = context->writeTtbr0(context->vm()->ttbr0());
+    if (status) return status;
     if (!hardwareInit() || !uploadSqe() || !programCp()) return kIOReturnIOError;
-    /* Contract point: the ring is reset between the GPU reset and the CP init. */
-    IOReturn status = ring->restart(completed);
+    status = ring->restart(completed);
     if (status) return status;
     s.next = 0;
     s.sequence = completed;
     gpuWrite(A620_CP_SQE_CNTL, 1);
     barrier();
     if (!cpInit()) return kIOReturnIOError;
-    uint32_t zap = 1;
-    if (!(PE_parse_boot_argn("sheng-gpu-zap", &zap, static_cast<int>(sizeof zap)) && !zap)) {
-        /* The probe below is the authority: a CP that is already non-secure may still refuse/ignore the
-         * packet, while a secure-only CP answers the probe and renders protected-only (the pre-existing
-         * bring-up limitation, reported by the secure-mode line rather than failing the restart). */
-        if (!leaveSecureMode()) printf("PICASSO_GPU restart: secure-mode packet failed; probing anyway\n");
-    }
+    if (!initializeSecureMode()) return kIOReturnIOError;
     if (!restartProbe()) return kIOReturnTimeout;
-    /* The CP consumed the init/probe words; resync leaves the ring's next write at its read pointer
-     * without wiping the fence page, so clients can submit immediately after the replay. */
+    /* Preserve fence numbering and start replay after the consumed probe. */
     status = ring->resync(completed);
     if (status) return status;
     s.next = ring->writePointer();
     s.sequence = completed;
-    if (cold) native_adreno620_gmu_release_gpu_set();
-    printf("PICASSO_GPU restart: ok completed=%u next=%u\n", completed, s.next);
+    hold.ready = true;
+    printf("PICASSO_GPU restart: ok completed=%u next=%u reset=1 probe=1\n", completed, s.next);
     return kIOReturnSuccess;
 }
 
@@ -2288,6 +2329,116 @@ bool acquireBuffers()
 
 } // namespace
 
+extern "C" int picasso_rpmh_active_write(uint32_t address, uint32_t value)
+{
+    if (!rpmhEnter()) return -16;
+    Mapping rsc = {};
+    int error = mapPhysical(kAppsRscDrv2Base, kAppsRscBytes, rsc) ? rscSend(rsc, 0, address, value) : -12;
+    if (rsc.keep) rsc.keep->release();
+    rpmhLeave();
+    return error;
+}
+
+extern "C" int picasso_rpmh_adsp_resources(PicassoArcResource rails[3])
+{
+    if (!rails) return -22;
+    // Command DB is immutable firmware data. Snapshot and verify it without
+    // holding the physical RSC transaction gate across allocation and reads.
+    // Otherwise this read-only plan can time out GPU authentication at boot.
+    Mapping db = {};
+    auto *copy = static_cast<uint8_t *>(IOMalloc(kRpmhCmdDbBytes));
+    int error = -12;
+    if (copy && mapPhysical(kRpmhCmdDbBase, kRpmhCmdDbBytes, db)) {
+        for (unsigned i = 0; i < kRpmhCmdDbBytes; i += 4) {
+            uint32_t w = read32(db, i);
+            for (unsigned j = 0; j < 4; ++j) copy[i + j] = uint8_t(w >> (8 * j));
+        }
+        barrier();
+        error = 0;
+        for (unsigned i = 0; i < kRpmhCmdDbBytes; i += 4)
+            if (picasso_db32(copy + i) != read32(db, i)) { error = -11; break; }
+        printf("PICASSO_ADSP rpmh cmd_db_version=%x stable=%u vote_sent=0\n", picasso_db32(copy), !error);
+        const char *names[] = {"lcx.lvl", "lmx.lvl", "xo.lvl"};
+        for (unsigned i = 0; !error && i < 3; ++i) {
+            error = picasso_arc_lookup(copy, kRpmhCmdDbBytes, names[i], i < 2 ? 384 : UINT32_MAX, &rails[i]);
+            printf("PICASSO_ADSP rpmh resource=%s error=%d address=%x index=%u level=%u vote_sent=0\n",
+                names[i], error, rails[i].address, i < 2 ? rails[i].index : 3, rails[i].level);
+        }
+        // No trustworthy prior DRV2 ARC request is available. Use the highest
+        // supported level so an inherited higher vote cannot be lowered, and
+        // retain it until a shared aggregate owner can restore prior requests.
+        for (unsigned i=0; !error && i<2; ++i) {
+            error=picasso_arc_lookup(copy,kRpmhCmdDbBytes,names[i],UINT32_MAX-1,&rails[i]);
+            if(!error && rails[i].level<384)error=-34;
+            printf("PICASSO_ADSP rpmh resource=%s boot_floor=%u index=%u retained=1 error=%d\n",
+                names[i],rails[i].level,rails[i].index,error);
+        }
+        rails[2].index=3;
+        // XO is the stock ARC on-value 3, not a voltage-table index chosen for
+        // the rails. No vote until a PAS transaction owns their full lifetime.
+        if (!error && (rails[0].address == rails[1].address || rails[0].address == rails[2].address ||
+                       rails[1].address == rails[2].address)) error = -22;
+    }
+    if (db.keep) db.keep->release();
+    if (copy) IOFree(copy, kRpmhCmdDbBytes);
+    printf("PICASSO_ADSP rpmh stage=plan error=%d vote_sent=0 pending=pas-lifecycle\n", error);
+    return error;
+}
+
+extern "C" int picasso_rpmh_adsp_plan(void) {
+    PicassoArcResource rails[3]={};
+    return picasso_rpmh_adsp_resources(rails);
+}
+extern "C" int picasso_rpmh_crypto_ready(void) { return rpmhVoteCryptoPath()==7 ? 0 : -5; }
+
+// PIL calls and the reserved metadata slot are shared with the GPU ZAP loader.
+static unsigned pasGate, pasPoisoned;
+extern "C" int picasso_pas_acquire(void) {
+    for (unsigned n = 0; n < 30000; ++n) {
+        if (__atomic_load_n(&pasPoisoned, __ATOMIC_ACQUIRE)) return -115;
+        if (!__atomic_exchange_n(&pasGate, 1U, __ATOMIC_ACQ_REL)) {
+            if (!__atomic_load_n(&pasPoisoned, __ATOMIC_ACQUIRE)) return 0;
+            __atomic_store_n(&pasGate, 0U, __ATOMIC_RELEASE); return -115;
+        }
+        IOSleep(1);
+    }
+    return -16;
+}
+extern "C" void picasso_pas_release(bool uncertain) {
+    if (uncertain) __atomic_store_n(&pasPoisoned, 1U, __ATOMIC_RELEASE);
+    __atomic_store_n(&pasGate, 0U, __ATOMIC_RELEASE);
+}
+static PicassoPasReply adspScm(void *, uint32_t function, uint32_t arginfo,
+    uint64_t pas, uint64_t address, uint64_t bytes, uint64_t session, bool first) {
+    uint64_t pmr = 0, daif = 0;
+    if (first) {
+        __asm__ volatile("mrs %0, icc_pmr_el1" : "=r"(pmr));
+        __asm__ volatile("mrs %0, daif" : "=r"(daif));
+        __asm__ volatile("msr daifset, #2" ::: "memory");
+        __asm__ volatile("msr icc_pmr_el1, %0" :: "r"(UINT64_C(0)) : "memory");
+        __asm__ volatile("isb" ::: "memory");
+    }
+    const auto r = scmSipCall(function, arginfo, pas, address, bytes, 0, session);
+    if (first) {
+        __asm__ volatile("msr icc_pmr_el1, %0" :: "r"(pmr) : "memory");
+        __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+        __asm__ volatile("isb" ::: "memory");
+    }
+    return {r.a0, r.a1, r.a2, r.a3, r.a6};
+}
+static void adspScmDelay(void *, unsigned ms) { IOSleep(ms); }
+extern "C" int picasso_pas_adsp(unsigned command, uint64_t address, uint64_t bytes) {
+    if (!__atomic_load_n(&pasGate, __ATOMIC_ACQUIRE) || __atomic_load_n(&pasPoisoned, __ATOMIC_ACQUIRE)) return -115;
+    PicassoPasIo io = {nullptr, adspScm, adspScmDelay}; PicassoPasReply reply = {};
+    printf("PICASSO_ADSP pas stage=call command=%u address=%llx bytes=%llx\n",
+        command,(unsigned long long)address,(unsigned long long)bytes);
+    int error = picasso_pas_execute(&io, command, address, bytes, &reply);
+    printf("PICASSO_ADSP pas command=%u error=%d a0=%x a1=%x session=%llx\n",
+        command, error, reply.a0, reply.a1, (unsigned long long)reply.a6);
+    if (error == -115) __atomic_store_n(&pasPoisoned, 1U, __ATOMIC_RELEASE);
+    return error;
+}
+
 extern "C" int native_adreno620_cp_start(void)
 {
     /* The driver's diagnostic reader of client BOs reads DRAM through this hook, and the cacheable alias through the other. */
@@ -2374,26 +2525,7 @@ extern "C" int native_adreno620_cp_start(void)
     }
 
     if (!cpInit()) return -1;
-    /* mainline hw_init(): load the zap through TZ, then switch the CP out of
-     * secure mode. The GPU powers on in secure mode and there "can only render
-     * to protected buffers" (freedreno zap documentation) — the measured
-     * signature of every submit so far. wf100 sent CP_SET_SECURE_MODE(0)
-     * without a zap and the SQE answered CP_OPCODE_ERROR, so the packet is only
-     * sent once the zap has authenticated. sheng-gpu-zap=0 keeps the old path
-     * for a controlled comparison. */
-    uint32_t zapEnabled = 1;
-    if (PE_parse_boot_argn("sheng-gpu-zap", &zapEnabled,
-            static_cast<int>(sizeof zapEnabled)) && !zapEnabled) {
-        printf("PICASSO_GPU zap: disabled by boot arg\n");
-    } else if (!loadZap()) {
-        printf("PICASSO_GPU zap: not loaded; keeping secure mode\n");
-    } else {
-        const uint32_t trustBefore = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
-        const bool left = leaveSecureMode();
-        const uint32_t trustAfter = gpuRead(A620_RBBM_SECVID_TRUST_CNTL);
-        printf("PICASSO_GPU cp: secure mode left=%d trust %08x -> %08x\n",
-            int(left), trustBefore, trustAfter);
-    }
+    if (!initializeSecureMode()) return -1;
     /* wf125: the CP was started in secure mode and its RBBM interrupt sources
      * are enabled by hw_init (RBBM_INT_0_MASK). After the zap the GPU is the
      * only block whose state changed, and an asserted line this kernel has no

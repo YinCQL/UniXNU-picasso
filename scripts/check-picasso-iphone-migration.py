@@ -137,7 +137,7 @@ def main():
             assert nodes['']['model'] == b'iPhone10,3\0' and nodes['']['target-type'] == b'D22\0'
             expected = {'product-name': b'iPhone X\0', 'product-description': b'iPhone X\0',
                         'artwork-device-idiom': b'phone\0', 'artwork-device-subtype': struct.pack('<I', 2436),
-                        'artwork-scale-factor': struct.pack('<I', 3), 'artwork-display-gamut': b'P3\0',
+                        'artwork-scale-factor': struct.pack('<I', 3), 'artwork-display-gamut': b'sRGB\0',
                         'compatible-device-fallback': b'iPhone9,2\0', 'thin-bezel': struct.pack('<I', 1)}
             assert all(nodes['/product'].get(k) == v for k, v in expected.items())
             assert nodes['/chosen']['display-scale'] == struct.pack('<I', 3)

@@ -47,10 +47,14 @@ def main():
     if raw is None or len(raw) != 4:
         raise ValueError('ADT must contain one 32-bit chosen display-scale')
     scale = struct.unpack('<I', raw)[0]
+    gamut = nodes['/product'].get('artwork-display-gamut')
+    if gamut != b'sRGB\0':
+        raise ValueError('ADT must declare the supported SDR sRGB display gamut')
     source = (ROOT / 'package/PicassoDisplay.cpp').read_text(encoding='utf-8')
     markers = ['static void finishDisplayPolicy(', 'static bool matchWord(']
     if 'static bool matchDisplayScale(' in source:
         markers.append('static bool matchDisplayScale(')
+    markers.append('static bool publishPanelPitch(')
     markers.append('extern "C" bool native_legacy_gop_mapping_observed(')
     actual = '\n\n'.join(extract(source, marker) for marker in markers) + '\n'
     (out / 'display-policy.inc').write_text(actual, encoding='utf-8', newline='\n')
@@ -61,7 +65,7 @@ def main():
     if not vcvars and not compiler:
         raise RuntimeError('No C++ compiler available')
     report = {'scope': __doc__, 'adt_sha256': hashlib.sha256(adt).hexdigest(),
-              'adt_scale': scale, 'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
+              'adt_scale': scale, 'adt_gamut': gamut.rstrip(b'\0').decode(), 'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
               'runs': [], 'pass': False}
     try:
         for asan in (False, True):
@@ -78,7 +82,7 @@ def main():
                 command = [compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror', '-O0', '-g',
                            '-I', str(out), str(fixture), '-o', str(out / exe)]
                 if asan:
-                    command.insert(1, '-fsanitize=address')
+                    command.insert(1, '-fsanitize=address,undefined')
                 with compile_log.open('w', encoding='utf-8') as log:
                     result = subprocess.run(command, cwd=out, stdout=log, stderr=subprocess.STDOUT)
             run = {'asan': asan, 'compile_exit': result.returncode, 'compile_log': str(compile_log)}

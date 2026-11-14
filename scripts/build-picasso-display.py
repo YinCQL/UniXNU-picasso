@@ -247,17 +247,24 @@ def main():
                ROOT / 'kits/picasso/PicassoAccelerator.cpp',
                source_dir / 'NativeGOPPresenter.cpp', source_dir / 'NativeGOPGlue.cpp',
                ROOT / 'kits/picasso/PicassoPr13.cpp', ROOT / 'kits/picasso/PicassoBacklight.cpp',
-               ROOT / 'kits/picasso/PicassoBrightness.cpp', ROOT / 'kits/picasso/PicassoSpmi.cpp']
+               ROOT / 'kits/picasso/PicassoBrightness.cpp', ROOT / 'kits/picasso/PicassoSpmi.cpp',
+               ROOT / 'kits/picasso/PicassoPower.cpp', ROOT / 'kits/picasso/PicassoBattery.cpp',
+               ROOT / 'kits/picasso/PicassoAdsp.cpp', ROOT / 'kits/picasso/PicassoAdspFirmware.cpp',
+               ROOT / 'kits/picasso/PicassoFat.cpp', ROOT / 'kits/picasso/PicassoQmp.cpp',
+               ROOT / 'kits/picasso/PicassoAop.cpp', ROOT / 'kits/picasso/PicassoSmp2p.cpp',
+               ROOT / 'kits/picasso/PicassoSmp2pDevice.cpp', ROOT / 'kits/picasso/PicassoAdspBoot.cpp',
+               ROOT / 'kits/picasso/PicassoAudioService.cpp', ROOT / 'kits/picasso/PicassoGlink.cpp', ROOT / 'kits/picasso/PicassoRpcDma.cpp', ROOT / 'kits/picasso/PicassoRpcFs.cpp']
     audit = None
     for source in sources:
         obj = out / (source.stem + '.o')
         command = platform.compile_command(record, source, obj, ROOT) + ['-I', str(out), '-I', str(source_dir),
-            '-I', str(ROOT / 'drivers/NativeAdreno'), '-mgeneral-regs-only']
+            '-I', str(ROOT / 'drivers/NativeAdreno'), '-I', str(ROOT / 'drivers/NativeWlan'),
+            '-I', str(ROOT / 'drivers/NativeUfs'), '-I', str(ROOT / 'drivers/NativeAdrenoPicasso'), '-mgeneral-regs-only']
         platform.run(command, obj.with_suffix('.compile.log'), record['directory'])
         if source.stem == 'NativeLegacyDisplay':
             audit = audit_object(platform, native, obj, slots, aliases, names)
             platform.write_json(out / 'object-audit.json', audit)
-        if source.stem in ('NativeLegacyDisplay', 'NativeKeyStoreEvents', 'PicassoAccelerator', 'NativeGOPPresenter', 'PicassoBrightness'):
+        if source.stem in ('NativeLegacyDisplay', 'NativeKeyStoreEvents', 'PicassoAccelerator', 'NativeGOPPresenter', 'PicassoBrightness', 'PicassoAudioService'):
             late = out / (source.stem + '.late.o')
             objcopy = shutil.which('llvm-objcopy')
             require(objcopy, 'llvm-objcopy required')
@@ -278,9 +285,19 @@ def main():
     objects += hid_objects
     sources += hid_sources
     sources += [ROOT / 'drivers/NativeNovatekTouch/TouchPublish.h']
+    sources += [ROOT / 'kits/picasso/PicassoAudioAbi.h', ROOT / 'kits/picasso/PicassoAudioQueue.h']
     sources += [ROOT / 'kits/picasso/PicassoBacklightCore.h', ROOT / 'kits/picasso/PicassoButtonsCore.h',
-                ROOT / 'kits/picasso/PicassoSpmi.h', ROOT / 'kits/picasso/PicassoSpmiCore.h']
-    sources += [ROOT / 'drivers/NativeAdreno/OriginalAcceleratorABI.h']
+                ROOT / 'kits/picasso/PicassoSpmi.h', ROOT / 'kits/picasso/PicassoSpmiCore.h', ROOT / 'kits/picasso/PicassoPowerCore.h', ROOT / 'kits/picasso/PicassoBatteryCore.h', ROOT / 'kits/picasso/PicassoChargerCore.h', ROOT / 'kits/picasso/PicassoBatteryProfile.h', ROOT / 'kits/picasso/PicassoBattery.h',
+                ROOT / 'kits/picasso/PicassoAdsp.h', ROOT / 'drivers/NativeWlan/WlanSmem.h',
+                ROOT / 'kits/picasso/PicassoFat.h', ROOT / 'kits/picasso/PicassoAdspFirmwareProfile.h',
+                ROOT / 'kits/picasso/PicassoAdspLoadPlan.h', ROOT / 'kits/picasso/PicassoAdspBoot.h',
+                ROOT / 'kits/picasso/PicassoQmp.h', ROOT / 'kits/picasso/PicassoSmp2p.h', ROOT / 'kits/picasso/PicassoGlink.h',
+                ROOT / 'kits/picasso/PicassoApr.h', ROOT / 'kits/picasso/PicassoAudioPins.h', ROOT / 'kits/picasso/PicassoTfa.h', ROOT / 'kits/picasso/PicassoQrtr.h', ROOT / 'kits/picasso/PicassoQmi.h', ROOT / 'kits/picasso/PicassoServloc.h', ROOT / 'kits/picasso/PicassoTftp.h',
+                ROOT / 'kits/picasso/PicassoRpcFs.h', ROOT / 'kits/picasso/PicassoRpcStock.inc',
+                ROOT / 'kits/picasso/PicassoFastrpc.h', ROOT / 'kits/picasso/PicassoPlayback.h', ROOT / 'kits/picasso/PicassoPlaybackApr.h', ROOT / 'kits/picasso/PicassoPcm.h', ROOT / 'kits/picasso/PicassoRpcDma.h',
+                ROOT / 'kits/picasso/PicassoSmemLock.h']
+    sources += [ROOT / 'drivers/NativeAdreno/OriginalAcceleratorABI.h', ROOT / 'drivers/NativeUfs/FirmwareWindow.h',
+                ROOT / 'drivers/NativeAdrenoPicasso/PicassoRpmh.h', ROOT / 'drivers/NativeAdrenoPicasso/PicassoPas.h']
     pending = Path(tempfile.mkdtemp(prefix='qualified-display-', dir=out)) / 'libNativeLegacyDisplay.late.a'
     platform.run(['xcrun', 'ar', 'rcs', pending, *objects], out / 'archive.log')
     members = platform.check_archive_members(platform.run(['xcrun', 'ar', 't', pending], out / 'members.log').splitlines(), objects)

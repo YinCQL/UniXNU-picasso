@@ -41,7 +41,8 @@
  * gltrace_at=SECONDS does so for the first frame that long after the window server started,
  * gltrace_draws=N for the first frame after one of N draws, gltrace_function=N[,K] for the frame
  * after the Kth draw CoreAnimation makes of its function N with no program, gltrace_frames=N for
- * N frames from any of them on; gltrace_place=X0,Y0,X1,Y1 writes down, of those frames, only the draws whose corners
+ * N frames from any of them on; gldiag=1 enables compositor observations, call timings
+ * and periodic summaries (off by default); gltrace_place=X0,Y0,X1,Y1 writes down, of those frames, only the draws whose corners
  * reach into that rectangle, a line each (lines "gl-at:"; writing everything down is slow, and a
  * window server that is slow draws other frames), gltrace_look=1 adds the pixel each of them
  * left in the middle of itself; gltrace_shaders=1 writes down the text of the shaders of every
@@ -103,6 +104,13 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_UNPACK_ALIGNMENT             0x0cf5
 #define GL_PACK_ROW_LENGTH              0x0d02
 #define GL_PACK_ALIGNMENT               0x0d05
+#define GL_PACK_SKIP_ROWS               0x0d03
+#define GL_PACK_SKIP_PIXELS             0x0d04
+#define GL_PIXEL_PACK_BUFFER            0x88eb
+#define GL_PIXEL_PACK_BUFFER_BINDING    0x88ed
+#define GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL 0x8cd2
+#define GL_TEXTURE_WIDTH                0x1000
+#define GL_TEXTURE_HEIGHT               0x1001
 #define GL_TEXTURE_2D                   0x0de1
 #define GL_UNSIGNED_BYTE                0x1401
 #define GL_RGBA                         0x1908
@@ -111,6 +119,7 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_VERSION                      0x1f02
 #define GL_EXTENSIONS                   0x1f03
 #define GL_TEXTURE_BINDING_2D           0x8069
+#define GL_COLOR_WRITEMASK              0x0c23
 #define GL_BGRA                         0x80e1
 #define GL_INFO_LOG_LENGTH              0x8b84
 #define GL_COMPILE_STATUS               0x8b81
@@ -257,6 +266,60 @@ ktrace(const char *format, ...)
 	nativegl_text(text);
 }
 
+/* Small, independent budgets keep compositor observations visible without full tracing.
+ * Contended observations are dropped; neither a draw nor another logger waits for this lock.
+ */
+static int compositor_diagnostics;    /* boot-arg gldiag=1; no normal-path observations */
+static unsigned compositor_keys[8][32], compositor_counts[8];
+static unsigned compositor_lock;
+
+static bool
+compositor_claim(unsigned bucket, unsigned key)
+{
+	static const unsigned limits[8] = { 32, 16, 16, 8, 8, 16, 8, 8 };
+	bool take = false;
+
+	if (!compositor_diagnostics || bucket >= 8 || __sync_lock_test_and_set(&compositor_lock, 1)) {
+		return false;
+	}
+	unsigned count = compositor_counts[bucket];
+	if (count < limits[bucket]) {
+		unsigned i;
+		for (i = 0; i < count && compositor_keys[bucket][i] != key; i++) {}
+		if (i == count) {
+			compositor_keys[bucket][count] = key;
+			compositor_counts[bucket] = count + 1;
+			take = true;
+		}
+	}
+	__sync_lock_release(&compositor_lock);
+	return take;
+}
+
+static void
+compositor_text(const char *format, ...)
+{
+	if (!compositor_diagnostics) return;
+	char line[200] = "eagl comp ";
+	va_list ap;
+
+	va_start(ap, format);
+	vsnprintf(line + 10, sizeof(line) - 10, format, ap);
+	va_end(ap);
+	for (unsigned i = 10; line[i] != 0; i++) {
+		if ((unsigned char)line[i] < 32) line[i] = ' ';
+	}
+	nativegl_text(line);
+}
+
+static void
+compositor_program(unsigned program, int good, const char *what)
+{
+	if (compositor_claim(4, program)) {
+		compositor_text("program=%u linked=%d purpose=%.80s", program, good, what);
+	}
+}
+
 static void
 eagl_trace(const char *format, ...)
 {
@@ -322,8 +385,11 @@ static unsigned group_covered, group_laid, group_flattened;    /* (glframes=1) t
 struct image {
 	GLuint texture;
 	IOSurfaceRef surface;
-	bool target;                    /* drawn into (attachImage) rather than shown (texImageIOSurface) */
+	bool target;                    /* attached explicitly or subsequently used as a render target */
 	bool invert, drawn;
+	bool retiring;                  /* a deletion awaiting successful surface publication */
+	bool mip_pending;               /* level zero was drawn after generation */
+	bool mipmapped;                 /* generated levels must follow subsequent IOSurface uploads */
 	bool shared;                    /* the texture is the surface's memory: nothing to copy */
 	GLuint mirror;                  /* a texture that is the surface's memory, which the GPU copies the frame into (blit_targets) */
 	bool wrapped;                   /* the surface is memory of somebody's with a surface made around it */
@@ -340,15 +406,31 @@ struct image {
 	GLsizei width, height;
 };
 
+/* Recent two-dimensional storage requests, retained for an error snapshot. */
+struct texture_definition {
+	GLuint texture;
+	unsigned frame, source;
+	GLint level, internal;
+	GLsizei width, height;
+	GLenum format, type;
+};
+
 struct eagl {
 	void *table[SLOTS];             /* [EAGL_TABLE_BASE / 8] is the context itself: what every entry gets as its first argument */
 	id object;                      /* the EAGLContext */
 	struct hakios_gl *gl;
 	unsigned long api;
+	struct texture_definition definitions[256];
+	unsigned definition_next;
 	struct image images[1024];
 	unsigned image_count;
+	unsigned target_refresh_notes;  /* bounded external target ownership observations */
+	unsigned preserved_errors;     /* errors observed by storage ownership checks */
+	unsigned surface_handoff_notes;
+	bool mip_pending;
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
+	GLint colour_level;             /* mip level of the draw framebuffer attachment */
 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
 	GLuint writer;                  /* ... and one to copy a frame into its surface with (blit_targets) */
 	GLuint program;                 /* the one in use, as CoreAnimation has it */
@@ -361,7 +443,7 @@ struct eagl {
 	GLbitfield unclear;             /* a glClear put off until the next draw (clear_now()), and what it was to be made with */
 	GLint unclear_box[4];
 	GLfloat unclear_colour[4];
-	GLboolean unclear_boxed;
+	GLboolean unclear_boxed, unclear_write[4];
 	struct group_texture *groups;   /* CoreAnimation's textures: which are groups with a vibrant layer in them (group_draw_begin()) */
 	GLuint group_cover, group_over, group_flat;     /* ... and our programs for them */
 	bool group_failed;
@@ -423,6 +505,7 @@ struct eagl {
 	unsigned beat_fill_calls[90];
 	/* everything so far */
 	unsigned frames, shaders, programs, errors, shared, refused;
+	unsigned draw_function;         /* last function observed at a draw, for error diagnostics */
 	uint64_t all_calls, all_draws, all_triangles, readback_us, wait_us, attach_us, flush_us, frame_us;
 	unsigned most_calls, most_triangles;
 	const char *sources[256];       /* the text of the shaders being made, by name (modulo this) */
@@ -455,9 +538,9 @@ static uint64_t slot_time_us[SLOTS];
 static uint32_t slot_time_calls[SLOTS];
 /* NATIVEGL: the phases of the glFlush that ends a frame, for the heartbeat's "fph" line. */
 static uint64_t flush_clear_us, flush_real_us, flush_end_us;
-static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
+static int check_errors;                /* gldiag=1: errors after calls; normally one check per frame */
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
-static int fast_surface_hash;           /* experimental glh=1; default detector is unchanged */
+static int fast_surface_hash = 1;       /* four independent full-byte chains; glh=0: legacy detector */
 /*
  * A frame is not drawn into its surface's memory but into a texture of the library's own, and the
  * GPU copies it into the surface at the frame's end (one blit; the display's driver waits for that
@@ -511,7 +594,10 @@ static int fetch_offered = 1;
 
 static const char *eagl_slot_name(unsigned offset);
 static void census_report(void);
+static void compositor_framebuffer(struct eagl *e, const char *where);
 static void clear_now(struct eagl *e);
+static void group_read(struct eagl *e, GLuint texture);
+static void group_forget(struct eagl *e, GLuint texture);
 
 static void
 eagl_enter(struct eagl *e, unsigned offset)
@@ -524,21 +610,25 @@ eagl_enter(struct eagl *e, unsigned offset)
 	}
 	slot_calls[offset / 8]++;
 	e->calls++;
-	call_began_us = now_us();
+	if (compositor_diagnostics || slow_calls_us) call_began_us = now_us();
 }
 
 static void
 eagl_leave(struct eagl *e, unsigned offset)
 {
 	GLenum error;
-	uint64_t now = now_us();
-	uint64_t took = now - call_began_us;
+	uint64_t now = compositor_diagnostics || slow_calls_us ? now_us() : 0;
+	uint64_t took = now ? now - call_began_us : 0;
 
-	if (offset != 0 && offset / 8 < SLOTS) {
+	if (compositor_diagnostics && offset != 0 && offset / 8 < SLOTS) {
 		slot_time_us[offset / 8] += took;
 		slot_time_calls[offset / 8]++;
 	}
 	if (check_errors && offset != 0x338 && (error = glGetError()) != 0) {
+		if (compositor_claim(2, (offset << 16) | error)) {
+			compositor_text("error=%x slot=%x frame=%u", error, offset, e->frames);
+			if (error == 0x506) compositor_framebuffer(e, "draw-error");
+		}
 		if (e->errors++ < 60) {
 			say("hakios-gl: %s: error %#x\n", eagl_slot_name(offset), error);
 		}
@@ -559,6 +649,9 @@ eagl_missing(void *context, unsigned offset)
 	struct eagl *e = context;
 
 	eagl_enter(e, offset);
+	if (compositor_claim(1, 0x10000u | offset)) {
+		compositor_text("missing-slot=%x frame=%u", offset, e->frames);
+	}
 	if (slot_calls[offset / 8] == 1) {
 		say("hakios-gl: CALLED AND NOT THERE: entry %#x, %s\n", offset, eagl_slot_name(offset));
 	}
@@ -589,6 +682,7 @@ static unsigned widest_texture, tallest_texture;
 static void
 note_format(const char *how, GLenum internal, GLenum format, GLenum type, GLsizei width, GLsizei height)
 {
+	if (!compositor_diagnostics) return;
 	struct format_use *use = NULL;
 
 	for (unsigned i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
@@ -650,6 +744,27 @@ summary(struct eagl *e)
 
 /* ---- IOSurfaces ----------------------------------------------------------------------------------- */
 
+static struct texture_definition *
+texture_definition_of(struct eagl *e, GLuint texture)
+{
+	for (unsigned i = 0; i < 256; i++) {
+		if (e->definitions[i].texture == texture && texture != 0) return &e->definitions[i];
+	}
+	return NULL;
+}
+
+static void
+texture_defined(struct eagl *e, GLuint texture, unsigned source, GLint level, GLint internal,
+    GLsizei width, GLsizei height, GLenum format, GLenum type)
+{
+	struct texture_definition *d;
+
+	if (!compositor_diagnostics || texture == 0) return;
+	d = texture_definition_of(e, texture);
+	if (d == NULL) d = &e->definitions[e->definition_next++ % 256];
+	*d = (struct texture_definition){ texture, e->frames, source, level, internal, width, height, format, type };
+}
+
 static struct image *
 image_of(struct eagl *e, GLuint texture)
 {
@@ -661,6 +776,10 @@ image_of(struct eagl *e, GLuint texture)
 	return NULL;
 }
 
+static void vblur_forget(struct eagl *e, GLuint texture);
+static bool image_publish(struct eagl *e, struct image *image, const char *reason);
+static bool surface_publish_aliases(struct eagl *e, IOSurfaceRef surface);
+
 static struct image *
 image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 {
@@ -668,8 +787,12 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 	IOSurfaceRef previous = NULL;
 	uint64_t sum = 0;
 	unsigned quiet = 0, next_check = 0;
+	bool mipmapped = false;
 
 	e->image_news++;
+	/* A new view of a surface must see earlier GPU writes in this context. */
+	if (!surface_publish_aliases(e, surface) ||
+	    (image != NULL && !image_publish(e, image, "replace"))) return NULL;
 	if (image == NULL) {
 		if (e->image_count == sizeof(e->images) / sizeof(e->images[0])) {
 			/*
@@ -705,15 +828,17 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 				return NULL;
 			}
 			e->image_evicted++;
+			if ((oldest->shared || oldest->mirror != 0) && IOSurfaceGetID(oldest->surface) != IOSurfaceGetID(surface)) glFinish();
 			if (oldest->mirror != 0) {
 				glDeleteTextures(1, &oldest->mirror);
 			}
-			CFRelease(oldest->surface);
+			previous = oldest->surface;
 			image = oldest;
 		} else {
 			image = &e->images[e->image_count++];
 		}
 	} else {
+		if ((image->shared || image->mirror != 0) && IOSurfaceGetID(image->surface) != IOSurfaceGetID(surface)) glFinish();
 		if (image->mirror != 0) {
 			glDeleteTextures(1, &image->mirror);
 		}
@@ -725,18 +850,29 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 		sum = image->sum;
 		quiet = image->quiet;
 		next_check = image->next_check;
+		mipmapped = image->mipmapped;
 	}
 	memset(image, 0, sizeof(*image));
 	image->texture = texture;
+	image->mipmapped = mipmapped;
 	image->surface = (IOSurfaceRef)CFRetain(surface);
+	/* A CF reference retains the object, not its reservation in a producer's
+	 * reusable surface pool. Reserve before returning the old view so reusing
+	 * the same surface never briefly advertises it as available. */
+	IOSurfaceIncrementUseCount(surface);
 	if (previous != NULL) {
 		if (IOSurfaceGetID(previous) == IOSurfaceGetID(surface)) {
 			image->sum = sum;
 			image->quiet = quiet;
 			image->next_check = next_check;
 		}
+		IOSurfaceDecrementUseCount(previous);
 		CFRelease(previous);
 	}
+	/* Registration replaces ordinary texture contents with an IOSurface view.
+	 * Its previous material-group interpretation must not flatten over the new
+	 * image on a later read. Preserve that state if registration failed above. */
+	group_forget(e, texture);
 	return image;
 }
 
@@ -746,12 +882,28 @@ image_forget(struct eagl *e, GLuint texture)
 	struct image *image = image_of(e, texture);
 
 	if (image != NULL) {
+		/* Imported storage may still be read by an earlier draw. Retire that
+		 * access before its pool reservation is returned to another producer. */
+		if (image->shared || image->mirror != 0) glFinish();
 		if (image->mirror != 0) {
 			glDeleteTextures(1, &image->mirror);
 		}
+		IOSurfaceDecrementUseCount(image->surface);
 		CFRelease(image->surface);
 		*image = e->images[--e->image_count];
 	}
+}
+
+/* Called after the GL context has retired and destroyed all of its resources.
+ * Context teardown also releases views whose texture names were never deleted. */
+static void
+images_release(struct eagl *e)
+{
+	for (unsigned i = 0; i < e->image_count; i++) {
+		IOSurfaceDecrementUseCount(e->images[i].surface);
+		CFRelease(e->images[i].surface);
+	}
+	e->image_count = 0;
 }
 
 /* Apple's OpenGL ES takes blue-first pixels into a texture called GL_RGBA; everybody else's calls the texture so too. */
@@ -820,7 +972,7 @@ surface_shared(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
 
-	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
+	if (!share_surfaces || image->mipmapped || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
 	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
 	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
 	    !hakios_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
@@ -829,6 +981,117 @@ surface_shared(struct eagl *e, struct image *image)
 	}
 	image->shared = true;
 	e->shared++;
+	return true;
+}
+
+#ifndef GL_PIXEL_UNPACK_BUFFER
+#define GL_PIXEL_UNPACK_BUFFER 0x88ec
+#define GL_PIXEL_UNPACK_BUFFER_BINDING 0x88ef
+#endif
+#ifndef GL_UNPACK_SKIP_ROWS
+#define GL_UNPACK_SKIP_ROWS 0x0cf3
+#define GL_UNPACK_SKIP_PIXELS 0x0cf4
+#endif
+
+/* A sampled surface becomes a render target without rendering into its imported
+ * backing. Keep its pixels in a temporary texture while redefining the original
+ * name: framebuffer attachments and texture parameters still refer to that name.
+ * The final surface is imported separately by surface_mirrored().
+ */
+static bool
+surface_render_copy(struct eagl *e, struct image *image)
+{
+	GLint bound = 0, read = 0, unpack = 0;
+	GLuint snapshot = 0, framebuffer = 0;
+	GLenum error = 0, status = GL_FRAMEBUFFER_COMPLETE;
+	bool copied = false, detached = false;
+
+	if (!image->shared || (!blit_targets && !image->mipmapped)) return true;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	/* Retain an earlier error instead of misattributing it to storage replacement. */
+	if ((error = glGetError()) != 0) goto done;
+	glGenFramebuffers(1, &framebuffer);
+	glGenTextures(1, &snapshot);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+	status = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+	if (status != GL_FRAMEBUFFER_COMPLETE) goto done;
+	glBindTexture(GL_TEXTURE_2D, snapshot);
+	glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, image->width, image->height, 0);
+	if ((error = glGetError()) != 0) goto done;
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, snapshot, 0);
+	status = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+	if (status != GL_FRAMEBUFFER_COMPLETE) goto done;
+	glBindTexture(GL_TEXTURE_2D, image->texture);
+	/* Same-size and empty images can retain the imported resource. Allocate
+	 * a different extent first; snapshot retains the complete previous GPU pixels.
+	 */
+	glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image->width == 1 && image->height == 1 ? 2 : 1,
+	    1, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
+	if ((error = glGetError()) != 0) goto done;
+	detached = true;
+	glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, image->width, image->height, 0);
+	if ((error = glGetError()) != 0) goto done;
+	image->shared = false;
+	texture_defined(e, image->texture, 6, 0, GL_RGBA, image->width, image->height, GL_RGBA, GL_UNSIGNED_BYTE);
+	copied = true;
+done:
+	if (detached && !copied) {
+		glBindTexture(GL_TEXTURE_2D, image->texture);
+		/* Keep the imported source available if allocating the copy failed. */
+		if (!hakios_gl_surface_texture(e->gl, IOSurfaceGetID(image->surface)) &&
+		    compositor_claim(2, 0x61000000u | image->texture)) {
+			compositor_text("surface-copy-restore-failed tex=%u frame=%u", image->texture, e->frames);
+		}
+	}
+	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	if (framebuffer != 0) glDeleteFramebuffers(1, &framebuffer);
+	if (snapshot != 0) glDeleteTextures(1, &snapshot);
+	if (!copied) {
+		e->errors++;
+		if (compositor_claim(2, 0x60000000u | image->texture)) {
+			compositor_text("surface-copy-failed tex=%u error=%x status=%x frame=%u",
+			    image->texture, error, status, e->frames);
+		}
+	}
+	return copied;
+}
+
+/* texImageIOSurface also creates CoreAnimation snapshot render targets. Promote
+ * only a supported full-surface level-zero texture when it is actually written.
+ * Preserve its existing GPU contents when detaching imported render storage.
+ */
+static bool
+image_render_target(struct eagl *e, struct image *image)
+{
+	IOSurfaceRef surface = image->surface;
+	GLint bound = 0, width = 0, height = 0;
+	size_t row = IOSurfaceGetBytesPerRow(surface);
+
+	if (image->target) return true;
+	if (image->to != GL_TEXTURE_2D || image->plane != 0 || image->format != GL_BGRA ||
+	    image->type != GL_UNSIGNED_BYTE || image->alpha_first || IOSurfaceGetPixelFormat(surface) != 'BGRA' ||
+	    IOSurfaceGetPlaneCount(surface) != 0 || IOSurfaceGetBytesPerElement(surface) != 4 ||
+	    image->width <= 0 || image->height <= 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
+	    (size_t)image->height != IOSurfaceGetHeight(surface) || row / 4 < (size_t)image->width || row % 4 != 0 ||
+	    row > IOSurfaceGetAllocSize(surface) / (size_t)image->height) return false;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	glBindTexture(GL_TEXTURE_2D, image->texture);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+	if (width != image->width || height != image->height || !surface_render_copy(e, image)) return false;
+	image->target = true;
+	if (!image->shared) surface_mirrored(e, image);
+	if (compositor_claim(6, image->texture)) {
+		compositor_text("render-surface=%u tex=%u size=%dx%d shared=%u mirror=%u frame=%u",
+		    IOSurfaceGetID(surface), image->texture, width, height, image->shared, image->mirror != 0, e->frames);
+	}
 	return true;
 }
 
@@ -862,9 +1125,9 @@ surface_changed(struct eagl *e, struct image *image)
 		return false;
 	}
 	image->looked = e->frames + 1;
-	e->hashes++;
-	e->hash_bytes += size;
-	{
+	if (compositor_diagnostics) {
+		e->hashes++;
+		e->hash_bytes += size;
 		unsigned slot = (unsigned)(image - e->images);
 
 		if (slot < 256) {
@@ -905,14 +1168,15 @@ surface_to_texture(struct eagl *e, struct image *image)
 	bool planar = IOSurfaceGetPlaneCount(surface) > 0;
 	size_t row = planar ? IOSurfaceGetBytesPerRowOfPlane(surface, image->plane) : IOSurfaceGetBytesPerRow(surface);
 	unsigned pixel = bytes_a_pixel(image->format, image->type);
-	GLint row_length = 0, alignment = 4;
+	GLint row_length = 0, alignment = 4, skip_rows = 0, skip_pixels = 0, unpack = 0;
 	uint8_t *base, *flipped = NULL;
 	bool alpha_first = image->alpha_first && !planar && pixel == 4;
+	uint32_t seed = image->seed;
 
 	if (image->shared) {
 		return;
 	}
-	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
+	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, &seed) != 0) {
 		e->lock_fails++;
 		say("hakios-gl: an IOSurface cannot be locked\n");
 		return;
@@ -940,12 +1204,25 @@ surface_to_texture(struct eagl *e, struct image *image)
 	}
 	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
 	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+	glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
+	glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
+	glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
+	/* The IOSurface pointer is client memory, independent of the caller's unpack state. */
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+	glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+	glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(row / pixel));
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	glTexImage2D(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height, 0,
 	    image->format, image->type, base);
+	/* IOSurface uploads replace level zero. Keep levels requested by the caller
+	 * current, or minification continues sampling the previous surface contents. */
+	if (image->mipmapped) glGenerateMipmap(image->to);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+	glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
+	glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
 	if (trace_placing) {
 		size_t set[4] = { 0, 0, 0, 0 }, size = row * (size_t)(image->height - 1) + (size_t)image->width * pixel;
 
@@ -973,76 +1250,97 @@ surface_to_texture(struct eagl *e, struct image *image)
 	}
 	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
 	free(flipped);
-	image->seed = IOSurfaceGetSeed(surface);
+	/* The upload contains the revision observed when CPU access began. A later
+	 * producer may publish as soon as it ends; never label these older pixels
+	 * with a seed obtained after unlock or the next bind will skip its refresh. */
+	image->seed = seed;
 	e->uploads++;
 	e->upload_bytes += row * (size_t)image->height;
 }
 
-/* What has been drawn into a texture, into its IOSurface, unless it is there (frame_end() waits for it). */
+/* Queue a mirror copy; publication follows the GPU completion wait. */
+static bool
+mirror_to_surface(struct eagl *e, struct image *image)
+{
+	GLint read = 0, draw = 0;
+	GLboolean scissored;
+	GLint x0 = 0, y0 = 0, x1 = image->width, y1 = image->height;
+
+	if (damage_blits && image->damaged) {
+		x0 = image->dmg[0];
+		y0 = image->dmg[1];
+		x1 = x0 + image->dmg[2];
+		y1 = y0 + image->dmg[3];
+		x0 = x0 < 0 ? 0 : x0;
+		y0 = y0 < 0 ? 0 : y0;
+		x1 = x1 > image->width ? image->width : x1;
+		y1 = y1 > image->height ? image->height : y1;
+	}
+	image->damaged = false;
+	if (x1 <= x0 || y1 <= y0) {
+		image->drawn = false;
+		return false;
+	}
+	/* the frame into the surface's memory, by the GPU (blit_targets); upside down if it is drawn so */
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	if (e->reader == 0) {
+		glGenFramebuffers(1, &e->reader);
+	}
+	if (e->writer == 0) {
+		glGenFramebuffers(1, &e->writer);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
+	// Internal copies use their own damage rectangle, independent of the caller.
+	scissored = glIsEnabled(GL_SCISSOR_TEST);
+	if (scissored) glDisable(GL_SCISSOR_TEST);
+	glBlitFramebuffer(x0, y0, x1, y1, x0, image->invert ? image->height - y0 : y0, x1,
+	    image->invert ? image->height - y1 : y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	if (scissored) glEnable(GL_SCISSOR_TEST);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+	return true;
+}
+
+/* Publish completed shared pixels, or read back an ordinary render target. */
 static void
 target_to_surface(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
 	size_t row = IOSurfaceGetBytesPerRow(surface);
+	GLint read = 0, row_length = 0, alignment = 4, skip_rows = 0, skip_pixels = 0, buffer = 0;
 	uint8_t *base;
 
-	image->drawn = false;
-	if (image->mirror != 0) {
-		GLint read = 0, draw = 0;
-		GLint x0 = 0, y0 = 0, x1 = image->width, y1 = image->height;
-
-		if (damage_blits && image->damaged) {
-			x0 = image->dmg[0];
-			y0 = image->dmg[1];
-			x1 = x0 + image->dmg[2];
-			y1 = y0 + image->dmg[3];
-			x0 = x0 < 0 ? 0 : x0;
-			y0 = y0 < 0 ? 0 : y0;
-			x1 = x1 > image->width ? image->width : x1;
-			y1 = y1 > image->height ? image->height : y1;
+	uint32_t seed = image->seed;
+	if (image->shared || image->mirror != 0) {
+		/* Publish only after the caller has completed the GPU writes. Keep GPU
+		 * ownership on failure; use the returned seed of this publication. */
+		if (IOSurfaceLock(surface, 0, NULL) == 0 && IOSurfaceUnlock(surface, 0, &seed) == 0) {
+			image->seed = seed;
+			image->drawn = false;
 		}
-		image->damaged = false;
-		if (x1 <= x0 || y1 <= y0) {
-			return;                         /* (nothing drawn into it this frame) */
-		}
-		/* the frame into the surface's memory, by the GPU (blit_targets); upside down if it is drawn so */
+		return;
+	}
+	if (IOSurfaceLock(surface, 0, NULL) != 0) return;
+	base = IOSurfaceGetBaseAddress(surface);
+	if (base != NULL) {
 		glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
-		glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
-		if (e->reader == 0) {
-			glGenFramebuffers(1, &e->reader);
-		}
-		if (e->writer == 0) {
-			glGenFramebuffers(1, &e->writer);
-		}
+		glGetIntegerv(GL_PACK_ROW_LENGTH, &row_length);
+		glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
+		glGetIntegerv(GL_PACK_SKIP_ROWS, &skip_rows);
+		glGetIntegerv(GL_PACK_SKIP_PIXELS, &skip_pixels);
+		glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &buffer);
+		if (e->reader == 0) glGenFramebuffers(1, &e->reader);
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
 		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
-		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
-		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
-		glBlitFramebuffer(x0, y0, x1, y1, x0, image->invert ? image->height - y1 : y0, x1,
-		    image->invert ? image->height - y0 : y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
-		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
-			IOSurfaceUnlock(surface, 0, NULL);
-		}
-		return;
-	}
-	if (image->shared) {
-		/* whoever looks at the surface's seed is to see that it has changed */
-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
-			IOSurfaceUnlock(surface, 0, NULL);
-		}
-		return;
-	}
-	if (e->reader == 0) {
-		glGenFramebuffers(1, &e->reader);
-	}
-	glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
-	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
-	if (IOSurfaceLock(surface, 0, NULL) == 0) {
-		base = IOSurfaceGetBaseAddress(surface);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(row / 4));
-		glPixelStorei(GL_PACK_ALIGNMENT, 4);
+		glPixelStorei(GL_PACK_ALIGNMENT, 1);
+		glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+		glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
 		if (!image->invert) {
 			glReadPixels(0, 0, image->width, image->height, GL_BGRA, GL_UNSIGNED_BYTE, base);
 		} else {
@@ -1050,10 +1348,129 @@ target_to_surface(struct eagl *e, struct image *image)
 				glReadPixels(0, y, image->width, 1, GL_BGRA, GL_UNSIGNED_BYTE, base + row * (size_t)(image->height - 1 - y));
 			}
 		}
-		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-		IOSurfaceUnlock(surface, 0, NULL);
+		glPixelStorei(GL_PACK_ROW_LENGTH, row_length);
+		glPixelStorei(GL_PACK_ALIGNMENT, alignment);
+		glPixelStorei(GL_PACK_SKIP_ROWS, skip_rows);
+		glPixelStorei(GL_PACK_SKIP_PIXELS, skip_pixels);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)buffer);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 	}
-	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
+	if (IOSurfaceUnlock(surface, 0, &seed) == 0 && base != NULL) {
+		image->seed = seed;
+		image->drawn = false;
+	}
+}
+
+/* An IOSurface outlives the GL name used to draw it. CoreAnimation may delete
+ * that name, register it again, or create another view before its next flush.
+ * Complete and publish those writes before relinquishing the local owner. */
+static bool
+image_publish(struct eagl *e, struct image *image, const char *reason)
+{
+	uint32_t before;
+	if (!image->target || !image->drawn) return true;
+	clear_now(e);
+	if (e->groups != NULL) group_read(e, image->texture);
+	before = image->seed;
+	if (image->mirror != 0 && !mirror_to_surface(e, image)) return false;
+	if (image->shared || image->mirror != 0) glFinish();
+	target_to_surface(e, image);
+	if (e->surface_handoff_notes < 8 || image->drawn) {
+		if (e->surface_handoff_notes < 16) {
+			char line[256];
+			e->surface_handoff_notes++;
+			snprintf(line, sizeof(line), "surface-handoff ctx=%p s%u tex%u %ux%u seed%u>%u at=%s ok%u f%u",
+			    (void *)e, IOSurfaceGetID(image->surface), image->texture,
+			    (unsigned)image->width, (unsigned)image->height, before, image->seed,
+			    reason, !image->drawn, e->frames);
+			nativegl_text(line);
+		}
+	}
+	return !image->drawn;
+}
+
+static bool
+surface_publish_aliases(struct eagl *e, IOSurfaceRef surface)
+{
+	uint32_t identity = IOSurfaceGetID(surface);
+	for (unsigned i = 0; i < e->image_count; i++) {
+		struct image *image = &e->images[i];
+		if (image->drawn && IOSurfaceGetID(image->surface) == identity &&
+		    !image_publish(e, image, "register")) return false;
+	}
+	return true;
+}
+
+
+/* Ownership checks must observe the result of a storage call without stealing
+ * errors from the application's glGetError. GL permits one flag per error. */
+static void
+storage_error_save(struct eagl *e, GLenum error)
+{
+	if (error >= 0x500 && error <= 0x507) e->preserved_errors |= 1u << (error - 0x500);
+}
+
+static GLenum
+my_glGetError(void *context)
+{
+	struct eagl *e = context;
+	GLenum error;
+	EAGL_ENTER(e, 0x338);
+	if (e->preserved_errors) {
+		unsigned bit = (unsigned)__builtin_ctz(e->preserved_errors);
+		e->preserved_errors &= ~(1u << bit);
+		error = 0x500 + bit;
+	} else error = glGetError();
+	EAGL_LEAVE(e, 0x338);
+	return error;
+}
+
+/* A successful level-zero storage definition ends the IOSurface view. First
+ * publish its old pixels, then keep the association until GL accepts the call.
+ * Calls on ordinary textures and nonzero mip levels retain their normal path. */
+static bool
+image_storage_begin(struct eagl *e, GLenum target, GLint level, GLuint *texture)
+{
+	GLint bound = 0;
+	*texture = 0;
+	if (target != GL_TEXTURE_2D || level != 0 || !e->image_count) return true;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	struct image *image = image_of(e, (GLuint)bound);
+	if (image == NULL) return true;
+	GLenum error;
+	while ((error = glGetError()) != 0) storage_error_save(e, error);
+	if (!image_publish(e, image, "storage")) {
+		storage_error_save(e, 0x502);
+		return false;
+	}
+	if (image->shared) {
+		/* Same-size TexImage may retain an EGLImage sibling in Mesa. Preserve
+		 * its contents in independent storage before any replacement writes. */
+		bool mipmapped = image->mipmapped;
+		image->mipmapped = true;
+		bool copied = surface_render_copy(e, image);
+		image->mipmapped = mipmapped;
+		if (!copied) { storage_error_save(e, 0x502); return false; }
+	}
+	*texture = (GLuint)bound;
+	return true;
+}
+
+static void
+image_storage_end(struct eagl *e, GLuint texture)
+{
+	if (!texture) return;
+	bool failed = false;
+	GLenum error;
+	while ((error = glGetError()) != 0) {
+		storage_error_save(e, error);
+		failed = true;
+	}
+	if (!failed) {
+		image_forget(e, texture);
+		group_forget(e, texture);
+		vblur_forget(e, texture);
+	}
 }
 
 /*
@@ -1063,8 +1480,6 @@ target_to_surface(struct eagl *e, struct image *image)
  * that much of its corner and glshow_zoom=N every pixel of it as a square of N, for a texture
  * whose few pixels in a corner are what matters (a material's backdrop, say).
  */
-#define GL_TEXTURE_WIDTH        0x1000
-#define GL_TEXTURE_HEIGHT       0x1001
 
 static GLuint shown_texture;
 /*
@@ -1209,6 +1624,70 @@ show_texture(struct eagl *e, struct image *image)
 	free(pixels);
 }
 
+/* Regenerate only dirty generated chains that are being sampled. Unchanged
+ * snapshots incur no allocation or GL calls. The current render target waits
+ * until it becomes a source, after its deferred clear and group are resolved. */
+static void
+mipmaps_ready(struct eagl *e)
+{
+	GLint bound = 0;
+	bool rebound = false, pending = false;
+
+	if (!e->mip_pending) return;
+	for (unsigned n = 0; n < e->image_count; n++) {
+		struct image *image = &e->images[n];
+		bool sampled = false;
+		if (!image->mip_pending) continue;
+		for (unsigned unit = 0; unit < 8; unit++) sampled |= e->bound[unit] == image->texture;
+		if (!sampled || image->texture == e->colour) {
+			pending = true;
+			continue;
+		}
+		clear_now(e);
+		if (e->groups != NULL) group_read(e, image->texture);
+		if (!rebound) {
+			glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+			rebound = true;
+		}
+		glBindTexture(GL_TEXTURE_2D, image->texture);
+		glGenerateMipmap(GL_TEXTURE_2D);
+		image->mip_pending = false;
+	}
+	if (rebound) glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+	e->mip_pending = pending;
+}
+
+/* Record only external target updates: no GL query, clock or pixel readback,
+ * and at most eight short records per context over its entire lifetime. */
+static void
+image_refresh_note(struct eagl *e, struct image *image, uint32_t seed, const char *at)
+{
+	if (!image->target || e->target_refresh_notes >= 8) return;
+	char line[256];
+	e->target_refresh_notes++;
+	snprintf(line, sizeof(line), "target-refresh ctx=%p s%u tex%u %ux%u seed%u>%u p%u m%u i%u at=%s f%u",
+	    (void *)e, IOSurfaceGetID(image->surface), image->texture, (unsigned)image->width,
+	    (unsigned)image->height, image->seed, seed, image->painted,
+	    image->mipmapped, image->invert, at, e->frames);
+	nativegl_text(line);
+}
+
+/* An attachment may later be sampled after another renderer updates its
+ * IOSurface. Only unpublished local drawing owns level zero; after publication,
+ * an external seed must refresh targets as well as sampling-only textures. */
+static bool
+image_needs_upload(struct eagl *e, struct image *image)
+{
+	uint32_t seed;
+	if (image->shared || image->drawn) return false;
+	seed = IOSurfaceGetSeed(image->surface);
+	if (seed != image->seed) {
+		image_refresh_note(e, image, seed, "bind");
+		return true;
+	}
+	return (!image->target || !image->painted) && surface_changed(e, image);
+}
+
 /* Before the first drawing of a frame: the textures whose IOSurfaces somebody has written to since. */
 static void
 frame_begin(struct eagl *e)
@@ -1245,9 +1724,11 @@ frame_begin(struct eagl *e)
 	for (unsigned i = 0; i < e->image_count; i++) {
 		struct image *image = &e->images[i];
 
-		if (image->target || image->shared || IOSurfaceGetSeed(image->surface) == image->seed) {
-			continue;
-		}
+		uint32_t seed;
+		if (image->shared || image->drawn) continue;
+		seed = IOSurfaceGetSeed(image->surface);
+		if (seed == image->seed) continue;
+		image_refresh_note(e, image, seed, "begin");
 		if (!rebound) {
 			glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
 			rebound = true;
@@ -1265,12 +1746,14 @@ frame_begin(struct eagl *e)
  * library has been waited for already.
  */
 static void frame_functions(struct eagl *e);
+static void my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures);
 static void
 frame_end(struct eagl *e, bool finished)
 {
 	static unsigned unfollowed;
 	uint64_t before, waited, after;
 	unsigned copied = 0, in_place = 0;
+	bool mirror_queued = false;
 
 	clear_now(e);
 	if (perf_marks && e->perf_open) {
@@ -1278,20 +1761,33 @@ frame_end(struct eagl *e, bool finished)
 		nativegl_mark(0x6040u | e->perf_slot);
 		e->perf_open = false;
 	}
+	if (!check_errors) {
+		GLenum error = glGetError();
+		if (error != 0) {
+			if (e->errors++ < 8) ktrace("frame-error=%x frame=%u", error, e->frames);
+			if (compositor_claim(2, 0xffff0000u | error)) {
+				compositor_text("frame-error=%x frame=%u", error, e->frames);
+				if (error == 0x506) compositor_framebuffer(e, "frame-end");
+			}
+		}
+	}
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
-			target_to_surface(e, &e->images[i]);    /* (the GPU's copy: before what follows sends it out) */
-			in_place++;
-			glFlush();                              /* (also after a glFinish: the copy is new since) */
+			if (mirror_to_surface(e, &e->images[i])) {
+				mirror_queued = true;
+				in_place++;
+			}
 		}
-		if (e->images[i].target && e->images[i].drawn && e->images[i].shared) {
+		if (e->images[i].target && e->images[i].drawn && e->images[i].shared && e->images[i].mirror == 0) {
 			in_place++;
 		}
 	}
-	if (in_place != 0 && !finished && wait_for_frames) {
+	if (mirror_queued) glFlush();
+	// A caller's glFinish precedes these copies and cannot have completed them.
+	if (in_place != 0 && (!finished || mirror_queued) && (finished || wait_for_frames)) {
 		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
-	} else if (in_place != 0 && !finished && sync_frames) {
+	} else if (in_place != 0 && (!finished || mirror_queued) && sync_frames) {
 		/*
 		 * The display's driver waits for the last submission that named the surface -- and Mesa's
 		 * freedreno may still hold a batch back after glFlush, to merge it with the next (submit
@@ -1310,12 +1806,20 @@ frame_end(struct eagl *e, bool finished)
 	waited = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn) {
-			copied += !e->images[i].shared;
+			copied += !e->images[i].shared && e->images[i].mirror == 0;
 			target_to_surface(e, &e->images[i]);
-			if (shown_texture != 0) {
+			if (shown_texture != 0 && e->images[i].mirror == 0) {
 				show_texture(e, &e->images[i]);
 			}
 		}
+	}
+	/* A failed delete retained its GPU pixels. Reclaim it after a later flush
+	 * publishes successfully, even when the caller never repeats deletion. */
+	for (unsigned i = 0; i < e->image_count;) {
+		if (e->images[i].retiring && !e->images[i].drawn) {
+			GLuint texture = e->images[i].texture;
+			my_glDeleteTextures(e, 1, &texture);
+		} else i++;
 	}
 	if (!e->in_frame) {
 		return;
@@ -1343,7 +1847,7 @@ frame_end(struct eagl *e, bool finished)
 		bzero(&e->line, sizeof(e->line));
 		frame_functions(e);
 	}
-	if (in_place == 0 && copied == 0 && e->draws != 0 && unfollowed < 8) {
+	if (compositor_diagnostics && in_place == 0 && copied == 0 && e->draws != 0 && unfollowed < 8) {
 		/* (whatever it was drawn into is shown as it is, drawn or not: this is to be seen in the log) */
 		unfollowed++;
 		say("hakios-gl: frame %u: %u draws, and none into an IOSurface that is known here (framebuffer %u, texture %u)\n",
@@ -1363,14 +1867,14 @@ frame_end(struct eagl *e, bool finished)
 	if (e->triangles > e->most_triangles) {
 		e->most_triangles = e->triangles;
 	}
-	if (e->frames <= 40 || e->frames % 20 == 0) {
+	if (compositor_diagnostics && (e->frames <= 40 || e->frames % 20 == 0)) {
 		say("hakios-gl: frame %u: %u GL calls, %u draws, %u triangles, %u clears; %u textures refilled from IOSurfaces "
 		    "(%llu KB); %u picture%s copied out, %u drawn in place; %llu us (%llu handing on, %llu waiting, %llu copying "
 		    "out), %llu before it for the IOSurfaces\n", e->frames, e->calls, e->draws, e->triangles, e->clears, e->uploads,
 		    e->upload_bytes >> 10, copied, copied == 1 ? "" : "s", in_place, after - e->began, e->flushing, waited - before,
 		    after - waited, e->attaching);
 	}
-	if (e->frames == 30 || e->frames % 200 == 0) {
+	if (compositor_diagnostics && (e->frames == 30 || e->frames % 200 == 0)) {
 		summary(e);
 	}
 	census_report();
@@ -1383,7 +1887,7 @@ frame_end(struct eagl *e, bool finished)
 	 * One line every 20 frames or 2 s: frames, the interval since the last line, this frame's time, the
 	 * longest in the window, the handoff wait, and the frame's draws and GL calls.
 	 */
-	{
+	if (compositor_diagnostics || fill_accounting || perf_marks) {
 		static uint64_t beat_us, beat_frames;
 		static unsigned beat_max_us, beat_uploads, beat_hashes;
 		static unsigned long long beat_upload_kb, beat_hash_kb, beat_fill_kpx, beat_view_kpx;
@@ -1526,7 +2030,8 @@ drawing(struct eagl *e)
 	struct image *image;
 
 	frame_begin(e);
-	{
+	mipmaps_ready(e);
+	if (perf_marks || cut_count) {
 		/* glperf=2: the function CoreAnimation's context holds for this draw (the byte its function_uniform
 		 * path sets), as the segment the RB counters are read around. Both marks are taken with the GPU
 		 * finished, so the difference between them is exactly this segment's output. */
@@ -1559,8 +2064,10 @@ drawing(struct eagl *e)
 			e->perf_open = true;
 		}
 	}
-	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
+	if (e->framebuffer != 0 && e->colour != 0 && e->colour_level == 0 &&
+	    (image = image_of(e, e->colour)) != NULL && image_render_target(e, image)) {
 		image->drawn = image->painted = true;
+		if (image->mipmapped) image->mip_pending = e->mip_pending = true;
 		if (damage_blits && image->mirror != 0) {
 			GLint box[4] = { 0, 0, image->width, image->height };
 
@@ -1648,12 +2155,42 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
 	if (target == GL_TEXTURE_2D && e->unit < 8) {
 		e->bound[e->unit] = texture;
 	}
-	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && !image->shared &&
-	    (!image->target ? IOSurfaceGetSeed(image->surface) != image->seed || surface_changed(e, image) :
-	    image->wrapped && !image->painted && surface_changed(e, image))) {
+	if (target == GL_TEXTURE_2D && texture != 0 && e->image_count != 0 &&
+	    (image = image_of(e, texture)) != NULL && image_needs_upload(e, image)) {
 		surface_to_texture(e, image);
 	}
 	EAGL_LEAVE(e, 0x30);
+}
+
+/* Only IOSurface textures that explicitly requested generated levels are tracked.
+ * Ordinary textures and manually supplied mip chains retain their GL behavior. */
+static void
+my_glGenerateMipmap(void *context, GLenum target)
+{
+	struct eagl *e = context;
+	struct image *image;
+
+	EAGL_ENTER(e, 0x1550);
+	clear_now(e);
+	if (eagl_tracing) eagl_trace("glGenerateMipmap(%#x)\n", target);
+	image = target == GL_TEXTURE_2D && e->unit < 8 ? image_of(e, e->bound[e->unit]) : NULL;
+	/* Imported storage is a level-zero sibling. Preserve its GPU contents before
+	 * growing a mip chain, and keep later surface refreshes in independent storage. */
+	if (image != NULL && image->shared) {
+		bool previous = image->mipmapped;
+		image->mipmapped = true;
+		if (!surface_render_copy(e, image)) {
+			image->mipmapped = previous;
+			EAGL_LEAVE(e, 0x1550);
+			return;
+		}
+		/* Establish the CPU observation without replacing the retained GPU image. */
+		surface_changed(e, image);
+		image->seed = IOSurfaceGetSeed(image->surface);
+	}
+	glGenerateMipmap(target);
+	if (image != NULL) { image->mipmapped = true; image->mip_pending = false; }
+	EAGL_LEAVE(e, 0x1550);
 }
 
 static void
@@ -1681,6 +2218,7 @@ my_glClear(void *context, GLbitfield mask)
 		e->unclear_boxed = glIsEnabled(GL_SCISSOR_TEST);
 		glGetIntegerv(GL_SCISSOR_BOX, e->unclear_box);
 		glGetFloatv(GL_COLOR_CLEAR_VALUE, e->unclear_colour);
+		glGetBooleanv(GL_COLOR_WRITEMASK, e->unclear_write);
 	} else {
 		glClear(mask);
 	}
@@ -2458,6 +2996,7 @@ vblur_program(const char *vertex, const char *fragment, const char *what)
 	glLinkProgram(program);
 	glGetProgramiv(program, GL_LINK_STATUS, &good);
 	say("hakios-gl: a program of ours for the blur whose radius varies (%s): %s %s\n", what, good ? "made" : "NOT MADE", said);
+	compositor_program(program, good, what);
 	return good ? program : 0;
 }
 
@@ -2505,7 +3044,8 @@ vblur_level(struct eagl *e, int from)
 	GLuint picture = e->bound[0];
 	struct vblur_chain *chain;
 	GLint view[4], box[4], width = 0, height = 0, to = from + 1;
-	GLboolean scissored, blended;
+	GLboolean scissored, blended, write_mask[4];
+	GLint read_framebuffer, draw_framebuffer;
 	GLuint source;
 
 	if (from < 0 || to >= VBLUR_LEVELS || picture == 0) {
@@ -2543,6 +3083,8 @@ vblur_level(struct eagl *e, int from)
 		glActiveTexture(GL_TEXTURE0 + e->unit);
 		return;                                 /* (the level it is to be made of is not there) */
 	}
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_framebuffer);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_framebuffer);
 	if (chain->level_width[to] == 0) {
 		GLsizei w = chain->width, h = chain->height;
 
@@ -2574,6 +3116,8 @@ vblur_level(struct eagl *e, int from)
 	glViewport(0, 0, chain->level_width[to], chain->level_height[to]);
 	glDisable(GL_SCISSOR_TEST);
 	glDisable(GL_BLEND);
+	glGetBooleanv(GL_COLOR_WRITEMASK, write_mask);
+	glColorMask(1, 1, 1, 1);
 	glUseProgram(e->halve);
 	glBindTexture(GL_TEXTURE_2D, source);
 	glUniform2f(e->halve_texel, 1.0f / (float)(from == 0 ? chain->width : chain->level_width[from]),
@@ -2582,12 +3126,14 @@ vblur_level(struct eagl *e, int from)
 	chain->made = to + 1;
 	/* back as it was */
 	glBindTexture(GL_TEXTURE_2D, picture);
+	glColorMask(write_mask[0], write_mask[1], write_mask[2], write_mask[3]);
 	glUseProgram(0);
 	(blended ? glEnable : glDisable)(GL_BLEND);
 	(scissored ? glEnable : glDisable)(GL_SCISSOR_TEST);
 	glScissor(box[0], box[1], box[2], box[3]);
 	glViewport(view[0], view[1], view[2], view[3]);
-	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, read_framebuffer);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw_framebuffer);
 	glActiveTexture(GL_TEXTURE0 + e->unit);
 }
 
@@ -2598,12 +3144,30 @@ reads_what_it_writes(struct eagl *e)
 	       *(*(uint8_t **)((char *)ca_context + 0x10) + 0x10) == FUNCTION_VARIABLE_DOWNSAMPLE;
 }
 
+// The EDR pass (61) is already skipped for texture feedback. Preserve its
+// source before applying a deferred clear, as for variable-downsample (38).
+// Depth/stencil clears still execute; unrelated draws keep their own clears.
+static void
+resolve_feedback_clear(struct eagl *e, unsigned function)
+{
+	if (e->program == 0 && e->colour != 0 && e->colour == e->bound[0] &&
+	    (function == FUNCTION_VARIABLE_DOWNSAMPLE || function == 61) && (e->unclear & GL_COLOR_BUFFER_BIT)) {
+		static unsigned notes;
+		e->unclear &= ~GL_COLOR_BUFFER_BIT;
+		if (compositor_diagnostics && notes++ < 8) {
+			char line[128];
+			snprintf(line, sizeof(line), "eagl feedback-preserved function=%u texture=%u frame=%u", function, e->colour, e->frames);
+			nativegl_text(line);
+		}
+	}
+}
+
 static void
 clear_now(struct eagl *e)
 {
 	GLint box[4] = { 0, 0, 0, 0 };
 	GLfloat colour[4] = { 0, 0, 0, 0 };
-	GLboolean boxed;
+	GLboolean boxed, write_mask[4];
 
 	if (e->unclear == 0) {
 		return;
@@ -2611,11 +3175,14 @@ clear_now(struct eagl *e)
 	boxed = glIsEnabled(GL_SCISSOR_TEST);
 	glGetIntegerv(GL_SCISSOR_BOX, box);
 	glGetFloatv(GL_COLOR_CLEAR_VALUE, colour);
+	glGetBooleanv(GL_COLOR_WRITEMASK, write_mask);
+	glColorMask(e->unclear_write[0], e->unclear_write[1], e->unclear_write[2], e->unclear_write[3]);
 	(e->unclear_boxed ? glEnable : glDisable)(GL_SCISSOR_TEST);
 	glScissor(e->unclear_box[0], e->unclear_box[1], e->unclear_box[2], e->unclear_box[3]);
 	glClearColor(e->unclear_colour[0], e->unclear_colour[1], e->unclear_colour[2], e->unclear_colour[3]);
 	glClear(e->unclear);
 	e->unclear = 0;
+	glColorMask(write_mask[0], write_mask[1], write_mask[2], write_mask[3]);
 	(boxed ? glEnable : glDisable)(GL_SCISSOR_TEST);
 	glScissor(box[0], box[1], box[2], box[3]);
 	glClearColor(colour[0], colour[1], colour[2], colour[3]);
@@ -2644,7 +3211,9 @@ plain_program(const char *fragment, const char *what)
 	glBindAttribLocation(program, 2, "vertex_texcoord0");
 	glLinkProgram(program);
 	glGetProgramiv(program, GL_LINK_STATUS, &good);
-	say("hakios-gl: a program of ours for the draws CoreAnimation makes with none (%s): %s\n", what, good ? "made" : "NOT MADE");
+	if (compositor_diagnostics || !good)
+		say("hakios-gl: a program of ours for the draws CoreAnimation makes with none (%s): %s\n", what, good ? "made" : "NOT MADE");
+	compositor_program(program, good, what);
 	return program;
 }
 
@@ -2693,6 +3262,9 @@ static uint16_t frame_refused[90], frame_noprog[90][CENSUS_KINDS];     /* (glfra
 void
 hakios_gl_function_refused(unsigned function)
 {
+	if (function < 90 && compositor_claim(1, function)) {
+		compositor_text("refused-function=%u", function);
+	}
 	if (frame_lines && function < 90) {
 		frame_refused[function]++;
 	}
@@ -2700,6 +3272,79 @@ hakios_gl_function_refused(unsigned function)
 		census[function].refused++;
 		census[function].refused_lately++;
 	}
+}
+
+/* Error-only queries preserve texture bindings; no glGetError calls or pixel reads. */
+static void
+compositor_framebuffer(struct eagl *e, const char *where)
+{
+	if (!compositor_diagnostics) return;
+	GLint draw = 0, read = 0, program = 0, view[4] = { 0, 0, 0, 0 };
+	static const GLenum attachments[] = { GL_COLOR_ATTACHMENT0, 0x8d00, 0x8d20 };
+
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(0x8b8d, &program); /* GL_CURRENT_PROGRAM */
+	glGetIntegerv(GL_VIEWPORT, view);
+	compositor_text("fbo where=%s frame=%u f=%u status=%x draw=%d read=%d tracked=%u dst=%u p=%d view=%d,%d,%d,%d",
+	    where, e->frames, e->draw_function, glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER), draw, read,
+	    e->framebuffer, e->colour, program, view[0], view[1], view[2], view[3]);
+	if (draw == 0) return;
+	for (unsigned i = 0; i < 3; i++) {
+		GLint type = 0, name = 0, level = -1, red = 0, alpha = 0, component = 0;
+		glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachments[i], GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+		if (type == 0) continue;
+		glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachments[i], GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+		if (type == GL_TEXTURE)
+			glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachments[i], 0x8cd2, &level);
+		if (i == 0) {
+			glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachments[i], 0x8212, &red);
+			glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachments[i], 0x8215, &alpha);
+			glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachments[i], 0x8211, &component);
+		}
+		compositor_text("attachment=%x type=%x name=%d level=%d red=%d alpha=%d component=%x",
+		    attachments[i], type, name, level, red, alpha, component);
+		if (type == GL_TEXTURE && level >= 0) {
+			struct texture_definition *d = texture_definition_of(e, (GLuint)name);
+			struct image *im = image_of(e, (GLuint)name);
+
+			/* Only bind objects known to be 2D; another target must not generate a diagnostic error. */
+			if (d != NULL || (im != NULL && im->to == GL_TEXTURE_2D)) {
+				GLint bound = 0, width = 0, height = 0, internal = 0, immutable = 0;
+				glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+				glBindTexture(GL_TEXTURE_2D, (GLuint)name);
+				glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_WIDTH, &width);
+				glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_HEIGHT, &height);
+				glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_INTERNAL_FORMAT, &internal);
+				glGetTexParameteriv(GL_TEXTURE_2D, 0x912f, &immutable); /* GL_TEXTURE_IMMUTABLE_FORMAT */
+				glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+				compositor_text("storage tex=%d level=%d actual=%dx%d internal=%x immutable=%d",
+				    name, level, width, height, internal, immutable);
+			}
+			if (d != NULL)
+				compositor_text("defined tex=%u source=%u frame=%u level=%d size=%dx%d internal=%x format=%x type=%x",
+				    d->texture, d->source, d->frame, d->level, d->width, d->height, d->internal, d->format, d->type);
+			if (im != NULL)
+				compositor_text("surface tex=%d target=%u size=%dx%d internal=%x format=%x type=%x plane=%u shared=%u mirror=%u",
+				    name, (unsigned)im->target, im->width, im->height, im->internal, im->format, im->type,
+				    im->plane, (unsigned)im->shared, im->mirror);
+		}
+	}
+}
+
+/* Only called with a function already read by a draw path. No CA pointers or pixels are read here. */
+static void
+compositor_draw(struct eagl *e, unsigned function, unsigned kind)
+{
+	GLint view[4] = { 0, 0, 0, 0 };
+	unsigned given = function < 90 ? function_given[function] : 0;
+
+	if (function > 90 || kind > 11 || !compositor_claim(kind == 9 ? 5 : 0, function * 16 + kind)) return;
+	glGetIntegerv(GL_VIEWPORT, view);
+	compositor_text("draw f=%u k=%u frame=%u p=%u src=%u,%u dst=%u fb=%u view=%d,%d,%d,%d n=%u v=%.3g,%.3g",
+	    function, kind, e->frames, e->program, e->bound[0], e->bound[1], e->colour, e->framebuffer,
+	    view[0], view[1], view[2], view[3], given,
+	    given ? (double)function_values[function][0] : 0., given >= 20 ? (double)function_values[function][19] : 0.);
 }
 
 static void
@@ -2710,6 +3355,7 @@ census_draw(struct eagl *e, unsigned function, unsigned kind)
 	float low[2] = { 0, 0 }, high[2] = { 0, 0 };
 	size_t used = 0;
 
+	compositor_draw(e, function, kind);
 	if (frame_lines && function < 90) {
 		frame_noprog[function][kind]++;
 	}
@@ -2801,7 +3447,7 @@ census_report(void)
 {
 	char lately[900] = "", all[900] = "";
 	size_t used_lately = 0, used_all = 0;
-	uint64_t now = now_us();
+	uint64_t now = census_on ? now_us() : 0;
 
 	if (!census_on || now - census_told < 10000000) {
 		return;
@@ -3051,9 +3697,20 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 	static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 	static const GLfloat corners[8] = { -1, -1, 1, -1, -1, 1, 1, 1 };
 	GLint view[4], box[4], width = 0, height = 0, enabled[3];
-	GLboolean scissored, blending;
+	GLint read = 0, draw = 0, program = 0;
+	GLboolean scissored, blending, write_mask[4];
 	GLfloat flat[4], alpha = clamp01(g->colours[19]);
 
+	if (compositor_claim(3, alpha == 0 ? 0 : 1)) {
+		compositor_text("flatten frame=%u tex=%u alpha=%.3g rgb=%.3g,%.3g,%.3g", e->frames, texture,
+		    (double)alpha, (double)g->colours[16], (double)g->colours[17], (double)g->colours[18]);
+	}
+
+	/* This can run inside another replacement draw; tracked CA state is not the active GL state. */
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	glGetIntegerv(0x8b8d, &program); /* GL_CURRENT_PROGRAM */
+	glGetBooleanv(GL_COLOR_WRITEMASK, write_mask);
 	g->state = GROUP_NONE;
 	group_flattened++;
 	flat[3] = alpha;
@@ -3075,6 +3732,9 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+	if (compositor_diagnostics && glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE && compositor_claim(3, 0x10000u))
+		compositor_framebuffer(e, "group-flatten");
+	glColorMask(1, 1, 1, 1);
 	glViewport(0, 0, width, height);
 	glDisable(GL_SCISSOR_TEST);
 	if (flat[3] == 0) {
@@ -3102,10 +3762,12 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 		for (GLuint i = 0; i < 3; i++) {
 			(enabled[i] ? glEnableVertexAttribArray : glDisableVertexAttribArray)(i);
 		}
-		glUseProgram(e->program);
+		glUseProgram((GLuint)program);
 		(blending ? glEnable : glDisable)(GL_BLEND);
 	}
-	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
+	glColorMask(write_mask[0], write_mask[1], write_mask[2], write_mask[3]);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
 	glViewport(view[0], view[1], view[2], view[3]);
 	glScissor(box[0], box[1], box[2], box[3]);
 	(scissored ? glEnable : glDisable)(GL_SCISSOR_TEST);
@@ -3161,6 +3823,7 @@ group_draw_begin(struct eagl *e, GLint enabled[4])
 	GLfloat matrix[16], texmat[4] = { 1, 1, 0, 0 };
 	bool cover;
 
+	if (compositor_diagnostics) e->draw_function = function;
 	if (!group_vibrant_on || e->colour == 0 || e->framebuffer == 0) {
 		return 0;
 	}
@@ -3179,12 +3842,14 @@ group_draw_begin(struct eagl *e, GLint enabled[4])
 		memcpy(matrix, e->matrix != NULL ? e->matrix : identity, sizeof(matrix));
 		colours = function_values[function];
 		cover = true;
+		compositor_draw(e, function, 10);
 	} else if (e->program != 0 && e->bound[0] != 0 && e->bound[0] != e->colour && (from = group_of(e, e->bound[0])) != NULL &&
 	    from->state == GROUP_VIBRANT) {
 		/* a group that holds a vibrant layer laid over something */
+		compositor_draw(e, function, 11);
 		bool laid = function == 1 || function == 3;    /* ("img", "cim": the picture as it is, by the colour) */
 
-		if (function < 90 && !said[function]) {
+		if ((compositor_diagnostics || census_on) && function < 90 && !said[function]) {
 			said[function] = 1;
 			say("hakios-gl: a group that holds a vibrant layer is drawn with CoreAnimation's function %u (\"%s\"): %s\n",
 			    function, census_name(function), laid ? "the layer over what is behind it" : "made what it would have been");
@@ -3288,11 +3953,10 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		e->line.vrb += function == FUNCTION_VARIABLE_BLUR;
 	}
 
-	if (e->unclear != 0 && reads_what_it_writes(e)) {
-		e->unclear = 0;
-	}
+	resolve_feedback_clear(e, function);
 	clear_now(e);
 	if (e->program != 0) {
+		compositor_draw(e, function, 9);
 		return false;
 	}
 	if (vblur_on && reads_what_it_writes(e) && function_given[FUNCTION_VARIABLE_DOWNSAMPLE] != 0) {
@@ -3300,7 +3964,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 
 		vblur_level(e, (int)function_values[FUNCTION_VARIABLE_DOWNSAMPLE][0]);
 		census_draw(e, function, CENSUS_LEVEL);
-		if (told++ < 8) {
+		if (compositor_diagnostics && told++ < 8) {
 			say("hakios-gl: a blur whose radius varies: level %d of texture %u made of level %d\n",
 			    (int)function_values[FUNCTION_VARIABLE_DOWNSAMPLE][0] + 1, e->bound[0],
 			    (int)function_values[FUNCTION_VARIABLE_DOWNSAMPLE][0]);
@@ -3320,7 +3984,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		census_draw(e, function, CENSUS_NOT_DRAWN);
 		return false;
 	}
-	if (function < 90 && !said[function]) {
+	if ((compositor_diagnostics || census_on) && function < 90 && !said[function]) {
 		said[function] = 1;
 		say("hakios-gl: a draw with no program is CoreAnimation's function %u (\"%s\")\n", function, census_name(function));
 	}
@@ -3443,7 +4107,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 			glEnableVertexAttribArray(i);
 		}
 	}
-	if (eagl_tracing || e->plain_said < 4) {
+	if (eagl_tracing || (compositor_diagnostics && e->plain_said < 4)) {
 		const GLfloat *position = e->arrays[0].pointer, *where = e->arrays[2].pointer;
 
 		e->plain_said++;
@@ -3641,22 +4305,22 @@ static void
 my_glFlush(void *context)
 {
 	struct eagl *e = context;
-	uint64_t began, t0, t1, t2;
+	uint64_t t0, t1, t2;
 
 	EAGL_ENTER(e, 0x2d8);
 	if (eagl_tracing) {
 		eagl_trace("glFlush()\n");
 	}
-	t0 = now_us();
+	t0 = compositor_diagnostics ? now_us() : 0;
 	clear_now(e);
-	t1 = now_us();
+	t1 = compositor_diagnostics ? now_us() : 0;
 	glFlush();
-	t2 = now_us();
+	t2 = compositor_diagnostics ? now_us() : 0;
 	e->flushing += t2 - t1;
 	frame_end(e, false);
 	flush_clear_us += t1 - t0;
 	flush_real_us += t2 - t1;
-	flush_end_us += now_us() - t2;
+	if (compositor_diagnostics) flush_end_us += now_us() - t2;
 	EAGL_LEAVE(e, 0x2d8);
 }
 
@@ -3679,18 +4343,31 @@ static void
 my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
 {
 	struct eagl *e = context;
+	bool blocked = false;
 
 	EAGL_ENTER(e, 0x1e0);
 	clear_now(e);
 	for (GLsizei i = 0; i < n; i++) {
+		struct image *image = image_of(e, textures[i]);
+		if (image != NULL && !image_publish(e, image, "delete")) {
+			image->retiring = true;
+			blocked = true;
+		}
+	}
+	for (GLsizei i = 0; i < n; i++) {
+		struct image *image = image_of(e, textures[i]);
+		/* A failed publication still owns pixels. Retain this name for retry;
+		 * unrelated names in the same deletion request can be released. */
+		if (image != NULL && image->drawn) continue;
+		struct texture_definition *d = compositor_diagnostics ? texture_definition_of(e, textures[i]) : NULL;
+		if (d != NULL) d->texture = 0;
 		image_forget(e, textures[i]);
 		vblur_forget(e, textures[i]);
 		group_forget(e, textures[i]);
-		if (textures[i] == e->colour) {
-			e->colour = 0;          /* (a texture that is deleted leaves the framebuffer bound) */
-		}
+		if (textures[i] == e->colour) e->colour = 0;
+		if (blocked) glDeleteTextures(1, &textures[i]);
 	}
-	glDeleteTextures(n, textures);
+	if (!blocked) glDeleteTextures(n, textures);
 	EAGL_LEAVE(e, 0x1e0);
 }
 
@@ -3723,14 +4400,14 @@ my_glGetString(void *context, GLenum name)
 	/* The list of extensions is longer than a line of the log, and it was being cut at 900
 	   characters -- which is where one looks to see whether the driver takes a compressed
 	   texture of iOS's kind (ASTC). In pieces, then, so that none of it is lost. */
-	if (name == GL_EXTENSIONS && string != NULL) {
+	if (compositor_diagnostics && name == GL_EXTENSIONS && string != NULL) {
 		size_t length = strlen((const char *)string);
 
 		say("hakios-gl: asked for string %#x, %zu characters:\n", name, length);
 		for (size_t at = 0; at < length; at += 700) {
 			say("hakios-gl:  %.700s\n", (const char *)string + at);
 		}
-	} else {
+	} else if (compositor_diagnostics) {
 		say("hakios-gl: asked for string %#x: %.900s\n", name, string ? (const char *)string : "(none)");
 	}
 	EAGL_LEAVE(e, 0x3b0);
@@ -3745,7 +4422,7 @@ my_glGetIntegerv(void *context, GLenum name, GLint *values)
 
 	EAGL_ENTER(e, 0x348);
 	glGetIntegerv(name, values);
-	if (said < 40) {
+	if (compositor_diagnostics && said < 40) {
 		said++;
 		say("hakios-gl: asked for number %#x: %d\n", name, values[0]);
 	}
@@ -3777,10 +4454,17 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 		group_forget(e, e->bound[e->unit]);
 	}
 	uint64_t began = slow_calls_us != 0 ? now_us() : 0;
-	while (glGetError() != 0) {
+	if (check_errors) while (glGetError() != 0) {}
+	if (compositor_diagnostics && target == GL_TEXTURE_2D) {
+		GLint texture = 0;
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+		texture_defined(e, (GLuint)texture, 1, level, internal, width, height, format, type);
 	}
+	GLuint replaced = 0;
+	if (!image_storage_begin(e, target, level, &replaced)) { EAGL_LEAVE(e, 0x970); return; }
 	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
-	{
+	image_storage_end(e, replaced);
+	if (check_errors) {
 		/* A texture CoreAnimation made that the library refused: what it asked for, so a format
 		 * the driver does not take (the glyph masks) can be told from one it does. */
 		GLenum error = glGetError();
@@ -3799,25 +4483,61 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 	EAGL_LEAVE(e, 0x970);
 }
 
+/* Keep the storage request's origin; the original GL error consumer remains unchanged. */
+static void
+my_glTexStorage2D(void *context, GLenum target, GLsizei levels, GLenum internal, GLsizei width, GLsizei height)
+{
+	struct eagl *e = context;
+
+	EAGL_ENTER(e, 0x2040);
+	clear_now(e);
+	if (compositor_diagnostics && target == GL_TEXTURE_2D) {
+		GLint texture = 0;
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+		texture_defined(e, (GLuint)texture, 2, 0, (GLint)internal, width, height, 0, 0);
+	}
+	GLuint replaced = 0;
+	if (!image_storage_begin(e, target, 0, &replaced)) { EAGL_LEAVE(e, 0x2040); return; }
+	glTexStorage2D(target, levels, internal, width, height);
+	image_storage_end(e, replaced);
+	EAGL_LEAVE(e, 0x2040);
+}
+
 /* An upload into part of a texture: a group with a vibrant layer in it is made what it would have been first. */
 static void
 my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format,
     GLenum type, const void *pixels)
 {
 	struct eagl *e = context;
+	struct image *image = NULL;
+	GLint texture = 0;
 
 	EAGL_ENTER(e, 0x9a0);
 	if (eagl_tracing) {
 		eagl_trace("glTexSubImage2D(%#x, %d, %d, %d, %d, %d, %#x, %#x, %p)\n", target, level, x, y, width, height, format, type,
 		    pixels);
 	}
+	frame_begin(e);
 	clear_now(e);
+	if (target == GL_TEXTURE_2D && level == 0 && width > 0 && height > 0) {
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+		image = image_of(e, (GLuint)texture);
+		if (image != NULL && (x < 0 || y < 0 || width > image->width || height > image->height ||
+		    x > image->width - width || y > image->height - height || !image_render_target(e, image))) image = NULL;
+	}
 	if (target == GL_TEXTURE_2D && e->unit < 8 && e->groups != NULL) {
 		group_read(e, e->bound[e->unit]);
 		group_forget(e, e->bound[e->unit]);
 	}
 	glTexSubImage2D(target, level, x, y, width, height, format, type, pixels);
-	{
+	if (image != NULL) {
+		/* Uploads change the surface view just as render/copy writes do. A
+		 * snapshot consumer and minification must see those updated pixels. */
+		image->drawn = image->painted = true;
+		if (image->mipmapped) image->mip_pending = e->mip_pending = true;
+		image->damaged = false;  /* uploads ignore the drawing scissor */
+	}
+	if (check_errors) {
 		GLenum error = glGetError();
 		static unsigned texture_errors;
 
@@ -3829,26 +4549,111 @@ my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y, 
 	EAGL_LEAVE(e, 0x9a0);
 }
 
+/* Snapshot reads must observe deferred clears and materialized group pixels,
+ * including when READ and DRAW name different framebuffers. */
+static GLuint
+framebuffer_read_texture(void)
+{
+	GLint read = 0, kind = 0, texture = 0;
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	if (read != 0) {
+		glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &kind);
+		if (kind == GL_TEXTURE) glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &texture);
+	}
+	return (GLuint)texture;
+}
+
+static void
+my_glCopyTexImage2D(void *context, GLenum target, GLint level, GLenum internal, GLint x, GLint y,
+    GLsizei width, GLsizei height, GLint border)
+{
+	struct eagl *e = context;
+	GLuint source;
+	GLint texture = 0;
+
+	EAGL_ENTER(e, 0x1b8);
+	frame_begin(e);
+	clear_now(e);
+	source = e->groups != NULL || compositor_diagnostics ? framebuffer_read_texture() : 0;
+	if (e->groups != NULL) group_read(e, source);
+	if (target == GL_TEXTURE_2D && (e->groups != NULL || compositor_diagnostics)) {
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+		group_forget(e, (GLuint)texture);
+		texture_defined(e, (GLuint)texture, 5, level, (GLint)internal, width, height, 0, 0);
+	}
+	GLuint replaced = 0;
+	if (!image_storage_begin(e, target, level, &replaced)) { EAGL_LEAVE(e, 0x1b8); return; }
+	glCopyTexImage2D(target, level, internal, x, y, width, height, border);
+	image_storage_end(e, replaced);
+	if (compositor_claim(7, 0x10000000u | (GLuint)texture)) {
+		compositor_text("copy-image src=%u dst=%d level=%d size=%dx%d internal=%x frame=%u",
+		    source, texture, level, width, height, internal, e->frames);
+	}
+	EAGL_LEAVE(e, 0x1b8);
+}
+
+static void
+my_glReadPixels(void *context, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels)
+{
+	struct eagl *e = context;
+	GLuint source;
+
+	EAGL_ENTER(e, 0x770);
+	clear_now(e);
+	source = e->groups != NULL || compositor_diagnostics ? framebuffer_read_texture() : 0;
+	if (e->groups != NULL) group_read(e, source);
+	glReadPixels(x, y, width, height, format, type, pixels);
+	if (compositor_claim(7, 0x20000000u | source)) {
+		compositor_text("read-pixels src=%u size=%dx%d format=%x type=%x frame=%u",
+		    source, width, height, format, type, e->frames);
+	}
+	EAGL_LEAVE(e, 0x770);
+}
+
 /* A copy of what is drawn into a texture: both made what they would have been first (see group_draw_begin()). */
 static void
 my_glCopyTexSubImage2D(void *context, GLenum target, GLint level, GLint x0, GLint y0, GLint x, GLint y, GLsizei width,
     GLsizei height)
 {
 	struct eagl *e = context;
+	struct image *image = NULL;
+	GLint read = 0, kind = 0, source = 0, texture = 0;
 
 	EAGL_ENTER(e, 0x1c8);
 	if (eagl_tracing) {
 		eagl_trace("glCopyTexSubImage2D(%#x, %d, %d, %d, %d, %d, %d, %d)\n", target, level, x0, y0, x, y, width, height);
 	}
+	frame_begin(e);
 	clear_now(e);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	if (read != 0) {
+		glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &kind);
+		if (kind == GL_TEXTURE) glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &source);
+	}
+	if (target == GL_TEXTURE_2D && level == 0 && width > 0 && height > 0) {
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+		image = image_of(e, (GLuint)texture);
+		if (image != NULL && (x0 < 0 || y0 < 0 || width > image->width || height > image->height ||
+		    x0 > image->width - width || y0 > image->height - height || !image_render_target(e, image))) image = NULL;
+	}
 	if (e->groups != NULL) {
-		group_read(e, e->colour);
+		group_read(e, (GLuint)source);
 		if (target == GL_TEXTURE_2D && e->unit < 8) {
 			group_read(e, e->bound[e->unit]);
 			group_forget(e, e->bound[e->unit]);
 		}
 	}
 	glCopyTexSubImage2D(target, level, x0, y0, x, y, width, height);
+	if (image != NULL) {
+		image->drawn = image->painted = true;
+		if (image->mipmapped) image->mip_pending = e->mip_pending = true;
+		/* Copies ignore scissor; a full mirror copy also covers any earlier draws. */
+		image->damaged = false;
+	}
 	EAGL_LEAVE(e, 0x1c8);
 }
 
@@ -3941,13 +4746,17 @@ my_glCompressedTexImage2D(void *context, GLenum target, GLint level, GLenum inte
 	static unsigned told;
 
 	EAGL_ENTER(e, 0xbe8);
+	clear_now(e);
 	if (level == 0) {
 		note_format("compressed", internal, 0, 0, width, height);
 	}
-	if (told < 40) {
+	if (compositor_diagnostics && told < 40) {
 		(void)glGetError();             /* so that what is left behind is this call's own */
 	}
+	GLuint replaced = 0;
+	if (!image_storage_begin(e, target, level, &replaced)) { EAGL_LEAVE(e, 0xbe8); return; }
 	glCompressedTexImage2D(target, level, internal, width, height, border, size, data);
+	image_storage_end(e, replaced);
 	/*
 	 * A format the driver has not got is refused here, and then the texture stays undefined and
 	 * is read as whatever the driver leaves in it -- magenta, with some. The first of these are
@@ -3955,7 +4764,7 @@ my_glCompressedTexImage2D(void *context, GLenum target, GLint level, GLenum inte
 	 * asked for over the first six hundred frames (see eagl_leave) and the pictures of the
 	 * switcher arrive long after that.
 	 */
-	if (told < 40) {
+	if (compositor_diagnostics && told < 40) {
 		GLenum error = glGetError();
 		char head[3 * 32 + 1] = "";
 
@@ -4011,6 +4820,8 @@ my_glBindFramebuffer(void *context, GLenum target, GLuint framebuffer)
 			glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 			    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
 			e->colour = (GLuint)name;
+			glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+			    GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL, &e->colour_level);
 		}
 	}
 	EAGL_LEAVE(e, 0x1508);
@@ -4025,6 +4836,7 @@ my_glFramebufferTexture2D(void *context, GLenum target, GLenum attachment, GLenu
 	clear_now(e);
 	if (attachment == GL_COLOR_ATTACHMENT0 && target != GL_READ_FRAMEBUFFER) {
 		e->colour = texture;
+		e->colour_level = level;
 	}
 	if (eagl_tracing) {
 		eagl_trace("glFramebufferTexture2D(%#x, %#x, %#x, %u, %d)\n", target, attachment, to, texture, level);
@@ -4173,7 +4985,7 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 	bool fragment = e->fragment[shader % 256], fetch;
 	const GLchar *parts[6] = { "#version 300 es\n", fragment ? fragment_start : vertex_start, "", NULL, "",
 		                   full_precision ? all_highp : "" };
-	size_t size = 1, extensions = 0;
+	size_t size = 1;
 	char *text, *line, *head;
 
 	EAGL_ENTER(e, 0x12a0);
@@ -4196,7 +5008,6 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 		strncat(head, line, length);
 		strcat(head, "\n");
 		line[0] = line[1] = '/';
-		extensions++;
 	}
 	parts[0] = head;
 	parts[3] = text;
@@ -4252,6 +5063,9 @@ my_glCompileShader(void *context, GLuint shader)
 	e->shaders++;
 	if (!good) {
 		glGetShaderInfoLog(shader, sizeof(said), NULL, said);
+		if (compositor_claim(2, 0x40000000u | shader)) {
+			compositor_text("compile-failed shader=%u frame=%u %.120s", shader, e->frames, said);
+		}
 		say("hakios-gl: A SHADER DOES NOT COMPILE (shader %u): %s\n", shader, said);
 		if (e->sources[shader % 256] != NULL) {
 			say_long("its text", e->sources[shader % 256]);
@@ -4276,6 +5090,9 @@ my_glLinkProgram(void *context, GLuint program)
 	e->programs++;
 	if (!good) {
 		glGetProgramInfoLog(program, sizeof(said), NULL, said);
+		if (compositor_claim(2, 0x20000000u | program)) {
+			compositor_text("link-failed program=%u frame=%u %.120s", program, e->frames, said);
+		}
 		say("hakios-gl: A PROGRAM DOES NOT LINK (program %u): %s\n", program, said);
 	}
 	EAGL_LEAVE(e, 0x12c0);
@@ -4433,22 +5250,23 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	image->invert = invert;
 	image->width = width;
 	image->height = height;
+	texture_defined(e, (GLuint)texture, 3, 0, (GLint)internal, width, height, (GLenum)format, (GLenum)type);
 	note_format(invert ? "IOSurface shown, inverted" : "IOSurface shown", image->internal, image->format, image->type, width,
 	    height);
-	if (shown++ < 24) {
+	if (compositor_diagnostics && shown++ < 24) {
 		say("hakios-gl: -texImageIOSurface: surface %u ('%.4s' %zu x %zu, %zu planes) as texture %d: %d x %d, plane %u%s\n",
 		    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(IOSurfaceGetPixelFormat(surface)) },
 		    IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), IOSurfaceGetPlaneCount(surface), texture, width,
 		    height, plane, invert ? ", inverted" : "");
 	}
 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
-	began = now_us();
+	began = compositor_diagnostics ? now_us() : 0;
 	if (!surface_shared(e, image)) {
 		surface_changed(e, image);              /* (what it adds up to now) */
 		surface_to_texture(e, image);
 	}
-	e->attaching += now_us() - began;
-	if (shown <= 8 || ((size_t)width * (size_t)height >= 400000 && large++ < 8)) {
+	if (compositor_diagnostics) e->attaching += now_us() - began;
+	if (compositor_diagnostics && (shown <= 8 || ((size_t)width * (size_t)height >= 400000 && large++ < 8))) {
 		char line[64];
 
 		snprintf(line, sizeof line, "eagl tx s%u %dx%d %x/%x sh%u", (unsigned)IOSurfaceGetID(surface), (int)width,
@@ -4492,6 +5310,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	image->height = (GLsizei)IOSurfaceGetHeight(surface);
 	image->internal = image->format = GL_BGRA;
 	image->type = GL_UNSIGNED_BYTE;
+	texture_defined(e, (GLuint)texture, 4, 0, GL_BGRA, image->width, image->height, GL_BGRA, GL_UNSIGNED_BYTE);
 	/*
 	 * A surface with no pixel format is memory CoreAnimation has made a surface around: a
 	 * picture to be shown, as an application has drawn it. Those that come this way are mostly
@@ -4509,13 +5328,13 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	 * What is attached is as often read as drawn into (a picture CoreAnimation has made a surface
 	 * around, to be shown): a texture that is not the surface's memory starts with what the surface holds.
 	 */
-	began = now_us();
+	began = compositor_diagnostics ? now_us() : 0;
 	if (surface_mirrored(e, image) || !surface_shared(e, image)) {
 		surface_changed(e, image);              /* (what it adds up to now) */
 		surface_to_texture(e, image);
 	}
-	e->attaching += now_us() - began;
-	if (attached < 8) {
+	if (compositor_diagnostics) e->attaching += now_us() - began;
+	if (compositor_diagnostics && attached < 8) {
 		char line[64];
 
 		snprintf(line, sizeof line, "eagl at s%u %dx%d px%x inv%u sh%u mr%u", (unsigned)IOSurfaceGetID(surface),
@@ -4523,7 +5342,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 		    (unsigned)(image->mirror != 0));
 		nativegl_text(line);
 	}
-	if (attached++ < 24) {
+	if (compositor_diagnostics && attached++ < 24) {
 		say("hakios-gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row)%s%s\n", texture,
 		    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, image->width, image->height,
 		    IOSurfaceGetBytesPerRow(surface), inverted ? ", drawn inverted" : "", image->shared ? ": its memory" :
@@ -4547,11 +5366,22 @@ my_dealloc(id self, SEL selector)
 				contexts[i] = NULL;
 			}
 		}
-		if (current == e) {
-			hakios_gl_make_current(NULL);
-			current = NULL;
+		struct eagl *previous = current;
+		bool active = current == e || hakios_gl_make_current(e->gl);
+		if (active) {
+			current = e;
+			frame_end(e, false);
+			glFinish();
+			if (previous != NULL && previous != e && hakios_gl_make_current(previous->gl)) {
+				current = previous;
+			} else {
+				hakios_gl_make_current(NULL);
+				current = NULL;
+			}
 		}
 		hakios_gl_destroy(e->gl);
+		images_release(e);
+		free(e->groups);
 		free(e);
 	}
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
@@ -4601,6 +5431,7 @@ install(void)
 	const char *argument;
 
 	ktrace("eagl ctor class=%p", (void *)class);
+	ktrace("eagl mirror=scissor-isolated publish=after-wait");
 
 	/* the kernel's boot-args are where a run is told things */
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
@@ -4644,6 +5475,8 @@ install(void)
 		}
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
 		say_kernel = strstr(arguments, "glsay=1") != NULL;
+		compositor_diagnostics = strstr(arguments, "gldiag=1") != NULL;
+		check_errors = compositor_diagnostics;
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
@@ -4685,7 +5518,7 @@ install(void)
 			}
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
-		fast_surface_hash = strstr(arguments, "glh=1") != NULL;
+		fast_surface_hash = strstr(arguments, "glh=0") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		damage_blits = strstr(arguments, "gldamage=1") != NULL;
 		fill_accounting = strstr(arguments, "glfill=1") != NULL || strstr(arguments, "glf=1") != NULL;

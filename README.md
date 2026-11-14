@@ -1,49 +1,41 @@
 # UniXNU on Redmi K30 5G (picasso, SM7250)
 
-> **This branch builds an experimental iPhone X / iOS 16.7.16 (20H392) target.**
-> Firmware inputs, ADT identity and the owner-signed root policy have been updated.
-> XNU 10063 / Darwin 23 and its qualified native kexts are retained. iOS 16
-> userspace compatibility is not yet established. Input, root-policy and native
-> ABI checks gate the build; runtime validation is reported separately.
-> Device results below describe the previous iPadOS branch.
-
-> **Status: original early userspace runs; service startup is still incomplete.**
-> UFS, authenticated OS/SystemOS, the dyld shared cache, volatile Data and AES
-> startup pass on the device. The latest tested image reboots after a userspace
-> watchdog timeout. The current SystemOS union change addresses an observed
-> missing-library abort and passes [build 77](https://github.com/YinCQL/UniXNU-picasso/actions/runs/40974341838);
-> device validation is pending. CPU/GOP display is next; see
-> [the investigation](docs/objc-trampolines-investigation.md).
->
-> UEFI firmware: https://github.com/YinCQL/uefi_picasso
+Experimental iPhone X / iOS 16.7.16 (20H392) userspace on XNU 10063 / Darwin 23,
+with the retained native kext backend. This is a development port.
 
 ## Progress
 
-- **UEFI firmware: working.** Boots to the UniXNU menu. UFS Mass Storage, GOP
-  framebuffer, button input and stable boot all work. Built via the UniXNU build
-  driver; produces a flashable `Mu-picasso-unixnu-0.img`.
-- **XNU kernel: reaches original launchd and system services.** NativeUfs
-  publishes the authenticated OS and SystemOS volumes; APFS mounts them and
-  dyld maps the shared cache. A separate writable Data volume runs in RAM.
-  Service failures and the watchdog reboot remain under investigation; a
-  usable SpringBoard display and persistent Data are not established.
-- **USB kernel console: working.** The kernel exposes a CDC-ACM device named
-  `picasso XNU USB console` and streams the buffered/live console over DWC3.
-  Capture it on macOS with `scripts/capture-picasso-usb-console.py`, or on Windows
-  by double-clicking `capture-logs.cmd` for automatic device detection and saving; see
-  `docs/usb-console-bringup.md` for hardware results and safeguards.
+- SpringBoard and apps run on the device, with touch, buttons, brightness,
+  NativeGL rendering and speaker audio. Boot audio self-tests are disabled by default.
+- Authenticated OS/SystemOS and unencrypted persistent 20 GiB Data are working.
+- Battery percentage, charging status and USB CDC-ACM logging work. Charging is
+  source-limited: computer USB stays at 500 mA; a tested USB-A adapter reaches
+  about 1.6 A at 5.1 V. The 5 V / 3 A policy is a ceiling, not a guaranteed rate.
+- Long-press power opens the shutdown UI, and shutdown backlight delay is fixed.
+- Known issues: app-switcher card edge lines and intermittent white cards;
+  suspend/wake, standby consumption and battery learning still need work.
+  Other hardware support and complete shutdown remain under validation.
 
+USB logs: run `capture-logs.cmd` on Windows, or
+`scripts/capture-picasso-usb-console.py` on macOS.
 
 ## Build
 
-- Firmware: `Build UniXNU UEFI for picasso` workflow -> `fastboot boot Mu-picasso-unixnu-0.img`.
-- Kernel + payload + boot image: `Compose Boot Image (FD + kernel + payload)`
-  workflow (macos-latest).
+- Firmware: [UEFI for picasso](https://github.com/YinCQL/uefi_picasso).
+- Kernel, 80 MiB media payload and boot image: run
+  `Compose Boot Image (FD + kernel + payload)` manually on the selected branch.
+  It builds the audio HAL, NativeGL and runtime UI with real Apple SDK inputs,
+  then verifies signatures, Data identity and the payload.
+- Existing persistent Data requires its exact saved seed. Compose reuses a
+  compatible retained artifact, or accepts an explicit `seed_artifact_id`.
+  If no seed is available, it stops unless `create_data_seed` is explicitly
+  enabled for a new installation. A new seed cannot restore an existing Data overlay.
+- Build success does not establish device stability or complete hardware support.
 
 ## Credits
 
-- [silenzio111](https://github.com/silenzio111) 
-- [huydre](https://github.com/huydre) 
+- [silenzio111](https://github.com/silenzio111)
+- [huydre](https://github.com/huydre)
 
 ## Reference
 

@@ -31,6 +31,7 @@ void picasso_keystore_probe(void);
 void picasso_hid_start_later(void);
 void picasso_pr13_start(void);
 void picasso_backlight_start(IOService *);
+void picasso_power_start(void);
 void native_gop_presenter_static_init(void) __asm__("__GLOBAL__sub_I_NativeGOPPresenter.cpp");
 bool native_gop_glue_start(IOService *nub);
 void picasso_hid_frame_presented(void);
@@ -40,8 +41,6 @@ kern_return_t OSKextLoadKextWithIdentifier(const char *);
 }
 
 static IOService *pendingDisplay;
-static IOService *activeDisplay;
-static IOPlatformDevice *activeNub;
 static bool initialized, screenReleased;
 static unsigned reportCounts[12][2];
 static IORegistryEntry *displayChosen;
@@ -64,9 +63,15 @@ static unsigned takeReport(unsigned *counter) {
     return 0;
 }
 
+static bool displayDiagnostics(void) {
+    static int enabled=-1;
+    if(enabled<0) {unsigned on=0;PE_parse_boot_argn("gldiag",&on,sizeof on);enabled=on==1;}
+    return enabled==1;
+}
+
 // Bounded per-event output, including failures, without logging every frame.
 static void report(unsigned event, uint64_t a, uint64_t b, uint64_t c, bool failed = false) {
-    if (event >= 12) return;
+    if (event >= 12 || (!failed && !displayDiagnostics())) return;
     unsigned sample = takeReport(&reportCounts[event][failed ? 1 : 0]);
     if (!sample) return;
     IOLog("PICASSO_DISPLAY event=%u sample=%u a=%llx b=%llx c=%llx failure=%u\n",
@@ -135,16 +140,17 @@ extern "C" void native_legacy_retirement_observed(IOService *) { report(9, 1, 0,
 extern "C" void native_legacy_swap_geometry_observed(const uint32_t *a, const uint32_t *b, uint32_t o0, uint32_t o1,
     uint32_t o2, uint32_t w, uint32_t h) {
     static unsigned count;
-    if (takeReport(&count)) IOLog("PICASSO_DISPLAY geometry rect0=%u,%u,%u,%u rect1=%u,%u,%u,%u options=%x,%x,%x size=%ux%u\n",
+    if (displayDiagnostics() && takeReport(&count)) IOLog("PICASSO_DISPLAY geometry rect0=%u,%u,%u,%u rect1=%u,%u,%u,%u options=%x,%x,%x size=%ux%u\n",
         a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], o0, o1, o2, w, h);
 }
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks, uint64_t bytes) {
     report(10, ticks, bytes, 0);
+    if(!displayDiagnostics()) return;
     static unsigned count;
     unsigned sample=__atomic_add_fetch(&count,1,__ATOMIC_RELAXED);
     if(sample<=4 || sample%64==0) {
         uint64_t hz=0;__asm__ volatile("mrs %0, cntfrq_el0":"=r"(hz));
-        IOLog("PICASSO_DISPLAY copy sample=%u ticks=%llu hz=%llu stored_bytes=%llu\n",sample,ticks,hz,bytes);
+        IOLog("PICASSO_DISPLAY copy sample=%u ticks=%llu hz=%llu stored_bytes=%llu compare=exact64-paired\n",sample,ticks,hz,bytes);
     }
 }
 extern "C" void native_legacy_vsync_observed(unsigned event, unsigned hz) { report(11, event, hz, 0); }
@@ -153,6 +159,7 @@ extern "C" void native_legacy_frame_observed(unsigned kind, uint64_t pixels, uin
     // A substantial rendered UI, not the centered logo or a blank, ends boot input.
     if(kind==0 && pixels!=UINT64_MAX && pixels>=1080ULL*2400/8)
         picasso_hid_content_presented();
+    if(!displayDiagnostics()) return;
     static unsigned count, frames;
     // Count every completed copy/blank/held request; unscanned pixels are unknown.
     unsigned frame = __atomic_add_fetch(&frames, 1, __ATOMIC_RELAXED);
@@ -190,6 +197,15 @@ static bool matchWord(IORegistryEntry *entry, const char *key, uint32_t value, b
     OSSafeReleaseNULL(data);
     added = ok;
     return ok;
+}
+
+// The native framebuffer selector expects a uint32 OSData containing pixels
+// per inch. The 1080 x 2400 G7A panel is about 69.5 x 154.4 mm: 395 PPI.
+// MobileGestalt forwards this to UIKit's physical dock-button sizing.
+static bool publishPanelPitch(IORegistryEntry *entry, uint32_t width, uint32_t height) {
+    if (!entry || width != 1080 || height != 2400) return false;
+    bool added = false;
+    return matchWord(entry, "dot-pitch", 395, added);
 }
 
 // Honor the ADT's iPhone scale while keeping the existing 2x default when no
@@ -317,10 +333,10 @@ static void publishAcceleratorStub(void) {
     OSSafeReleaseNULL(accel);
     IOLog("PICASSO_ACCEL published=%u\n", started);
     // Its metaclass was registered with the accelerator's above (same file). boot-arg
-    // picasso-power-source=0 leaves the fixed "full, on a charger" power source out.
+    // picasso-power-source=0 leaves the gauge service disabled.
     unsigned power = 1;
     PE_parse_boot_argn("picasso-power-source", &power, sizeof(power));
-    if (power == 1) IOLog("PICASSO_POWER fixed power source published=%u\n", picasso_power_source_publish());
+    if (power == 1) IOLog("PICASSO_POWER battery service started=%u\n", picasso_power_source_publish());
 }
 
 // IOBSD is published at this call site. Load the original software network
@@ -340,6 +356,7 @@ static void picasso_network_stack_start(void) {
 }
 
 extern "C" void native_legacy_display_late_probe(void) {
+    picasso_power_start();
     picasso_network_stack_start();
     picasso_keystore_probe();
     IOService *display = pendingDisplay;
@@ -366,7 +383,8 @@ extern "C" void native_legacy_display_late_probe(void) {
     const char type[] = "display-subsystem";
     OSData *typeData = OSData::withBytes(type, sizeof(type));
     bool nubAttached = false, nubStarted = false, dtAttached = false, attached = false, started = false;
-    if (nub && memory && ranges && treeParent && typeData && parent && nub->init() && ranges->setObject(memory)) {
+    if (nub && memory && ranges && treeParent && typeData && parent && nub->init() &&
+        publishPanelPitch(nub, (uint32_t)video.v_width, (uint32_t)video.v_height) && ranges->setObject(memory)) {
         nub->setDeviceMemory(ranges); nub->setName("NativeGOPFramebuffer");
         nubAttached = nub->attach(parent);
         if (nubAttached) nubStarted = nub->start(parent);
@@ -383,7 +401,7 @@ extern "C" void native_legacy_display_late_probe(void) {
     finishDisplayPolicy(started);
     OSSafeReleaseNULL(typeData); OSSafeReleaseNULL(ranges); OSSafeReleaseNULL(memory);
     if (started) {
-        activeDisplay = display; activeNub = nub;
+        IOLog("PICASSO_DISPLAY panel pitch=395 ppi\n");
         publishDisplayModes(display, (uint32_t)video.v_width, (uint32_t)video.v_height);
         publishAcceleratorStub();
         picasso_hid_start_later();

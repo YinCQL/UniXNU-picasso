@@ -29,8 +29,8 @@ extern "C" {
 extern volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
 extern volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
 }
-// Keyboard Application collection ensures the original generic keyboard
-// personality can match. Report 2 carries the Consumer buttons, bit 0 Menu (Home),
+// Keep the Keyboard Application collection so the original generic keyboard
+// personality can match any DeviceUsagePairs entry. Report 2 carries the Consumer buttons, bit 0 Menu (Home),
 // bit 1 Power, bit 2 Volume Increment, bit 3 Volume Decrement. Report 1 is an
 // ordinary boot keyboard report.
 static const unsigned char descriptor[]={
@@ -71,6 +71,7 @@ static const unsigned char touchDescriptor[]={
 // calls); _children at +24 (IOHIDEvent.h; appendChild stores into it and free releases it). _parent is never set (appendChild only
 // stores the child, int-163 skipped every finger by comparing it), so each child is an IOHIDEvent by its class instead.
 namespace edge {
+static unsigned digitizerDispatches;
 #if defined(NATIVE_HID_SOURCE_API) && NATIVE_HID_SOURCE_API && !__has_feature(ptrauth_calls)
 // Source-only bring-up without pointer authentication emits ordinary digitizer reports: a copied vtable of another family's ABI is never used.
 extern "C" {volatile uint32_t native_touch_hid_multi[3];}
@@ -127,6 +128,17 @@ static bool mark(void *child) {
     const bool edged=fromEdge[index];
     if(edged)call<void,uint32_t,int32_t,IOOptionBits>(child,kSetInteger,kDivSetInteger,kMask,(int32_t)(mask|kFromEdgeTip),0);
     if(!touch && (mask&kMaskTouch))fromEdge[index]=false;   // the lift keeps the bit; the next contact with this index starts fresh
+    // Separate virtual/physical and transition/move budgets. Startup probes
+    // must not hide the first real press or the corresponding release.
+    static unsigned virtualLogs,physicalMoves,physicalTransitions;
+    unsigned &logged=index==255?virtualLogs:(mask&kMaskTouch)?physicalTransitions:physicalMoves;
+    if(logged<16) {
+        ++logged;
+        printf("PICASSO_HID digitizer id=%u touch=%u mask=%x edge=%u x=%d y=%d\n",index,touch?1u:0u,
+            mask|(edged?kFromEdgeTip:0),edged?1u:0u,
+            call<int32_t,uint32_t,IOOptionBits>(child,kGetFixed,kDivGetFixed,kX,0),
+            call<int32_t,uint32_t,IOOptionBits>(child,kGetFixed,kDivGetFixed,kY,0));
+    }
     return edged;
 }
 // IOHIDFamily-2031.120.4 getIntegerValue jump table: Keyboard=3,
@@ -143,7 +155,19 @@ static void dispatch(IOService *self,OSObject *event,IOOptionBits options) {
         }
     }
     if(event && call<uint32_t,IOOptionBits>(event,kGetType,kDivGetType,0)==kDigitizer) {
+        ++digitizerDispatches;
         OSArray *children=*reinterpret_cast<OSArray **>(reinterpret_cast<uint8_t *>(event)+24);
+        static unsigned routeLogs;
+        if(routeLogs<8 || (digitizerDispatches%256==0 && routeLogs<16)) {
+            ++routeLogs;
+            // handleIsOpen in the retained event service checks its client
+            // dictionary. This distinguishes generation from a subscribed
+            // service; it still does not prove userspace consumed the event.
+            printf("PICASSO_HID route registry=%llx open=%u event=%u mask=%x touch=%u\n",
+                self->getRegistryEntryID(), self->isOpen()?1u:0u, digitizerDispatches,
+                (unsigned)call<int32_t,uint32_t,IOOptionBits>(event,kGetInteger,kDivGetInteger,kMask,0),
+                (unsigned)call<int32_t,uint32_t,IOOptionBits>(event,kGetInteger,kDivGetInteger,kTouch,0));
+        }
         if(children && OSDynamicCast(OSArray,children) && children->getCount()) {
             // A collection (the driver's touch-screen dispatch): its mask is the union of its fingers', so it takes the bit as well.
             bool any=false;
@@ -273,8 +297,8 @@ class NativeHidInput : public IOHIDDevice {
     uint8_t buttons=0;   // report 2 bits held by the hardware buttons
     bool buttonsStopping=false; // serialized by inputLoop
     bool touchEnabled=false;
-    // The digitizer is a separate service from the keyboard: backboardd matches digitizers by primary usage page/usage
-    // (Digitizer/Touch Screen) and the Built-In flag, which a combined keyboard-first descriptor would not provide.
+    // Optional separate digitizer. The default combined device also advertises
+    // Touch Screen as its primary application collection, before registration.
     bool touchOnly=false;
     bool eventDriverFound=false;
     IOReturn submitReport(IOMemoryDescriptor *report) {
@@ -286,12 +310,52 @@ class NativeHidInput : public IOHIDDevice {
     }
     uint32_t lastSeq=0;
     bool touchRetry=false;
+    // A failed report is an ordered input transition, not a request to sample
+    // again. In particular a failed lift must survive a newer same-ID press.
+    bool touchPending=false;
+    uint32_t pendingSeq=0;
+    unsigned pendingCount=0;
+    unsigned char pendingReport[1+TOUCH_FINGERS*6+1]={};
+    int pendingIds[TOUCH_FINGERS]={},pendingX[TOUCH_FINGERS]={},pendingY[TOUCH_FINGERS]={};
+    unsigned physicalLogs=0,physicalTransitionLogs=0,virtualLogs=0,touchErrorLogs=0,touchWaitLogs=0;
     // Fingers sent as down in the previous report; a vanished identifier gets one explicit tip-up report.
     int prevIds[TOUCH_FINGERS]={-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
     int prevX[TOUCH_FINGERS]={},prevY[TOUCH_FINGERS]={};
     static unsigned transformCoordinate(int value,int maximum) {
         if(value<0)value=0;if(value>=maximum)value=maximum-1;
         return (unsigned)((long long)value*32767/(maximum-1));
+    }
+    bool submitPendingTouch() {
+        const unsigned eventsBefore=edge::digitizerDispatches;
+        IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(pendingReport,sizeof(pendingReport),kIODirectionNone);
+        IOReturn result=buffer?submitReport(buffer):kIOReturnNoMemory;
+        OSSafeReleaseNULL(buffer);
+        native_hid_input_observed(6,result);
+        native_touch_hid_reports=native_touch_hid_reports+1;
+        bool physical=false;
+        for(unsigned i=0;i<pendingReport[1+TOUCH_FINGERS*6];++i)
+            if(pendingReport[2+i*6]!=255)physical=true;
+        bool transition=false;
+        for(unsigned i=0;i<TOUCH_FINGERS;++i)
+            if(prevIds[i]!=(i<pendingCount?pendingIds[i]:-1))transition=true;
+        unsigned &printed=physical?(transition?physicalTransitionLogs:physicalLogs):virtualLogs;
+        if(printed<24 || (result && touchErrorLogs<8)) {
+            if(printed<24)++printed;
+            if(result && touchErrorLogs<8)++touchErrorLogs;
+            printf("PICASSO_HID touch source=%s seq=%u down=%u entries=%u id=%u flags=%u x=%u y=%u result=%x dispatches=%u\n",
+                physical?"physical":"virtual",pendingSeq,pendingCount,(unsigned)pendingReport[61],
+                (unsigned)pendingReport[2],(unsigned)pendingReport[1],
+                (unsigned)(pendingReport[3]|(pendingReport[4]<<8)),
+                (unsigned)(pendingReport[5]|(pendingReport[6]<<8)),(unsigned)result,edge::digitizerDispatches-eventsBefore);
+        }
+        if(result!=kIOReturnSuccess){touchRetry=true;return false;}
+        lastSeq=pendingSeq;touchPending=false;
+        for(unsigned j=0;j<TOUCH_FINGERS;++j) {
+            prevIds[j]=j<pendingCount?pendingIds[j]:-1;
+            if(j<pendingCount){prevX[j]=pendingX[j];prevY[j]=pendingY[j];}
+        }
+        touchRetry=native_touch_seq!=lastSeq;
+        return true;
     }
     // One finger set to the event driver. The touch thread (kits/sheng/TouchProbe.cpp) calls touchNotify after it publishes a frame; there is no timer
     // watching the seqlock any more (it woke the work loop every 8 ms for nothing).
@@ -306,10 +370,21 @@ class NativeHidInput : public IOHIDDevice {
     }
     void touchSend() {
         NativeHidInput *self=this;
+        // At most one queued retry and one latest snapshot per callback. Never
+        // overwrite a failed down/move/lift with a newer producer snapshot.
+        if(self->touchPending) {
+            if(!self->hasEventDriverCached() || !self->submitPendingTouch())return;
+        }
         uint32_t before=native_touch_seq;
         if(before==self->lastSeq){self->touchRetry=false;return;}
         self->touchRetry=true;
-        if(!self->hasEventDriverCached() || (before&1))return;
+        if(!self->hasEventDriverCached() || (before&1)) {
+            if(self->touchWaitLogs<8) {
+                ++self->touchWaitLogs;
+                printf("PICASSO_HID touch waiting seq=%u odd=%u\n",before,before&1);
+            }
+            return;
+        }
         __asm__ volatile("dmb ish":::"memory");
         unsigned count=native_touch_count;if(count>TOUCH_FINGERS)count=TOUCH_FINGERS;
         int ids[TOUCH_FINGERS],xs[TOUCH_FINGERS],ys[TOUCH_FINGERS];
@@ -346,19 +421,13 @@ class NativeHidInput : public IOHIDDevice {
         }
         if(!slot){self->lastSeq=before;self->touchRetry=false;return;}
         report[1+TOUCH_FINGERS*6]=(unsigned char)slot;
-        IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
-        IOReturn result=buffer?self->submitReport(buffer):kIOReturnNoMemory;
-        OSSafeReleaseNULL(buffer);
-        native_hid_input_observed(6,result);
-        native_touch_hid_reports=native_touch_hid_reports+1;
-        // Commit only reports accepted by the original family. A failed lift
-        // keeps the previous fingers so the next tick still releases them.
-        if(result!=kIOReturnSuccess){self->touchRetry=true;return;}
-        self->lastSeq=before;self->touchRetry=false;
-        for(unsigned j=0;j<TOUCH_FINGERS;++j) {
-            self->prevIds[j]=j<downCount?nextIds[j]:-1;
-            if(j<downCount){self->prevX[j]=nextX[j];self->prevY[j]=nextY[j];}
+        memcpy(self->pendingReport,report,sizeof(report));
+        self->pendingSeq=before;self->pendingCount=downCount;
+        for(unsigned j=0;j<downCount;++j) {
+            self->pendingIds[j]=nextIds[j];self->pendingX[j]=nextX[j];self->pendingY[j]=nextY[j];
         }
+        self->touchPending=true;
+        self->submitPendingTouch();
     }
     // The button driver's thread calls buttonsNotify on every change of the pressed set.
     static bool buttonsNotify(void *context,uint32_t mask) {
@@ -456,10 +525,15 @@ public:
         size_t size;
         if(touchOnly){size=sizeof(touchDescriptor);memcpy(combined,touchDescriptor,size);}
         else{
-            size=sizeof(descriptor);memcpy(combined,descriptor,size);
-            // Default: one device, keyboard collection first, digitizer second (the arrangement whose event driver
-            // and user client attach on hardware); the separate digitizer device is the opt-in sheng-touch-split.
-            if(touchEnabled){memcpy(combined+size,touchDescriptor,sizeof(touchDescriptor));size+=sizeof(touchDescriptor);}
+            size=0;
+            // IOHIDDevice::publishProperties and IOHIDEventService both derive
+            // PrimaryUsage from DeviceUsagePairs[0]. Publish the real digitizer
+            // identity on the device/interface/event service from the start;
+            // changing only two registry properties after matching is too late
+            // for clients that already cached a keyboard service. The retained
+            // keyboard personality matches any pair, not just the first one.
+            if(touchEnabled){memcpy(combined,touchDescriptor,sizeof(touchDescriptor));size=sizeof(touchDescriptor);}
+            memcpy(combined+size,descriptor,sizeof(descriptor));size+=sizeof(descriptor);
         }
         *out=IOBufferMemoryDescriptor::withBytes(combined,size,kIODirectionNone);
         return *out?kIOReturnSuccess:kIOReturnNoMemory;

@@ -32,15 +32,19 @@ def main():
     # Match production conditional compilation; the host has no PAC.
     dispatch = dispatch.replace('#if __has_feature(ptrauth_calls)\n    originalDispatch(self,event,options);\n#else\n', '').replace('#endif\n', '')
     (out / 'hid-events.inc').write_text(setup + call + '\n' + mark + '\n' + dispatch + '\n' + install, newline='\n')
+    descriptors = source[source.index('static const unsigned char descriptor[]'):source.index('// Edge contacts')]
+    method = module.extract(source, '    IOReturn newReportDescriptor(').replace(' const override', ' const')
+    (out / 'hid-descriptors.inc').write_text(descriptors + '\n', newline='\n')
+    (out / 'hid-descriptor-method.inc').write_text(method + '\n', newline='\n')
     cc = shutil.which('clang++') or (r'C:\Program Files\LLVM\bin\clang++.exe' if os.name == 'nt' else None)
     if not cc:
         raise RuntimeError('clang++ required')
     runs = []
-    for sanitized in (False, True):
-        name = 'events' + ('-sanitized' if sanitized else '')
+    for label, sanitized in ((label, mode) for label in ('events', 'descriptor') for mode in (False, True)):
+        name = label + ('-sanitized' if sanitized else '')
         exe = out / (name + ('.exe' if os.name == 'nt' else ''))
         cmd = [cc, '-std=c++17', '-Wall', '-Wextra', '-Werror', '-O1', '-I', str(out),
-               str(ROOT / 'scripts/tests/picasso-hid-events-host.cpp'), '-o', str(exe)]
+               str(ROOT / ('scripts/tests/picasso-hid-' + label + '-host.cpp')), '-o', str(exe)]
         if sanitized:
             cmd += ['-fsanitize=address' if os.name == 'nt' else '-fsanitize=address,undefined']
         for stage, command in (('compile', cmd), ('run', [str(exe)])):
@@ -49,9 +53,13 @@ def main():
             if result.returncode:
                 raise RuntimeError(result.stdout + result.stderr)
             runs.append(dict(name=name, stage=stage, passed=True))
+    names = ['drivers/NativeHidInput/NativeHidInput.cpp', 'package/PicassoHidInput.cpp',
+             'scripts/check-picasso-hid-events.py', 'scripts/tests/picasso-hid-events-host.cpp',
+             'scripts/tests/picasso-hid-descriptor-host.cpp']
     (out / 'results.json').write_text(json.dumps(dict(scope=__doc__, passed=True, runs=runs,
+        inputs={n: hashlib.sha256((ROOT / n).read_bytes()).hexdigest() for n in names},
         source_sha256=hashlib.sha256(source.encode()).hexdigest()), indent=2) + '\n')
-    print('PASS HID table bounds/rejection, unchanged Consumer dispatch, logging limit and digitizer edge state')
+    print('PASS HID bounds/dispatch/edge state and initial digitizer identity with unchanged per-report fields')
 
 
 if __name__ == '__main__':

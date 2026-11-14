@@ -75,6 +75,7 @@ static void IOLog(const char *format, ...) {
 }
 #include "../RootTransportDiagnostics.h"
 #include "../RootCommands.h"
+#include "../FirmwareCommands.h"
 #include "../RootQueue.h"
 extern "C" {
 void ufs_test_reset(Callback cb, uint64_t physical) {
@@ -94,11 +95,13 @@ bool ufs_test_poisoned() { return gHost.poisoned; }
 bool ufs_test_stop_queue() { const char *why=nullptr; return hostStopQueue(&why); }
 bool ufs_test_start_queue() { const char *why=nullptr; return hostStartQueue(&why); }
 uint32_t ufs_test_query(uint8_t op,uint8_t idn,uint32_t *value) { return hostQueryRead(op,idn,value); }
+int ufs_test_firmware_geometry(uint8_t lun,uint64_t *blocks) { return hostFirmwareGeometry(lun,blocks); }
 uint32_t ufs_test_scsi(uint8_t lun,const uint8_t *cdb,unsigned length,bool read,uint32_t bytes,uint32_t *scsi) {
   return hostScsi(lun,cdb,length,read,bytes,200000,scsi);
 }
 uint32_t ufs_test_read(uint8_t lun,uint64_t lba,uint32_t blocks,void *out) { return hostRead4k(lun,lba,blocks,out); }
 uint32_t ufs_test_store_open(uint64_t first,uint64_t blocks) { return hostStoreOpen(first,blocks) ? 1 : 0; }
+uint32_t ufs_test_aux_open(uint64_t first,uint64_t blocks) { return hostAuxOpen(first,blocks) ? 1 : 0; }
 uint32_t ufs_test_log_open(uint64_t first,uint64_t blocks) { return hostLogOpen(first,blocks) ? 1 : 0; }
 uint32_t ufs_test_write(uint8_t lun,uint64_t lba,uint32_t blocks,const void *src) { return hostWrite4k(lun,lba,blocks,src); }
 uint32_t ufs_test_sync() { return hostSyncCache(); }

@@ -29,6 +29,10 @@ template<class T, class U> static T __atomic_fetch_add(T *p, U amount, int) {
 }
 #endif
 static unsigned snapshots, calls, locks;
+static bool PE_parse_boot_argn(const char *name,void *value,unsigned size) {
+    assert(!strcmp(name,"gldiag") && size==sizeof(unsigned));
+    *static_cast<unsigned *>(value)=0;return false;
+}
 static std::unordered_map<void *, size_t> allocations;
 static int diagnostic(const char *, ...) { return 0; }
 #define printf diagnostic
@@ -86,10 +90,28 @@ int main() {
     void *swap = picasso_ios16_swap(oldSwap.data());
     assert(!memcmp(swap, expected.data(), expected.size())); IOFreeData(swap, expected.size()); ++scenarios;
     std::vector<uint8_t> limits(0x28), lock(0xc68), converted(0xa68);
-    for (unsigned i = 0; i < limits.size(); ++i) limits[i] = static_cast<uint8_t>(i+1);
+    // The donor publishes alignment masks followed by three 64-bit maxima.
+    // iOS 16's property getter reads row bytes, width and height at 8/12/16.
+    uint32_t masks[2] = {63, 127}; memcpy(limits.data(), masks, sizeof(masks));
+    wide(limits.data()+8, 65536); wide(limits.data()+16, 16384); wide(limits.data()+24, 8192);
+    limits[32] = 1; limits[34] = 1;
     uint8_t small[0x18]; picasso_ios16_limits(small, limits.data());
-    assert(!memcmp(small, limits.data(), 0x14) && small[0x14] == limits[0x20] && small[0x15] == 0);
-    assert(!memcmp(small+0x16, limits.data()+0x22, 2)); ++scenarios;
+    assert(!memcmp(small, masks, 8));
+    assert(word(small+8)==65536 && word(small+12)==16384 && word(small+16)==8192);
+    assert(small[20]==1 && small[21]==0 && small[22]==1 && small[23]==0);
+    // Reproduce the previous memcpy: width becomes the high half of row bytes.
+    uint8_t broken[0x18]={};memcpy(broken,limits.data(),20);
+    assert(word(broken+12)==0 && word(broken+16)==16384);
+    assert(4352<=word(small+8) && 1080<=word(small+12) && 2400<=word(small+16));
+    assert(!(1080<=word(broken+12) && 2400<=word(broken+16))); ++scenarios;
+    // Independent limits, >32-bit values and unaligned source/destination.
+    for(unsigned i=0;i<3;++i){
+        std::vector<uint8_t> input(41,0),output(25,0xcc);
+        wide(input.data()+1+8+i*8,UINT64_MAX);
+        picasso_ios16_limits(output.data()+1,input.data()+1);
+        for(unsigned j=0;j<3;++j)assert(word(output.data()+1+8+j*4)==(i==j?UINT32_MAX:0));
+        assert(output[0]==0xcc);++scenarios;
+    }
     for (unsigned i = 0; i < lock.size(); ++i) lock[i] = static_cast<uint8_t>(i % 251);
     const unsigned header[][2] = {{0x1c,0x20},{0x20,0x28},{0x24,0x30},{0x28,0x38},{0x2c,0x40}};
     for (unsigned i = 0; i < 5; ++i) wide(lock.data()+header[i][1], 100+i);
@@ -160,6 +182,6 @@ int main() {
     IOUserClient2022 modern; modern.uc2022 = true;
     handler = [](uint32_t s, auto *) { assert(s == 99); return 6; };
     assert(modern.callExternalMethod(99, &args) == 6); ++scenarios;
-    assert(allocations.empty() && !locks && calls > 0 && snapshots == 1);
+    assert(allocations.empty() && !locks && calls > 0 && snapshots == 0);
     std::printf("PASS iOS16 ABI: %u scenarios\n", scenarios);
 }

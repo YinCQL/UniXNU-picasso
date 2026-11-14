@@ -37,7 +37,7 @@ def main():
     backlight = (ROOT / 'package/PicassoBacklight.cpp').read_text()
     (out / 'brightness-backend.inc').write_text('\n'.join(extract(backlight, n) for n in
         ('extern "C" IOReturn picasso_backlight_power(', 'extern "C" IOReturn picasso_backlight_level(',
-         'extern "C" bool picasso_backlight_current(')))
+         'extern "C" bool picasso_backlight_current(', 'extern "C" void picasso_backlight_shutdown(')))
     brightness = (ROOT / 'package/PicassoBrightness.cpp').read_text()
     brightness = re.sub(r'^#include <[^>]+>[^\n]*\n', '', brightness, flags=re.M)
     (out / 'brightness-service.inc').write_text(brightness)

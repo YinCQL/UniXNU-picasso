@@ -47,6 +47,8 @@ struct {
     uint64_t session_deadline;
 } ud;
 static bool pur_live;
+static uint64_t charger_deadline;
+static int ud_charger_restore(){assert(false);return -54;}
 enum Action { NoAction, EnterPanic, RequestReboot, RequestHang, RequestPanic, RequestReset };
 static Action action;
 static unsigned poll_calls, pet_calls, reboot_calls, hang_calls, panic_calls;

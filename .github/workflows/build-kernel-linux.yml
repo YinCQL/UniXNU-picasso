@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   kernel_linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     defaults:
       run:
@@ -72,12 +72,35 @@ jobs:
           path: device/out/picasso/linux-inputs
           key: ${{ steps.inputs_cache.outputs.cache-primary-key }}
 
+      - name: Identify the runner dependency cache
+        id: host_key
+        run: |
+          echo "image=${ImageVersion:?}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Linux dependency downloads
+        id: host_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/picasso-apt-archives/*.deb
+          key: picasso-apt-v1-ubuntu24-x64-${{ steps.host_key.outputs.image }}-${{ hashFiles('device/scripts/install-picasso-linux-host.py', 'device/upstream.rev', 'device/patches/picasso-linux-toolchain-v1.patch') }}
+          restore-keys: |
+            picasso-apt-v1-ubuntu24-x64-${{ steps.host_key.outputs.image }}-
+            picasso-apt-v1-ubuntu24-x64-
+
       - name: Install Linux host dependencies
         run: |
-          sudo python3 "$UNIXNU_TREE/scripts/linux/setup-toolchain.py" --host-only \
+          sudo python3 scripts/install-picasso-linux-host.py --tree "$UNIXNU_TREE" \
+            --cache-dir "$RUNNER_TEMP/picasso-apt-archives" --report out/picasso/logs/linux-host-tools.json \
             2>&1 | tee out/picasso/logs/linux-host-tools.log
           # Save host compilers before the target-only LLVM is added to PATH.
           echo "PICASSO_HOST_PATH=$PATH" >> "$GITHUB_ENV"
+
+      - name: Cache verified Linux dependency downloads
+        if: steps.host_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/picasso-apt-archives/*.deb
+          key: ${{ steps.host_cache.outputs.cache-primary-key }}
 
       - name: Install the fixed Linux toolchain Release
         env:

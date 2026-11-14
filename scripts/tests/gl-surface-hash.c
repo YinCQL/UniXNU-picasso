@@ -1,6 +1,17 @@
 #include "../../drivers/NativeGL/eagl/surface_hash.h"
 #include <assert.h>
+#ifdef __APPLE__
 #include <mach/mach_time.h>
+#else
+#include <time.h>
+typedef struct { unsigned numer, denom; } mach_timebase_info_data_t;
+static void mach_timebase_info(mach_timebase_info_data_t *info) { info->numer=info->denom=1; }
+static uint64_t mach_absolute_time(void) {
+    struct timespec now;
+    assert(clock_gettime(CLOCK_MONOTONIC, &now)==0);
+    return (uint64_t)now.tv_sec*1000000000+now.tv_nsec;
+}
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>

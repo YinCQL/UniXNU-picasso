@@ -272,7 +272,7 @@
  		uint32_t rebuild = 0;
 -		if (PE_parse_boot_argn("picasso-ls-rebuild", &rebuild, sizeof(rebuild)) && rebuild == 1) {
 +		extern volatile uint32_t native_data_persist_state;
-+		if(native_data_persist_state==2)printf("PICASSO_CACHE restored Data: rebuild LaunchServices; retain MobileGestalt and application Data\n");
++		if(native_data_persist_state==2)printf("PICASSO_CACHE restored Data: rebuild LaunchServices; retain application Data; rebuild display capability cache\n");
 +		if (PE_parse_boot_argn("picasso-ls-rebuild", &rebuild, sizeof(rebuild)) && rebuild == 1) {
  			if (native_picasso_apps_stage == 5 && !native_picasso_apps_status &&
  			    found == 0xfff && resolved == 0xfff) {
@@ -284,14 +284,6 @@
 +	if(picasso_persistence_start && picasso_persistence_start())picasso_nvram_restore_before_launchd();
  	native_owner_data_seed_base = base;
  	native_owner_data_seed_size = size;
-@@ -9543,5 +9570,6 @@
- 		extern void vm_swap_retry_create(void);
- 		vm_swap_retry_create();
--		picasso_clear_mobilegestalt_cache();
-+		extern volatile uint32_t native_data_persist_state;
-+		if(native_data_persist_state!=2)picasso_clear_mobilegestalt_cache();
- 	}
- #if defined(XNU_BOOT_PROGRESS) && XNU_BOOT_PROGRESS
 --- a/bsd/dev/picasso_usb.c
 +++ b/bsd/dev/picasso_usb.c
 @@ -3240,2 +3240,20 @@

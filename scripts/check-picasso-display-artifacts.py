@@ -55,6 +55,10 @@ def check(tree, work, kernelcache, output):
     builder.require(platform.initializer_state(directory / 'PicassoBrightness.o', native, initializer, True) ==
                     platform.initializer_state(directory / 'PicassoBrightness.late.o', native, initializer, False),
                     'Late conversion changed brightness-service instructions')
+    initializer = '__GLOBAL__sub_I_PicassoAudioService.cpp'
+    builder.require(platform.initializer_state(directory / 'PicassoAudioService.o', native, initializer, True) ==
+                    platform.initializer_state(directory / 'PicassoAudioService.late.o', native, initializer, False),
+                    'Late conversion changed audio-service instructions')
     archive = directory / 'libNativeLegacyDisplay.late.a'
     builder.require(builder.sha(archive.read_bytes()) == build['archive_sha256'], 'Stale display archive')
     for name in build['members']:
@@ -65,7 +69,8 @@ def check(tree, work, kernelcache, output):
         'original-bindings.o', 'NativeHidInput.late.o', 'PicassoHidInput.o',
         'hid-original-bindings.o', 'NativeGOPPresenter.late.o', 'NativeGOPGlue.o',
         'PicassoPr13.o', 'PicassoButtons.o', 'PicassoBacklight.o', 'PicassoBrightness.late.o',
-        'PicassoSpmi.o'}, 'Wrong display/state/input archive members')
+        'PicassoSpmi.o', 'PicassoPower.o', 'PicassoBattery.o', 'PicassoAdsp.o', 'PicassoAdspFirmware.o', 'PicassoFat.o',
+        'PicassoAudioService.late.o', 'PicassoQmp.o', 'PicassoAop.o', 'PicassoSmp2p.o', 'PicassoSmp2pDevice.o', 'PicassoAdspBoot.o', 'PicassoGlink.o', 'PicassoRpcDma.o', 'PicassoRpcFs.o'}, 'Wrong display/state/input archive members')
     kernel = work / 'kernel/kernel.macho'
     plan = json.loads(kernel.with_suffix('.json').read_text())
     report = builder.verify_kernel(aes, native, original, kernel.read_bytes(), plan, audit)
@@ -73,8 +78,24 @@ def check(tree, work, kernelcache, output):
     from picasso_original_abi import OriginalReference
     linked_image = native.macho(kernel.read_bytes())
     linked_names = {name for names in native.exports(kernel.read_bytes(), linked_image).values() for name in names}
+    builder.require({'_picasso_adsp_boot', '_picasso_adsp_image_open', '_picasso_adsp_image_load',
+                     '_picasso_adsp_image_close', '_picasso_aop_load_state', '_picasso_aop_finish',
+                     '_picasso_pas_acquire', '_picasso_pas_release', '_picasso_pas_adsp',
+                     '_picasso_rpmh_adsp_resources', '_picasso_rpmh_crypto_ready'} <= linked_names,
+                    'Missing ADSP boot transaction or shared GPU power/PAS owner')
+    builder.require(any('picasso_glink_prepare' in n for n in linked_names) and
+                    any('picasso_glink_service' in n for n in linked_names) and
+                    any('picasso_glink_stop' in n for n in linked_names) and
+                    any('picasso_smem_prepare_glink' in n for n in linked_names),
+                    'Missing GLINK allocation, channel transport or session invalidation')
+    builder.require({'_picasso_power_start', '_picasso_spmi_quiesce', '_picasso_battery_open', '_picasso_battery_read', '_picasso_battery_close'} <= linked_names, 'Missing board power backend')
     builder.require({'_picasso_backlight_start', '_picasso_backlight_power', '_picasso_backlight_level',
-                     '_picasso_backlight_current', '_picasso_brightness_allocate', '_picasso_brightness_is_service', '__GLOBAL__sub_I_PicassoBrightness.cpp'} <= linked_names, 'Missing physical display power backend')
+                     '_picasso_backlight_current', '_picasso_backlight_shutdown', '_picasso_brightness_allocate', '_picasso_brightness_is_service', '__GLOBAL__sub_I_PicassoBrightness.cpp'} <= linked_names, 'Missing physical display power backend')
+    builder.require({'_picasso_audio_service_tick', '__GLOBAL__sub_I_PicassoAudioService.cpp',
+                     '__ZN12PicassoAudio10gMetaClassE', '__ZN22PicassoAudioUserClient10gMetaClassE'} <= linked_names,
+                    'Missing PCM worker, audio-service initializer or client metaclasses')
+    report['audio_service'] = {'worker_linked': True, 'late_initializer_verified': True,
+                               'classes_linked': True, 'hal_payload_checked_separately': True, 'runtime_qualified': False}
     report['hid'] = hid.verify(platform, aes, native, OriginalReference(kernelcache, board),
                                directory, kernel.read_bytes(), plan)
     config = (work / '.config').read_text()

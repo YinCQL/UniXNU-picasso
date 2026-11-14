@@ -84,8 +84,10 @@ static void picasso_frame_trace(uint64_t offer_ticks)
     /* Split offer-to-done: scheduling (offer to the client taking it, including the page mapping), the client's
      * present (take to its completion), and this handler (completion to the display driver seeing it). */
     if(take>offer_ticks)absolutetime_to_nanoseconds(take-offer_ticks,&take_ns);
-    if(complete>take)absolutetime_to_nanoseconds(complete-take,&comp_ns);
-    if(done>complete)absolutetime_to_nanoseconds(done-complete,&hand_ns);
+    if(take>=offer_ticks && complete>=take && complete<=done) {
+        absolutetime_to_nanoseconds(complete-take,&comp_ns);
+        absolutetime_to_nanoseconds(done-complete,&hand_ns);
+    }
     printf("PICASSO_FRAME n=%llu offer_ns=%llu done_ns=%llu svc_us=%llu gap_us=%llu take_us=%llu comp_us=%llu hand_us=%llu\n",
         (unsigned long long)++count,(unsigned long long)offer_ns,(unsigned long long)done_ns,
         (unsigned long long)(svc_ns/1000),(unsigned long long)(gap_ns/1000),
@@ -194,11 +196,11 @@ static bool dpuStart() {
     return gDpuTables!=nullptr;
 }
 static uint32_t dpuMap(unsigned slot,const uint64_t *pages,unsigned count) {
-    if(!gDpuTables || slot>=kDpuSlots || count>kDpuSlotBytes/4096)return 0;
+    if(!gDpuTables || !pages || !count || slot>=kDpuSlots || count>kDpuSlotBytes/4096)return 0;
+    for(unsigned i=0;i<count;++i)if(!pages[i] || (pages[i]&0xfff))return 0;
     uint64_t *l3=gDpuTables+1024+(size_t)slot*kDpuSlotTables*512;
     const uint64_t attrs=(1ULL<<10)|(1ULL<<6);
     for(unsigned i=0;i<kDpuSlotTables*512;++i) {
-        if(i<count && (pages[i]&0xfff))return 0;
         l3[i]=i<count?(pages[i]|attrs|3):0;
     }
     dpuClean(l3,kDpuSlotTables*4096);
@@ -243,7 +245,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     unsigned directFlips=0,directMaps=0,directMapFails=0,directLatchTimeouts=0,directFallbacks=0;
     uint64_t directLatchUs=0,directLatchMax=0;
     uint64_t directLastFlip=0,directFenceUs=0,directPeriodUs=0,directLatchLastUs=0;
-    bool latchNeedsFinish=false;
+    bool latchNeedsFinish=false,directLatchStalled=false;
     uint32_t bootStride=0;
     // The GOP panel's geometry, fixed from the boot video mode in startDisplay(). This line publishes
     // the full panel height (2400 rows) as the mode, so there are no bars and the surface matches it.
@@ -258,6 +260,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // retirement callbacks while serializing queue pumps from other threads.
     IORecursiveLock *kickLock=nullptr;
     bool benchmarked=false;
+    // Bounded metadata only: correlate late UI clipping reports with the
+    // compositor's surface geometry without reading the scanout or all pixels.
+    uint64_t observedWidth=0,observedHeight=0,observedStride=0;
+    unsigned surfaceSamples=0,surfaceChanges=0;
     // One bounded cached copy of visible pixels, independent of IOSurface lifetime.
     void *copyShadow=nullptr;
     uint64_t copyShadowBytes=0,copyShadowStride=0;
@@ -538,7 +544,8 @@ public:
         // Nothing in the family publishes IOMFBDisplayRefresh (its platform subclass does), and without it the render server keeps its own
         // 1/60 s heartbeat (int-210: refresh=0). Publish it before any client can find the display, only when sheng-vsync asks for more.
         unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
-        if(primary && hz>60 && hz<=240)native_legacy_set_refresh_properties(this);
+        unsigned locked=0;PE_parse_boot_argn("sheng-vsync-fixed",&locked,sizeof(locked));
+        if(primary && (hz>60 || (hz==60 && locked==1)) && hz<=240)native_legacy_set_refresh_properties(this);
         IOService::registerService(options);native_legacy_registration_observed(this);
     }
     bool isMainDisplay() override {return primary;}
@@ -550,8 +557,8 @@ public:
     bool getRefreshAttributes(uint64_t *words,bool fixed) override {
         if(!IOMobileFramebufferLegacy::getRefreshAttributes(words,fixed) || !words)return false;
         unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
-        if(hz<=60 || hz>240)return true;
         unsigned locked=0;PE_parse_boot_argn("sheng-vsync-fixed",&locked,sizeof(locked));
+        if(hz<60 || hz>240 || (hz==60 && !fixed && locked!=1))return true;
         const uint64_t interval=(1ull<<32)/hz;
         uint64_t machTime=0;nanoseconds_to_absolutetime(interval*1000000000ull>>32,&machTime);
         words[0]=interval;words[1]=machTime;
@@ -587,16 +594,7 @@ public:
         kicking=false;
     }
     void kickOnce() {
-        // The GPU client owns one frame until it completes it; the presenter's flip timeout normally takes a
-        // stalled frame back. If that timer was never created (no work loop) or the completion never reached this
-        // driver, do not wait forever: take the frame back here and use the CPU path for this kick.
-        if(transferred && gpuStartTick) {
-            uint64_t held=0;absolutetime_to_nanoseconds(mach_absolute_time()-gpuStartTick,&held);
-            if(held>=1500000000ull) {
-                gpuRequest=nullptr;gpuLength=0;transferred=false;gpuBypass=true;gpuStartTick=0;
-                native_legacy_gpu_fallback_observed(kIOReturnTimeout);
-            }
-        }
+        // The presenter retains this request until its completion callback.
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
@@ -664,17 +662,27 @@ public:
            !native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
             native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
+        const uint64_t surfaceWidth=native_legacy_surface_width(surface);
+        const uint64_t surfaceHeight=native_legacy_surface_height(surface);
+        const bool geometryChanged=observedWidth!=surfaceWidth || observedHeight!=surfaceHeight || observedStride!=sourceStride;
+        ++surfaceSamples;
+        if(surfaceSamples<=4 || surfaceSamples%256==0 || (geometryChanged && surfaceChanges<64)) {
+            IOLog("PICASSO_DISPLAY surface sample=%u time_ms=%llu panel=%ux%u surface=%llux%llu stride=%llu destination_stride=%lu allocation=%llu changed=%u\n",
+                surfaceSamples,nowMs,width,height,surfaceWidth,surfaceHeight,sourceStride,video.v_rowBytes,allocation,(unsigned)geometryChanged);
+        }
+        if(geometryChanged) {
+            if(surfaceChanges<64)++surfaceChanges;
+            observedWidth=surfaceWidth;observedHeight=surfaceHeight;observedStride=sourceStride;
+        }
         // The diagnostic renderer repaints the page over the scanout until it
         // is told the system owns the display; every accepted frame needs that,
         // GPU-copied or not (int-093). A failed prepare is retried next kick.
         if(!gpuBypass) {
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
         }
-        /* sheng-dpu-scanout=2: the display fetches the compositor's surface itself. The swap waits
-         * for the GPU to finish the frame (the compositor submits when its command buffer is
-         * scheduled), flips, and retires at once; the pipe's latch completes asynchronously and
-         * only gates the next flip, so the compositor can commit on the next vsync instead of
-         * waiting for the latch. */
+        /* Experimental direct scanout waits for GPU completion and the DPU latch.
+         * A latch is not the end of scanout: producer reuse after retirement still
+         * needs qualification. Playback images disable direct scanout. */
         if(directOn && !gpuBypass && native_legacy_surface_width(surface)>=width && native_legacy_surface_height(surface)>=height) {
             if(latchRequest && !(sdeRegs[0x2000/4+0x18/4]&1u)) completeLatch();
             if(latchRequest) {transferred=true;return;}
@@ -694,10 +702,8 @@ public:
                     directLastFlip=now;
                     native_legacy_swap_stage(1);
                     native_legacy_frame_observed(3,0,0,0,0,0);
-                    /* Early retire: the surface on screen stays mapped in its slot and the
-                     * compositor's other drawables are free, so the next frame may commit now. */
-                    if(retireSwap(request,true)) {transferred=false;native_legacy_early_retires=native_legacy_early_retires+1;}
-                    else {transferred=true;latchNeedsFinish=true;}
+                    // Never signal completion merely because the flip was queued.
+                    transferred=true;latchNeedsFinish=true;
                     if((directFlips%30)==0)directFrameStats();
                     if((directFlips%120)==0)directStats();
                     if(!transferred)kickSwapQueue();
@@ -1168,7 +1174,10 @@ public:
     bool gpuWrote(const OriginalLegacySwapRequest *request) {
         if(fenceFor!=request) {fenceFor=request;fenceTarget=0;fenceCaptured=false;fenceSince=0;}
         uint32_t submitted=0,retired=0;
-        if(!&native_adreno_fences || !native_adreno_fences(&submitted,&retired)) {fenceFor=nullptr;return true;}
+        if(!&native_adreno_fences || !native_adreno_fences(&submitted,&retired)) {
+            if(fenceTimer)fenceTimer->setTimeoutUS(500);
+            return false;
+        }
         if(!fenceCaptured) {fenceTarget=submitted;fenceCaptured=true;}
         if(int32_t(retired-fenceTarget)>=0) {fenceFor=nullptr;return true;}
         if(!fenceSince)fenceSince=mach_absolute_time();
@@ -1176,12 +1185,11 @@ public:
         return false;
     }
     static void latchFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->latchTick();}
-    /* Finish a latch whose flush bit has cleared (or that timed out). The swap was already retired
-     * when the flip was written; this only advances the shown slot and releases a held swap. */
+    /* A timeout never substitutes for a cleared flush bit. */
     void completeLatch() {
-        if(!latchRequest)return;
+        if(!latchRequest || !sdeRegs || (sdeRegs[0x2000/4+0x18/4]&1u))return;
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-latchStart,&ns);
-        if(ns>=50000000ull)++directLatchTimeouts;
+        directLatchStalled=false;
         const uint32_t us=uint32_t(ns/1000);
         if(us>directLatchMax)directLatchMax=us;
         directLatchUs+=us;directLatchLastUs=us;
@@ -1194,7 +1202,10 @@ public:
     void latchTick() {
         if(!latchRequest)return;
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-latchStart,&ns);
-        if((sdeRegs[0x2000/4+0x18/4]&1u) && ns<50000000ull){latchTimer->setTimeoutUS(500);return;}
+        if(sdeRegs[0x2000/4+0x18/4]&1u){
+            if(ns>=50000000ull && !directLatchStalled){++directLatchTimeouts;directLatchStalled=true;directStats();}
+            latchTimer->setTimeoutUS(500);return;
+        }
         completeLatch();
     }
     static void fenceFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->fenceTick();}

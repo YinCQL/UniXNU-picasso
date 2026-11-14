@@ -9,6 +9,8 @@ extern "C" {
 void native_adreno620_set_embedded_firmware(void);
 void native_adreno_probe(void);
 void native_wlan_probe(void);
+void picasso_adsp_poll(void);
+void picasso_adsp_firmware_start(void);
 void sheng_cpufreq_probe(void);
 void sheng_cpufreq_poll(void);
 void picasso_pr13_start(void);
@@ -30,9 +32,11 @@ static void probes(void *, wait_result_t) {
     native_adreno620_set_embedded_firmware();
     native_adreno_probe();
     native_wlan_probe();
+    picasso_adsp_firmware_start();
     bool reported = false;
     for (;;) {
         sheng_cpufreq_poll();
+        picasso_adsp_poll();
         const ml_topology_info_t *topology = ml_get_topology_info();
         if (!reported && topology) {
             const unsigned en = ml_get_cpu_number_type(CLUSTER_TYPE_E, true, true);

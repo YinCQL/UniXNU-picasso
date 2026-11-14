@@ -81,8 +81,12 @@ static inline int wlan_smem_find(const struct wlan_smem_io *io,const struct wlan
     if (!found) return -2;
     *out=item;return 0;
 }
-static inline int wlan_smp2p_wlan(const struct wlan_smem_io *io,const struct wlan_smem_item *item,uint16_t local,uint16_t remote,uint32_t *value) {
+static inline int wlan_smp2p_entry(const struct wlan_smem_io *io,const struct wlan_smem_item *item,uint16_t local,uint16_t remote,const char *name,uint32_t *value) {
     uint8_t h[20],e[20],after[20];int found=0;uint32_t candidate=0;
+    unsigned length=0;
+    if (!name) return -22;
+    while (length<16 && name[length]) ++length;
+    if (!length || length==16) return -22;
     if (!item || !value || item->offset>WLAN_SMEM_SIZE || item->size>WLAN_SMEM_SIZE-item->offset ||
         item->size<20 || wlan_smread(io,item->offset,h,20)) return -22;
     unsigned total=wlan_sm16(h+12),valid=wlan_sm16(h+14);
@@ -90,8 +94,12 @@ static inline int wlan_smp2p_wlan(const struct wlan_smem_io *io,const struct wla
         total>16 || valid>total || item->size<20+20*total) return -22;
     for (unsigned i=0;i<valid;++i) {
         if (wlan_smread(io,item->offset+20+20*i,e,20)) return -22;
-        if (e[0]=='w' && e[1]=='l' && e[2]=='a' && e[3]=='n' && !e[4]) {
+        unsigned n=0;while (n<length && e[n]==(uint8_t)name[n]) ++n;
+        if (n==length && !e[n]) {
             if (found++) return -22;
+            uint8_t stable[20];
+            if (wlan_smread(io,item->offset+20+20*i,stable,20)) return -22;
+            for (unsigned j=0;j<20;++j) if (e[j]!=stable[j]) return -11;
             candidate=wlan_sm32(e+16);
         }
     }
@@ -99,5 +107,8 @@ static inline int wlan_smp2p_wlan(const struct wlan_smem_io *io,const struct wla
     for (unsigned i=0;i<20;++i) if (h[i]!=after[i]) return -11;
     if (!found) return -2;
     *value=candidate;return 0;
+}
+static inline int wlan_smp2p_wlan(const struct wlan_smem_io *io,const struct wlan_smem_item *item,uint16_t local,uint16_t remote,uint32_t *value) {
+    return wlan_smp2p_entry(io,item,local,remote,"wlan",value);
 }
 #endif

@@ -4,7 +4,7 @@
 #include <stddef.h>
 extern "C" int printf(const char *, ...) __attribute__((format(printf, 1, 2)));
 extern "C" bool PE_parse_boot_argn(const char *, void *, int);
-class IOMemoryMap { public: uintptr_t getVirtualAddress(); };
+class IOMemoryMap { public: uintptr_t getVirtualAddress(); void release(); };
 class IODeviceMemory {
 public:
     static IODeviceMemory *withRange(uint64_t, uint64_t);

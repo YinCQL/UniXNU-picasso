@@ -250,11 +250,18 @@ def main():
         # display still needs separate logical-geometry/ABI qualification.
         node('product', [('product-name', b'iPhone X\0' if args.iphone_identity else b'iPad Pro (12.9-inch) (2nd generation)\0' if args.ipad_identity else b'Redmi K30 5G\0'),
                          ('model', b'xiaomi,picasso\0'),
+                         # Original d22ap /product identity (20H392). MobileGestalt
+                         # uses this 20-byte key, not the root model string, to
+                         # select its product type and VirtualAudio routing DB.
+                         *([('product-id', bytes.fromhex('fd079b298144a7deb4d7c87fef3eb474d8f0e7eb'))]
+                           if args.iphone_identity else []),
                          *([('product-description', b'iPhone X\0' if args.iphone_identity else b'iPad Pro (12.9-inch) (2nd generation)\0'),
                             ('artwork-device-idiom', b'phone\0' if args.iphone_identity else b'pad\0'),
                             ('artwork-device-subtype', struct.pack('<I', 2436 if args.iphone_identity else 2732)),
                             ('artwork-scale-factor', struct.pack('<I', 3 if args.iphone_identity else 2)),
-                            ('artwork-display-gamut', b'P3\0'),
+                            # The display path publishes 8-bit SDR BGRA. Extended color
+                            # would make system snapshots request unsupported 10-bit surfaces.
+                            ('artwork-display-gamut', b'sRGB\0'),
                             ('compatible-device-fallback', b'iPhone9,2\0' if args.iphone_identity else b'iPad6,7\0')] if apple_identity else []),
                          *([('thin-bezel', struct.pack('<I', 1))] if args.iphone_identity else [])]),
         node('pram', [('reg', struct.pack('<2Q', PANIC_LOG_PADDR, PANIC_LOG_SIZE))]),

@@ -1,0 +1,219 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+#include <cassert>
+#include <cstdio>
+#include <vector>
+#include "PicassoBatteryCore.h"
+#include "PicassoChargerCore.h"
+using namespace picasso_charger;
+struct Bus {
+    uint8_t data[7][256]={};
+    unsigned calls=0,fail=0,ignored=0,writes=0,reads=0;
+    std::vector<unsigned> written;
+    bool race=false,apsdRace=false,machineRace=false,debugRace=false,otgRace=false;
+    Bus(){data[1][0x70]=10;data[1][0x80]=4;data[5][6]=8;data[5][0xb]=9;data[5][9]=0x20;data[1][7]=1;
+        data[1][0x10]=0x10;data[1][8]=8;data[3][0xb]=0x95;}
+    int read(unsigned ch,uint8_t reg,uint8_t &v){++reads;if(++calls==fail)return -90;
+        v=data[ch][reg];if(race&&ch==1&&reg==8)v=1;
+        if(apsdRace&&ch==1&&reg==7)v=0;
+        if(machineRace&&ch==5&&reg==9)v^=0x20;
+        if(debugRace&&ch==5&&reg==7)v^=1;
+        if(otgRace&&ch==3&&reg==0x40)v^=1;return 0;}
+    int miscWrite(uint8_t reg,uint8_t v){++writes;if(++calls==fail)return -91;
+        assert(reg==0x44);written.push_back(0x600|reg);
+        if(writes!=ignored)data[6][reg]=v;return 0;}
+    int chargerRead(uint8_t reg,uint8_t &v){return read(1,reg,v);}
+    int chargerWrite(uint8_t reg,uint8_t v){++writes;if(++calls==fail)return -91;
+        assert(reg==0x70||reg==0x66||reg==0x42||reg==0x65);written.push_back(reg);
+        if(writes!=ignored)data[1][reg]=v;return 0;}
+};
+struct Fixture {
+    Bus bus;Controller c;picasso_battery::Sample s;picasso_battery::Input in;Source src;Result r;
+    Fixture(){s.status=0x81;s.usb=0x10;s.path=0x95;s.charger=3;
+        in.statusValid=true;in.apsd=1;in.result=8;in.voltageValid=true;in.millivolts=5000;in.currentValid=true;in.milliamps=495;
+        assert(!sourceStatus(bus,src));r.verified=true;bus.calls=bus.reads=0;}
+    Control step(uint64_t now=1000,int temp=250,bool valid=true){bus.data[5][6]=src.sink;bus.data[5][0xb]=src.misc;bus.data[5][0xd]=src.legacy;bus.data[5][9]=src.machine;bus.data[5][7]=src.debug;bus.data[3][0x40]=src.otg;
+        bus.data[6][6]=src.thermal;bus.data[6][7]=src.die;bus.data[6][8]=src.skin;bus.data[6][9]=src.connector;
+        bus.data[1][0x40]=src.suspend;bus.data[1][0x80]=src.aiclOptions;
+        return c.update(bus,s,in,src,temp,valid,now,r);}
+    void active(){assert(step().state==1);auto out=step(2000);assert(out.verified&&out.targetMa==1600&&bus.data[1][0x70]==32);}
+    void safe(){assert(bus.data[1][0x70]<=10&&(bus.data[1][0x66]&7)==2&&(bus.data[1][0x42]&1)&&!(bus.data[1][0x65]&16));}
+};
+
+struct ThermalBus {
+    uint8_t command=0xa1,chargeError=0,thermal=0;unsigned calls=0,fail=0,writes=0;bool ignore=false;
+    int chargeRead(uint8_t reg,uint8_t &out){assert(reg==0x42||reg==7||reg==0x0d);if(++calls==fail)return -1;
+        out=reg==7?chargeError:reg==0x0d?thermal:command;return 0;}
+    int chargeWrite(uint8_t reg,uint8_t value){assert(reg==0x42&&(value&~1)==0xa0);if(++calls==fail)return -2;++writes;if(!ignore)command=value;return 0;}
+};
+static void test_thermal(){
+    for(unsigned reason=0;reason<5;reason++){
+        ThermalBus bus;ThermalControl t;int temp=reason==0?99:reason==1?450:250;
+        assert(!t.update(bus,reason!=2,temp,reason!=3,reason==4,1000));
+        assert(t.inhibited&&t.owned&&bus.command==0xa0&&bus.writes==1);
+        assert(!t.update(bus,true,430,true,false,2000)&&t.inhibited&&bus.writes==1);
+        for(unsigned n=3;n<=5;n++)assert(!t.update(bus,true,250,true,false,n*1000));
+        assert(!t.inhibited&&!t.owned&&bus.command==0xa1&&bus.writes==2);
+    }
+    {ThermalBus b;b.command=0xa0;ThermalControl t;
+     t.update(b,true,450,true,false,1000);for(unsigned n=2;n<=4;n++)t.update(b,true,250,true,false,n*1000);
+     assert(!t.inhibited&&!t.owned&&!b.writes&&b.command==0xa0);}
+    {ThermalBus b;ThermalControl t;t.update(b,true,450,true,false,1000);
+     t.update(b,true,250,true,false,2000);t.update(b,true,250,true,false,30000);assert(t.inhibited&&!t.recovery);
+     t.update(b,true,119,true,false,31000);assert(t.inhibited&&!t.recovery);}
+    for(unsigned op=1;op<=3;op++){ThermalBus b;ThermalControl t;b.fail=op;
+     assert(t.update(b,true,450,true,false,1000)&&t.inhibited&&!t.owned);}
+    {ThermalBus b;ThermalControl t;b.ignore=true;assert(t.update(b,true,450,true,false,1000)==-57&&t.inhibited&&!t.owned);}
+    {ThermalBus b;ThermalControl t;assert(!t.update(b,true,250,true,false,1000)&&!t.inhibited&&!b.writes);}
+    // A completed write remains recoverable when its first readback fails.
+    {ThermalBus b;ThermalControl t;b.fail=3;
+     assert(t.update(b,true,450,true,false,1000)&&t.disablePending&&!t.owned&&b.command==0xa0);
+     for(unsigned n=2;n<=4;n++)assert(!t.update(b,true,250,true,false,n*1000));
+     assert(!t.inhibited&&!t.owned&&!t.disablePending&&b.command==0xa1);}
+    // Each failed restore I/O resets the three-observation recovery window.
+    for(unsigned op=1;op<=5;op++){ThermalBus b;ThermalControl t;
+     t.update(b,true,450,true,false,1000);t.update(b,true,250,true,false,2000);t.update(b,true,250,true,false,3000);
+     b.calls=0;b.fail=op;assert(t.update(b,true,250,true,false,4000)&&t.inhibited&&!t.recovery);
+     b.fail=0;for(unsigned n=5;n<=7;n++)assert(!t.update(b,true,250,true,false,n*1000));
+     assert(!t.inhibited&&b.command==0xa1);}
+    {ThermalBus b;ThermalControl t;t.update(b,true,450,true,false,1000);b.ignore=true;
+     t.update(b,true,250,true,false,2000);t.update(b,true,250,true,false,3000);
+     assert(t.update(b,true,250,true,false,4000)==-57&&t.inhibited&&t.owned&&b.command==0xa0);}
+    for(unsigned kind=0;kind<2;kind++){ThermalBus b;ThermalControl t;
+     t.update(b,true,450,true,false,1000);t.update(b,true,250,true,false,2000);t.update(b,true,250,true,false,3000);
+     if(kind)b.thermal=0x20;else b.chargeError=2;
+     assert(!t.update(b,true,250,true,false,4000)&&t.inhibited&&!t.recovery&&b.command==0xa0&&b.writes==1);}
+    puts("PASS thermal stop/recovery, hysteresis, prior disable ownership, unrelated bits, stale sample gap and every I/O failure");
+}
+
+int main(){
+    test_thermal();
+    {Fixture f;f.active();assert((f.bus.data[1][0x66]&7)==1&&!(f.bus.data[1][0x42]&1)&&(f.bus.data[1][0x65]&16));
+     f.bus.written.clear();auto out=f.step(3000);assert(out.verified&&f.bus.written.empty());}
+    for(unsigned result=0;result<128;++result){Fixture f;f.in.result=uint8_t(result);f.bus.data[1][8]=uint8_t(result);
+        f.step();auto out=f.step(2000);unsigned want=result==1?500:result==4?1500:(result==2||result==8||result==0x28||result==0x48)?1600:0;
+        assert(out.sourceMa==want);assert(f.bus.data[1][0x70]<= (want>500?want/50:10));}
+    // Compare all encoded attached Rp values against the controller's
+    // one-hot source levels; mixed/absent bits cannot borrow the DCP path.
+    for(unsigned sink=0;sink<256;++sink){Fixture f;f.src.sink=uint8_t(sink);
+        f.step();auto out=f.step(2000);
+        const unsigned expected=sink==2?3000:sink==4?1500:sink==8?1600:0;
+        assert(out.sourceMa==expected);
+        if(!expected)f.safe();
+    }
+    // A protection or another owner can lower ICL after our first update.
+    // Repeated observations must preserve the new limit, then requalify
+    // when the external owner restores the normal USB baseline.
+    for(unsigned cfg=0;cfg<10;++cfg){Fixture f;f.active();f.bus.data[1][0x70]=uint8_t(cfg);
+        f.bus.written.clear();auto out=f.step(3000);
+        assert(out.verified&&out.targetMa==cfg*50&&f.r.configuredMa==cfg*50&&!f.c.owned);
+        assert(f.bus.written.empty()&&f.bus.data[1][0x70]==cfg);
+        out=f.step(4000);assert(out.targetMa==cfg*50&&f.bus.written.empty());
+        f.bus.data[1][0x70]=10;assert(f.step(5000).state==1);
+        assert(f.step(6000).targetMa==1600);
+    }
+    for(unsigned rp:{2u,4u}){Fixture f;f.src.sink=uint8_t(rp);f.step();auto out=f.step(2000);
+        assert(out.verified&&out.targetMa==(rp==2?3000:1500));}
+    {Fixture f;f.src.sink=2;f.src.legacy=2;f.active();}
+    {Fixture f;f.src.sink=2;f.in.result=1;f.bus.data[1][8]=1;auto out=f.step();assert(out.targetMa==500&&f.bus.data[1][0x70]==10);}
+    // Known BC1.2 sources without CC use the vendor NO_CC override mode.
+    // Unknown/float/mixed result codes still cannot authorize extra current.
+    for(unsigned result=0;result<128;++result){Fixture f;f.src.sink=0;f.src.misc=0x28;f.src.machine=0;
+        f.in.result=uint8_t(result);f.bus.data[1][8]=uint8_t(result);f.step();auto out=f.step(2000);
+        unsigned want=result==1?500:result==4?1500:(result==2||result==8||result==0x28||result==0x48)?1600:0;
+        assert(out.sourceMa==want);
+        if(want>500)assert(out.verified&&out.targetMa==want&&(f.bus.data[1][0x66]&7)==1&&
+            (f.bus.data[1][0x42]&1)&&(f.bus.data[1][0x65]&16));else f.safe();
+    }
+    for(unsigned misc=0;misc<256;++misc){Fixture f;f.src.sink=0;f.src.machine=0;f.src.misc=uint8_t(misc);
+        f.step();auto out=f.step(2000);const bool permit=!(misc&0xd1) || ((misc&0xdd)==0x18);
+        assert(out.sourceMa==(permit?1600:0));
+        if(!permit)f.safe();}
+    for(unsigned sink=1;sink<128;++sink){Fixture f;f.src.sink=uint8_t(sink);f.src.machine=0;f.src.misc=0x28;
+        f.step();auto out=f.step(2000);assert(!out.sourceMa);f.safe();}
+    for(unsigned kind=0;kind<19;++kind){Fixture f;f.src.sink=0;f.src.misc=0x28;f.src.machine=0;
+        f.step();assert(f.step(2000).targetMa==1600);int temp=250;bool valid=true;
+        switch(kind){case 0:f.in.apsd=0;f.bus.data[1][7]=0;break;case 1:f.in.result=0;f.bus.data[1][8]=0;break;
+         case 2:f.src.misc|=0x80;break;case 3:f.src.misc|=0x40;break;case 4:f.src.debug=1;break;
+         case 5:f.src.misc|=1;break;case 6:f.src.machine=0x20;break;case 7:f.src.sink=8;break;
+         case 8:f.src.legacy=1;break;case 9:f.src.die=3;break;case 10:f.src.skin=2;break;
+         case 11:f.src.connector=2;break;case 12:f.src.suspend=1;break;case 13:f.src.aiclOptions=0;break;
+         case 14:valid=false;break;case 15:temp=99;break;case 16:temp=450;break;
+         case 17:f.in.millivolts=5300;break;case 18:f.in.voltageValid=false;break;}
+        auto out=f.step(3000,temp,valid);assert(out.state==3);f.safe();
+    }
+    {Fixture f;f.step();f.src.sink=0;f.src.misc=0x28;f.src.machine=0;
+     assert(f.step(2000).state==1);assert(f.step(3000).targetMa==1600);}
+    {Fixture f;f.step();f.in.result=2;f.bus.data[1][8]=2;
+     assert(f.step(2000).state==1);assert(f.step(3000).targetMa==1600);}
+    for(unsigned kind=0;kind<2;++kind){Fixture f;f.step();f.bus.apsdRace=kind==0;f.bus.machineRace=kind==1;
+     auto out=f.step(2000);assert(!out.verified&&out.error==-56&&!out.fallbackError);f.safe();}
+    // Replay the observed OCP/NO_CC Type-C indication with independent
+    // USBIN safety states. The type-C bit stays set; only ICL mode changes.
+    for(unsigned result:{2u,8u}){Fixture f;f.src.sink=0;f.src.misc=0x38;f.src.machine=2;f.src.legacy=4;
+     f.in.result=uint8_t(result);f.bus.data[1][8]=uint8_t(result);f.in.millivolts=5190;
+     assert(f.step().state==1);
+     for(unsigned current:{750u,1000u,1250u,1500u,1600u}){
+      auto out=f.step(f.c.lastMs+1000);assert(out.verified&&out.sourceMa==1600&&out.targetMa==current);
+      assert(f.bus.data[1][0x70]==current/50&&(f.bus.data[1][0x66]&7)==1&&
+       (f.bus.data[1][0x42]&1)&&(f.bus.data[1][0x65]&16)&&f.src.misc==0x38);}
+     f.bus.written.clear();assert(f.step(7000).targetMa==1600&&f.bus.written.empty());}
+    for(unsigned result=0;result<128;++result){Fixture f;f.src.sink=0;f.src.misc=0x38;f.src.machine=2;
+     f.in.result=uint8_t(result);f.bus.data[1][8]=uint8_t(result);f.step();auto out=f.step(2000);
+     assert(out.sourceMa==(result==1?500:(result==2||result==8)?1600:0));
+     if(result!=2&&result!=8)f.safe();}
+    for(unsigned kind=0;kind<24;++kind){Fixture f;f.src.sink=0;f.src.misc=0x38;f.src.machine=2;f.in.result=2;f.bus.data[1][8]=2;
+     f.step();assert(f.step(2000).targetMa==750);int temp=338;bool valid=true;
+     switch(kind){case 0:f.src.debug=1;break;case 1:f.src.otg=1;break;case 2:f.src.misc|=0x80;break;
+      case 3:f.src.misc|=0x40;break;case 4:f.src.misc|=1;break;case 5:f.src.misc&=uint8_t(~8);break;
+      case 6:f.src.machine|=0x20;break;case 7:f.src.sink=8;break;case 8:f.src.legacy|=1;break;
+      case 9:f.s.usb|=1;break;case 10:f.s.usb|=2;break;case 11:f.s.usb|=4;break;case 12:f.s.usb|=8;break;
+      case 13:f.s.usb|=0x20;break;case 14:f.src.suspend=1;break;case 15:f.src.aiclOptions=0;break;
+      case 16:f.src.die=3;break;case 17:f.in.millivolts=5300;break;case 18:f.in.voltageValid=false;break;
+      case 19:valid=false;break;case 20:temp=400;break;case 21:f.s.path|=0x40;break;
+      case 22:f.in.apsd=0;f.bus.data[1][7]=0;break;case 23:f.in.currentValid=false;break;}
+     auto out=f.step(3000,temp,valid);assert(out.targetMa<=500);f.safe();}
+    {Fixture f;f.src.sink=0;f.src.misc=0x38;f.src.machine=2;f.src.thermal=8;f.src.die=3;f.in.result=2;f.bus.data[1][8]=2;
+     assert(f.step().targetMa==500);f.src.thermal=2;f.src.die=0;
+     assert(f.step(2000).state==1);assert(f.step(3000).targetMa==750);
+     f.in.result=1;f.bus.data[1][8]=1;assert(f.step(4000).targetMa==500);f.safe();}
+    {Fixture f;f.src.sink=0;f.src.misc=0x38;f.src.machine=2;f.in.result=2;f.bus.data[1][8]=2;f.bus.data[1][0x70]=2;
+     assert(f.step().targetMa==100&&f.bus.written.empty());}
+    {Fixture f;f.src.misc|=0x10;f.step();assert(f.step(2000).targetMa==500);f.safe();}
+    for(unsigned kind=0;kind<2;++kind){Fixture f;f.src.sink=0;f.src.misc=0x38;f.src.machine=2;f.in.result=2;f.bus.data[1][8]=2;
+     f.step();f.bus.debugRace=kind==0;f.bus.otgRace=kind==1;
+     auto out=f.step(2000);assert(!out.verified&&out.error==-56&&!out.fallbackError);f.safe();}
+    // AICL is requested on each NO_CC current change, never on stable SDP.
+    {Fixture f;f.src.sink=0;f.src.misc=0x38;f.src.machine=2;f.in.result=2;f.bus.data[1][8]=2;
+     f.bus.data[6][0x44]=0x80;f.step();f.step(2000);
+     assert(f.bus.written.back()==0x644&&f.bus.data[6][0x44]==0x81);}
+    Fixture ramp;ramp.src.sink=0;ramp.src.misc=0x38;ramp.src.machine=2;ramp.in.result=2;ramp.bus.data[1][8]=2;
+    ramp.step();ramp.bus.calls=0;ramp.step(2000);unsigned rampCalls=ramp.bus.calls;
+    for(unsigned i=1;i<=rampCalls;++i){Fixture f;f.src.sink=0;f.src.misc=0x38;f.src.machine=2;f.in.result=2;f.bus.data[1][8]=2;
+     f.step();f.bus.calls=0;f.bus.fail=i;auto out=f.step(2000);
+     assert(out.error&&!out.verified&&!out.fallbackError);f.safe();}
+    // Missing/unsafe measurement, source and protection states all revoke HC.
+    for(unsigned kind=0;kind<16;++kind){Fixture f;f.active();
+        int temp=250;bool valid=true;
+        switch(kind){case 0:valid=false;break;case 1:temp=99;break;case 2:temp=450;break;
+         case 3:f.src.valid=false;break;case 4:f.src.thermal=0x40;break;case 5:f.src.connector=2;break;
+         case 6:f.src.suspend=1;break;case 7:f.src.aiclOptions=0;break;case 8:f.in.voltageValid=false;break;
+         case 9:f.in.millivolts=5300;break;case 10:f.s.thermal=0x20;break;case 11:f.s.chargeError=2;break;
+         case 12:f.s.usb=0;break;case 13:f.src.misc|=0x80;break;case 14:f.src.legacy=1;break;
+         case 15:f.in.statusValid=false;break;}
+        auto out=f.step(3000,temp,valid);assert(out.state==0||out.state==3);assert(out.verified);f.safe();}
+    {Fixture f;f.active();assert(f.step(3000,400).targetMa==500);f.safe();
+     assert(f.step(4000,390).targetMa==500);assert(f.step(5000,380).state==1);assert(f.step(6000,380).targetMa==1600);}
+    {Fixture f;f.bus.data[1][0x70]=2;auto out=f.step();assert(out.targetMa==100&&f.bus.written.empty());}
+    {Fixture f;f.step();assert(f.step(30000).state==1);f.safe();}
+    {Fixture f;f.active();f.in.result=1;f.bus.data[1][8]=1;assert(f.step(3000).targetMa==500);f.safe();}
+    {Fixture f;f.step();f.bus.race=true;auto out=f.step(2000);assert(!out.verified&&out.error==-56&&!out.fallbackError);f.safe();}
+    Fixture base;base.step();base.bus.calls=base.bus.writes=0;base.step(2000);unsigned calls=base.bus.calls,writes=base.bus.writes;
+    for(unsigned i=1;i<=calls;++i){Fixture f;f.step();f.bus.calls=0;f.bus.fail=i;
+        auto out=f.step(2000);assert(!out.verified&&out.error);assert(!out.fallbackError);f.safe();}
+    for(unsigned i=1;i<=writes;++i){Fixture f;f.step();f.bus.writes=0;f.bus.ignored=i;
+        auto out=f.step(2000);assert(!out.verified&&out.error==-50);f.safe();}
+    {Fixture f;f.active();for(unsigned ch=0;ch<7;++ch)if(ch!=1)for(unsigned reg=0;reg<256;++reg)
+        assert(f.bus.data[ch][reg]==Bus{}.data[ch][reg]);}
+    for(unsigned i=1;i<=30;++i){Bus bus;Source src;bus.fail=i;assert(sourceStatus(bus,src)&&!src.valid);}
+    puts("PASS source-qualified 5V control, SDP/CDP/DCP/Rp, thermal hysteresis, lower limits, unplug/race, every control I/O fault and ignored write; register peer only");
+}

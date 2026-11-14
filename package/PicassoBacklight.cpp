@@ -10,6 +10,7 @@
 #include <pexpert/pexpert.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <mach/kmod.h>
+#include <kern/clock.h>
 #include "PicassoButtonsCore.h"
 #include "PicassoBacklightCore.h"
 #include "PicassoSpmi.h"
@@ -55,6 +56,7 @@ struct Backend {
     }
     bool adopting = true;
     bool displayOn = true;
+    bool shuttingDown = false;
     uint32_t requested = 0;
     int read(bool sink, uint8_t reg, uint8_t &value) {
         int error = picasso_spmi_read8(observer[sink].va, reg, value);
@@ -123,6 +125,7 @@ extern "C" IOReturn picasso_backlight_power(IOService *provider, bool on) {
     if(!b)return kIOReturnNotReady;
     if(provider!=b->display)return kIOReturnNotFound;
     IOLockLock(b->lock);
+    if(b->shuttingDown) {IOLockUnlock(b->lock);return kIOReturnNotReady;}
     int error=0;
     if(on && b->requested)error=b->state.brightness(*b,picasso_backlight::clamp(b->requested));
     if(!error)error=b->state.set(*b,on && b->requested!=0);
@@ -138,6 +141,7 @@ extern "C" IOReturn picasso_backlight_level(uint32_t level) {
     if(!b)return kIOReturnNotReady;
     if(level>picasso_backlight::max_level)return kIOReturnBadArgument;
     IOLockLock(b->lock);
+    if(b->shuttingDown) {IOLockUnlock(b->lock);return kIOReturnNotReady;}
     level=picasso_backlight::clamp(level);
     int error=b->state.failed?picasso_backlight::configuration:0;
     if(!error && b->displayOn) {
@@ -156,7 +160,26 @@ extern "C" IOReturn picasso_backlight_level(uint32_t level) {
 extern "C" bool picasso_backlight_current(uint32_t *level) {
     Backend *b=__atomic_load_n(&backend,__ATOMIC_ACQUIRE);
     if(!b || !level)return false;
-    IOLockLock(b->lock);bool ok=!b->state.failed;
+    IOLockLock(b->lock);bool ok=!b->state.failed && !b->shuttingDown;
     if(ok)*level=b->requested;
     IOLockUnlock(b->lock);return ok;
+}
+
+// Called after native shutdown confirmation or root-domain commit. Keep storage, SPMI
+// and panel scanout running for teardown; latch just the backlight off so a
+// queued brightness fade or display wake cannot relight it before power-off.
+extern "C" void picasso_backlight_shutdown(void) {
+    Backend *b=__atomic_load_n(&backend,__ATOMIC_ACQUIRE);
+    if(!b)return;
+    IOLockLock(b->lock);
+    if(b->shuttingDown) {IOLockUnlock(b->lock);return;}
+    b->shuttingDown=true;
+    int error=b->state.set(*b,false);
+    if(!error)b->displayOn=false;
+    uint64_t ns=0;
+    absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+    IOLog("PICASSO_WLED shutdown committed ms=%llu error=%d verified=%u\n",
+        static_cast<unsigned long long>(ns/1000000),error,!error);
+    if(error)b->report_error(error);
+    IOLockUnlock(b->lock);
 }

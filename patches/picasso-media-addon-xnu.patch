@@ -1,0 +1,82 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7644,6 +7644,27 @@
+         mode == ((index & 1) ? 0755U : 0644U);
+ }
+ 
++/* Combined payloads keep the four audio files first and only the pinned GPU
++ * bundle after them. No daemon replacements or arbitrary addon paths. */
++static bool
++picasso_media_addon_entry(uint32_t count, uint32_t index, const char *name, uint32_t mode, bool gpu)
++{
++    static const char *const names[] = {
++        "addons/NativeAdrenoMetal.bundle/Info.plist",
++        "addons/NativeAdrenoMetal.bundle/NativeAdrenoMetal",
++        "addons/NativeAdrenoMetal.bundle/_CodeSignature/CodeResources",
++        "addons/NativeAdrenoMetal.bundle/libNativeGL.dylib",
++        "addons/NativeAdrenoMetal.bundle/libOSMesa.8.dylib",
++        "addons/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib",
++        "addons/NativeAdrenoMetal.publish", "addons/NativeAdrenoMetal.clients"
++    };
++    static const uint32_t modes[] = {0644, 0755, 0644, 0755, 0755, 0755, 0644, 0644};
++    if (count == 4) return picasso_audio_addon_entry(count, index, name, mode);
++    if (!gpu || count != 12 || index >= 12) return false;
++    if (index < 4) return picasso_audio_addon_entry(4, index, name, mode);
++    return name && !strcmp(name, names[index - 4]) && mode == modes[index - 4];
++}
++
+ static void
+ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ {
+@@ -7664,8 +7685,9 @@
+ 		native_gpu_addon_error = EINVAL;
+ 		return;
+ 	}
+-	uint32_t audio_only = 0;
++	uint32_t audio_only = 0, media_gpu = 0;
+ 	PE_parse_boot_argn("picasso-audio-addon", &audio_only, sizeof(audio_only));
++	PE_parse_boot_argn("sheng-gpu-addon", &media_gpu, sizeof(media_gpu));
+ 	/* Validate the whole addon before writing anything. */
+ 	uint64_t at = 24;
+ 	for (uint32_t i = 0; i < count; ++i) {
+@@ -7687,7 +7709,7 @@
+ 			native_gpu_addon_error = EINVAL;
+ 			return;
+ 		}
+-		if (audio_only == 1 && !picasso_audio_addon_entry(count, i, name, mode)) {
++		if (audio_only == 1 && !picasso_media_addon_entry(count, i, name, mode, media_gpu == 1)) {
+ 			native_gpu_addon_error = EINVAL;
+ 			return;
+ 		}
+@@ -7806,7 +7828,10 @@
+ picasso_audio_prepare(proc_t p, user_addr_t scratch)
+ {
+     volatile int stage = -1, status = native_gpu_addon_error;
+-    if (!native_gpu_addon_failed && native_gpu_addon_files == 4 && !status) {
++    uint32_t gpu = 0;
++    PE_parse_boot_argn("sheng-gpu-addon", &gpu, sizeof(gpu));
++    if (!native_gpu_addon_failed && (native_gpu_addon_files == 4 ||
++        (gpu == 1 && native_gpu_addon_files == 12)) && !status) {
+         picasso_audio_route_mount(p, scratch, &stage, &status);
+         if (stage == 5 && !status) picasso_audio_addon_mount(p, scratch, &stage, &status);
+     }
+@@ -7824,13 +7849,18 @@
+ 	native_gpu_addon_install(p, scratch);
+ 	if (audio == 1) picasso_audio_prepare(p, scratch);
+ 
+-	if (enabled != 1) return;
++	if (enabled != 1 || native_gpu_addon_failed || native_gpu_addon_error) return;
+ 	static const char extensions_source[] = "/private/var/ngpu/addons", extensions_point[] = "/System/Library/Extensions";
+ 	static const char daemons_source[] = "/private/var/ngpu/daemons", daemons_point[] = "/System/Library/LaunchDaemons";
+ 	native_gpu_addon_mount(p, scratch, 0x400, extensions_source, sizeof(extensions_source), extensions_point,
+ 	    sizeof(extensions_point), "/System/Library/Extensions/AGXMetalA10.bundle",
+ 	    "/System/Library/Extensions/NativeAdrenoMetal.bundle/Info.plist", &native_gpu_addon_stage,
+ 	    &native_gpu_addon_status);
++	if (audio == 1) {
++		printf("PICASSO_GPU combined files=%d extensions=%d/%d\n",
++		    native_gpu_addon_files, native_gpu_addon_stage, native_gpu_addon_status);
++		return;
++	}
+ 	native_gpu_addon_mount(p, scratch, 0x600, daemons_source, sizeof(daemons_source), daemons_point, sizeof(daemons_point),
+ 	    "/System/Library/LaunchDaemons/com.apple.backboardd.plist",
+ 	    "/System/Library/LaunchDaemons/org.blu-sharky.adrenoprobed.plist", &native_gpu_addon2_stage, &native_gpu_addon2_status);

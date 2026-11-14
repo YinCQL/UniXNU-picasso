@@ -37,6 +37,7 @@ extern const uint8_t verified_root_key[];
 #include "RootReadDiagnostics.h"
 #include "TransferPoll.h"
 #include "SmmuTakeover.h"
+#include "FirmwareWindow.h"
 
 static UfsRootDiagnostics gRootDiagnostic;
 static bool gRootDiagnosticEnabled;
@@ -912,6 +913,7 @@ static bool gRootBringupTrace = false;
 #include "RootQueue.h"
 #define NATIVE_UFS_READ_TRACE(...) IOLog(__VA_ARGS__)
 #include "RootCommands.h"
+#include "FirmwareCommands.h"
 #undef NATIVE_UFS_READ_TRACE
 #undef NATIVE_UFS_TRACE
 
@@ -1472,6 +1474,7 @@ extern "C" unsigned native_ufs_store_gpt_check (void)
   return result;
 }
 
+#include "FirmwareRead.h"
 #include "PicassoPersistence.h"
 
 // One read-only window of the root image as a block device: 512-byte sectors on top of 4096-byte

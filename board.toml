@@ -319,7 +319,7 @@ packed_data_ramdisk = true
 persistent_data = true
 # Explicit unencrypted developer storage; does not claim keybag/password support.
 unprotected_developer_data = true
-# Use the original iPhone X identity and phone/2436/3/P3 artwork.
+# Use the iPhone X identity and phone/2436/3 artwork with the SDR display gamut.
 iphone_identity = true
 # Select the authenticated OS volume by UUID; verify its signed image independently.
 root_match_volume_uuid = "DADD93F8-DBBF-4B17-A1DF-0F11E64172F7"

@@ -3,6 +3,8 @@
 import argparse
 import json
 import os
+import platform
+import shutil
 from pathlib import Path
 import subprocess
 
@@ -25,7 +27,7 @@ def main():
                  'IOKit/IOLib.h', 'kern/task.h', 'pexpert/pexpert.h']:
         p = inc / name
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text('#pragma once\n#include "XnuMemoryFixture.h"\n' +
+        p.write_text('#pragma once\n#include <cstdio>\n#include "XnuMemoryFixture.h"\n' +
                      ('inline void IOFree(void *p,size_t) {std::free(p); }\n' if name.endswith('IOLib.h') else ''))
     phase = out / 'phase.cpp'
     phase.write_text('#include <cstdint>\nextern "C" { volatile uint64_t native_adreno_maint_phase[8][2]; }\n')
@@ -43,6 +45,8 @@ volatile uint32_t native_gpu_dcvs[15];
 unsigned native_pmap_user_mappings(unsigned,void **,uint64_t *,char *) {return 0;}
 }
 ''')
+    cc = [os.environ.get('CC') or shutil.which('clang') or 'cc']
+    cxx = [os.environ.get('CXX') or shutil.which('clang++') or 'c++']
     commands = []
     flags = ['-O1', '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if args.sanitize else ['-O2', '-g']
     env = dict(os.environ)
@@ -61,22 +65,38 @@ unsigned native_pmap_user_mappings(unsigned,void **,uint64_t *,char *) {return 0
                 raise RuntimeError((p.stdout + p.stderr)[-4000:])
 
         c_objects = []
-        for name in ['ArmSmmu4KContext', 'ArmSmmu4KLive', 'ArmSmmu4KMmio', 'ArmSmmu4KProgram', 'ArmSmmu4KStreams', 'AdrenoPM4']:
+        for name in ['ArmSmmu4KContext', 'ArmSmmu4KLive', 'ArmSmmu4KProgram', 'ArmSmmu4KStreams', 'AdrenoPM4']:
             obj = out / (name + '.o')
             src = (pm4 if name == 'AdrenoPM4' else smmu) / (name + '.c')
-            run(['xcrun', 'clang', '-std=c11', *flags, '-c', src, '-o', obj])
+            run([*cc, '-std=c11', *flags, '-c', src, '-o', obj])
             c_objects.append(obj)
-        base = ['xcrun', 'clang++', '-std=c++23', *flags, '-I', inc, '-I', kit / 'tests', '-I', kit, '-I', smmu, '-I', pm4]
+        base = [*cxx, '-std=c++23', *flags, '-I', inc, '-I', kit / 'tests', '-I', kit, '-I', smmu, '-I', pm4]
         objects = []
         for name in ['NativeAdrenoMemory', 'NativeAdrenoSmmuMemory', 'NativeAdrenoVm']:
             obj = out / (name + '.o')
-            run([*base, '-c', kit / (name + '.cpp'), '-o', obj])
+            source = kit / (name + '.cpp')
+            if name == 'NativeAdrenoSmmuMemory' and platform.machine() not in ('arm64', 'aarch64'):
+                code = source.read_text()
+                barrier = '__asm__ volatile("dsb st":::"memory");'
+                if code.count(barrier) != 1:
+                    raise ValueError('SMMU host barrier contract changed')
+                source = out / (name + '.cpp')
+                source.write_text(code.replace(barrier, '__atomic_thread_fence(__ATOMIC_SEQ_CST);'))
+            run([*base, '-c', source, '-o', obj])
             objects.append(obj)
         run([*base, kit / 'tests/test_vm.cpp', *objects, *c_objects, phase, vm_support, '-o', out / 'test_vm'])
         run([out / 'test_vm'])
         for name in ['NativeAdrenoRing', 'NativeAdrenoSubmit', 'NativeAdrenoPreempt']:
             obj = out / (name + '.o')
-            run([*base, '-c', kit / (name + '.cpp'), '-o', obj])
+            source = kit / (name + '.cpp')
+            if name in ('NativeAdrenoSubmit', 'NativeAdrenoPreempt') and platform.machine() not in ('arm64', 'aarch64'):
+                code = source.read_text()
+                barrier = '__asm__ volatile("dsb sy":::"memory");'
+                if code.count(barrier) != 1:
+                    raise ValueError('Submit host barrier contract changed')
+                source = out / (name + '.cpp')
+                source.write_text(code.replace(barrier, '__atomic_thread_fence(__ATOMIC_SEQ_CST);'))
+            run([*base, '-c', source, '-o', obj])
             objects.append(obj)
         run([*base, kit / 'tests/test_submit.cpp', *objects, *c_objects, phase, submit_support, '-o', out / 'test_submit'])
         run([out / 'test_submit'])

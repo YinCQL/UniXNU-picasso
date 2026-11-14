@@ -6,6 +6,8 @@
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSIterator.h>
 #include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSArray.h>
+#include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSSymbol.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
@@ -37,6 +39,7 @@ static PicassoHidPlan gesture;
 static void (*touchSink)(void *);
 static void *touchContext;
 static int results[8];
+static unsigned reportErrors[8];
 static unsigned autoStop;
 
 extern "C" void picasso_hid_content_presented(void) {
@@ -107,7 +110,9 @@ extern "C" void native_hid_input_observed(unsigned event, int result) {
     if (event >= 8) return;
     __atomic_store_n(&results[event], result, __ATOMIC_RELEASE);
     unsigned n = __atomic_add_fetch(&native_hid_input_events[event], 1, __ATOMIC_ACQ_REL);
-    if (event < 3 || ((event == 4 || event == 5 || event == 6) && result && n <= 8))
+    const bool reportError = (event == 4 || event == 5 || event == 6) && result &&
+        __atomic_add_fetch(&reportErrors[event], 1, __ATOMIC_RELAXED) <= 8;
+    if (event < 3 || reportError)
         IOLog("PICASSO_HID event=%u sample=%u result=%x\n", event, n, result);
 }
 
@@ -127,25 +132,39 @@ static IORegistryEntry *eventDriver(IORegistryEntry *parent, unsigned depth) {
     return found;
 }
 
+static unsigned hidNumber(OSObject *object) {
+    OSNumber *number = OSDynamicCast(OSNumber, object);
+    return number ? number->unsigned32BitValue() : 0;
+}
+
+static void logHidIdentity(IORegistryEntry *entry, const char *node) {
+    if (!entry) return;
+    OSArray *pairs = OSDynamicCast(OSArray, entry->getProperty("DeviceUsagePairs"));
+    OSDictionary *first = pairs && pairs->getCount() ? OSDynamicCast(OSDictionary, pairs->getObject(0)) : nullptr;
+    IOLog("PICASSO_HID identity node=%s registry=%llx page=%x usage=%x pairs=%u first=%x/%x built_in=%u integrated=%u\n",
+        node, entry->getRegistryEntryID(), hidNumber(entry->getProperty("PrimaryUsagePage")),
+        hidNumber(entry->getProperty("PrimaryUsage")), pairs ? pairs->getCount() : 0,
+        first ? hidNumber(first->getObject("DeviceUsagePage")) : 0,
+        first ? hidNumber(first->getObject("DeviceUsage")) : 0,
+        entry->getProperty("Built-In") == kOSBooleanTrue,
+        entry->getProperty("DisplayIntegrated") == kOSBooleanTrue);
+}
+
 extern "C" void native_hid_live_checkpoint(IOService *device) {
-    // The combined keyboard collection must match first; classify the attached
-    // event service as a built-in digitizer only after matching, once per service.
-    static IORegistryEntry *published;
+    // Classification is now derived from the descriptor before registration.
+    // Observe all three nodes without racing the family's property publication
+    // or rewriting a service that userspace has already discovered.
+    static uint64_t published[2]; // one combined device, or the two opt-in split devices
     IORegistryEntry *driver = eventDriver(device, 4);
     if (!driver) return;
-    if (device->getProperty("Built-In") && published != driver) {
-        driver->setProperty("Built-In", kOSBooleanTrue);
-        driver->setProperty("DisplayIntegrated", kOSBooleanTrue);
-        driver->setProperty("PrimaryUsagePage", (unsigned long long)0x0d, 32);
-        driver->setProperty("PrimaryUsage", (unsigned long long)4, 32);
-        if (IORegistryEntry *interface = driver->getParentEntry(gIOServicePlane)) {
-            interface->setProperty("Built-In", kOSBooleanTrue);
-            interface->setProperty("DisplayIntegrated", kOSBooleanTrue);
-            interface->setProperty("PrimaryUsagePage", (unsigned long long)0x0d, 32);
-            interface->setProperty("PrimaryUsage", (unsigned long long)4, 32);
-        }
-        published = driver;
-        IOLog("PICASSO_HID digitizer event service ready\n");
+    const uint64_t identity = driver->getRegistryEntryID();
+    unsigned slot = 0;
+    while (slot < 2 && published[slot] && published[slot] != identity) ++slot;
+    if (slot < 2 && !published[slot]) {
+        published[slot] = identity;
+        logHidIdentity(device, "device");
+        logHidIdentity(driver->getParentEntry(gIOServicePlane), "interface");
+        logHidIdentity(driver, "event-service");
     }
     driver->release();
 }
@@ -165,7 +184,9 @@ extern "C" void picasso_hid_frame_presented(void) {
 static void notifyPublished(void *) { native_touch_notify(); }
 
 static void publishContact(unsigned count, int y) {
-    const int x = 15240, id = 1;
+    // Novatek owns IDs 1..10. A physical takeover must release the synthetic
+    // contact, not continue its gesture and inherited edge state as ID 1.
+    const int x = 15240, id = 255;
     nvt_touch_publication publication = {&native_touch_seq, &native_touch_count,
         native_touch_xs, native_touch_ys, native_touch_ids, 12, notifyPublished, nullptr, &native_touch_writer_lock};
     nvt_touch_publish_if(&publication, &x, &y, &id, count, &autoStop);

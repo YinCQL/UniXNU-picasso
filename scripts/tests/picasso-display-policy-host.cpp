@@ -21,7 +21,9 @@ struct OSObject {
 };
 struct OSData : OSObject {
     std::vector<unsigned char> bytes;
+    static inline bool failAllocation = false;
     static OSData *withBytes(const void *value, unsigned length) {
+        if (failAllocation) return nullptr;
         auto *data = new OSData;
         auto *begin = static_cast<const unsigned char *>(value);
         data->bytes.assign(begin, begin + length);
@@ -96,6 +98,29 @@ int main(int argc, char **argv) {
     assert(argc == 2);
     uint32_t adtScale = static_cast<uint32_t>(std::strtoul(argv[1], nullptr, 10));
     assert(adtScale == 2 || adtScale == 3);
+    // Actual board property writer: exact native selector payload, no overwrite.
+    IORegistryEntry panel;
+    assert(!publishPanelPitch(nullptr, 1080, 2400));
+    assert(!publishPanelPitch(&panel, 2400, 1080) && panel.props.empty());
+    assert(!publishPanelPitch(&panel, 1170, 2532) && panel.props.empty());
+    OSData::failAllocation = true;
+    assert(!publishPanelPitch(&panel, 1080, 2400) && panel.props.empty());
+    OSData::failAllocation = false;
+    panel.failSet = true;
+    assert(!publishPanelPitch(&panel, 1080, 2400) && panel.props.empty());
+    panel.failSet = false;
+    assert(publishPanelPitch(&panel, 1080, 2400) && word(&panel, "dot-pitch") == 395);
+    OSObject *pitch = panel.getProperty("dot-pitch");
+    assert(publishPanelPitch(&panel, 1080, 2400) && panel.getProperty("dot-pitch") == pitch);
+    put(&panel, "dot-pitch", 460); pitch = panel.getProperty("dot-pitch");
+    assert(!publishPanelPitch(&panel, 1080, 2400) && panel.getProperty("dot-pitch") == pitch);
+    auto *wrongType = new OSObject;
+    assert(panel.setProperty("dot-pitch", wrongType)); wrongType->release();
+    assert(!publishPanelPitch(&panel, 1080, 2400) && panel.getProperty("dot-pitch") == wrongType);
+    uint64_t oversized = 395;
+    auto *wrongSize = OSData::withBytes(&oversized, sizeof(oversized));
+    assert(panel.setProperty("dot-pitch", wrongSize)); wrongSize->release();
+    assert(!publishPanelPitch(&panel, 1080, 2400) && panel.getProperty("dot-pitch") == wrongSize);
     IOMemoryMap map;
     root = new IORegistryEntry;
     assert(start(map)); assert(word(root, "display-scale") == 2); assert(word(root, "display-rotation") == 0);

@@ -89,6 +89,12 @@ def main():
             owned = check_owned_memory(nodes, int(str(adt['owned_memory_size']), 0))
         else:
             assert not any('darwinboot-memory-size' in node for node in nodes.values())
+        if name != 'minimal' and adt.get('iphone_identity'):
+            assert nodes['/product'].get('product-id') == bytes.fromhex('fd079b298144a7deb4d7c87fef3eb474d8f0e7eb')
+            assert nodes['']['model'] == b'iPhone10,3\0'
+            assert sum('product-id' in item for item in nodes.values()) == 1
+        else:
+            assert not any('product-id' in item for item in nodes.values())
         memory_map = nodes['/chosen/memory-map']
         if name == 'board-with-data':
             assert memory_map.get('PackedRAMDisk') == bytes(16)

@@ -1523,6 +1523,40 @@ int gxPowerOn(unsigned perfIndex)
 
 } // namespace
 
+extern "C" int native_adreno620_gmu_acquire_gpu_set(void)
+{
+    if (!gState || !gState->booted || !gState->hfiStarted) return -1;
+    /* A620 OOB GPU_SET: request bit 30, ACK/clear bit 31. Discard a stale ACK
+     * before requesting a new hold (a6xx_gmu_oob_set, non-legacy layout). */
+    coreWrite(kGmuGmu2HostIntrClr, 1u << 31);
+    barrier();
+    coreWrite(kGmuHost2GmuIntrSet, 1u << 30);
+    barrier();
+    uint32_t info = 0;
+    for (unsigned poll = 0; poll < 1000; ++poll) {
+        info = coreRead(kGmuGmu2HostIntrInfo);
+        if (info & (1u << 31)) break;
+        IODelay(100);
+    }
+    coreWrite(kGmuGmu2HostIntrClr, 1u << 31);
+    barrier();
+    if (!(info & (1u << 31))) {
+        coreWrite(kGmuHost2GmuIntrSet, 1u << 31);
+        barrier();
+        printf("PICASSO_GPU restart: GPU_SET acknowledgement timed out\n");
+        return -1;
+    }
+    constexpr uint32_t off = (1u << 6) | (1u << 7);
+    for (unsigned poll = 0; poll < 1000; ++poll) {
+        if (!(coreRead(kGmuGxPwrStatus) & off)) return 0;
+        IODelay(100);
+    }
+    coreWrite(kGmuHost2GmuIntrSet, 1u << 31);
+    barrier();
+    printf("PICASSO_GPU restart: GPU_SET power timed out\n");
+    return -1;
+}
+
 extern "C" void native_adreno620_gmu_release_gpu_set(void)
 {
     if (!gState) return;

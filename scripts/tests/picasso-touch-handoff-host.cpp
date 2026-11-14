@@ -17,7 +17,7 @@ static void (*touchSink)(void *)=sink;
 int main() {
     nvt_contact finger={};finger.x=5400;finger.y=12000;finger.tracking_id=3;
     assert(publish(nullptr,0) && notifications==0 && autoStop==0);
-    publishContact(1,20100);assert(native_touch_count==1 && notifications==1);
+    publishContact(1,20100);assert(native_touch_count==1 && notifications==1 && native_touch_ids[0]==255);
     assert(publish(nullptr,0) && native_touch_count==1 && notifications==1);
     native_touch_writer_lock=1;
     assert(!publish(&finger,1) && autoStop==2 && notifications==1);
