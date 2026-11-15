@@ -1,0 +1,22 @@
+SPDX-FileCopyrightText: 2026 daimile2 and contributors
+SPDX-License-Identifier: APSL-2.0
+
+Copyright (c) 2026 daimile2 and contributors. All Rights Reserved.
+
+This file contains Original Code and/or Modifications of Original Code
+as defined in and that are subject to the Apple Public Source License
+Version 2.0 (the 'License'). You may not use this file except in
+compliance with the License. Please obtain a copy of the License at
+https://opensource.apple.com/apsl/ and read it before using this file.
+
+The Original Code and all software distributed under the License are
+distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+Please see the License for the specific language governing rights and
+limitations under the License.
+
+Publication/notice: 2026-11-05. Interface adaptation provenance is recorded
+in NOTICE.md. This companion notice preserves the byte-identical audited
+source and does not relicense upstream XNU code or grant Apple binary rights.

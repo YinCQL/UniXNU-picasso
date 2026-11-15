@@ -157,7 +157,7 @@ volume = "PICASSOESP"
 # Exact 20H392 labels, selected by job label, plist name or executable name.
 # watchdogd stays disabled; wdt=0 disables its checkin policy below.
 runtime_enabled_jobs = ["com.apple.bluetoothd"]
-# bluetoothd supplies the BTAudioHALPlugin service; radio hardware is unimplemented.
+# The sealed root supplies BTAudioHALPlugin; the addon supplies WCN399x UART.SK.
 offline_disabled_jobs = [
   "com.apple.BTServer.avrcp",
   "com.apple.BTServer.le",

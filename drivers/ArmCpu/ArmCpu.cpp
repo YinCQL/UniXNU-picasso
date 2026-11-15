@@ -925,6 +925,21 @@ extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler
   return kIOReturnSuccess;
 }
 
+// Mask only an attached SPI. W1S/W1C avoids read-modify-write races with
+// other interrupt owners; usable by a hard IRQ and its deferred executor.
+extern "C" IOReturn armcpu_spi_mask (uint32_t intid, bool masked)
+{
+  if (!gDist || !armcpu_gic_ready) return kIOReturnNotReady;
+  const uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
+  bool attached = false;
+  for (uint32_t slot = 0; slot < used; ++slot)
+    if (gSpi[slot].id == intid) { attached = true; break; }
+  if (!attached || intid < 32 || intid >= 1020) return kIOReturnBadArgument;
+  write32 (gDist, (masked ? 0x180 : 0x100) + (intid / 32) * 4, 1U << (intid % 32));
+  __asm__ volatile ("dsb sy" ::: "memory");
+  return kIOReturnSuccess;
+}
+
 extern "C" uint64_t armcpu_spi_count (uint32_t intid)
 {
   const uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);

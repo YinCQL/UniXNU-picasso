@@ -1,0 +1,29 @@
+{
+  "repository": "https://github.com/ianchb/sm8550-mainline",
+  "commit": "1fb56e66091e71160d7c7f8e13b065d5b6ab8b8c",
+  "files": {
+    "drivers/bluetooth/btqca.c": "1c703048b005aa407e32bfecaedccf1c28f6a78e1e4a384d51215abfcdec6d16",
+    "drivers/bluetooth/btqca.h": "075eeaf78e4a9288ae228c0f99edbd137fcbd87c2645872cf748a9a33752205e"
+  },
+  "board_reference": "https://github.com/ianchb/debian-sheng",
+  "renoir_reference": "https://github.com/daimile2/renoir_xnu_bluethooth/tree/2b9d59c921c9ec803462b2be8deb6980f7297c22",
+  "hardware_sources": {
+    "drivers/tty/serial/qcom_geni_serial.c": "5bb9ba5ed694f1329eaf47d2de935bcfd0a405f63d5055a9b0ff1950890a527c",
+    "drivers/soc/qcom/qcom-geni-se.c": "993154d7a1045914bc464cb985518d3e7a7ec06769ff245f20c7435c879a0977",
+    "include/linux/soc/qcom/geni-se.h": "e4bd79c0b3f21dafa1a6f58db8958b811605bec9cf8b6ca92fcfe076dac21a25",
+    "arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dts": "1d01cfdf85be225eb2bb4710bfa8cf6afcfead357489c9d5e6843b6443eba3e2",
+    "arch/arm64/boot/dts/qcom/sm8550.dtsi": "9da67016bef2c6387291dac20b109cad10309c3e812201f450e04237cc068f6a",
+    "drivers/clk/qcom/gcc-sm8550.c": "292630e2c5825ab947c9a649d8c4ec43303f17c5670dbda4062c13c35775b7d4",
+    "drivers/clk/qcom/clk-rcg2.c": "e109e9113e6cbb18be3139f5838fa5d339f03256674df3ee8b6ed591ecd3c5c6",
+    "drivers/iommu/arm/arm-smmu/arm-smmu.h": "b7221ee9b767594ba79cfc139fca838236f81ba949fb5e0be81e31ef42b1911c"
+  },
+  "native_adapter_reference": {
+    "repository": "https://github.com/daimile2/renoir_xnu_bluethooth",
+    "commit": "2b9d59c921c9ec803462b2be8deb6980f7297c22",
+    "files": {
+      "userland/renoir_bt_type0.c": "bb66ba844f06ccbba1702399f52191fc53154af94e2db224dd7f6fd7630af479",
+      "tools/patch-renoir-bluetoothd.py": "d7fa6e4d9f976b1a065c997017590342e1d6d28a963dcd32012aaed19268ec59"
+    },
+    "license": "BSD-3-Clause"
+  }
+}

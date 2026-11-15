@@ -1,0 +1,202 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7678,7 +7678,7 @@
+ }
+ 
+ /* Combined payloads keep the four audio files first and only the pinned GPU
+- * bundle after them. No daemon replacements or arbitrary addon paths. */
++ * bundle after them, followed by the exact native Bluetooth runtime. */
+ static bool
+ picasso_media_addon_entry(uint32_t count, uint32_t index, const char *name, uint32_t mode, bool gpu)
+ {
+@@ -7693,9 +7693,17 @@
+     };
+     static const uint32_t modes[] = {0644, 0755, 0644, 0755, 0755, 0755, 0644, 0644};
+     if (count == 4) return picasso_audio_addon_entry(count, index, name, mode);
+-    if (gpu && count == 13 && index == 12)
++    if (gpu && count == 19 && index >= 13 && index < 19) {
++        static const char *const bt_names[] = {"ui/PicassoBTType0.dylib",
++            "bluetooth-bin/bluetoothd", "bluetooth-bin/BlueTool",
++            "bluetooth-firmware/crbtfw32.tlv", "bluetooth-firmware/crnv32.bin",
++            "bluetooth-firmware/crnv32u.bin"};
++        return name && !strcmp(name, bt_names[index-13]) &&
++            mode == ((index==14 || index==15) ? 0755U : 0644U);
++    }
++    if (gpu && (count == 13 || count == 19) && index == 12)
+         return name && !strcmp(name, "ui/libpicasso-sb.dylib") && mode == 0644;
+-    if (!gpu || (count != 12 && count != 13) || index >= 12) return false;
++    if (!gpu || (count != 12 && count != 13 && count != 19) || index >= 12) return false;
+     if (index < 4) return picasso_audio_addon_entry(4, index, name, mode);
+     return name && !strcmp(name, names[index - 4]) && mode == modes[index - 4];
+ }
+@@ -7866,7 +7874,7 @@
+     uint32_t gpu = 0;
+     PE_parse_boot_argn("sheng-gpu-addon", &gpu, sizeof(gpu));
+     if (!native_gpu_addon_failed && (native_gpu_addon_files == 4 ||
+-        (gpu == 1 && (native_gpu_addon_files == 12 || native_gpu_addon_files == 13))) && !status) {
++        (gpu == 1 && (native_gpu_addon_files == 12 || (native_gpu_addon_files == 13 || native_gpu_addon_files == 19)))) && !status) {
+         picasso_audio_route_mount(p, scratch, &stage, &status);
+         if (stage == 5 && !status) picasso_audio_addon_mount(p, scratch, &stage, &status);
+     }
+@@ -9382,7 +9390,7 @@
+ /* Validate the entire upper directory before giving it a system view. This
+  * boot-only seed is not a general library overlay or a writable plugin path. */
+ static int
+-picasso_ui_library_directory(vnode_t vp, vfs_context_t ctx)
++picasso_ui_library_directory(vnode_t vp, vfs_context_t ctx, const char *const *names, unsigned count)
+ {
+     char *buffer = kalloc_data(4096, Z_WAITOK);
+     uio_t uio = buffer ? uio_create(1, 0, UIO_SYSSPACE, UIO_READ) : NULL;
+@@ -9406,16 +9414,17 @@
+             int dot = entry->d_namlen == 1 && entry->d_name[0] == '.';
+             int dotdot = entry->d_namlen == 2 && !memcmp(entry->d_name, "..", 2);
+             if (!dot && !dotdot) {
+-                if (entry->d_namlen != sizeof("libpicasso-sb.dylib") - 1 ||
+-                    memcmp(entry->d_name, "libpicasso-sb.dylib", sizeof("libpicasso-sb.dylib") - 1) || ++found != 1) {
+-                    error = EINVAL; break;
+-                }
++                unsigned i=0;
++                for(;i<count;++i)if(strlen(names[i])==entry->d_namlen &&
++                    !memcmp(entry->d_name,names[i],entry->d_namlen))break;
++                if(i==count || (found&(1u<<i))){error=EINVAL;break;}
++                found|=1u<<i;
+             }
+             at += entry->d_reclen;
+         }
+         if (!used && !eof) error = EIO;
+     }
+-    if (!error && (!eof || found != 1)) error = EINVAL;
++    if (!error && (!eof || found != ((1u<<count)-1))) error = EINVAL;
+     if (uio) uio_free(uio);
+     if (buffer) kfree_data(buffer, 4096);
+     return error;
+@@ -9425,23 +9434,25 @@
+ picasso_ui_library_prepare(bool runtime)
+ {
+     const char *paths[] = {"/private/var/picasso", "/private/var/picasso/usr-lib",
+-        "/private/var/picasso/usr-lib/libpicasso-sb.dylib"};
++        "/private/var/picasso/usr-lib/libpicasso-sb.dylib", "/private/var/ngpu/ui/PicassoBTType0.dylib"};
++    const char *names[]={"libpicasso-sb.dylib","PicassoBTType0.dylib"};
++    unsigned count=runtime && native_gpu_addon_files==19?2:1;
+     if (runtime) {
+         paths[0] = "/private/var/ngpu";
+         paths[1] = "/private/var/ngpu/ui";
+         paths[2] = "/private/var/ngpu/ui/libpicasso-sb.dylib";
+     }
+     vfs_context_t ctx = vfs_context_current();
+-    for (unsigned i = 0; i < 3; ++i) {
++    for (unsigned i = 0; i < 2+count; ++i) {
+         vnode_t vp = NULLVP;
+         int error = vnode_lookup(paths[i], VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
+         if (error) return error;
+-        if (vnode_vtype(vp) != (i == 2 ? VREG : VDIR)) error = EINVAL;
+-        if (!error && i == 1) error = picasso_ui_library_directory(vp, ctx);
++        if (vnode_vtype(vp) != (i >= 2 ? VREG : VDIR)) error = EINVAL;
++        if (!error && i == 1) error = picasso_ui_library_directory(vp, ctx, names, count);
+         if (!error) {
+             struct vnode_attr va;
+             VATTR_INIT(&va);
+-            VATTR_SET(&va, va_mode, i == 2 ? 0644 : 0755);
++            VATTR_SET(&va, va_mode, i >= 2 ? 0644 : 0755);
+             VATTR_SET(&va, va_uid, 0);
+             VATTR_SET(&va, va_gid, 0);
+             error = vnode_setattr(vp, &va, ctx);
+@@ -9451,7 +9462,7 @@
+                 error = vnode_getattr(vp, &va, ctx);
+                 if (!error && (!VATTR_IS_SUPPORTED(&va, va_mode) || !VATTR_IS_SUPPORTED(&va, va_uid) ||
+                     !VATTR_IS_SUPPORTED(&va, va_gid) || va.va_uid || va.va_gid ||
+-                    (va.va_mode & 07777) != (i == 2 ? 0644 : 0755))) error = EPERM;
++                    (va.va_mode & 07777) != (i >= 2 ? 0644 : 0755))) error = EPERM;
+             }
+         }
+         vnode_put(vp);
+@@ -9802,7 +9813,7 @@
+     uint32_t audio = 0, gpu = 0;
+     PE_parse_boot_argn("picasso-audio-addon", &audio, sizeof(audio));
+     PE_parse_boot_argn("sheng-gpu-addon", &gpu, sizeof(gpu));
+-    bool runtime = audio == 1 && gpu == 1 && native_gpu_addon_files == 13;
++    bool runtime = audio == 1 && gpu == 1 && (native_gpu_addon_files == 13 || native_gpu_addon_files == 19);
+     if (runtime && (native_gpu_addon_failed || native_gpu_addon_error)) {
+         printf("PICASSO_INJECT runtime UI addon failed error=%d\n", native_gpu_addon_error); return;
+     }
+@@ -9816,6 +9827,47 @@
+     if (runtime) printf("PICASSO_INJECT runtime UI view stage=%d error=%d\n", stage, status);
+     printf("PICASSO_INJECT view stage=%d error=%d path=%s\n", stage, status, library);
+ }
++/* The board only starts after both runtime views are installed. */
++extern void picasso_bt_runtime_result(int) __attribute__((weak_import));
++static void
++picasso_bluetooth_mount(proc_t p,user_addr_t scratch)
++{
++    if(native_gpu_addon_files!=19)return;
++    int error=native_gpu_addon_error;
++    if(!error && native_gpu_addon_failed)error=EIO;
++    const char *names[]={"bluetoothd","BlueTool"};
++    const char *paths[]={"/private/var/ngpu/bluetooth-bin",
++        "/private/var/ngpu/bluetooth-bin/bluetoothd","/private/var/ngpu/bluetooth-bin/BlueTool"};
++    vfs_context_t ctx=vfs_context_current();
++    for(unsigned i=0;!error && i<3;++i){
++        vnode_t vp=NULLVP;
++        error=vnode_lookup(paths[i],VNODE_LOOKUP_NOFOLLOW,&vp,ctx);
++        if(error)break;
++        if(vnode_vtype(vp)!=(i?VREG:VDIR))error=EINVAL;
++        if(!error && !i)error=picasso_ui_library_directory(vp,ctx,names,2);
++        struct vnode_attr va;VATTR_INIT(&va);
++        VATTR_WANTED(&va,va_mode);VATTR_WANTED(&va,va_uid);VATTR_WANTED(&va,va_gid);VATTR_WANTED(&va,va_nlink);
++        if(!error)error=vnode_getattr(vp,&va,ctx);
++        if(!error && (!VATTR_IS_SUPPORTED(&va,va_mode)||!VATTR_IS_SUPPORTED(&va,va_uid)||
++            !VATTR_IS_SUPPORTED(&va,va_gid)||!VATTR_IS_SUPPORTED(&va,va_nlink)||
++            va.va_uid||va.va_gid||(va.va_mode&07777)!=0755||(i && va.va_nlink!=1)))error=EPERM;
++        vnode_put(vp);
++    }
++    vnode_t library=NULLVP;
++    if(!error)error=vnode_lookup("/usr/lib/PicassoBTType0.dylib",VNODE_LOOKUP_NOFOLLOW,&library,ctx);
++    if(library){if(vnode_vtype(library)!=VREG)error=EINVAL;vnode_put(library);}
++    volatile int stage=0,status=-1;
++    if(!error){
++        static const char source[]="/private/var/ngpu/bluetooth-bin",point[]="/usr/sbin";
++        native_gpu_addon_mount(p,scratch,0xc00,source,sizeof(source),point,sizeof(point),
++            "/usr/sbin/notifyd","/usr/sbin/bluetoothd",&stage,&status);
++        if(stage!=5 || status)error=status?status:EIO;
++    }
++    printf("PICASSO_BT runtime files=%d binaries=%d/%d error=%d\n",
++        native_gpu_addon_files,stage,status,error);
++    if(picasso_bt_runtime_result)picasso_bt_runtime_result(error);
++}
++
+ #endif
+ 
+ 
+@@ -9898,6 +9950,7 @@
+ 	if (!error) native_picasso_apps_mount(p, scratch);
+ 	if (!error) picasso_ui_library_mount(p, scratch);
++	if (!error) picasso_bluetooth_mount(p, scratch);
+ 	if (!error) picasso_ifnamer_mount(p, scratch);
+ 	if (!error) (void)picasso_jobs_enable(p, scratch);
+ #endif
+ done:
+--- a/bsd/skywalk/core/skywalk.c
++++ b/bsd/skywalk/core/skywalk.c
+@@ -29,6 +29,7 @@
+ #include <skywalk/os_skywalk_private.h>
+ #include <pexpert/pexpert.h>    /* for PE_parse_boot_argn */
+ #include <sys/codesign.h>       /* for csproc_get_platform_binary */
++#include <IOKit/IOBSD.h>        /* signed Boolean entitlement query */
+ #include <sys/signalvar.h>      /* for psignal_with_reason */
+ #include <sys/reason.h>
+ #include <sys/kern_memorystatus.h>
+@@ -531,6 +532,14 @@
+ #pragma unused(p)
+ 	int ret = EPERM;
+ 
++	/* The native Bluetooth A2DP user pipe is authorized by its existing
++	 * signed entitlement. Bind the grant to this exact current credential;
++	 * other privileges and delegated processes retain their normal checks. */
++	if (priv == PRIV_SKYWALK_REGISTER_USER_PIPE && p == current_proc() &&
++	    cred == kauth_cred_get() && csproc_get_platform_binary(p) &&
++	    IOTaskHasEntitlement(current_task(), "com.apple.private.skywalk.register-user-pipe"))
++		return 0;
++
+ 	if (cred != NULL) {
+ 		ret = priv_check_cred(cred, priv, 0);
+ 	}
