@@ -1,16 +1,17 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -9535,6 +9535,118 @@
+@@ -9535,6 +9535,134 @@
      printf("PICASSO_NETWORK config stage=%d error=%d stack_s=5 quiet_s=5\n", stage, error);
  }
  
-+/* Update the one approved launchd job before launchd opens its persistent
++/* Release the seven Bluetooth launchd jobs before launchd opens its persistent
 + * overrides. The seed recipe/UUID stays stable. Unknown contents are preserved;
-+ * only the exact shipped XML and the exact result are accepted. This does not
++ * only the seed, previous bluetoothd-only result and final XML are accepted. This does not
 + * provide Bluetooth hardware. Atomic rename leaves old or new policy on disk.
 + */
 +static const uint8_t picasso_jobs_before_sha[32] = {0xc5,0x49,0xe5,0x7f,0x02,0x60,0xf4,0x82,0x98,0x95,0x3f,0xa2,0x14,0xff,0x2e,0x73,0x2a,0xe9,0xa3,0xd8,0x4d,0x57,0x5c,0x74,0xea,0x16,0xd6,0xbc,0xb3,0xce,0x4e,0x17};
-+static const uint8_t picasso_jobs_after_sha[32] = {0x78,0x53,0xda,0x13,0x46,0x3f,0x30,0x91,0x2b,0x95,0x19,0x31,0xe7,0xed,0xc3,0xdc,0x31,0xc2,0xd3,0xf9,0xed,0x64,0x70,0x62,0x08,0xdb,0x43,0x34,0x14,0x83,0x11,0x50};
++static const uint8_t picasso_jobs_legacy_sha[32] = {0x78,0x53,0xda,0x13,0x46,0x3f,0x30,0x91,0x2b,0x95,0x19,0x31,0xe7,0xed,0xc3,0xdc,0x31,0xc2,0xd3,0xf9,0xed,0x64,0x70,0x62,0x08,0xdb,0x43,0x34,0x14,0x83,0x11,0x50};
++static const uint8_t picasso_jobs_after_sha[32] = {0x34,0x02,0xf0,0xbe,0x6b,0xb1,0x16,0x4d,0x62,0xb1,0xb2,0xcb,0x88,0x21,0x58,0x3d,0xc4,0x45,0x34,0xd3,0x16,0x33,0x31,0x56,0x88,0xeb,0x7d,0x84,0xcb,0xd2,0x4e,0xfe};
 +
 +static int
 +picasso_jobs_match(const uint8_t *bytes, size_t size, const uint8_t expected[32])
@@ -54,7 +55,15 @@
 +{
 +    static const char file[] = "/private/var/db/com.apple.xpc.launchd/disabled.plist";
 +    static const char temp[] = "/private/var/db/com.apple.xpc.launchd/.picasso-disabled.tmp";
-+    static const char entry[] = "\t<key>com.apple.bluetoothd</key>\n\t<true/>\n";
++    static const char *const entries[] = {
++        "\t<key>com.apple.BTServer.avrcp</key>\n\t<true/>\n",
++        "\t<key>com.apple.BTServer.le</key>\n\t<true/>\n",
++        "\t<key>com.apple.BTServer.map</key>\n\t<true/>\n",
++        "\t<key>com.apple.BTServer.pbap</key>\n\t<true/>\n",
++        "\t<key>com.apple.BluetoothUIService</key>\n\t<true/>\n",
++        "\t<key>com.apple.bluetoothd</key>\n\t<true/>\n",
++        "\t<key>com.apple.bluetoothuserd</key>\n\t<true/>\n",
++    };
 +    const char *dirs[] = {"/private/var", "/private/var/db", "/private/var/db/com.apple.xpc.launchd"};
 +    vfs_context_t ctx = vfs_context_current();
 +    int error = 0, changed = 0;
@@ -68,13 +77,20 @@
 +    if (!bytes) { error = ENOMEM; goto done; }
 +    error = picasso_ifnamer_read(file, bytes, 8192, &size, ctx);
 +    if (error || picasso_jobs_match(bytes, (size_t)size, picasso_jobs_after_sha)) goto done;
-+    if (!picasso_jobs_match(bytes, (size_t)size, picasso_jobs_before_sha)) { error = EINVAL; goto done; }
-+    size_t at;
-+    for (at = 0; at + sizeof(entry) - 1 <= size; ++at)
-+        if (!memcmp(bytes + at, entry, sizeof(entry) - 1)) break;
-+    if (at + sizeof(entry) - 1 > size) { error = EINVAL; goto done; }
-+    memmove(bytes + at, bytes + at + sizeof(entry) - 1, (size_t)size - at - (sizeof(entry) - 1));
-+    size -= sizeof(entry) - 1;
++    bool legacy = picasso_jobs_match(bytes, (size_t)size, picasso_jobs_legacy_sha);
++    if (!legacy && !picasso_jobs_match(bytes, (size_t)size, picasso_jobs_before_sha)) { error = EINVAL; goto done; }
++    for (unsigned i = 0; i < sizeof(entries)/sizeof(entries[0]); ++i) {
++        size_t length = strlen(entries[i]), at;
++        for (at = 0; at + length <= size; ++at)
++            if (!memcmp(bytes + at, entries[i], length)) break;
++        if (at + length > size) {
++            /* v2 already removed exactly the bluetoothd override. */
++            if (legacy && i == 5) continue;
++            error = EINVAL; goto done;
++        }
++        memmove(bytes + at, bytes + at + length, (size_t)size - at - length);
++        size -= length;
++    }
 +    if (!picasso_jobs_match(bytes, (size_t)size, picasso_jobs_after_sha)) { error = EINVAL; goto done; }
 +    /* A power loss may leave our exclusive temporary file. Never follow links. */
 +    error = picasso_jobs_metadata(temp, VREG, ctx);
@@ -112,7 +128,7 @@
 +    }
 +done:
 +    if (bytes) kfree_data(bytes, 8192);
-+    printf("PICASSO_JOBS bluetoothd enabled=%u changed=%u error=%d\n", !error, changed, error);
++    printf("PICASSO_JOBS bluetooth enabled=%u changed=%u error=%d\n", !error, changed, error);
 +    return error;
 +}
 +

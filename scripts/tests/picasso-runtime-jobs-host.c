@@ -3,6 +3,7 @@
  */
 #include <assert.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,15 +66,19 @@ static void SHA256_Final(uint8_t out[32],SHA256_CTX *s);
 static void SHA256_Final(uint8_t out[32],SHA256_CTX *s){
     memset(out,0,32);
     if(s->size==sizeof jobs_before && !memcmp(s->data,jobs_before,s->size))memcpy(out,picasso_jobs_before_sha,32);
+    if(s->size==sizeof jobs_legacy && !memcmp(s->data,jobs_legacy,s->size))memcpy(out,picasso_jobs_legacy_sha,32);
     if(s->size==sizeof jobs_after && !memcmp(s->data,jobs_after,s->size))memcpy(out,picasso_jobs_after_sha,32);
 }
 static void setup(void){assert(!refs && !allocs);memset(nodes,0,sizeof nodes);for(unsigned i=0;i<4;++i){nodes[i].exists=1;nodes[i].type=i==3?VREG:VDIR;nodes[i].attr.va_mode=i==3?0644:0755;nodes[i].attr.va_nlink=1;}nodes[3].attr.va_data_size=sizeof jobs_before;memcpy(nodes[3].data,jobs_before,sizeof jobs_before);ops=renames=writes=failAt=0;shortWrite=corruptRead=0;}
 static int is_after(void){return nodes[3].attr.va_data_size==sizeof jobs_after && !memcmp(nodes[3].data,jobs_after,sizeof jobs_after);}
-static int is_before(void){return nodes[3].attr.va_data_size==sizeof jobs_before && !memcmp(nodes[3].data,jobs_before,sizeof jobs_before);}
+static int is_before(void){if(nodes[3].attr.va_data_size==sizeof jobs_legacy && !memcmp(nodes[3].data,jobs_legacy,sizeof jobs_legacy))return 1;return nodes[3].attr.va_data_size==sizeof jobs_before && !memcmp(nodes[3].data,jobs_before,sizeof jobs_before);}
 static int run(void){int e=picasso_jobs_enable((void *)2,0x1000);assert(!refs && !allocs);return e;}
 int main(void){
     setup();assert(!run() && is_after() && renames==1);unsigned max=ops;ops=0;assert(!run() && renames==1);
     for(unsigned at=1;at<=max;++at){setup();failAt=at;assert(run()!=0);assert(is_before() || is_after());failAt=0;assert(!run() && is_after());}
+    setup();nodes[3].attr.va_data_size=sizeof jobs_legacy;memcpy(nodes[3].data,jobs_legacy,sizeof jobs_legacy);assert(!run() && is_after());
+    unsigned legacyMax=ops;
+    for(unsigned at=1;at<=legacyMax;++at){setup();nodes[3].attr.va_data_size=sizeof jobs_legacy;memcpy(nodes[3].data,jobs_legacy,sizeof jobs_legacy);failAt=at;assert(run()!=0 && (is_before() || is_after()));failAt=0;assert(!run() && is_after());}
     setup();shortWrite=1;assert(run()==EIO && is_before());shortWrite=0;assert(!run() && is_after());
     setup();corruptRead=1;assert(run()==EIO && is_before());corruptRead=0;assert(!run() && is_after());
     for(unsigned n=0;n<5;++n){for(unsigned bad=0;bad<4;++bad){setup();if(n==4){nodes[4]=nodes[3];nodes[4].attr.va_data_size=1;}if(bad==0)nodes[n].type=9;if(bad==1)nodes[n].attr.va_uid=501;if(bad==2)nodes[n].attr.va_gid=501;if(bad==3)nodes[n].attr.va_mode|=2;assert(run()!=0 && is_before() && !renames);}}
