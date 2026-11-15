@@ -243,11 +243,14 @@ bool address() {
             uint32_t encoding=1,speed=3000000;
             if(node && node->init() && parent) {
                 node->setName("bluetooth");
-                node->setProperty("device_type","bluetooth");
-                node->setProperty("compatible","qcom,wcn3990-bt");
-                node->setProperty("transport-encoding",&encoding,4);
-                node->setProperty("transport-speed",&speed,4);
-                if(!node->attachToParent(parent,gIODTPlane)){node->release();node=nullptr;}
+                /* Device-tree strings are NUL-terminated OSData. Frameworks
+                 * enumerate all arm-io children with CFData accessors. */
+                char type[]="bluetooth",compatible[]="qcom,wcn3990-bt";
+                bool valid=node->setProperty("device_type",type,sizeof(type)) &&
+                    node->setProperty("compatible",compatible,sizeof(compatible)) &&
+                    node->setProperty("transport-encoding",&encoding,sizeof(encoding)) &&
+                    node->setProperty("transport-speed",&speed,sizeof(speed));
+                if(!valid || !node->attachToParent(parent,gIODTPlane)){node->release();node=nullptr;}
             } else {if(node)node->release();node=nullptr;}
             if(parent)parent->release();
         }
