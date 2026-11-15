@@ -112,6 +112,7 @@ int main(int argc,char **argv) {
         Status s=snapshot();assert(s.qualified && s.observing && !s.ownedVotes);
         for(unsigned e=0;e<EndpointCount;++e)assert(s.owner[e]==4);
         assert(picasso_mic_rails_check()==0 && fake::readCalls==104);
+        assert(fake::log.find("rail-compare")!=std::string::npos);
         assert(picasso_mic_rails_acquire()==0 && fake::mapCalls==6);
         assert(picasso_mic_rails_release()==0 && !fake::liveMaps);
         assert(!snapshot().qualified && !snapshot().observing);

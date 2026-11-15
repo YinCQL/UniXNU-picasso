@@ -21,7 +21,8 @@ struct Status {
     uint16_t ppid[EndpointCount];
     int32_t apid[EndpointCount];
     uint8_t owner[EndpointCount],pmicType[2],pmicSubtype[2];
-    Rail rail[2];
+    Rail rail[2],comparison[2];
+    uint32_t mismatch[2];
 };
 // Stock SPMI v5 uses an observer channel even when a different EE owns writes.
 // Prefer the APPS-owned mapping, as the stock PPID table builder does. Reject
@@ -41,9 +42,12 @@ template<class Read> int find_observer(Read read,uint16_t ppid,uint8_t &owner) {
     }
     return chosen<0?Unavailable:(!apps && candidates!=1)?Protocol:chosen;
 }
+// The unified regulator readiness API consumes bit 7. Bit 5 is latched OCP;
+// other status bits may change while both observations remain ready.
+constexpr uint8_t RailStatusMask=0xa0;
 inline bool same(const Rail &a,const Rail &b) {
     return a.major==b.major && a.type==b.type && a.subtype==b.subtype &&
-        a.status==b.status && a.mode==b.mode && a.enable==b.enable &&
+        !((a.status^b.status)&RailStatusMask) && a.mode==b.mode && a.enable==b.enable &&
         a.follow==b.follow && a.requestedMv==b.requestedMv && a.validMv==b.validMv;
 }
 template<class Bus> int read_rail(Bus &bus,unsigned endpoint,Rail &out) {
@@ -75,7 +79,7 @@ inline int validate(unsigned endpoint,const Rail &r) {
         // BOB_CONFIG revision numbering. Do not accept the old PMIC4 block.
         if(r.type!=41 || r.subtype!=5 || r.major!=0)return Unsupported;
     } else return Invalid;
-    if(!(r.status&0x80) || !(r.enable&0x80) || (r.follow&0x0f))return NotReady;
+    if((r.status&RailStatusMask)!=0x80 || !(r.enable&0x80) || (r.follow&0x0f))return NotReady;
     unsigned mode=r.mode&7;
     // PMIC5 PFM/AUTO/PWM are 4/6/7. Retention and BOB pass-through do not
     // qualify a regulated voltage for the codec, even if a request is cached.
@@ -86,14 +90,15 @@ inline int validate(unsigned endpoint,const Rail &r) {
     // of consumer requests; the board limits this rail to 3960 mV. A codec
     // vote therefore does not imply that the aggregate must equal 3296 mV.
     // Check both the requested and accepted settings within that envelope.
-    // READY plus repeated identical snapshots qualify the observed setting;
+    // READY plus repeated matching configuration qualify the observed setting;
     // do not infer a DAC step or an analog measurement from their difference.
     return r.requestedMv>=3296 && r.requestedMv<=3960 &&
         r.validMv>=3296 && r.validMv<=3960?0:Voltage;
 }
 template<class Bus> int qualify(Bus &bus,Status &s) {
     s.qualified=0;s.error=0;s.stage=PmicIdentity;++s.checks;
-    for(unsigned i=0;i<2;++i){s.pmicType[i]=s.pmicSubtype[i]=0;s.rail[i]={};}
+    s.mismatch[0]=s.mismatch[1]=0;
+    for(unsigned i=0;i<2;++i){s.pmicType[i]=s.pmicSubtype[i]=0;s.rail[i]=s.comparison[i]={};}
     const uint8_t subtype[2]={0x1e,0x1f};
     for(unsigned i=0;i<2;++i) {
         uint8_t type=0,part=0,againType=0,againPart=0;
@@ -112,7 +117,14 @@ template<class Bus> int qualify(Bus &bus,Status &s) {
         int e=read_rail(bus,endpoint,s.rail[i]);
         if(!e)e=read_rail(bus,endpoint,again);
         if(e)return s.error=e;
-        if(!same(s.rail[i],again))return s.error=Unstable;
+        s.comparison[i]=again;
+        const Rail &first=s.rail[i];
+        s.mismatch[i]=(first.major!=again.major?1U:0U)|(first.type!=again.type?2U:0U)|
+            (first.subtype!=again.subtype?4U:0U)|(((first.status^again.status)&RailStatusMask)?8U:0U)|
+            (first.mode!=again.mode?16U:0U)|(first.enable!=again.enable?32U:0U)|
+            (first.follow!=again.follow?64U:0U)|(first.requestedMv!=again.requestedMv?128U:0U)|
+            (first.validMv!=again.validMv?256U:0U);
+        if(!same(first,again))return s.error=Unstable;
         e=validate(endpoint,s.rail[i]);if(e)return s.error=e;
     }
     s.stage=Qualified;s.qualified=1;return 0;

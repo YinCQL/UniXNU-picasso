@@ -8,6 +8,7 @@ using namespace picasso_mic_power;
 struct Fake {
     uint8_t reg[EndpointCount][256]={};
     unsigned reads=0,failAt=0,tearAt=0;
+    uint8_t statusDelta=0;unsigned statusReads=0;
     Fake() {
         reg[PmicA][4]=reg[PmicC][4]=0x51;
         reg[PmicA][5]=0x1e;reg[PmicC][5]=0x1f;
@@ -26,6 +27,7 @@ struct Fake {
         assert(e<EndpointCount);++reads;
         if(reads==failAt)return -60;
         v=reg[e][r];if(reads==tearAt)v^=1;
+        if(e>=S4A && r==8 && (++statusReads&1)==0)v^=statusDelta;
         return 0;
     }
 };
@@ -59,10 +61,24 @@ int main() {
     // Identity and rail observations may change between any two readbacks.
     for(unsigned tear=1;tear<=52;++tear) {
         Fake b;b.tearAt=tear;
-        assert(qualify(b,s)==Unstable && !s.qualified);
+        int expected=(tear==12 || tear==23 || tear==34 || tear==45)?0:Unstable;
+        assert(qualify(b,s)==expected && bool(s.qualified)==(expected==0));
+        if(expected==Unstable && tear>=9)assert(s.mismatch[tear<=30?0:1]);
+    }
+    // Firmware checks READY (bit 7) and unified OCP (bit 5), not equality
+    // of the full dynamic status byte. Retain all configuration comparisons.
+    for(unsigned delta:{1U,2U,4U,8U,16U,64U}) {
+        Fake b;b.reg[S4A][8]=0x86;b.reg[BobC][8]=0x86;b.statusDelta=uint8_t(delta);
+        assert(!qualify(b,s) && s.qualified);
+    }
+    for(unsigned delta:{32U,128U}) {
+        Fake b;b.statusDelta=uint8_t(delta);
+        assert(qualify(b,s)!=0 && !s.qualified);
     }
     for(unsigned endpoint=S4A;endpoint<=BobC;++endpoint) {
-        Fake b;b.reg[endpoint][1]=endpoint==S4A?3:1;
+        Fake b;b.reg[endpoint][8]|=0x20;
+        assert(qualify(b,s)==NotReady && !s.qualified);
+        b=Fake{};b.reg[endpoint][1]=endpoint==S4A?3:1;
         assert(qualify(b,s)==Unsupported && !s.qualified);
         b=Fake{};b.reg[endpoint][4]^=1;
         assert(qualify(b,s)==Unsupported && !s.qualified);

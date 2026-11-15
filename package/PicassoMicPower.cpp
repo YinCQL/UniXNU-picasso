@@ -95,6 +95,10 @@ void report(const char *operation) {
         IOLog("PICASSO_MIC rail=%u ppid=%x apid=%d owner=%u pmic=%02x/%02x rev=%u type=%02x/%02x status=%02x mode=%02x en=%02x follow=%02x mv=%u/%u\n",
             i,s.ppid[e],s.apid[e],s.owner[e],s.pmicType[i],s.pmicSubtype[i],r.major,r.type,r.subtype,
             r.status,r.mode,r.enable,r.follow,r.requestedMv,r.validMv);
+        const Rail &other=s.comparison[i];
+        IOLog("PICASSO_MIC rail-compare rail=%u mismatch=%x status=%02x/%02x mode=%02x/%02x en=%02x/%02x follow=%02x/%02x request=%u/%u valid=%u/%u\n",
+            i,s.mismatch[i],r.status,other.status,r.mode,other.mode,r.enable,other.enable,
+            r.follow,other.follow,r.requestedMv,other.requestedMv,r.validMv,other.validMv);
     }
 }
 }
