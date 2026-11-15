@@ -113,14 +113,15 @@ void completeRoute() {
     assert(picasso_mic_hardware_action(h, PicassoMicPrepare) == 0);
     assert(h.status.ready && !h.status.unmuted && h.status.slaveId == 0xd01170223ULL);
     assert(f.slave[0x3022] == 0x63); // 2.75 V, micbias on
-    assert(f.slave[0x3410] == 3 && f.slave[0x300e] == 12);
+    assert(f.slave[0x3410] == 1 && f.slave[0x300e] == 12);
     assert(f.slave[0x128] == 1 && f.slave[0x138] == 1);
     assert(f.slave[0xe0] == 1 && f.slave[0xf0] == 1);
     assert(f.reg[Key(PicassoMicSwr, 0x1224)] == 0x01000001);
     assert(f.reg[Key(PicassoMicSwr, 0x1264)] == 0x01000001);
     assert(f.reg[Key(PicassoMicTx, 0x100)] == 1);
     assert(f.reg[Key(PicassoMicTx, 0x104)] == 1);
-    assert(f.reg[Key(PicassoMicTx, 0x404)] == 0xa5000040);
+    assert(f.reg[Key(PicassoMicTx, 0x404)] == 0xa5000044);
+    assert(f.reg[Key(PicassoMicTx, 0x40c)] == 0);
     assert(f.reg[Key(PicassoMicTx, 0x400)] == 0x34);
     assert(f.broadcasts == 1);
     for (const auto &write : f.writes)
@@ -143,6 +144,22 @@ void completeRoute() {
     assert(picasso_mic_hardware_action(h, PicassoMicStop) == 0 && f.releases == 1);
     assert(picasso_mic_hardware_action(h, PicassoMicPrepare) == 0);
     assert(picasso_mic_hardware_action(h, PicassoMicStop) == 0);
+}
+void fidelityModeRestoration() {
+    Fake f;auto h=f.core();
+    // The adjacent ADC and unrelated decimator bits are not ours to change.
+    f.slave[0x3410]=0xb3;f.reg[Key(PicassoMicTx,0x404)]=0xa5000069;
+    assert(!picasso_mic_hardware_action(h,PicassoMicPrepare));
+    assert(f.slave[0x3410]==0xb1);
+    assert(f.reg[Key(PicassoMicTx,0x404)]==0xa500004c);
+    assert(!picasso_mic_hardware_action(h,PicassoMicUnmute));
+    assert(!picasso_mic_hardware_action(h,PicassoMicStop));
+    assert(f.slave[0x3410]==0xb3 && f.reg[Key(PicassoMicTx,0x404)]==0xa5000069);
+    Fake reject;auto failed=reject.core();reject.ignoredSlave=0x3410;
+    assert(picasso_mic_hardware_action(failed,PicassoMicPrepare)==-5 && !failed.status.ready);
+    reject.ignoredSlave=0;assert(!picasso_mic_hardware_action(failed,PicassoMicStop));
+    assert(!failed.savedCount && !failed.status.rails);
+    puts("PASS HiFi mode readback, adjacent-channel preservation and rollback");
 }
 void gatesAndTransport() {
     { Fake f; auto h = f.core(); f.railError = -19;
@@ -254,6 +271,6 @@ void failureRestoration() {
 }
 } // namespace
 int main() {
-    completeRoute(); gatesAndTransport(); dataPathStatus(); frameRestoration(); failureRestoration();
+    completeRoute(); fidelityModeRestoration(); gatesAndTransport(); dataPathStatus(); frameRestoration(); failureRestoration();
     std::puts("picasso microphone hardware: route and fault-injection checks passed");
 }

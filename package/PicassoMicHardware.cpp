@@ -8,6 +8,10 @@ constexpr uint32_t BusErrors = 0x131f8;
 constexpr uint32_t DataMismatch = 0x200;
 constexpr uint32_t FrameMask = 0xff07ff;
 constexpr uint32_t CaptureFrame = (5U << 16) | (1U << 3) | 7U;
+// WCD938x ADC_HIFI uses the same 9.6 MHz link as ADC_NORMAL. Pair it with
+// Bolero ADC_HIGH_PERF (2 << 1); preserve the established gain and bandwidth.
+constexpr uint32_t AdcHifiMode = 1;
+constexpr uint32_t DecimatorHighPerformance = 2U << 1;
 constexpr unsigned Swr = PicassoMicSwr, Tx = PicassoMicTx, Slave = PicassoMicSlave;
 
 void stage(PicassoMicHardwareCore &h, unsigned value) {
@@ -298,7 +302,7 @@ int codec(PicassoMicHardwareCore &h) {
     if (!e) delay(h, 2000);
     const Setting enable[] = {
         {Slave, 0x300e, 0x1f, 12}, {Slave, 0x3408, 0x18, 0x18},
-        {Slave, 0x300f, 0x40, 0x40}, {Slave, 0x3410, 0x0f, 3},
+        {Slave, 0x300f, 0x40, 0x40}, {Slave, 0x3410, 0x0f, AdcHifiMode},
         {Slave, 0x3409, 0x10, 0x10}, {Slave, 0x300f, 0x40, 0}, {Slave, 0x3457, 3, 2}
     };
     if (!e) e = settings(h, enable);
@@ -328,9 +332,9 @@ int route(PicassoMicHardwareCore &h) {
     if (e) return e;
     const Setting s[] = {
         {Tx, 0x100, 0x0f, 1}, {Tx, 0x104, 3, 1},
-        {Tx, 0x404, 0xe7, 0x40}, // analog, normal mode, 150 Hz high-pass, BCS off
+        {Tx, 0x404, 0xe7, 0x40 | DecimatorHighPerformance}, // analog, 150 Hz high-pass, BCS off
         {Tx, 0x42c, 0x3f, 0x0a}, {Tx, 0x400, 0x3f, 0x34},
-        {Tx, 0x40c, 0xff, 0} // unity digital gain for initial acoustic qualification
+        {Tx, 0x40c, 0xff, 0} // unity digital gain; no software noise gate
     };
     e = settings(h, s);
     uint32_t bank = 0;
