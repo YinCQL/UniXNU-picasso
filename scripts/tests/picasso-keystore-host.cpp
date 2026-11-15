@@ -8,6 +8,8 @@
 #include <string>
 #include <cstdio>
 #include <cstdarg>
+#include <openssl/aes.h>
+#include <openssl/sha.h>
 #include <intrin.h>
 #define __ATOMIC_ACQUIRE 0
 #define __ATOMIC_RELEASE 0
@@ -66,7 +68,7 @@ public:
     void detach(IOService *){++detached;}
     void setName(const char *){}
     bool setProperty(const char *name,bool value){
-        if(!strcmp(name,"KeyOperationsAvailable"))assert(!value);
+        if(!strcmp(name,"KeyOperationsAvailable"))assert(value);
         return ++propertyCount!=failProperty;
     }
     void registerService(){++publications;}
@@ -92,6 +94,13 @@ static void IOLog(const char *fmt,...) {
     char line[256];va_list args;va_start(args,fmt);int n=vsnprintf(line,sizeof(line),fmt,args);va_end(args);
     assert(n>0 && n<(int)sizeof(line));diagnosticOutput+=line;
 }
+using aes_encrypt_ctx=AES_KEY;using aes_decrypt_ctx=AES_KEY;
+static int aes_encrypt_key(const unsigned char *k,int n,aes_encrypt_ctx *c){return AES_set_encrypt_key(k,n*8,c);}
+static int aes_decrypt_key(const unsigned char *k,int n,aes_decrypt_ctx *c){return AES_set_decrypt_key(k,n*8,c);}
+static int aes_encrypt(const unsigned char *i,unsigned char *o,aes_encrypt_ctx *c){AES_encrypt(i,o,c);return 0;}
+static int aes_decrypt(const unsigned char *i,unsigned char *o,aes_decrypt_ctx *c){AES_decrypt(i,o,c);return 0;}
+static bool identityAvailable=true;
+extern "C" bool picasso_aks_device_id(uint8_t out[12]){if(!identityAvailable)return false;for(unsigned i=0;i<12;++i)out[i]=(uint8_t)i;return true;}
 #include "observed.inc"
 #include "NativeKeyStoreEvents.cpp"
 
@@ -117,7 +126,7 @@ int main() {
     enabled=true;
     assert(service.newUserClient(nullptr,nullptr,0,&client)==kIOReturnBadArgument);
     assert(service.newUserClient((void *)1,nullptr,1,&client)==kIOReturnUnsupported && !client);
-    for(unsigned p=1;p<=4;++p) {
+    for(unsigned p=1;p<=6;++p) {
         AppleKeyStore failing;failing.failProperty=p;
         assert(!failing.start(&provider) && !failing.publications && failing.stops==1);
     }
@@ -195,7 +204,7 @@ int main() {
     static const unsigned bookkeeping[]={4,5,9,12,13,26,27,55,101,102};
     for(unsigned selector=1;selector<300;++selector) {
         if(selector==7 || selector==14 || selector==17 || selector==31 ||
-            selector==35)continue;
+            selector==35 || selector==10 || selector==11)continue;
         bool known=false;
         for(unsigned candidate:bookkeeping)if(candidate==selector)known=true;
         if(known)continue;
@@ -207,6 +216,50 @@ int main() {
     a.structureInputDescriptor=&memory;assert(call(client,7,a)==kIOReturnBadArgument);a.structureInputDescriptor=nullptr;
     a.asyncWakePort=1;assert(call(client,7,a)==kIOReturnBadArgument);a.asyncWakePort=0;
     a.asyncReferenceCount=1;assert(call(client,7,a)==kIOReturnBadArgument);a.asyncReferenceCount=0;
+    // Production RFC3394 against OpenSSL's independent wrap oracle.
+    for(size_t keySize=16;keySize<=256;keySize+=8) {
+        uint8_t plain[256],wrapped[264],oracle[264],unwrapped[256],kek[32];
+        for(size_t i=0;i<keySize;++i)plain[i]=(uint8_t)(i*7+keySize);
+        uint64_t scalars[2]={0,6},outClass=0xdeadbeef;
+        IOExternalMethodArguments w;w.scalarInput=scalars;w.scalarInputCount=2;w.scalarOutput=&outClass;w.scalarOutputCount=1;
+        w.structureInput=plain;w.structureInputSize=(uint32_t)keySize;w.structureOutput=wrapped;w.structureOutputSize=sizeof(wrapped);
+        assert(call(client,10,w)==0 && w.structureOutputSize==keySize+8 && outClass==6);
+        assert(wrappingKey(6,kek));AES_KEY encrypt;assert(AES_set_encrypt_key(kek,256,&encrypt)==0);
+        assert(AES_wrap_key(&encrypt,nullptr,oracle,plain,(unsigned)keySize)==(int)keySize+8);
+        assert(!memcmp(wrapped,oracle,keySize+8));
+        IOExternalMethodArguments u;u.scalarInput=scalars;u.scalarInputCount=2;u.structureInput=wrapped;u.structureInputSize=(uint32_t)keySize+8;
+        u.structureOutput=unwrapped;u.structureOutputSize=sizeof(unwrapped);
+        assert(call(client,11,u)==0 && u.structureOutputSize==keySize && !memcmp(plain,unwrapped,keySize));
+        wrapped[7]^=1;memset(unwrapped,0xa5,sizeof(unwrapped));u.structureOutputSize=sizeof(unwrapped);
+        assert(call(client,11,u)==kIOReturnError && u.structureOutputSize==sizeof(unwrapped));
+        for(uint8_t byte:unwrapped)assert(byte==0xa5);wrapped[7]^=1;
+        scalars[1]=7;assert(call(client,11,u)==kIOReturnError);scalars[1]=6;
+        scalars[0]=1;assert(call(client,10,w)==kIOReturnUnsupported);scalars[0]=0;
+        identityAvailable=false;assert(call(client,10,w)==kIOReturnNotReady);identityAvailable=true;
+        w.structureOutputSize=(uint32_t)keySize+7;outClass=0xdeadbeef;
+        assert(call(client,10,w)==kIOReturnNoSpace && outClass==0xdeadbeef);
+    }
+    {
+        uint8_t plain[32]={},blob[40]={};uint64_t scalars[2]={0,6},outClass=0xdeadbeef;
+        IOExternalMethodArguments w;w.scalarInput=scalars;w.scalarInputCount=2;w.scalarOutput=&outClass;w.scalarOutputCount=1;
+        w.structureInput=plain;w.structureInputSize=32;w.structureOutput=blob;w.structureOutputSize=40;
+        assert(call(client,10,w)==0);
+        for(unsigned size:{0u,1u,8u,15u,17u,257u,264u}) {
+            w.structureInputSize=size;assert(call(client,10,w)==kIOReturnBadArgument);
+        }
+        w.structureInputSize=32;w.structureInput=nullptr;assert(call(client,10,w)==kIOReturnBadArgument);w.structureInput=plain;
+        w.scalarOutputCount=0;assert(call(client,10,w)==kIOReturnBadArgument);w.scalarOutputCount=1;
+        IOMemoryDescriptor descriptor;w.structureOutput=nullptr;w.structureOutputSize=0;w.structureOutputDescriptor=&descriptor;w.structureOutputDescriptorSize=40;
+        assert(call(client,10,w)==0 && descriptor.written==40 && descriptor.prepares==1 && descriptor.completes==1 && !memcmp(descriptor.bytes,blob,40));
+        descriptor.written=0;w.structureOutputDescriptorSize=39;assert(call(client,10,w)==kIOReturnNoSpace && !descriptor.written);
+        w.structureOutputDescriptorSize=40;descriptor.prepareResult=kIOReturnError;assert(call(client,10,w)==kIOReturnError && !descriptor.written);
+        descriptor.prepareResult=0;descriptor.shortWrite=true;assert(call(client,10,w)==kIOReturnUnderrun && !descriptor.prepared && descriptor.completes==2);
+        descriptor.shortWrite=false;descriptor.completeResult=kIOReturnError;assert(call(client,10,w)==kIOReturnError && !descriptor.prepared && descriptor.completes==3);
+        assert(w.structureOutputDescriptorSize==40);
+        IOExternalMethodArguments u;u.scalarInput=scalars;u.scalarInputCount=2;u.structureInput=blob;u.structureInputSize=40;
+        descriptor.completeResult=0;u.structureOutputDescriptor=&descriptor;u.structureOutputDescriptorSize=32;
+        assert(call(client,11,u)==0 && descriptor.written==32 && !memcmp(descriptor.bytes,plain,32));
+    }
     enabled=false;assert(call(client,7,a)==kIOReturnNotReady);enabled=true;
     assert(client->clientClose()==0 && call(client,7,a)==kIOReturnNotReady);
     client->release();
@@ -218,5 +271,5 @@ int main() {
     assert(diagnosticOutput.find("sample=3")==std::string::npos);
     processName="securityd";picasso_aks_observed(0,kIOReturnSuccess,0,0,0,0,0);
     assert(diagnosticOutput.find("name=securityd selector=0 sample=1 result=0")!=std::string::npos);
-    puts("PASS development compatibility ABI, no cryptography, lifecycle failures, input/output bounds and short writes");
+    puts("PASS development state and RFC3394 wrapping versus OpenSSL, integrity/class/bag errors, lifecycle and descriptor bounds");
 }

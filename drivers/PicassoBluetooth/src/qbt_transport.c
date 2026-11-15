@@ -440,7 +440,7 @@ static int bt_sk_keychain_trace_sysctl SYSCTL_HANDLER_ARGS
         trace[0],trace[1],(int32_t)trace[2],trace[3],n+1);
     return 0;
 }
-SYSCTL_OID_MANUAL(_kern,OID_AUTO,qbt_keychain_trace,CTLTYPE_OPAQUE|CTLFLAG_WR|CTLFLAG_LOCKED,NULL,0,bt_sk_keychain_trace_sysctl,"S,bt_keychain_trace","Bluetooth keychain boot status");
+SYSCTL_OID_MANUAL(_kern,OID_AUTO,qbt_keychain_trace,CTLTYPE_OPAQUE|CTLFLAG_WR|CTLFLAG_ANYBODY|CTLFLAG_LOCKED,NULL,0,bt_sk_keychain_trace_sysctl,"S,bt_keychain_trace","Bluetooth keychain boot status");
 
 int qbt_transport_init(const struct qbt_transport_ops *ops)
 {

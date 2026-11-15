@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Adapted from AppleKeyStoreState 42ff83e08b2265fe741d4adaf084bebe003452ba.
 // Compatibility stubs for Picasso's unencrypted developer Data only.
-// No real keybag, password protection or cryptography is implemented.
+// No hardware keybag or password protection is implemented.
+// RFC 3394 software wrapping uses the public, stable board identity only.
 // The synthetic handle and no-op successes are explicitly development-only.
 // Contract mirrored from UniXNU/NativeKeyStoreEvents:
 //   0, 4, 5, 9, 12, 13, 26, 27, 55, 101, 102: no-output bookkeeping
@@ -13,6 +14,9 @@
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
+#include <libkern/crypto/aes.h>
+#include <libkern/crypto/sha2.h>
+extern "C" bool picasso_aks_device_id(uint8_t out[12]);
 
 extern "C" bool picasso_aks_state_enabled(void);
 extern "C" void picasso_aks_observed(unsigned selector, IOReturn result,
@@ -42,6 +46,76 @@ static size_t encodeState(uint8_t *out, size_t capacity) {
     return n;
 }
 
+
+// The native 20H392 libaks ABI passes bag/class scalars and an n+8 byte blob.
+// RFC 3394 authenticates the wrapped key; this public identity provides no
+// hardware confidentiality. Reject protected bags and reference-key contracts.
+static constexpr size_t maxKeyBytes=256;
+static void clearBytes(void *memory,size_t n) {
+    volatile uint8_t *p=(volatile uint8_t *)memory;while(n--)*p++=0;
+}
+static IOReturn writeOutput(IOExternalMethodArguments *args,const uint8_t *data,size_t n) {
+    if(args->structureOutputDescriptor) {
+        IOMemoryDescriptor *memory=args->structureOutputDescriptor;
+        if(n>args->structureOutputDescriptorSize || n>memory->getLength())return kIOReturnNoSpace;
+        IOReturn rc=memory->prepare(kIODirectionIn);if(rc)return rc;
+        bool copied=memory->writeBytes(0,data,n)==n;
+        IOReturn completed=memory->complete(kIODirectionIn);
+        if(!copied)return kIOReturnUnderrun;
+        if(completed)return completed;
+        args->structureOutputDescriptorSize=(uint32_t)n;
+    } else {
+        if(!args->structureOutput || n>args->structureOutputSize)return kIOReturnNoSpace;
+        memcpy(args->structureOutput,data,n);args->structureOutputSize=(uint32_t)n;
+    }
+    return kIOReturnSuccess;
+}
+static bool wrappingKey(uint64_t keyClass,uint8_t key[32]) {
+    uint8_t id[12],kind[8];if(!picasso_aks_device_id(id))return false;
+    for(unsigned i=0;i<8;++i)kind[i]=(uint8_t)(keyClass>>(8*i));
+    static const char domain[]="Picasso unprotected RFC3394 v1";
+    SHA256_CTX context;SHA256_Init(&context);
+    SHA256_Update(&context,domain,sizeof(domain)-1);SHA256_Update(&context,id,sizeof(id));
+    SHA256_Update(&context,kind,sizeof(kind));SHA256_Final(key,&context);
+    clearBytes(&context,sizeof(context));clearBytes(id,sizeof(id));return true;
+}
+static IOReturn wrapKey(IOExternalMethodArguments *args,bool unwrap) {
+    size_t input=args->structureInputSize;
+    if(args->scalarInputCount!=2 || !args->scalarInput || args->scalarInput[0]!=0 ||
+        args->scalarInput[1]<1 || args->scalarInput[1]>12)return kIOReturnUnsupported;
+    if(args->structureInputDescriptor || !args->structureInput ||
+        args->scalarOutputCount!=(unwrap?0u:1u) || (!unwrap && !args->scalarOutput))return kIOReturnBadArgument;
+    if(input<(unwrap?24u:16u) || input>(unwrap?maxKeyBytes+8:maxKeyBytes) || input%8)return kIOReturnBadArgument;
+    uint8_t key[32]={},blob[maxKeyBytes+8]={},block[16]={};
+    union {aes_encrypt_ctx encrypt;aes_decrypt_ctx decrypt;} context;
+    IOReturn result=kIOReturnError;
+    if(!wrappingKey(args->scalarInput[1],key))return kIOReturnNotReady;
+    size_t n=unwrap?input-8:input,words=n/8;
+    memcpy(blob+8,((const uint8_t *)args->structureInput)+(unwrap?8:0),n);
+    if(unwrap)memcpy(blob,args->structureInput,8);else memset(blob,0xa6,8);
+    int error=unwrap?aes_decrypt_key(key,32,&context.decrypt):aes_encrypt_key(key,32,&context.encrypt);
+    if(!error) {
+        for(unsigned pass=0;pass<6 && !error;++pass) {
+            for(size_t step=0;step<words && !error;++step) {
+                size_t i=unwrap?words-step:step+1;
+                uint64_t t=words*(unwrap?5-pass:pass)+i;
+                memcpy(block,blob,8);memcpy(block+8,blob+8*i,8);
+                if(unwrap)for(unsigned k=0;k<8;++k)block[7-k]^=(uint8_t)(t>>(8*k));
+                error=unwrap?aes_decrypt(block,block,&context.decrypt):aes_encrypt(block,block,&context.encrypt);
+                if(!unwrap)for(unsigned k=0;k<8;++k)block[7-k]^=(uint8_t)(t>>(8*k));
+                memcpy(blob,block,8);memcpy(blob+8*i,block+8,8);
+            }
+        }
+        uint8_t difference=0;if(unwrap)for(unsigned k=0;k<8;++k)difference|=blob[k]^0xa6;
+        if(!error && !difference) {
+            result=writeOutput(args,blob+(unwrap?8:0),n+(unwrap?0:8));
+            if(!result && !unwrap)args->scalarOutput[0]=args->scalarInput[1];
+        }
+    }
+    clearBytes(key,sizeof(key));clearBytes(blob,sizeof(blob));clearBytes(block,sizeof(block));clearBytes(&context,sizeof(context));
+    return result;
+}
+
 class AppleKeyStoreUserClient final : public IOUserClient {
     OSDeclareDefaultStructors(AppleKeyStoreUserClient)
     unsigned handshaken=0;
@@ -67,16 +141,19 @@ private:
     IOReturn query(uint32_t selector,IOExternalMethodArguments *args) {
         if(!picasso_aks_state_enabled() || isInactive())return kIOReturnNotReady;
         if(!args)return kIOReturnBadArgument;
-        // This compatibility surface accepts no async or structure-input contracts.
-        if(args->asyncWakePort || args->asyncReferenceCount || args->structureInputSize ||
+        // Async and out-of-line input remain unsupported. Inline key input is
+        // accepted only by the explicit wrap/unwrap selectors below.
+        if(args->asyncWakePort || args->asyncReferenceCount ||
             args->structureInputDescriptor)return kIOReturnBadArgument;
         if(selector==0) {
-            if(args->scalarInputCount || args->scalarOutputCount || args->structureOutputSize ||
+            if(args->structureInputSize || args->scalarInputCount || args->scalarOutputCount || args->structureOutputSize ||
                 args->structureOutputDescriptor)return kIOReturnBadArgument;
             // Establish this actual client session; idempotent, with no bag state.
             __atomic_store_n(&handshaken,1,__ATOMIC_RELEASE);return kIOReturnSuccess;
         }
         if(!__atomic_load_n(&handshaken,__ATOMIC_ACQUIRE))return kIOReturnNotOpen;
+        if(selector==10 || selector==11)return wrapKey(args,selector==11);
+        if(args->structureInputSize)return kIOReturnBadArgument;
         switch(selector) {
         case 4: case 5: case 9: case 12: case 13: case 26: case 27:
         case 55: case 101: case 102:
@@ -156,7 +233,8 @@ public:
     bool start(IOService *provider) override {
         if(!picasso_aks_state_enabled() || !IOService::start(provider))return false;
         setName("Picasso unprotected keystore compatibility");
-        if(!setProperty("NativeKeyStoreEvents",true) || !setProperty("KeyOperationsAvailable",false) ||
+        if(!setProperty("SoftwareKeyWrapping",true) || !setProperty("HardwareKeyProtection",false) ||
+            !setProperty("NativeKeyStoreEvents",true) || !setProperty("KeyOperationsAvailable",true) ||
             !setProperty("UnprotectedStorageOnly",true) || !setProperty("CompatibilityStubs",true)) {
             IOService::stop(provider);return false;
         }
