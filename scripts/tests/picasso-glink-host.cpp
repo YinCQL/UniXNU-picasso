@@ -50,6 +50,7 @@ static void pcmTests();
 static void playTests();
 static void continuousPlayTests();
 static void controlContinuationTests();
+static void captureIntentTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -135,7 +136,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    audioPinTests();afePortTests();tfaPortTests();streamTests();pcmTests();playTests();continuousPlayTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();controlContinuationTests();channelTests();qrtrTests();
+    audioPinTests();afePortTests();tfaPortTests();streamTests();pcmTests();playTests();continuousPlayTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();controlContinuationTests();captureIntentTests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -1917,4 +1918,66 @@ static void controlContinuationTests(){
     for(unsigned i=0;i<100;++i)picasso_play_tick(a,q,false);
     assert(a.play.wait==31 && a.play.phase==PicassoPlayConfigure && !a.play.error);
     puts("PASS source control ACK continuation: committed/fragmented RX, real intent ownership, stale/error refusal and unchanged deadline aging");
+}
+
+static int captureCheck(PicassoCaptureDma &) {return 0;}
+static int capturePrepare(PicassoCaptureDma &d,unsigned slot) {assert(slot<2 && !(d.busyMask&(1U<<slot)));return 0;}
+static int captureComplete(PicassoCaptureDma &,unsigned,unsigned,unsigned) {return 0;}
+static int captureHardware(void *,unsigned) {return 0;}
+static void captureReady(PicassoGlink &s,unsigned phase=PicassoCaptureVoteMacro) {
+    auto &v=s.apr.capture;v={};v.enabled=v.attempted=true;v.phase=phase;
+    v.dma.ready=v.dma.retained=true;v.dma.address=0x180008000ULL;v.dma.bytes=32768;v.dma.slotBytes=4096;
+    v.dma.check=captureCheck;v.dma.prepare=capturePrepare;v.dma.complete=captureComplete;
+    v.hardware=captureHardware;v.targetFrames=96000;v.handle=0x7788;
+}
+static unsigned captureNoIntent(PicassoGlink &s,unsigned phase=PicassoCaptureVoteMacro) {
+    unsigned rx=playReady(s);s.apr.play.enabled=false;captureReady(s,phase);
+    for(auto &i:s.remoteIntent)i={};
+    assert(!s.apr.intentAsked && !s.apr.intentGranted);step(s);drain(s);
+    assert(s.apr.intentAsked && s.apr.intentOwner==PicassoAprIntentCapture && !s.apr.capture.pending);
+    return rx;
+}
+static void captureIntentTests() {
+    static PicassoGlink s;
+    // The channel-level refusal belongs to the command that asked, even when
+    // the other stream becomes due before its ACK arrives.
+    unsigned rx=captureNoIntent(s);s.apr.play.enabled=true;
+    message(s,rx,8,7,0);step(s);
+    assert(s.apr.capture.firstError==-28 && s.apr.capture.phase==PicassoCaptureClose);
+    assert(!s.apr.play.error && !s.apr.play.firstError && !s.apr.play.done);
+    assert(!s.apr.intentAsked && s.apr.intentOwner==PicassoAprIntentNone);
+    rx=playReady(s);for(auto &i:s.remoteIntent)i={};step(s);drain(s);
+    assert(s.apr.intentOwner==PicassoAprIntentPlayback);captureReady(s);
+    message(s,rx,8,7,0);step(s);
+    assert(s.apr.play.error==-28 && !s.apr.capture.firstError && s.apr.capture.phase==PicassoCaptureVoteMacro);
+    // A descriptor can be used before its request ACK. A stale refusal cannot
+    // cancel the transmitted command or its subsequent unsent control phase.
+    rx=captureNoIntent(s);offer(s,rx);step(s);drain(s);step(s);drain(s);
+    assert(s.apr.capture.pending && s.apr.intentAsked);
+    message(s,rx,8,7,0);step(s);
+    assert(s.apr.capture.pending && !s.apr.capture.firstError && !s.apr.intentAsked);
+    rx=captureNoIntent(s);offer(s,rx);step(s);drain(s);step(s);drain(s);
+    uint32_t handle=0x80;
+    assert(picasso_capture_receive(s.apr.capture,reinterpret_cast<uint8_t *>(&handle),4,1,0x404,0x504,s.apr.capture.token,0x100f5));
+    message(s,rx,8,7,0);step(s);drain(s);
+    assert(s.apr.capture.phase==PicassoCaptureVoteCodec && !s.apr.capture.firstError && !s.apr.capture.pending);
+    assert(!s.apr.intentAsked);step(s);drain(s);
+    assert(s.apr.intentOwner==PicassoAprIntentCapture && s.apr.intentPhase==PicassoCaptureVoteCodec);
+    message(s,rx,8,7,0);step(s);assert(s.apr.capture.firstError==-28);
+    // READ has a sequence identity within one phase. An ACK for read N cannot
+    // fail N+1 while the first slot already belongs to the DSP.
+    rx=captureNoIntent(s,PicassoCaptureRead);uint32_t token=s.apr.intentToken;
+    offer(s,rx);step(s);drain(s);step(s);drain(s);
+    assert(s.apr.capture.readSent==1 && s.apr.capture.inflight==1);
+    message(s,rx,8,7,0);step(s);drain(s);
+    assert(!s.apr.capture.firstError && s.apr.capture.prepared && !s.apr.intentAsked);
+    step(s);assert(s.apr.intentAsked && s.apr.intentToken==token+1);
+    // Grant-first and descriptor-first orderings both release the ACK bookkeeping.
+    rx=captureNoIntent(s);message(s,rx,8,7,1);step(s);drain(s);
+    assert(s.apr.intentGranted && !s.apr.intentAsked);
+    offer(s,rx);step(s);drain(s);step(s);assert(s.apr.capture.pending && !s.apr.intentGranted);
+    rx=captureNoIntent(s);offer(s,rx);step(s);drain(s);step(s);drain(s);
+    message(s,rx,8,7,1);step(s);
+    assert(s.apr.capture.pending && !s.apr.intentGranted && !s.apr.intentAsked);
+    puts("PASS APR intent ownership: independent capture/playback refusal, stale phase/sequence ACK and grant ordering");
 }

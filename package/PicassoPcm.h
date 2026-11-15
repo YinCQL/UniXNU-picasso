@@ -4,7 +4,9 @@
 #include <stdint.h>
 // Dedicated SID1401 pool. MAP ownership is separate from GLINK and ASM stream.
 // Retain memory even after transport loss. Filling is allowed only with no DSP buffer owner.
+struct PicassoCaptureDma;
 struct PicassoPcm {
+    PicassoCaptureDma *capture; // optional independent capture pool, before SMMU publication
     void (*prepare)(PicassoPcm &);
     int (*check)(PicassoPcm &);
     int (*silence)(PicassoPcm &);

@@ -100,6 +100,66 @@ void updateChannel(PicassoGlink *s, PicassoGlinkChannel *c) {
     bool up = c->supported && !c->closing && c->openSent && c->openAck && c->ackSent && c->remote;
     if (up != c->up) { c->up = up; ++s->channelEvents; }
 }
+// An intent ACK has no APR token. Remember the command that requested it and
+// accept a refusal only while that same command still waits for publication.
+// A descriptor may arrive and carry the command before the ACK itself arrives.
+bool aprIntentIdentity(const PicassoAprProbe &a,unsigned owner,uint32_t &token,uint32_t &phase) {
+    uint32_t w[18]={};phase=0;
+    switch(owner) {
+    case PicassoAprIntentCapture:
+        phase=a.capture.phase;picasso_capture_request(a.capture,w);break;
+    case PicassoAprIntentPlayback:
+        phase=a.play.phase;picasso_play_request(a,w);break;
+    case PicassoAprIntentPcm:
+        phase=a.pcm.phase;picasso_pcm_request(a.pcm,w);break;
+    case PicassoAprIntentStream:
+        phase=a.stream.phase;picasso_stream_request(phase,w);break;
+    case PicassoAprIntentPort:
+        phase=a.port.phase;picasso_port_request(phase,w);break;
+    case PicassoAprIntentClock:
+        phase=a.clock.phase;picasso_clock_request(phase,w);break;
+    case PicassoAprIntentAfe:
+        phase=a.afe.phase;picasso_afe_request(phase,w);break;
+    case PicassoAprIntentFramework:token=0x18710001;return true;
+    case PicassoAprIntentCore:token=a.token+1;return true;
+    default:return false;
+    }
+    token=w[3];return w[4]!=0;
+}
+bool aprIntentWaiting(const PicassoAprProbe &a) {
+    uint32_t token=0,phase=0;
+    if(!aprIntentIdentity(a,a.intentOwner,token,phase) || token!=a.intentToken || phase!=a.intentPhase)return false;
+    switch(a.intentOwner) {
+    case PicassoAprIntentCapture:
+        return a.capture.enabled && a.capture.attempted && !a.capture.done && !a.capture.sent && !a.capture.pending &&
+            (!picasso_capture_data_phase(phase) || a.capture.prepared);
+    case PicassoAprIntentPlayback:
+        return a.play.enabled && a.play.attempted && !a.play.done && !a.play.sent && !a.play.error &&
+            ((phase==PicassoPlayWrite && picasso_play_queued(a.play))?a.play.bufferReady:!a.play.pending);
+    case PicassoAprIntentPcm:return a.pcm.attempted && !a.pcm.done && !a.pcm.sent && !a.pcm.pending && !a.pcm.error;
+    case PicassoAprIntentStream:return a.stream.attempted && !a.stream.done && !a.stream.sent && !a.stream.pending && !a.stream.error;
+    case PicassoAprIntentPort:return a.port.attempted && !a.port.done && !a.port.sent && !a.port.pending && !a.port.error;
+    case PicassoAprIntentClock:return a.clock.attempted && !a.clock.completed && !a.clock.sent && !a.clock.pending && !a.clock.error;
+    case PicassoAprIntentAfe:return !a.afe.sent && !a.afe.pending && !a.afe.error;
+    case PicassoAprIntentFramework:return a.ready && !a.fw.sent && !a.fw.pending && !a.fw.error;
+    case PicassoAprIntentCore:return !a.ready && !a.pending && !a.error;
+    default:return false;
+    }
+}
+void aprIntentRefused(PicassoAprProbe &a) {
+    switch(a.intentOwner) {
+    case PicassoAprIntentCapture:picasso_capture_fail(a.capture,-28);break;
+    case PicassoAprIntentPlayback:a.play.error=-28;++a.play.events;break;
+    case PicassoAprIntentPcm:a.pcm.error=-28;++a.pcm.events;break;
+    case PicassoAprIntentStream:a.stream.error=-28;++a.stream.events;break;
+    case PicassoAprIntentPort:a.port.error=-28;++a.port.events;break;
+    case PicassoAprIntentClock:a.clock.error=-28;++a.clock.events;break;
+    case PicassoAprIntentAfe:a.afe.error=-28;++a.afe.events;break;
+    case PicassoAprIntentFramework:a.fw.error=-28;++a.fw.events;break;
+    case PicassoAprIntentCore:a.error=-28;break;
+    default:break;
+    }
+}
 // Submit at most one APR request. A post-receive playback continuation may
 // use only an already-open audio channel and actual reusable remote intents.
 int aprWork(const PicassoSmemIo *io,PicassoGlink *s,PicassoGlinkChannel &c,bool *kick,bool playbackOnly=false) {
@@ -113,11 +173,16 @@ int aprWork(const PicassoSmemIo *io,PicassoGlink *s,PicassoGlinkChannel &c,bool 
     bool stream=!playbackOnly && picasso_stream_due(a);
     bool pcm=!playbackOnly && picasso_pcm_due(a);
     bool play=picasso_play_due(a);
+    bool capture=!playbackOnly && picasso_capture_due(a.capture);
+    // Both streams keep their prepared buffers while awaiting a remote intent.
+    // Alternate only successful submissions so capture cannot starve playback.
+    if(play && capture) {if(a.captureTurn)play=false;else capture=false;}
     if(playbackOnly && !play)return 0;
-    if ((a.ready && !version && !afe && !clock && !port && !stream && !pcm && !play) || a.error) return 0;
-    if (!version && !afe && !clock && !port && !stream && !pcm && !play && (a.pending || a.ticks < a.next)) return 0;
-    uint32_t playRequest[18];unsigned playBytes=play?picasso_play_request(a,playRequest):0;
-    unsigned requestBytes=play?playBytes:pcm?(a.pcm.phase?24:40):stream?(a.stream.phase==0?36:a.stream.phase==1?44:20):port?24:clock?68:afe?(a.afe.phase==1?68:56):20;
+    if ((a.ready && !version && !afe && !clock && !port && !stream && !pcm && !play && !capture) || a.error) return 0;
+    if (!version && !afe && !clock && !port && !stream && !pcm && !play && !capture && (a.pending || a.ticks < a.next)) return 0;
+    uint32_t playRequest[18];unsigned playBytes=play?picasso_play_request(a,playRequest):
+        capture?picasso_capture_request(a.capture,playRequest):0;
+    unsigned requestBytes=(play||capture)?playBytes:pcm?(a.pcm.phase?24:40):stream?(a.stream.phase==0?36:a.stream.phase==1?44:20):port?24:clock?68:afe?(a.afe.phase==1?68:56):20;
     PicassoGlinkRemoteIntent *slot = nullptr;
     for (auto &i : s->remoteIntent) if (i.used && !i.busy && i.size >= requestBytes) { slot = &i; break; }
     if (!slot) {
@@ -125,14 +190,19 @@ int aprWork(const PicassoSmemIo *io,PicassoGlink *s,PicassoGlinkChannel &c,bool 
             const uint32_t words[2] = {7U | (uint32_t(c.local) << 16), requestBytes};
             if ((error = transmit(io, s, words, sizeof(words), kick))) return error;
             a.intentAsked = true;
+            a.intentOwner=play?PicassoAprIntentPlayback:capture?PicassoAprIntentCapture:
+                pcm?PicassoAprIntentPcm:stream?PicassoAprIntentStream:port?PicassoAprIntentPort:
+                clock?PicassoAprIntentClock:afe?PicassoAprIntentAfe:version?PicassoAprIntentFramework:PicassoAprIntentCore;
+            aprIntentIdentity(a,a.intentOwner,a.intentToken,a.intentPhase);
         }
         return 0;
     }
     uint32_t words[22] = {9U | (uint32_t(c.local) << 16), slot->id, requestBytes, 0};
     uint32_t query[5]; picasso_apr_query(version?0x18710001:a.token + 1, query);
-    if(play) {for(unsigned i=0;i<requestBytes/4;++i)words[4+i]=playRequest[i];}
+    if(play || capture) {for(unsigned i=0;i<requestBytes/4;++i)words[4+i]=playRequest[i];}
     else if(afe || clock || port || stream || pcm) { uint32_t request[18];if(pcm)picasso_pcm_request(a.pcm,request);else if(stream)picasso_stream_request(a.stream.phase,request);else if(port)picasso_port_request(a.port.phase,request);else if(clock)picasso_clock_request(a.clock.phase,request);else picasso_afe_request(a.afe.phase,request);for(unsigned i=0;i<requestBytes/4;++i)words[4+i]=request[i]; }
     else { if(version)query[4]=0x1292c;for (unsigned i = 0; i < 5; ++i) words[4 + i] = query[i]; }
+    unsigned capturePhase=a.capture.phase,captureSlot=a.capture.preparedSlot;
     if ((error = transmit(io, s, words,16+((requestBytes+7)&~7U), kick))) {
         // I/O failure may leave publication ambiguous; lack of an ACK never
         // establishes that an enable vote was not applied. TX pressure did not
@@ -141,6 +211,17 @@ int aprWork(const PicassoSmemIo *io,PicassoGlink *s,PicassoGlinkChannel &c,bool 
         if(port && !a.port.phase && s->failed)a.port.uncertain=true;
         if(stream && !a.stream.phase && s->failed)a.stream.uncertain=true;
         if(pcm && !a.pcm.phase && s->failed)a.pcm.uncertain=true;
+        if(capture && s->failed) {
+            // A failed FIFO publication may still have reached the DSP.
+            // Retain its command/buffer lease instead of recycling its pages.
+            auto &v=a.capture;v.owned|=picasso_capture_acquires(capturePhase);
+            if(picasso_capture_data_phase(capturePhase) && captureSlot<2) {
+                v.readSequence[captureSlot]=v.readSent++;v.readWait[captureSlot]=0;
+                v.inflight|=1U<<captureSlot;v.dma.busyMask|=1U<<captureSlot;
+                v.owned|=PicassoCaptureBuffer;
+            }
+            ++v.events;
+        }
         if(play && s->failed) {
             a.play.owned|=picasso_play_acquires(a.play.phase);
             if(a.play.phase==PicassoPlayWrite) {
@@ -151,7 +232,8 @@ int aprWork(const PicassoSmemIo *io,PicassoGlink *s,PicassoGlinkChannel &c,bool 
         return error;
     }
     slot->busy = true;
-    if(play)picasso_play_sent(a);
+    if(capture) {picasso_capture_sent(a.capture);a.captureTurn=false;}
+    else if(play) {picasso_play_sent(a);a.captureTurn=true;}
     else if(pcm) { a.pcm.sent=a.pcm.pending=true;a.pcm.token=words[7];a.pcm.wait=0;if(!a.pcm.phase)a.pcm.uncertain=true;++a.pcm.events; }
     else if(stream) { a.stream.sent=a.stream.pending=true;a.stream.token=words[7];a.stream.wait=0;if(!a.stream.phase)a.stream.uncertain=true;++a.stream.events; }
     else if(port) { a.port.sent=a.port.pending=true;a.port.token=words[7];a.port.wait=0;if(!a.port.phase)a.port.uncertain=true;++a.port.events; }
@@ -194,7 +276,9 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
     if (!c.up) return 0;
     auto &a = s->apr;
     int qmiDue=c.local==2 ? picasso_qmi_due(&s->qrtr.qmi):-1;
-    if (c.local==1) { ++a.ticks;picasso_afe_advance(&a,s->qrtr.qmi);picasso_clock_tick(&a,s->qrtr.qmi);picasso_stream_tick(&a,s->qrtr.qmi);picasso_pcm_tick(&a,s->qrtr.qmi);picasso_play_tick(a,s->qrtr.qmi); }
+    if (c.local==1) { ++a.ticks;picasso_afe_advance(&a,s->qrtr.qmi);picasso_clock_tick(&a,s->qrtr.qmi);picasso_stream_tick(&a,s->qrtr.qmi);picasso_pcm_tick(&a,s->qrtr.qmi);picasso_play_tick(a,s->qrtr.qmi);
+        if(a.pcm.done)picasso_capture_tick(a.capture,a.ready && a.fw.valid && picasso_afe_domains_up(s->qrtr.qmi));
+    }
     // Worker cadence is 20 ms. Hold expiry while responses are backpressured.
     if(c.local==2 && !s->qrtr.count && s->qrtr.tftp.announced) {
         auto &q=s->qrtr;int retry=picasso_tftp_tick(&q.tftp);
@@ -455,24 +539,16 @@ int receive(const PicassoSmemIo *io, PicassoGlink *s, unsigned command, unsigned
         auto &asked=c->local==1 ? s->apr.intentAsked : c->local==2 ? s->qrtr.intentAsked : s->fastrpc.intentAsked;
         auto &granted=c->local==1 ? s->apr.intentGranted : c->local==2 ? s->qrtr.intentGranted : s->fastrpc.intentGranted;
         if (!c->up || !asked || data > 1) return fail(s, -71);
-        granted=data!=0 && (c->local!=1 || !s->apr.pending); asked=false;
-        if (!data) {
-            if (c->local==1 && !s->apr.pending) {
-                auto &a=s->apr;
-                if(a.ready && a.fw.valid) {
-                    if(picasso_play_due(a)) { a.play.error=-28;++a.play.events; }
-                    else if(picasso_pcm_due(a)) { a.pcm.error=-28;++a.pcm.events; }
-                    else if(picasso_stream_due(a)) { a.stream.error=-28;++a.stream.events; }
-                    else if(picasso_port_due(a)) { a.port.error=-28;++a.port.events; }
-                    else if(picasso_clock_due(a)) { a.clock.error=-28;++a.clock.events; }
-                    else if(!a.afe.sent && !a.afe.error) { a.afe.error=-28;++a.afe.events; }
-                } else if(a.ready) {
-                    if(!a.fw.sent && !a.fw.error) { a.fw.error=-28;++a.fw.events; }
-                } else a.error=-28;
-            }
-            if (c->local==2) s->qrtr.error=-28;
+        if(c->local==1) {
+            auto &a=s->apr;bool waiting=aprIntentWaiting(a);
+            granted=data!=0 && waiting;
+            if(!data && waiting)aprIntentRefused(a);
+            a.intentOwner=PicassoAprIntentNone;a.intentToken=a.intentPhase=0;
+        } else {
+            granted=data!=0;
+            if(!data && c->local==2)s->qrtr.error=-28;
         }
-        return 0;
+        asked=false;return 0;
     }
     if (command == 6 || command == 14) {
         if (!c->up) return fail(s, -71);

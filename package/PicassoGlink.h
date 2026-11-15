@@ -9,6 +9,7 @@
 #include "PicassoTfa.h"
 #include "PicassoPcm.h"
 #include "PicassoPlayback.h"
+#include "PicassoCapture.h"
 enum { PicassoGlinkChannels = 16, PicassoGlinkRemoteIntents = 64,
        PicassoGlinkLocalIntents = 20, PicassoGlinkPacket = 512 };
 struct PicassoGlinkChannel {
@@ -29,11 +30,18 @@ struct PicassoGlinkRemoteIntent {
     uint32_t id, size;
     bool used, busy;
 };
+enum PicassoAprIntentOwner {
+    PicassoAprIntentNone, PicassoAprIntentCore, PicassoAprIntentFramework,
+    PicassoAprIntentAfe, PicassoAprIntentClock, PicassoAprIntentPort,
+    PicassoAprIntentStream, PicassoAprIntentPcm, PicassoAprIntentPlayback,
+    PicassoAprIntentCapture
+};
 struct PicassoAprProbe {
     uint32_t token, attempts, ticks, wait, next, state, status, opcode, receivedToken;
     uint32_t header, source, destination, bytes;
     uint32_t received, ignored, malformed;
     bool pending, responded, ready, intentAsked, intentGranted;
+    uint32_t intentOwner,intentToken,intentPhase; // exact APR command waiting for capacity
     int error;
     struct {
         uint32_t token, wait, status, build[4], count, services[25][3], events;
@@ -67,6 +75,8 @@ struct PicassoAprProbe {
     PicassoTfa tfa;
     PicassoPcm pcm;
     PicassoPlayback play;
+    PicassoCapture capture;
+    bool captureTurn;
 };
 struct PicassoGlink {
     // Contains pointers into its own static storage: prepare in final location,

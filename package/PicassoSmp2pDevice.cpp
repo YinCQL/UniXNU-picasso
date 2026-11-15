@@ -14,6 +14,7 @@
 #include "PicassoAdsp.h"
 #include "PicassoGlink.h"
 #include "PicassoRpcDma.h"
+#include "PicassoMicService.h"
 extern "C" void picasso_audio_service_tick(PicassoAprProbe &,bool);
 
 // Display also builds without the optional Adreno archive. A missing shared
@@ -460,6 +461,7 @@ void bootService(void *context) {
             else if(kind==PlayLogProgress)logPlayProgress(a);
         }
         picasso_audio_service_tick(a,g->failed);
+        picasso_mic_service_tick(a,g->failed);
         if(a.pcm.events!=b->pcmEvents) { b->pcmEvents=a.pcm.events;logPcm(a); }
         if(a.stream.events!=b->streamEvents) { b->streamEvents=a.stream.events;logStream(a); }
         if(q.locator.events!=b->locatorEvents && b->locatorLogs<32) {
@@ -552,6 +554,8 @@ extern "C" void picasso_smp2p_start(void) {
     logAudit(s);
     if (error) return;
     glink.apr.pins.read=audioPinRead;glink.apr.pins.write=audioPinWrite;glink.apr.tfa.probe=tfaProbe;glink.apr.pcm.prepare=picasso_pcm_device_prepare;uint32_t audioTest=0;PE_parse_boot_argn("picasso-audio-test",&audioTest,sizeof audioTest);glink.apr.play.enabled=audioTest==1;glink.apr.play.amplifier=tfaPlayback;
+    uint32_t micTest=0;PE_parse_boot_argn("picasso-mic-test",&micTest,sizeof micTest);
+    picasso_mic_service_configure(glink.apr,micTest);
     smpKick(&d);
     IOLog("PICASSO_ADSP glink stage=prepared descriptor=%x/%x tx=%x/%x remote_pid=2\n",
         glink.desc.offset,glink.desc.size,glink.tx.offset,glink.tx.size);
@@ -564,6 +568,7 @@ extern "C" void picasso_smp2p_start(void) {
     picasso_adsp_boot(&events);
     picasso_glink_stop(&glink);
     picasso_audio_service_tick(glink.apr,true);
+    picasso_mic_service_tick(glink.apr,true);
     unsigned missing = 0, logs = 0;
     bool wasOpen = false, hadValue = false;
     for (;;) {

@@ -253,7 +253,9 @@ def main():
                ROOT / 'kits/picasso/PicassoFat.cpp', ROOT / 'kits/picasso/PicassoQmp.cpp',
                ROOT / 'kits/picasso/PicassoAop.cpp', ROOT / 'kits/picasso/PicassoSmp2p.cpp',
                ROOT / 'kits/picasso/PicassoSmp2pDevice.cpp', ROOT / 'kits/picasso/PicassoAdspBoot.cpp',
-               ROOT / 'kits/picasso/PicassoAudioService.cpp', ROOT / 'kits/picasso/PicassoGlink.cpp', ROOT / 'kits/picasso/PicassoRpcDma.cpp', ROOT / 'kits/picasso/PicassoRpcFs.cpp']
+               ROOT / 'kits/picasso/PicassoAudioService.cpp', ROOT / 'kits/picasso/PicassoMicService.cpp',
+               ROOT / 'kits/picasso/PicassoMicHardware.cpp', ROOT / 'kits/picasso/PicassoMicPower.cpp',
+               ROOT / 'kits/picasso/PicassoGlink.cpp', ROOT / 'kits/picasso/PicassoRpcDma.cpp', ROOT / 'kits/picasso/PicassoRpcFs.cpp']
     audit = None
     for source in sources:
         obj = out / (source.stem + '.o')
@@ -286,6 +288,8 @@ def main():
     sources += hid_sources
     sources += [ROOT / 'drivers/NativeNovatekTouch/TouchPublish.h']
     sources += [ROOT / 'kits/picasso/PicassoAudioAbi.h', ROOT / 'kits/picasso/PicassoAudioQueue.h']
+    sources += [ROOT / 'kits/picasso' / name for name in ('PicassoCapture.h', 'PicassoCaptureApr.h',
+                'PicassoCaptureDma.h', 'PicassoMicService.h', 'PicassoMicHardware.h', 'PicassoMicPower.h')]
     sources += [ROOT / 'kits/picasso/PicassoBacklightCore.h', ROOT / 'kits/picasso/PicassoButtonsCore.h',
                 ROOT / 'kits/picasso/PicassoSpmi.h', ROOT / 'kits/picasso/PicassoSpmiCore.h', ROOT / 'kits/picasso/PicassoPowerCore.h', ROOT / 'kits/picasso/PicassoBatteryCore.h', ROOT / 'kits/picasso/PicassoChargerCore.h', ROOT / 'kits/picasso/PicassoBatteryProfile.h', ROOT / 'kits/picasso/PicassoBattery.h',
                 ROOT / 'kits/picasso/PicassoAdsp.h', ROOT / 'drivers/NativeWlan/WlanSmem.h',
