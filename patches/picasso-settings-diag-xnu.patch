@@ -1,0 +1,232 @@
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -4355,3 +4355,77 @@
+ 	kfree_data(rows, 256 * sizeof *rows);
+ }
+ #endif
++
++/* PICASSO_SETTINGS_DIAG_BSD_BEGIN */
++#if __arm64__ && (DEVELOPMENT || DEBUG)
++/* Explicit CDC request only. A worker keeps VM reads off the USB drain thread.
++ * Three task references are acquired under the process-list lock; no printing,
++ * task locks or VM accesses occur there. No user configuration is modified. */
++extern void picasso_settings_task_snapshot(task_t, int, uint64_t, unsigned, const char *);
++static unsigned settings_diag_busy, settings_diag_sample;
++static uint64_t settings_diag_last;
++static thread_call_t settings_diag_call;
++
++static void
++picasso_settings_diag_fire(thread_call_param_t unused, thread_call_param_t argument)
++{
++    (void)unused;
++    (void)argument;
++    static const char *const names[] = {"Preferences", "configd", "lockdownd"};
++    struct { task_t task; int pid; uint64_t unique; } rows[3] = {0};
++    proc_t p;
++    unsigned sample = settings_diag_sample;
++    proc_list_lock();
++    ALLPROC_FOREACH(p) {
++        for (unsigned i = 0; i < 3; ++i) {
++            if (rows[i].task || strcmp(p->p_name, names[i])) continue;
++            task_t task = proc_task(p);
++            if (!task) continue;
++            task_reference(task);
++            rows[i].task = task;
++            rows[i].pid = proc_getpid(p);
++            rows[i].unique = proc_uniqueid(p);
++        }
++    }
++    proc_list_unlock();
++    printf("PICASSO_SETTINGS begin sample=%u coherent=0 readonly=1\n", sample);
++    for (unsigned i = 0; i < 3; ++i) {
++        if (rows[i].task) {
++            picasso_settings_task_snapshot(rows[i].task, rows[i].pid, rows[i].unique, sample, names[i]);
++            task_deallocate(rows[i].task);
++        } else {
++            printf("PICASSO_SETTINGS absent sample=%u name=%s\n", sample, names[i]);
++        }
++    }
++    printf("PICASSO_SETTINGS end sample=%u\n", sample);
++    os_atomic_store(&settings_diag_busy, 0, release);
++}
++
++void picasso_settings_diag_request(void);
++void
++picasso_settings_diag_request(void)
++{
++    if (!os_atomic_cmpxchg(&settings_diag_busy, 0, 1, acquire)) {
++        printf("PICASSO_SETTINGS unavailable=busy\n");
++        return;
++    }
++    uint64_t interval = 0, now = mach_absolute_time();
++    nanoseconds_to_absolutetime(5ULL * NSEC_PER_SEC, &interval);
++    if (settings_diag_sample >= 8 ||
++        (settings_diag_sample && now - settings_diag_last < interval)) {
++        printf("PICASSO_SETTINGS unavailable=%s\n", settings_diag_sample >= 8 ? "budget" : "rate-limit");
++        os_atomic_store(&settings_diag_busy, 0, release);
++        return;
++    }
++    if (!settings_diag_call) settings_diag_call = thread_call_allocate(picasso_settings_diag_fire, NULL);
++    if (!settings_diag_call) {
++        printf("PICASSO_SETTINGS unavailable=allocation\n");
++        os_atomic_store(&settings_diag_busy, 0, release);
++        return;
++    }
++    settings_diag_last = now;
++    ++settings_diag_sample;
++    thread_call_enter(settings_diag_call);
++}
++#endif
++/* PICASSO_SETTINGS_DIAG_BSD_END */
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10404,3 +10404,110 @@
+ 	}
+ }
+ #endif
++
++/* PICASSO_SETTINGS_DIAG_TASK_BEGIN */
++#if __arm64__ && (DEVELOPMENT || DEBUG)
++#include <sys/errno.h>
++struct picasso_settings_thread_row {
++    uint64_t tid, pc, lr, fp;
++    unsigned valid, state, hint, regs;
++};
++
++/* Remote reads use a referenced map and never page in or wait on a VM fault.
++ * Only 16-byte frame records are read; addresses are checked before switching.
++ * A concurrent user stack/register update makes this best-effort evidence,
++ * not a coherent stack or proof of a wait site. */
++static unsigned
++picasso_settings_frames(vm_map_t map, const struct picasso_settings_thread_row *row,
++    uint64_t frames[12], unsigned *error)
++{
++    const uint64_t mask = 0x7fffffffffULL;
++    unsigned depth = 2;
++    frames[0] = row->pc & mask;
++    frames[1] = row->lr & mask;
++    uint64_t fp = row->fp & mask;
++    *error = 0;
++    while (fp && depth < 12) {
++        if ((fp & 15) || fp < 0x1000 || fp > mask - 15) { *error = EFAULT; break; }
++        uint64_t pair[2] = {0};
++        vm_map_t previous = vm_map_switch(map);
++        disable_preemption();
++        int copied = copyin(fp, pair, sizeof(pair));
++        enable_preemption();
++        vm_map_switch(previous);
++        if (copied) { *error = copied; break; }
++        if (!pair[1]) break;
++        frames[depth++] = pair[1] & mask;
++        uint64_t next = pair[0] & mask;
++        if (next && next <= fp) { *error = EINVAL; break; }
++        fp = next;
++    }
++    return depth;
++}
++
++void picasso_settings_task_snapshot(task_t, int, uint64_t, unsigned, const char *);
++void
++picasso_settings_task_snapshot(task_t task, int pid, uint64_t unique, unsigned sample, const char *name)
++{
++    struct picasso_settings_thread_row rows[8] = {0};
++    unsigned count = 0, total = 0, locked = 0, active = 0;
++    uint64_t header = 0, slide = 0;
++    vm_map_t map = VM_MAP_NULL;
++    /* One task/scheduler lock attempt, copied scalars only, no console or VM
++     * work under either lock. Task lock stabilizes thread queue/lifetimes. */
++    if (task_lock_try(task)) {
++        locked = 1;
++        active = task->active;
++        if (active) {
++            total = task->thread_count;
++            header = task->mach_header_vm_address;
++            slide = task->task_shared_region_slide;
++            map = task->map;
++            if (map) vm_map_reference(map);
++            thread_t thread;
++            queue_iterate(&task->threads, thread, thread_t, task_threads) {
++                if (count == 8) break;
++                struct picasso_settings_thread_row *row = &rows[count++];
++                row->tid = thread_tid(thread);
++                spl_t level = splsched();
++                if (simple_lock_try(&thread->sched_lock, &thread_lck_grp)) {
++                    row->valid = 1;
++                    row->state = thread->state;
++                    if (thread->state & TH_WAIT) row->hint = thread->block_hint;
++                    arm_saved_state_t *state = get_user_regs(thread);
++                    if (state && is_saved_state64(state) && PSR64_IS_USER64(get_saved_state_cpsr(state))) {
++                        row->regs = 1;
++                        row->pc = get_saved_state_pc(state);
++                        row->lr = get_saved_state_lr(state);
++                        row->fp = get_saved_state_fp(state);
++                    }
++                    thread_unlock(thread);
++                }
++                splx(level);
++            }
++        }
++        task_unlock(task);
++    }
++    printf("PICASSO_SETTINGS task sample=%u name=%s pid=%d unique=%llu locked=%u active=%u total=%u sampled=%u main_header=%llx cache_slide=%llx coherent=0\n",
++        sample, name, pid, (unsigned long long)unique, locked, active, total, count,
++        (unsigned long long)header, (unsigned long long)slide);
++    for (unsigned i = 0; i < count; ++i) {
++        const struct picasso_settings_thread_row *row = &rows[i];
++        printf("PICASSO_SETTINGS state sample=%u name=%s pid=%d tid=%llu valid=%u state=%x hint=%u regs=%u\n",
++            sample, name, pid, (unsigned long long)row->tid, row->valid, row->state, row->hint, row->regs);
++        if (!row->regs || !map) continue;
++        uint64_t frames[12] = {0};
++        unsigned error = 0, depth = picasso_settings_frames(map, row, frames, &error);
++        printf("PICASSO_SETTINGS stack sample=%u name=%s pid=%d tid=%llu frames=%u error=%u coherent=0\n",
++            sample, name, pid, (unsigned long long)row->tid, depth, error);
++        for (unsigned j = 0; j < depth; j += 4) {
++            printf("PICASSO_SETTINGS frames sample=%u name=%s pid=%d tid=%llu offset=%u %llx %llx %llx %llx\n",
++                sample, name, pid, (unsigned long long)row->tid, j,
++                (unsigned long long)frames[j], (unsigned long long)frames[j+1],
++                (unsigned long long)frames[j+2], (unsigned long long)frames[j+3]);
++        }
++    }
++    if (map) vm_map_deallocate(map);
++}
++#endif
++/* PICASSO_SETTINGS_DIAG_TASK_END */
+--- a/bsd/dev/picasso_usb.c
++++ b/bsd/dev/picasso_usb.c
+@@ -383,6 +383,7 @@
+ 	bool        reboot_pending;
+ 	uint64_t    session_deadline;
+ 	unsigned    ps_pending;
++	unsigned    settings_diag_pending;
+ 	unsigned    save_ls_pending;
+ 	bool        reset_pending;
+ 	bool        hang_pending;
+@@ -2355,7 +2356,7 @@
+ 	ud.commands++;
+ 	printf("PICASSO CDC: command '%s'\n", ud.cmd);
+ 	if (ud_command_is(ud.cmd, "help")) {
+-		printf("PICASSO CDC: commands: help | status | ps | snapshot | save-ls | gpu-table | panic-test | reset-test | hang-test | reboot-fastboot\n");
++		printf("PICASSO CDC: commands: help | status | ps | settings-diag | snapshot | save-ls | gpu-table | panic-test | reset-test | hang-test | reboot-fastboot\n");
+ 	} else if (ud_command_is(ud.cmd, "snapshot")) {
+ 		ud_snapshot();
+ 	} else if (ud_command_is(ud.cmd, "gpu-table")) {
+@@ -2384,6 +2385,8 @@
+ 		    os_atomic_load(&pur_dropped, relaxed));
+ 	} else if (ud_command_is(ud.cmd, "ps")) {
+ 		ud.ps_pending = ++processSamples;
++	} else if (ud_command_is(ud.cmd, "settings-diag")) {
++		os_atomic_store(&ud.settings_diag_pending, 1, release);
+ 	} else if (ud_command_is(ud.cmd, "save-ls")) {
+ 		ud.save_ls_pending = 1;
+ 	} else if (ud_command_is(ud.cmd, "panic-test")) {
+@@ -2719,6 +2722,10 @@
+ 	if (sample && !ud.panic_mode) {
+ 		extern void picasso_live_process_list(unsigned);
+ 		picasso_live_process_list(sample);
++	}
++	if (os_atomic_xchg(&ud.settings_diag_pending, 0, acquire) && normal) {
++		extern void picasso_settings_diag_request(void);
++		picasso_settings_diag_request();
+ 	}
+ 	if (os_atomic_xchg(&ud.save_ls_pending, 0, relaxed) && !ud.panic_mode) {
+ 		extern int picasso_ls_export(void);
