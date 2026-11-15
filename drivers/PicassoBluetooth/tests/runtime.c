@@ -12,7 +12,7 @@ struct fixture {
     uint8_t patch[1001], nvm[603], downloaded[2048]; size_t downloaded_length, download_size;
     bool progress_acks, progress_loss, speed_reply; unsigned progress_sent; uint64_t progress_delay, speed_settle, speed_command_at;
     unsigned download_mode, failed_opcode; bool missing_replies, missing_wake, board_specific;
-    unsigned family, bad_version, reject_segment; bool missing_firmware;
+    unsigned family, bad_version, reject_segment; bool missing_firmware, captured_version;
     bool nvm_edited, address_written, wake_armed, hardware_fault, clock_fault;
 };
 static void put16(uint8_t *p,unsigned v){p[0]=v;p[1]=v>>8;}
@@ -40,8 +40,14 @@ static void controller(struct fixture *f,const uint8_t *p,unsigned n){
     if(op==0xfc00){
         response[1]=param[0];length=2;
         if(param[0]==0x19){
+            if(f->captured_version) {
+                /* Exact pre-firmware Picasso serial response, including H4. */
+                static const uint8_t captured[]={4,0x0e,0x12,1,0,0xfc,0,0x19,0x0c,
+                    0x0a,0,0,0,0xe9,0x0d,2,3,0x20,3,1,0x40};
+                queue(f,captured,sizeof(captured),200000);return;
+            }
             length=f->family==3990?14:15;unsigned at=f->family==3990?2:3;
-            response[1]=f->family==3990?2:0x19;response[2]=0;
+            response[1]=f->family==3990?2:0x19;response[2]=f->family==3990?0:12;
             put32(response+at,0x21);put16(response+at+4,0x1234);
             put16(response+at+6,f->family?0x0302:0x0200);
             put32(response+at+8,f->family==3991?0x40014320:f->family==3990?0x40010320:0x400c0200);
@@ -50,6 +56,8 @@ static void controller(struct fixture *f,const uint8_t *p,unsigned n){
             if(f->bad_version==3)put32(response+at+8,0);
             if(f->bad_version==4)put32(response+at+8,0x400c0200);
             if(f->bad_version==5)put16(response+at+6,0x1302);
+            if(f->bad_version==6)response[0]=1;
+            if(f->bad_version==7 && f->family!=3990)response[2]=11;
         }
         else if(param[0]==0x23){length=5;if(f->board_specific){response[3]=0x12;response[4]=0x34;}}
         else if(param[0]==0x20){const char *label="WCN7850-fixture";length=strlen(label)+3;response[2]=strlen(label);memcpy(response+3,label,strlen(label));}
@@ -149,7 +157,7 @@ static int firmware(void *c,const char *name,const uint8_t **p,size_t *n){
     if(f->family){
         if(f->missing_firmware)return -ENOENT;
         if(!strcmp(name,"qca/crbtfw32.tlv")){*p=f->patch;*n=sizeof(f->patch);return 0;}
-        assert(!strcmp(name,f->family==3991?"qca/crnv32u.bin":"qca/crnv32.bin"));
+        assert(!strcmp(name,(f->family==3991 && !f->captured_version)?"qca/crnv32u.bin":"qca/crnv32.bin"));
         *p=f->nvm;*n=sizeof(f->nvm);return 0;
     }
     if(!strcmp(name,"qca/hmtbtfw20.tlv")){*p=f->patch;*n=sizeof(f->patch);return 0;}
@@ -276,7 +284,7 @@ static void wcn399x(void) {
             qbt_reset(f->q);assert(!qbt_boot_wcn399x(f->q,3000000,address));
             destroy(f);
         }
-        for(unsigned bad=1;bad<=5;++bad) {
+        for(unsigned bad=1;bad<=(family==3990?6u:7u);++bad) {
             make(f,0);f->family=family;f->bad_version=bad;
             assert(qbt_boot_wcn399x(f->q,3000000,address)<0 && !f->firmware_gets && !f->address_written);
             destroy(f);
@@ -292,6 +300,13 @@ static void wcn399x(void) {
         assert(qbt_boot_wcn399x(f->q,3000000,address)==-ETIMEDOUT && f->commands==1);
         destroy(f);
     }
+    make(f,0);f->family=3991;f->captured_version=true;
+    assert(!qbt_boot_wcn399x(f->q,3000000,address));
+    assert(f->q->info.product==0x0a && f->q->info.soc==0x40010320 &&
+        f->q->info.rom==0x0302 && f->q->info.patch==0x0de9);
+    assert(f->q->info.state==2 && f->firmware_gets==2 && f->address_written && f->nvm_edited);
+    assert(!qbt_shutdown(f->q));destroy(f);
+    puts("PASS: exact Picasso CC version replay, 12-byte length, SoC-based non-UMC NVM, strict status/length rejection");
     free(f);
     puts("PASS: WCN3990 VSE/3991 CC, ROM-specific NVM and baud edit, rejected TLV, malformed/unknown version, missing firmware/reply, shutdown/restart");
 }

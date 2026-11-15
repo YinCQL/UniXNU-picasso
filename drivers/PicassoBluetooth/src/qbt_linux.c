@@ -109,17 +109,24 @@ static int wcn399x_version(struct hci_dev *h,struct qca_btsoc_version *v,enum qc
     }
     if(e)return e;
     bool cc=h->q->reply[0]==HCI_EV_CMD_COMPLETE;
+    /* The CC EDL header has a version-length byte; status/cresp is reply[0]. */
     unsigned offset=cc?3:2;
     if(length!=offset+sizeof(*v))return -EILSEQ;
     if(reply[0]!=EDL_CMD_REQ_RES_EVT || reply[1]!=(cc?EDL_PATCH_VER_REQ_CMD:EDL_APP_VER_RES_EVT) ||
-       (cc && reply[2]))return -EIO;
+       (cc && reply[2]!=sizeof(*v)))return -EIO;
     memcpy(v,reply+offset,sizeof(*v));
     if(!v->soc_id || !v->rom_ver)return -EILSEQ;
     // Stock btfm_slim_slave.h identifies Cherokee 3.2 and its UMC variant.
     // These are the only ROMs covered by this board's pinned cr*32 firmware.
+    uint32_t id=le32_to_cpu(v->soc_id);
     if(le16_to_cpu(v->rom_ver)!=0x0302 ||
-       le32_to_cpu(v->soc_id)!=(cc?QCA_WCN3991_SOC_ID:0x40010320u))return -ENODEV;
+       (id!=0x40010320u && !(cc && id==QCA_WCN3991_SOC_ID)))return -ENODEV;
+    /* Picasso's 40010320 ROM also uses the newer command-complete envelope.
+     * Select the reply/TLV protocol from that envelope. Upstream selects the
+     * UMC NVM variant independently from the actual reported SoC identity. */
     *soc=cc?QCA_WCN3991:QCA_WCN3990;
+    qbt_linux_log(h->q,3,"PICASSO_BT version identity product=%x soc=%x rom=%x patch=%x cc=%u",
+        le32_to_cpu(v->product_id),id,le16_to_cpu(v->rom_ver),le16_to_cpu(v->patch_ver),cc);
     return 0;
 }
 static int boot_soc(struct qbt *q,uint32_t speed,const uint8_t address[6],enum qca_btsoc_type soc) {
