@@ -33,11 +33,10 @@ int busError(PicassoMicHardwareCore &h) {
     if (v & DataMismatch) {
         ++h.status.dataMismatches;
         // READ_EN_RD_VALID concerns the macro data path, not command FIFO
-        // responses. Stock acknowledges/masks it separately. Before AFE is
-        // consuming samples (and during teardown), it must not block the
-        // control transactions needed to finish configuration or stop ports.
-        // Once unmuted, a new mismatch still invalidates capture.
-        if (h.status.unmuted) return -5;
+        // responses. Stock acknowledges/masks it separately, including while
+        // streaming. Keep it observable without aborting this bounded capture;
+        // actual command faults and DSP read/address/length checks still fail.
+        // Acoustic qualification must examine the returned PCM separately.
         e = wr(h, Swr, 0x208, DataMismatch);
         if (e) return e;
     }
@@ -399,8 +398,8 @@ int unmute(PicassoMicHardwareCore &h) {
     if (!e) e = update(h, Tx, 0x418, 3, 2);
     if (!e) { delay(h, 20); e = update(h, Tx, 0x418, 3, 1); }
     if (!e) e = update(h, Tx, 0x400, 0x10, 0);
-    // Discard only the startup data-path latch after AFE has started and
-    // settling/unmute completed. Future data mismatches are capture failures.
+    // Account for the startup data-path latch after AFE has started and
+    // settling/unmute completed, before publishing the running state.
     if (!e) e = busError(h);
     if (!e) { h.status.unmuted = 1; stage(h, PicassoMicRunning); }
     if (e) { h.status.error = e; h.status.failedStage = h.status.stage; }

@@ -170,10 +170,13 @@ void dataPathStatus() {
     assert(h.status.ready && h.status.dataMismatches == 1);
     assert(picasso_mic_hardware_action(h, PicassoMicUnmute) == 0);
     assert(picasso_mic_hardware_action(h, PicassoMicCheck) == 0);
-    // A fresh mismatch while recording is still a failure, not hidden.
+    // Stock treats this data-path warning as informational during streaming.
+    // Count and acknowledge it; successful PCM still requires DSP validation.
     f.reg[{PicassoMicSwr, 0x200}] |= 0x200;
-    assert(picasso_mic_hardware_action(h, PicassoMicCheck) == -5);
-    assert(!h.status.ready && h.status.dataMismatches == 2);
+    assert(picasso_mic_hardware_action(h, PicassoMicCheck) == 0);
+    assert(h.status.ready && h.status.dataMismatches == 2);
+    assert(!(f.reg[Key(PicassoMicSwr, 0x200)] & 0x200));
+    f.reg[{PicassoMicSwr, 0x200}] |= 0x200;
     // The latched data warning cannot prevent orderly data-port shutdown.
     assert(picasso_mic_hardware_action(h, PicassoMicStop) == 0);
     assert(!h.savedCount && !h.status.rails && !h.status.restoreError);
@@ -186,6 +189,11 @@ void dataPathStatus() {
         broken.reg[{PicassoMicSwr, 0x200}] = bit | 0x200;
         assert(picasso_mic_hardware_action(core, PicassoMicUnmute) == -5);
         assert(!core.status.unmuted);
+        broken.reg[{PicassoMicSwr, 0x200}] = 0;
+        assert(picasso_mic_hardware_action(core, PicassoMicUnmute) == 0);
+        broken.reg[{PicassoMicSwr, 0x200}] = bit | 0x200;
+        assert(picasso_mic_hardware_action(core, PicassoMicCheck) == -5);
+        assert(!core.status.ready);
         broken.reg[{PicassoMicSwr, 0x200}] = 0;
         assert(picasso_mic_hardware_action(core, PicassoMicStop) == 0);
     }
