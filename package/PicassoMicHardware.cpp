@@ -289,7 +289,10 @@ int port(PicassoMicHardwareCore &h, unsigned bank) {
         {Slave, 0xe0 + s, 1, 1},
         {Slave, 0x122 + s, 0xff, 1}, {Slave, 0x124 + s, 0xff, 0},
         {Slave, 0x125 + s, 0xff, 0}, {Slave, 0x128 + s, 7, 1},
-        {Swr, 0x1228 + m, 7, 1}, {Swr, 0x1234 + m, 0xff, 0xf0},
+        // Stock TX port 2 leaves HSTART/HSTOP unspecified. Its HCTRL default
+        // write reads back as zero on this master; the PDM route uses only
+        // sample interval, offsets, lane and channel enable below.
+        {Swr, 0x1228 + m, 7, 1},
         {Swr, 0x1224 + m, 0xffffffff, 0x01000001}, {Slave, 0x120 + s, 0xff, 1},
         {Swr, 0x101c + m, FrameMask, CaptureFrame}
     };

@@ -33,6 +33,11 @@ struct Fake {
     }
     static int read(void *ctx, unsigned region, uint32_t at, uint32_t *out) {
         auto &f = *static_cast<Fake *>(ctx); ++f.reads;
+        // The board's TX HCTRL readback stays zero. Do not model every MMIO
+        // address as writable RAM: that hid the first real route failure.
+        if (region == PicassoMicSwr && (at == 0x1234 || at == 0x1274)) {
+            *out = 0; return 0;
+        }
         if (region == PicassoMicSwr && at == 0x30c) {
             *out = (f.full ? 8U << 8 : 0) | (f.available ? 1U << 16 : 0); return 0;
         }
@@ -43,6 +48,7 @@ struct Fake {
     }
     static int write(void *ctx, unsigned region, uint32_t at, uint32_t value) {
         auto &f = *static_cast<Fake *>(ctx); f.writes.push_back({region, at});
+        if (region == PicassoMicSwr && (at == 0x1234 || at == 0x1274)) return 0;
         if (region == PicassoMicSwr && at == 0x1044) {
             assert(value == 2); // CLK_START self-clears; it is never restored.
             f.reg[{region, at}] = 0; return 0;
@@ -107,6 +113,8 @@ void completeRoute() {
     assert(f.reg[Key(PicassoMicTx, 0x404)] == 0xa5000040);
     assert(f.reg[Key(PicassoMicTx, 0x400)] == 0x34);
     assert(f.broadcasts == 1);
+    for (const auto &write : f.writes)
+        assert(write != Key(PicassoMicSwr, 0x1234) && write != Key(PicassoMicSwr, 0x1274));
     uint64_t before = f.waited;
     assert(picasso_mic_hardware_action(h, PicassoMicUnmute) == 0);
     assert(f.waited - before >= 100000 && h.status.unmuted);
