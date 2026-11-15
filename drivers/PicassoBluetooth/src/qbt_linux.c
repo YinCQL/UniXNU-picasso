@@ -94,6 +94,19 @@ static int set_speed(struct qbt *q,uint32_t speed,uint8_t baud) {
 static int wcn399x_version(struct hci_dev *h,struct qca_btsoc_version *v,enum qca_btsoc_type *soc) {
     uint8_t cmd=EDL_PATCH_VER_REQ_CMD,reply[32];size_t length=sizeof(reply);
     int e=qbt_command(h->q,EDL_PATCH_CMD_OPCODE,&cmd,1,QBT_VERSION_EVENT,reply,&length);
+    /* Version discovery precedes firmware download and native HCI traffic.
+     * Keep a bounded trace of this public controller identity response so a
+     * rejected envelope can be compared with the pinned Linux ABI. */
+    static unsigned version_samples;
+    if(version_samples<16) {
+        ++version_samples;
+        char bytes[97];unsigned n=h->q->reply_length;
+        if(n>32)n=32;
+        for(unsigned i=0;i<n;++i)snprintf(bytes+3*i,sizeof(bytes)-3*i,"%02x ",h->q->reply[i]);
+        bytes[3*n]=0;
+        qbt_linux_log(h->q,3,"PICASSO_BT version-reply sample=%u error=%d event_bytes=%u raw=%s",
+            version_samples,e,h->q->reply_length,bytes);
+    }
     if(e)return e;
     bool cc=h->q->reply[0]==HCI_EV_CMD_COMPLETE;
     unsigned offset=cc?3:2;
