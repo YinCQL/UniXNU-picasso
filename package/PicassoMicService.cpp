@@ -96,6 +96,10 @@ extern "C" void picasso_mic_service_tick(PicassoAprProbe &a,bool failed) {
             lastPhase=v.phase;reportTicks=0;
             IOLog("PICASSO_MIC session=%u phase=%u reads=%u bytes=%llu gaps=%llu overruns=%llu peak=%u error=%d\n",
                 input.status.epoch,v.phase,v.readDone,v.bytesDone,input.status.gapFrames,input.status.overruns,input.status.peak,v.error);
+            IOLog("PICASSO_MIC flow epoch=%u sent=%u inflight=%x waits=%u/%u pending=%u token=%x rejected=%u opcode=%x bytes=%u offset=%u sequence=%u timestamp=%llu first=%d cleanup=%d dma=%d owned=%x\n",
+                input.status.epoch,v.readSent,v.inflight,v.readWait[0],v.readWait[1],v.pending,v.token,
+                v.rejected,v.replyOpcode,v.lastBytes,v.lastOffset,v.lastSequence,v.lastTimestamp,
+                v.firstError,v.cleanupError,v.dmaError,v.owned);
         }
         if(v.done) {
             bool clean=!v.owned && !v.inflight && !v.dma.busyMask && !v.cleanupError && !v.dmaError &&

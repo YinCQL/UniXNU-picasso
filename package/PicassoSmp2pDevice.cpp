@@ -55,6 +55,12 @@ void smpKick(SmemDevice *d) {
     *reinterpret_cast<volatile uint32_t *>(d->ipcc + 0x0c) = (3U << 16) | 2;
     smemBarrier(d);
 }
+void glinkKick(SmemDevice *d) {
+    // lito: LPASS client 3, GLINK signal 0; SMP2P uses signal 2.
+    smemBarrier(d);
+    *reinterpret_cast<volatile uint32_t *>(d->ipcc + 0x0c) = 3U << 16;
+    smemBarrier(d);
+}
 IOMemoryMap *smemMap(uint64_t base, uint64_t bytes) {
     IODeviceMemory *m = IODeviceMemory::withRange(base, bytes);
     if (!m) return nullptr;
@@ -357,7 +363,7 @@ bool bootFast(void *context) {
     if(g->failed || !v.streaming || !v.enabled || !v.attempted || v.done || v.firstError ||
        v.phase<PicassoCapturePrime || v.phase>PicassoCaptureRead)return false;
     bool kick=false;(void)picasso_glink_service(b->io,g,&kick,false);
-    if(kick)smpKick(b->device);
+    if(kick)glinkKick(b->device);
     return !g->failed;
 }
 void bootService(void *context) {
@@ -369,11 +375,7 @@ void bootService(void *context) {
         for(const auto &c:g->channel)if(c.used && c.local==3 && c.up && !g->fastrpc.bound && !g->fastrpc.stopped)
             picasso_rpc_device_prepare(&g->fastrpc);
         int transport=picasso_glink_service(b->io,g,&kick);
-        if(kick) {
-            smemBarrier(b->device);
-            *reinterpret_cast<volatile uint32_t *>(b->device->ipcc+0x0c)=3U<<16;
-            smemBarrier(b->device);
-        }
+        if(kick)glinkKick(b->device);
         if(g->sent && !b->sentLogged) {
             b->sentLogged=true;
             IOLog("PICASSO_ADSP glink stage=version-sent version=1 features=0 signal=3/0\n");

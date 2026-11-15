@@ -17,6 +17,8 @@ struct Fake {
     unsigned reads = 0, commands = 0, broadcasts = 0, releases = 0;
     bool available = false, full = false, silent = false, wrongId = false;
     bool noBankAck = false, rejectRestore = false, startupMismatch = false;
+    bool checkFrameSync = false;
+    uint32_t slaveFrame = 0;
     int railError = 0, railCheckError = 0;
     unsigned ignoredSlave = 0;
 
@@ -65,12 +67,19 @@ struct Fake {
                 ++f.broadcasts;
                 if (!f.noBankAck) {
                     f.reg[{region, 0x104c}] = (address - 0x60) / 0x10;
+                    f.slaveFrame = byte;
                     f.reg[{region, 0x200}] |= 0x400;
                     if (f.startupMismatch) f.reg[{region, 0x200}] |= 0x200;
                 }
                 return 0;
             }
             assert(dev == 1); ++f.commands;
+            if(f.checkFrameSync && f.broadcasts){
+                unsigned bank=f.reg[{region,0x104c}]&1;
+                if((f.reg[{region,0x101c+bank*0x40}]&255)!=f.slaveFrame){
+                    f.reg[{region,0x200}]|=8;return 0;
+                }
+            }
             if (at == 0x304) {
                 assert(byte == 1 && !f.available);
                 if (!f.silent) {
@@ -198,6 +207,16 @@ void dataPathStatus() {
         assert(picasso_mic_hardware_action(core, PicassoMicStop) == 0);
     }
 }
+void frameRestoration() {
+    Fake f;f.checkFrameSync=true;auto h=f.core();
+    assert(!picasso_mic_hardware_action(h,PicassoMicPrepare));
+    assert(!picasso_mic_hardware_action(h,PicassoMicUnmute));
+    assert(!picasso_mic_hardware_action(h,PicassoMicStop));
+    assert(!h.savedCount&&!h.status.rails&&!h.status.restoreError);
+    assert(f.reg[Key(PicassoMicSwr,0x101c)]==0&&f.reg[Key(PicassoMicSwr,0x105c)]==0);
+    assert(!f.slave[0x120]&&!f.slave[0x130]);
+    puts("PASS master/slave frame agreement until all codec restoration completes");
+}
 void failureRestoration() {
     { Fake f; auto h = f.core(); f.ignoredSlave = 0x3022;
       assert(picasso_mic_hardware_action(h, 0) == -5 && !h.status.ready);
@@ -235,6 +254,6 @@ void failureRestoration() {
 }
 } // namespace
 int main() {
-    completeRoute(); gatesAndTransport(); dataPathStatus(); failureRestoration();
+    completeRoute(); gatesAndTransport(); dataPathStatus(); frameRestoration(); failureRestoration();
     std::puts("picasso microphone hardware: route and fault-injection checks passed");
 }

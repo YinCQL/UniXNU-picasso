@@ -209,8 +209,19 @@ int initBus(PicassoMicHardwareCore &h) {
             if (e) return e;
             if (v & 0xff000000) return -16;
         }
+    // Save both frame banks before any bus enable or slave transaction.
+    // Restoring a live master frame alone breaks agreement with the codec.
+    // These early entries are restored only after later codec operations and
+    // the master enable have been unwound. Port changes reuse this journal.
+    for(unsigned bank=0;bank<2;++bank) {
+        uint32_t reg=0x101c+bank*0x40,value=0;
+        e=rd(h,Swr,reg,value);if(e)return e;
+        if(h.savedCount==sizeof(h.saved)/sizeof(h.saved[0]))return -28;
+        h.saved[h.savedCount++]={Swr,reg,FrameMask,value};
+    }
+    e=update(h,Swr,0x101c,FrameMask,(47U<<16)|8,false);
+    if(e)return e;
     const Setting s[] = {
-        {Swr, 0x101c, FrameMask, (47U << 16) | 8},
         {Swr, 0x500, 1, 1}, {Swr, 0x1048, 0x3e0000, 0x3e0000},
         {Swr, 0x314, 0x80000007, 0x80000003}
     };
@@ -305,11 +316,11 @@ int port(PicassoMicHardwareCore &h, unsigned bank) {
         // write reads back as zero on this master; the PDM route uses only
         // sample interval, offsets, lane and channel enable below.
         {Swr, 0x1228 + m, 7, 1},
-        {Swr, 0x1224 + m, 0xffffffff, 0x01000001}, {Slave, 0x120 + s, 0xff, 1},
-        {Swr, 0x101c + m, FrameMask, CaptureFrame}
+        {Swr, 0x1224 + m, 0xffffffff, 0x01000001}, {Slave, 0x120 + s, 0xff, 1}
     };
     h.portsTouched = true;
-    return settings(h, config);
+    int e=settings(h, config);
+    return e?e:update(h,Swr,0x101c+m,FrameMask,CaptureFrame,false);
 }
 int route(PicassoMicHardwareCore &h) {
     uint32_t existing = 0; int e = rd(h, Tx, 0x400, existing);
