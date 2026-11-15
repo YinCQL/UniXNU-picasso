@@ -19,6 +19,7 @@
 #include "NativeAdrenoKernelTime.h"
 #include "AdrenoFirmware.h"
 #include "AdrenoHfi.h"
+#include "NativeAdrenoDvfs.h"
 #include "AdrenoHfiStartup.h"
 #include "AdrenoHfiVotes.h"
 #include <IOKit/IODeviceMemory.h>
@@ -189,6 +190,8 @@ struct GmuState {
     bool bandwidthTable;
     unsigned bandwidthLevels;
     uint8_t bwIndex[16];
+    uint32_t perfCount, perfIndex, perfHz[16];
+    bool dcvsFailed;
 };
 
 GmuState *gState;
@@ -1523,6 +1526,60 @@ int gxPowerOn(unsigned perfIndex)
 
 } // namespace
 
+/* Runtime DCVS uses the same ascending table and HFI command as kgsl_gmu.c.
+ * No GPU_SET is needed while IFPC is disabled and GX stays on. All callers
+ * serialize with submissions and recovery through NativeAdrenoPublish's lock. */
+extern "C" int native_adreno620_dvfs_read(NativeAdrenoDvfsSample *out)
+{
+    if(!out || !gState || !gState->booted || !gState->hfiStarted ||
+        gState->dcvsFailed || gState->votesAvailable!=gState->perfCount ||
+        gState->hfi.poisoned || gState->hfi.pending_header)return -1;
+    if(coreRead(kGmuGxPwrStatus)&((1u<<6)|(1u<<7)))return -1;
+    NativeAdrenoDvfsSample value={};
+    value.count=gState->perfCount;value.current=gState->perfIndex;
+    if(value.count>16)return -1;
+    for(uint32_t i=0;i<value.count;++i)value.hz[i]=gState->perfHz[i];
+    if(!NativeAdrenoDvfsPolicy::usable(value))return -1;
+    /* XOCLK0 countable 0x20 is GPU busy at 19.2 MHz (a6xx_reg.h).
+     * CP0 selects PERF_CP_ALWAYS_COUNT. Its rate over wall time includes
+     * clock gating; it is supporting telemetry, not a PLL measurement. */
+    value.busyTicks=coreRead(0x1F844);
+    bool stable=false;
+    for(unsigned attempt=0;attempt<3;++attempt) {
+        const uint32_t hi=gpuRead(0x401),lo=gpuRead(0x400);
+        if(hi==gpuRead(0x401)) {value.cycles=(uint64_t(hi)<<32)|lo;stable=true;break;}
+    }
+    if(!stable)return -1;
+    *out=value;
+    return 0;
+}
+
+extern "C" int native_adreno620_dvfs_vote(uint32_t index)
+{
+    if(!gState || !gState->booted || !gState->hfiStarted || gState->dcvsFailed ||
+        gState->hfi.poisoned || gState->hfi.pending_header ||
+        gState->votesAvailable!=gState->perfCount)return -1;
+    GmuState &s=*gState;
+    if(index<1 || index>=s.perfCount || index>=16 || !s.perfHz[index])return -1;
+    if(coreRead(kGmuGxPwrStatus)&((1u<<6)|(1u<<7)))return -1;
+    if(index==s.perfIndex)return 0;
+    uint32_t bw=0xFF;
+    if(s.bandwidthTable && s.bwIndex[index]<s.bandwidthLevels)bw=s.bwIndex[index];
+    const uint32_t vote[3]={1,index,bw};
+    uint32_t output[16]={},error=0;size_t count=0;
+    /* At most 20 sleeping polls, rather than the one-second boot budget.
+     * Timeout poisons HFI in the transport; never clear/retry that live queue. */
+    const AdrenoHfiStatus status=AdrenoHfiExchange(&s.hfi,30,vote,3,20,gxWait,output,16,&count,&error);
+    if(status!=AdrenoHfiSuccess) {
+        s.dcvsFailed=true;
+        printf("PICASSO_GPU dcvs: failed status=%d fw=%x requested=%u last_ack=%u poisoned=%u\n",
+            int(status),error,index,s.perfIndex,s.hfi.poisoned);
+        return -1;
+    }
+    s.perfIndex=index;
+    return 0;
+}
+
 extern "C" int native_adreno620_gmu_acquire_gpu_set(void)
 {
     if (!gState || !gState->booted || !gState->hfiStarted) return -1;
@@ -1689,6 +1746,7 @@ extern "C" int native_adreno620_hfi_handshake(void)
         if (s.cmdDb.valid && arcVote(s.cmdDb, s.cmdDb.gfx, s.cmdDb.gfxCount,
                 s.cmdDb.mx, s.cmdDb.mxCount, vlvl, &vote))
             ++s.votesAvailable;
+        s.perfHz[index] = uint32_t(hz);
         config.gpu[index].hz = hz;
         config.gpu[index].vote = vote;
     }
@@ -1831,6 +1889,9 @@ extern "C" int native_adreno620_hfi_handshake(void)
             s.hfi.skipped_header, s.hfi.skipped_ret, s.hfi.skipped_code);
         return -1;
     }
+    s.perfCount = config.gpu_count;
+    s.perfIndex = perfIndex;
+    s.dcvsFailed = false;
     s.hfiStarted = true;
     printf("PICASSO_GPU hfi: core firmware started\n");
     return 0;

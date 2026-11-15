@@ -23,8 +23,11 @@
 #include "NativeAdrenoUserClient.h"
 #include "NativeAdrenoGpuContext.h"
 #include "NativeAdrenoProfile.h"
+#include "NativeAdrenoDvfs.h"
 
 extern "C" void proc_selfname(char *, int);
+extern "C" int native_adreno620_dvfs_read(NativeAdrenoDvfsSample *) __attribute__((weak_import));
+extern "C" int native_adreno620_dvfs_vote(uint32_t) __attribute__((weak_import));
 extern "C" volatile uint32_t native_adreno_table_switches[8];
 /* The RB performance counters (Adreno620Cp.cpp): 3D output pixels, 2D valid pixels, RB busy cycles. Present
  * when the Picasso CP driver is linked; the sheng-gpu-perf=1 sampler below reads them while the ring is busy. */
@@ -235,6 +238,111 @@ extern "C" void native_adreno_set_restart(NativeAdrenoRestart restart,void *cook
  * Normal completion and hang recovery read their own fences and do not use this table. */
 extern "C" {volatile uint64_t native_adreno_fence_done[64][2];}
 extern "C" {extern volatile uint32_t native_adreno_tl_cap;}
+/* Separate from the hangcheck: 50 ms sampling only while work is active, then
+ * an event sleep. Every HFI request, sample, submit and reset holds g.lock. */
+static NativeAdrenoDvfsPolicy gDvfs;
+static bool gDvfsEnabled=false,gDvfsParked=false;
+static uint32_t gDvfsVotes=0,gDvfsErrors=0,gDvfsInvalid=0;
+static uint64_t gDvfsReport=0,gDvfsWall=0,gDvfsBusy=0,gDvfsCycles=0;
+static uint64_t gDvfsLevelWall[16]={},gDvfsLevelBusy[16]={},gDvfsLevelCycles[16]={};
+static void nativeAdrenoDvfsReport(uint64_t now,const NativeAdrenoDvfsSample &s,bool park)
+{
+    if(!park && now-gDvfsReport<5000000)return;
+    printf("PICASSO_GPU dcvs: ack_mhz=%u busy_permille=%llu cp_cycles_per_us=%llu "
+        "window_us=%llu votes=%u errors=%u invalid=%u parked=%u measured_clock=0\n",
+        s.hz[s.current]/1000000,(unsigned long long)(gDvfsWall?gDvfsBusy/gDvfsWall:0),
+        (unsigned long long)(gDvfsWall?gDvfsCycles/gDvfsWall:0),
+        (unsigned long long)gDvfsWall,gDvfsVotes,gDvfsErrors,gDvfsInvalid,unsigned(park));
+    for(uint32_t i=1;i<s.count;++i) {
+        const uint64_t wall=gDvfsLevelWall[i];
+        if(wall)printf("PICASSO_GPU dcvs-level: ack_mhz=%u dwell_us=%llu busy_permille=%llu cp_cycles_per_us=%llu\n",
+            s.hz[i]/1000000,(unsigned long long)wall,
+            (unsigned long long)(gDvfsLevelBusy[i]/wall),(unsigned long long)(gDvfsLevelCycles[i]/wall));
+        gDvfsLevelWall[i]=gDvfsLevelBusy[i]=gDvfsLevelCycles[i]=0;
+    }
+    gDvfsReport=now;gDvfsWall=gDvfsBusy=gDvfsCycles=0;
+}
+static bool nativeAdrenoDvfsVote(uint32_t target,NativeAdrenoDvfsSample &s)
+{
+    if(target==s.current)return true;
+    if(native_adreno620_dvfs_vote(target)) {
+        ++gDvfsErrors;gDvfsEnabled=false;gDvfs.invalidate();
+        return false;
+    }
+    ++gDvfsVotes;s.current=target;
+    return true;
+}
+static void nativeAdrenoDvfsWork()
+{
+    if(!gDvfsEnabled || g.submit->poisoned() || g.ring->poisoned())return;
+    const uint64_t now=g.clock.now_us(g.clock.cookie);
+    /* No MMIO or HFI overhead on the usual per-frame submission path. */
+    if(!gDvfsParked && gDvfs.lastWork && now-gDvfs.lastWork<250000) {
+        gDvfs.lastWork=now;return;
+    }
+    NativeAdrenoDvfsSample s={};
+    if(native_adreno620_dvfs_read(&s)) {gDvfs.invalidate();return;}
+    const uint32_t target=gDvfs.work(now,s,gDvfsParked);
+    (void)nativeAdrenoDvfsVote(target,s);
+    gDvfs.baseline(g.clock.now_us(g.clock.cookie),s);
+    if(gDvfsParked) {
+        gDvfsParked=false;
+        IOLockWakeup(g.lock,&gDvfs,false);
+    }
+}
+static void nativeAdrenoDvfs(void *,wait_result_t)
+{
+    for(;;) {
+        IOSleep(50);
+        IOLockLock(g.lock);
+        while(gDvfsParked && gDvfsEnabled)IOLockSleep(g.lock,&gDvfs,THREAD_UNINT);
+        if(!gDvfsEnabled) {IOLockUnlock(g.lock);break;}
+        NativeAdrenoDvfsSample s={};
+        if(g.submit->poisoned() || g.ring->poisoned() || native_adreno620_dvfs_read(&s)) {
+            gDvfs.invalidate();++gDvfsInvalid;
+            IOLockUnlock(g.lock);IOSleep(450);continue;
+        }
+        const uint64_t now=g.clock.now_us(g.clock.cookie);
+        const IOReturn idleStatus=g.ring->idle(&g.clock,0);
+        if(idleStatus!=kIOReturnSuccess && idleStatus!=kIOReturnTimeout) {
+            gDvfs.invalidate();++gDvfsInvalid;IOLockUnlock(g.lock);continue;
+        }
+        const bool idle=idleStatus==kIOReturnSuccess;
+        const uint32_t target=gDvfs.sample(now,s,idle);
+        if(gDvfs.valid) {
+            gDvfsWall+=gDvfs.elapsedUs;gDvfsBusy+=uint64_t(gDvfs.elapsedUs)*gDvfs.busyPermille;
+            gDvfsCycles+=gDvfs.cycleDelta;
+            gDvfsLevelWall[s.current]+=gDvfs.elapsedUs;
+            gDvfsLevelBusy[s.current]+=uint64_t(gDvfs.elapsedUs)*gDvfs.busyPermille;
+            gDvfsLevelCycles[s.current]+=gDvfs.cycleDelta;
+        } else ++gDvfsInvalid;
+        if(nativeAdrenoDvfsVote(target,s)) {
+            gDvfsParked=gDvfs.canPark(now,s,idle);
+            nativeAdrenoDvfsReport(now,s,gDvfsParked);
+        }
+        IOLockUnlock(g.lock);
+    }
+    thread_terminate(current_thread());
+}
+static void nativeAdrenoDvfsStart()
+{
+    if(!native_adreno620_dvfs_read || !native_adreno620_dvfs_vote)return;
+    uint32_t on=1;PE_parse_boot_argn("picasso-gpu-dcvs",&on,sizeof on);
+    if(!on)return;
+    IOLockLock(g.lock);
+    NativeAdrenoDvfsSample s={};
+    if(!native_adreno620_dvfs_read(&s)) {
+        const uint64_t now=g.clock.now_us(g.clock.cookie);
+        gDvfs.baseline(now,s);gDvfs.lastWork=now;gDvfsReport=now;
+        thread_t thread=nullptr;
+        if(kernel_thread_start(nativeAdrenoDvfs,nullptr,&thread)==KERN_SUCCESS) {
+            gDvfsEnabled=true;thread_deallocate(thread);
+            printf("PICASSO_GPU dcvs: enabled=1 sample_ms=50 idle=event min_mhz=%u max_mhz=%u initial_ack_mhz=%u\n",
+                s.hz[1]/1000000,s.hz[s.count-1]/1000000,s.hz[s.current]/1000000);
+        }
+    }
+    IOLockUnlock(g.lock);
+}
 static void nativeAdrenoHangcheckWait()
 {
     if(!native_adreno_tl_cap) {
@@ -338,6 +446,9 @@ static void nativeAdrenoHangcheck(void *,wait_result_t)
                 }
                 NativeAdrenoRecovery result{};
                 const IOReturn status=g.submit->recover(g.restart,g.restart_cookie,&g.clock,&result);
+                gDvfs.invalidate(); // Counter state cannot span hardware reinitialization.
+                gDvfsParked=false;
+                IOLockWakeup(g.lock,&gDvfs,false);
                 /* The first few restarts print what the hang looked like: the fence that stopped, the board's result, how many
                  * submissions were replayed, and whether the SMMU had latched a fault (endFault's FSR/FAR). Bounded like the stall print. */
                 static uint32_t restart_prints;
@@ -883,6 +994,7 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         spans=native_adreno_bo_memory[1];
         if(connection->live_)connection->core_->offerSystemPages(pages.descriptor?&pages:nullptr);
         if(connection->live_ && freeing)connection->core_->collectFreedPages(&freed);
+        if(connection->live_ && method==NativeAdrenoMethodSubmit)nativeAdrenoDvfsWork();
         {NativeAdrenoProfileTimer prof_dispatch(NativeProfileDispatch,method==NativeAdrenoMethodSubmit);
          status=connection->live_?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;}
         if(connection->live_)connection->core_->offerSystemPages(nullptr);
@@ -1507,6 +1619,7 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
         thread_t thread=nullptr;
         if(kernel_thread_start(nativeAdrenoHangcheck,nullptr,&thread)==KERN_SUCCESS)thread_deallocate(thread);
     }
+    nativeAdrenoDvfsStart();
     service->setName("NativeAdrenoGpu");
     service->registerService();
     return kIOReturnSuccess;
