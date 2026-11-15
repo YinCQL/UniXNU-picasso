@@ -420,6 +420,28 @@ static int bt_sk_power_on_sysctl SYSCTL_HANDLER_ARGS
 }
 SYSCTL_OID_MANUAL(_kern,OID_AUTO,qbt_power_on,CTLTYPE_INT|CTLFLAG_RD|CTLFLAG_LOCKED,NULL,0,bt_sk_power_on_sysctl,"I","WCN399x startup request");
 
+/* Bounded boot diagnostics: status and length only, never root-key bytes.
+ * The daemon retains its native Keychain operations and error handling. */
+static int bt_sk_keychain_trace_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp,arg1,arg2)
+    uint32_t trace[4]={0};
+    if(!req->newptr)return EPERM;
+    char name[32]={0};
+    if(!req->p)return EPERM;
+    proc_name(proc_getpid(req->p),name,sizeof(name));
+    if(strcmp(name,"bluetoothd"))return EPERM;
+    if(req->newlen!=sizeof(trace))return EINVAL;
+    int error=SYSCTL_IN(req,trace,sizeof(trace));if(error)return error;
+    if(trace[0]<1 || trace[0]>2 || trace[1]>16 || trace[3]>65536)return EINVAL;
+    static unsigned samples;
+    unsigned n=__atomic_fetch_add(&samples,1u,__ATOMIC_RELAXED);
+    if(n<32)printf("PICASSO_BT keychain operation=%u kind=%u status=%d bytes=%u sample=%u\n",
+        trace[0],trace[1],(int32_t)trace[2],trace[3],n+1);
+    return 0;
+}
+SYSCTL_OID_MANUAL(_kern,OID_AUTO,qbt_keychain_trace,CTLTYPE_OPAQUE|CTLFLAG_WR|CTLFLAG_LOCKED,NULL,0,bt_sk_keychain_trace_sysctl,"S,bt_keychain_trace","Bluetooth keychain boot status");
+
 int qbt_transport_init(const struct qbt_transport_ops *ops)
 {
     if(!ops || !ops->wake || !ops->power)return EINVAL;
@@ -435,6 +457,7 @@ int qbt_transport_init(const struct qbt_transport_ops *ops)
     sysctl_register_oid(&sysctl__kern_qbt_boot);
     sysctl_register_oid(&sysctl__kern_qbt_firmware);
     sysctl_register_oid(&sysctl__kern_qbt_power_on);
+    sysctl_register_oid(&sysctl__kern_qbt_keychain_trace);
     return 0;
 }
 

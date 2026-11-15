@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 
 static const uint8_t expected_uuid[16] = {0xaa,0x94,0x24,0xe8,0x06,0x48,0x34,0xe2,0xb3,0xcf,0xe6,0xc7,0x93,0xb9,0xd4,0x71};
 static intptr_t slide;
@@ -34,6 +35,10 @@ static os_log_t logger;
 #define AT(address) ((void *)((uintptr_t)(address) + slide))
 
 /* bluetoothd */
+#define SLOT_KEYCHAIN_GET     0x100867fc0
+#define SLOT_KEYCHAIN_SET     0x100867fc8
+#define ORIGINAL_KEYCHAIN_GET 0x100006000
+#define ORIGINAL_KEYCHAIN_SET 0x100006010
 #define SLOT_PUBLISH          0x100867ff0
 #define SLOT_PREPARE_ADV      0x100867ff8
 #define SUPPORT_TABLE         0x100863938   /* 47 bytes, byte:mask per descriptor */
@@ -215,6 +220,22 @@ static void publish(void)
     }
 }
 
+static void keychain_trace(uint32_t operation,uint32_t kind,int32_t status,uint32_t bytes)
+{
+    const uint32_t record[4]={operation,kind,(uint32_t)status,bytes};
+    (void)sysctlbyname("kern.qbt_keychain_trace",NULL,NULL,(void *)record,sizeof(record));
+}
+static int32_t keychain_get(uint32_t kind,void *bytes,uint32_t capacity,uint32_t *length)
+{
+    int32_t result=((int32_t (*)(uint32_t,void *,uint32_t,uint32_t *))AT(ORIGINAL_KEYCHAIN_GET))(kind,bytes,capacity,length);
+    keychain_trace(1,kind,result,length?*length:0);return result;
+}
+static int32_t keychain_set(uint32_t kind,const void *bytes,uint32_t length)
+{
+    int32_t result=((int32_t (*)(uint32_t,const void *,uint32_t))AT(ORIGINAL_KEYCHAIN_SET))(kind,bytes,length);
+    keychain_trace(2,kind,result,length);return result;
+}
+
 __attribute__((constructor)) static void type0_init(void)
 {
     logger = os_log_create("com.apple.bluetooth", "RenoirType0");
@@ -231,6 +252,8 @@ __attribute__((constructor)) static void type0_init(void)
         return;
     }
     slide = _dyld_get_image_vmaddr_slide(0);
+    *(void **)AT(SLOT_KEYCHAIN_GET) = (void *)keychain_get;
+    *(void **)AT(SLOT_KEYCHAIN_SET) = (void *)keychain_set;
     *(void **)AT(SLOT_PUBLISH) = (void *)publish;
     *(void **)AT(SLOT_PREPARE_ADV) = (void *)prepare_advertising;
 }

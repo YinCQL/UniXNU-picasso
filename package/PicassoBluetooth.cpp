@@ -379,7 +379,14 @@ int powerOn() {
     native_bluetooth_stats[14]=4;
     e=pulse(0xc0,2400,10);if(e)return phaseResult(e,"pulse-off");
     e=pulse(0xfc,115200,100);if(e)return phaseResult(e,"pulse-on");
-    e=quiesce();if(!e)e=qbt_geni_resume(&bt.geni);if(e)return phaseResult(e,"boot-quiesce");
+    // hci_qca reopens the port after the boot pulse to resynchronise RTS/CTS.
+    // Keep the controller supplies on, but reset both sequencers and their DMA.
+    e=quiesce();if(e)return phaseResult(e,"boot-close");
+    e=stopEngine();if(e)return phaseResult(e,"boot-reset");
+    e=prepareEngine();if(e)return phaseResult(e,"boot-reprepare");
+    e=qbt_geni_start(&bt.geni);if(e)return phaseResult(e,"boot-reopen");
+    qbt_geni_set_flow(&bt.geni,true);
+    printf("PICASSO_BT reopen pins=%x status=%x rate=%x/%x error=0\n",linePins(),urd(nullptr,0x40),urd(nullptr,0x48),urd(nullptr,0x4c));
     native_bluetooth_stats[14]=6;bt.initializing=true;bt.discard_rx=false;
     e=qbt_boot_wcn399x(bt.core,3000000,bt.address);bt.initializing=false;
     (void)phaseResult(e,"firmware-handshake");
@@ -388,6 +395,9 @@ int powerOn() {
         stats.tx_bytes,stats.rx_bytes,bt.geni.stats.interrupts,bt.geni.stats.tx_dma,bt.geni.stats.rx_dma,
         linePins(),urd(nullptr,0x40),urd(nullptr,0x2ac),urd(nullptr,0x25c),urd(nullptr,0x48),urd(nullptr,0x4c),
         bt.geni.stats.line_errors,bt.geni.stats.dma_errors);
+    printf("PICASSO_BT line-fault irq=%x/%x/%x/%x rxbytes=%llu txbytes=%llu\n",
+        bt.geni.fault_irq[0],bt.geni.fault_irq[1],bt.geni.fault_irq[2],bt.geni.fault_irq[3],
+        bt.geni.stats.rx_bytes,bt.geni.stats.tx_bytes);
     struct qbt_info info;qbt_get_info(bt.core,&info);
     printf("PICASSO_BT init state=%u error=%d product=%x soc=%x rom=%x patch=%x baud=%u\n",
         info.state,e,info.product,info.soc,info.rom,info.patch,info.baud);

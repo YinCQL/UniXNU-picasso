@@ -142,7 +142,22 @@ def patch(data):
         0xa8c17be0,                              # ldp x0,x30,[sp],#16
         0xd10183ff,lambda pc:b(pc,0x10050a190)])
     im.put(0x10050a18c,[b(0x10050a18c,adv_start)])
-    if cave>BASE+0x693c:raise SystemExit('cave overflow')
+    # Observe the real BTKC root-key read/write status; no key material is copied.
+    # Tail-call the library wrapper, or run the unchanged original prologue.
+    # Fixed continuation locations are checked by the library's native tests.
+    for site,slot,continuation,prologue in [
+        (0x100257654,0x100867fc0,0x100006000,0xd10183ff),
+        (0x100257820,0x100867fc8,0x100006010,0xa9bc5ff8),
+    ]:
+        im.expect(site,[prologue])
+        im.expect(continuation,[0,0])
+        im.put(continuation,[prologue,b(continuation+4,site+4)])
+        entry=cave;fallback=cave+4*4
+        cave=assemble(im,cave,[lambda pc,slot=slot:adrp(pc,16,slot),ldr_x(16,16,slot&0xfff),
+            lambda pc,fallback=fallback:cbz_x(pc,16,fallback),0xd61f0200,
+            prologue,lambda pc,site=site:b(pc,site+4)])
+        im.put(site,[b(site,entry)])
+    if cave>BASE+0x6000:raise SystemExit('cave overflow')
 
     # 8. LC_LOAD_DYLIB /usr/lib/PicassoBTType0.dylib, appended after the last command.
     magic,cpu,sub,ft,ncmds,sizeofcmds,flags,res=struct.unpack_from('<IiiIIIII',im.d,0)

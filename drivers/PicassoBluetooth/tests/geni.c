@@ -25,7 +25,7 @@ static void write_reg(void *p,uint32_t r,uint32_t v) {
     else if(r==G_TX_CLEAR)f->regs[G_TX_IRQ/4]&=~v;
     else if(r==G_RX_CLEAR)f->regs[G_RX_IRQ/4]&=~v;
     else f->regs[r/4]=v;
-    if(r==G_S_CMD)f->regs[G_STATUS/4]|=G_S_ACTIVE;
+    if(r==G_S_CMD){assert(f->g.rx_busy && f->regs[G_RX_DMA_LEN/4]==QBT_GENI_RX_SIZE);f->regs[G_STATUS/4]|=G_S_ACTIVE;}
     if(r==G_M_CMD)f->regs[G_STATUS/4]|=G_M_ACTIVE;
     if(r==G_TX_DMA_LEN){assert(f->device_tx);f->sent_length=v;memcpy(f->sent,f->tx,v);f->regs[0x910/4]=v;}
     if(r==G_RX_DMA_LEN)assert(f->device_rx[f->g.rx_active]);
