@@ -114,6 +114,16 @@ bool serialClock(bool enabled) {
     }
     return false;
 }
+int phaseResult(int error,const char *phase) {
+    if(error && bt.clocked) {
+        printf("PICASSO_BT failure phase=%s error=%d state=%u baud=%u status=%x dma=%x irq=%x/%x\n",
+            phase,error,(unsigned)bt.geni.state,bt.baud,urd(nullptr,0x40),urd(nullptr,0xe40),urd(nullptr,0x610),urd(nullptr,0x640));
+        printf("PICASSO_BT clock cmd=%x cfg=%x m=%x n=%x d=%x branch=%x vote=%x pll=%x\n",
+            grd(nullptr,0x17600),grd(nullptr,0x17604),grd(nullptr,0x17608),grd(nullptr,0x1760c),
+            grd(nullptr,0x17610),grd(nullptr,0x175fc),grd(nullptr,0x52008),grd(nullptr,0));
+    }
+    return error;
+}
 int sourceClock(uint32_t baud,uint32_t &hz) {
     picasso_bt::Clock c={};if(!picasso_bt::clock(baud,c))return -EINVAL;
     // Do not rewrite an engine under firmware DFS ownership.
@@ -136,7 +146,7 @@ int sourceClock(uint32_t baud,uint32_t &hz) {
     gwr(nullptr,0x17610,c.n?~c.n&0xffffu:0);
     gwr(nullptr,0x17604,c.cfg);gwr(nullptr,0x17600,grd(nullptr,0x17600)|1u);
     for(unsigned n=0;n<1000;++n){if(!(grd(nullptr,0x17600)&1u)){hz=c.hz;return 0;}IODelay(1);}
-    return -ETIMEDOUT;
+    return phaseResult(-ETIMEDOUT,"source-clock-update");
 }
 size_t rxBytes(void *,const uint8_t *bytes,size_t n) {
     if(bt.discard_rx)return n;
@@ -198,7 +208,7 @@ int clockVote(void *,bool enabled) {
     return enabled?0:-EBUSY;
 }
 int setRate(void *,uint32_t baud) {
-    int e=quiesce();if(e)return e;
+    int e=quiesce();if(e)return phaseResult(e,"rate-quiesce");
     uint32_t hz=0;
     e=sourceClock(baud,hz);
     if(!e)e=qbt_geni_set_rate(&bt.geni,baud,hz,16);
@@ -358,14 +368,15 @@ int powerOn() {
     native_bluetooth_stats[11]=urd(nullptr,0x68);native_bluetooth_stats[12]=bt.wrapper.va[1];
     printf("PICASSO_BT uart fw=%x wrapper=%x dfs=%x pins=%x\n",urd(nullptr,0x68),bt.wrapper.va[1],grd(nullptr,0x17614),linePins());
     if(((urd(nullptr,0x68)>>8)&255)!=2)return -ENXIO;
-    e=stopEngine();if(e)return e;
+    e=stopEngine();if(e)return phaseResult(e,"stop-engine");
     qbt_reset(bt.core);bt.discard_rx=true;
-    e=prepareEngine();if(e)return e;
+    e=prepareEngine();if(e)return phaseResult(e,"prepare-engine");
     if(!bt.serial_irq){e=armcpu_spi_attach(picasso_bt::Irq,false,serialIrq,nullptr,nullptr,nullptr);if(e)return -EIO;bt.serial_irq=true;irqMask(nullptr,true);}
-    e=qbt_geni_start(&bt.geni);if(e)return e;
+    e=qbt_geni_start(&bt.geni);if(e)return phaseResult(e,"geni-start");
     native_bluetooth_stats[14]=4;
-    e=pulse(0xc0,2400,10);if(!e)e=pulse(0xfc,115200,100);if(e)return e;
-    e=quiesce();if(!e)e=qbt_geni_resume(&bt.geni);if(e)return e;
+    e=pulse(0xc0,2400,10);if(e)return phaseResult(e,"pulse-off");
+    e=pulse(0xfc,115200,100);if(e)return phaseResult(e,"pulse-on");
+    e=quiesce();if(!e)e=qbt_geni_resume(&bt.geni);if(e)return phaseResult(e,"boot-quiesce");
     native_bluetooth_stats[14]=6;bt.initializing=true;bt.discard_rx=false;
     e=qbt_boot_wcn399x(bt.core,3000000,bt.address);bt.initializing=false;
     struct qbt_info info;qbt_get_info(bt.core,&info);

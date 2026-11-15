@@ -1,13 +1,24 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -9762,7 +9762,11 @@
+@@ -9762,7 +9762,22 @@
      error = picasso_ifnamer_read(file, bytes, 8192, &size, ctx);
      if (error || picasso_jobs_match(bytes, (size_t)size, picasso_jobs_after_sha)) goto done;
      bool legacy = picasso_jobs_match(bytes, (size_t)size, picasso_jobs_legacy_sha);
 -    if (!legacy && !picasso_jobs_match(bytes, (size_t)size, picasso_jobs_before_sha)) { error = EINVAL; goto done; }
 +    if (!legacy && !picasso_jobs_match(bytes, (size_t)size, picasso_jobs_before_sha)) {
-+        printf("PICASSO_JOBS unknown size=%llu header=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-+            (unsigned long long)size, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
++        /* Bounded exact policy evidence; do not rewrite an unknown plist. */
++        printf("PICASSO_JOBS unknown size=%llu\n", (unsigned long long)size);
++        for (size_t at = 0; at < size; at += 48) {
++            static const char hex[] = "0123456789abcdef";
++            char line[97];
++            size_t count = size - at < 48 ? (size_t)size - at : 48;
++            for (size_t j = 0; j < count; ++j) {
++                line[j*2] = hex[bytes[at+j] >> 4];
++                line[j*2+1] = hex[bytes[at+j] & 15];
++            }
++            line[count*2] = 0;
++            printf("PICASSO_JOBS xml offset=%u hex=%s\n", (unsigned)at, line);
++        }
 +        error = EINVAL; goto done;
 +    }
      for (unsigned i = 0; i < sizeof(entries)/sizeof(entries[0]); ++i) {
@@ -15,7 +26,7 @@
          for (at = 0; at + length <= size; ++at)
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -2475,6 +2475,26 @@
+@@ -2475,6 +2475,48 @@
  	task_t task = proc_task(p);
  
  
@@ -34,6 +45,28 @@
 +                p->p_exit_reason ? (unsigned long long)p->p_exit_reason->osr_code : 0ULL, (unsigned long long)proc_getcsflags(p));
 +            picasso_service_description(p, rv, ticket + 1);
 +            picasso_report_user_fault(p, rv, ticket + 1, "BTBOOT");
++            if (ticket < 2 && current_proc() == p && current_task() == proc_task(p)) {
++                arm_saved_state_t *state = get_user_regs(current_thread());
++                if (state && is_saved_state64(state) && PSR64_IS_USER64(get_saved_state_cpsr(state))) {
++                    struct user64_dyld_all_image_infos images = {0};
++                    int image_error = copyin(task_get_all_image_info_addr(current_task()), &images, sizeof(images));
++                    uint64_t slide = !image_error && images.version >= 12 ? images.sharedCacheSlide : 0;
++                    printf("PICASSO_BT_STACK pid=%d name=%s pc=%llx lr=%llx fp=%llx slide=%llx image_error=%d\n",
++                        proc_getpid(p), p->p_name, (unsigned long long)get_saved_state_pc(state),
++                        (unsigned long long)get_saved_state_lr(state), (unsigned long long)get_saved_state_fp(state),
++                        (unsigned long long)slide, image_error);
++                    uint64_t frame = get_saved_state_fp(state);
++                    for (unsigned depth = 0; depth < 16 && frame && !(frame & 15); ++depth) {
++                        uint64_t pair[2] = {0};
++                        int copied = copyin((user_addr_t)frame, pair, sizeof(pair));
++                        printf("PICASSO_BT_STACK pid=%d depth=%u fp=%llx next=%llx lr=%llx error=%d\n",
++                            proc_getpid(p), depth, (unsigned long long)frame, (unsigned long long)pair[0],
++                            (unsigned long long)pair[1], copied);
++                        if (copied || pair[0] <= frame || pair[0] - frame > 1048576) break;
++                        frame = pair[0];
++                    }
++                }
++            }
 +        }
 +        break;
 +    }
