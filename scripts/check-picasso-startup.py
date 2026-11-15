@@ -77,9 +77,22 @@ def main():
         literal = re.search('picasso_jobs_' + name + r'_sha\[32\] = \{(.*?)\}', constants)[1]
         assert bytes(int(n, 16) for n in literal.split(',')) == hashlib.sha256(data).digest()
     policy = constants + '\n'.join(module.extract(source, name) for name in
-        ('static int\npicasso_jobs_match(', 'static int\npicasso_jobs_metadata(', 'static int\npicasso_jobs_sync(', 'static int\npicasso_jobs_enable('))
+        ('static int\npicasso_jobs_match(', 'static int\npicasso_jobs_space(', 'static int\npicasso_jobs_token(', 'static int\npicasso_jobs_transform(', 'static int\npicasso_jobs_metadata(', 'static int\npicasso_jobs_sync(', 'static int\npicasso_jobs_enable('))
     (out / 'runtime-jobs.inc').write_text(policy, newline='\n')
     (out / 'jobs-data.inc').write_text('\n'.join('static const unsigned char jobs_' + name + '[] = {' + ','.join(str(n) for n in data) + '};' for name, data in [('before', before), ('legacy', legacy), ('after', after)]), newline='\n')
+    device = (ROOT / 'scripts/tests/picasso-bluetooth-disabled.plist').read_bytes()
+    # Match the production removal extent while retaining the captured order.
+    device_after = device
+    for job in board['runtime_enabled_jobs']:
+        token = ('\n\t<key>' + job + '</key>\n\t<true/>').encode()
+        device_after = device_after.replace(token, b'')
+    assert plistlib.loads(device_after) == {k:v for k,v in plistlib.loads(device).items() if k not in board['runtime_enabled_jobs']}
+    with (out / 'jobs-data.inc').open('a') as stream:
+        for name, data in [('device', device), ('device_after', device_after)]:
+            stream.write('\nstatic const unsigned char jobs_' + name + '[] = {' + ','.join(str(n) for n in data) + '};\n')
+    # Use standard-library SHA-256 for the host digest oracle, including new
+    # reordered policies. The C wrapper buffers input and calls this helper.
+    (out / 'jobs-sha.py').write_text("import hashlib,sys\np=sys.argv[1]\nopen(p+'.sha','wb').write(hashlib.sha256(open(p,'rb').read()).digest())\n")
     assert data_prepare.count('picasso_jobs_enable(p, scratch)') == 1
     assert data_prepare.index('native_staged_apps_prepare(') < data_prepare.index('picasso_jobs_enable(')
     runs = []
@@ -93,6 +106,8 @@ def main():
             exe = out / (name + ('.exe' if os.name == 'nt' else ''))
             cmd = [compiler, '-std=c++17' if cpp else '-std=gnu11', '-Wall', '-Wextra', '-Werror',
                    '-O1', '-I', str(out), str(ROOT / 'scripts/tests' / fixture), '-o', str(exe)]
+            if fixture == 'picasso-runtime-jobs-host.c':
+                cmd += ['-DJOBS_SHA_SCRIPT=' + '"' + str(out / 'jobs-sha.py') + '"']
             if sanitized:
                 cmd += ['-fsanitize=address' if os.name == 'nt' else '-fsanitize=address,undefined']
             for stage, command in (('compile', cmd), ('run', [str(exe)])):
@@ -101,7 +116,7 @@ def main():
                 if result.returncode:
                     raise RuntimeError(result.stdout + result.stderr)
                 runs.append(dict(name=name, stage=stage, passed=True))
-    inputs = [Path(__file__), ROOT / 'board.toml', ROOT / 'unixnu', ROOT / 'patches/picasso-runtime-jobs-xnu.patch', ROOT / 'scripts/tests/picasso-runtime-jobs-host.c', ROOT / 'scripts/tests/picasso-startup-cache-host.c',
+    inputs = [Path(__file__), ROOT / 'board.toml', ROOT / 'unixnu', ROOT / 'patches/picasso-runtime-jobs-xnu.patch', ROOT / 'patches/picasso-bluetooth-policy-xnu.patch', ROOT / 'scripts/tests/picasso-runtime-jobs-host.c', ROOT / 'scripts/tests/picasso-bluetooth-disabled.plist', ROOT / 'scripts/tests/picasso-startup-cache-host.c',
               ROOT / 'scripts/tests/picasso-brightness-mac-host.cpp',
               ROOT / 'scripts/tests/picasso-network-start-host.cpp', ROOT / 'scripts/tests/picasso-network-config-host.c',
               ROOT / 'scripts/tests/picasso-network-observe-host.cpp', ROOT / 'scripts/tests/picasso-network-reader-host.c', ROOT / 'package/PicassoDisplay.cpp',

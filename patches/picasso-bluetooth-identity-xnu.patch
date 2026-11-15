@@ -1,0 +1,160 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7579,6 +7579,10 @@
+ volatile int native_gpu_addon_same = 0;
+ volatile int native_gpu_addon_failed = 0;
+ volatile int native_gpu_addon_error = 0;
++static uint8_t picasso_bt_runtime_hashes[2][32];
++static uint64_t picasso_bt_runtime_sizes[2];
++static unsigned picasso_bt_runtime_ready;
++
+ static int
+ native_gpu_addon_equal(vnode_t vp, const uint8_t *data, uint64_t size, uint32_t mode, vfs_context_t ctx)
+ {
+@@ -7794,6 +7798,15 @@
+ 				error = native_gpu_addon_write(path, data, size, mode, ctx);
+ 			}
+ 		}
++        /* Capture identity from the loader-owned RAM addon, after validating
++         * the complete inventory. Never learn executable hashes from Data. */
++        if (data && error <= 0 && audio_only == 1 && media_gpu == 1 && count == 19 &&
++            i >= 14 && i <= 15 && size && size <= 8*1024*1024) {
++            SHA256_CTX sha; unsigned index = i - 14;
++            SHA256_Init(&sha); SHA256_Update(&sha, data, (size_t)size);
++            SHA256_Final(picasso_bt_runtime_hashes[index], &sha);
++            picasso_bt_runtime_sizes[index] = size;
++        }
+ 		if (data) {
+ 			kfree_data(data, size ? size : 1);
+ 		}
+@@ -9908,6 +9921,75 @@
+     if (runtime) printf("PICASSO_INJECT runtime UI view stage=%d error=%d\n", stage, status);
+     printf("PICASSO_INJECT view stage=%d error=%d path=%s\n", stage, status, library);
+ }
++/* Retain the exact boot-addon executable identity, never a whole Data mount.
++ * AMFI still checks its code signature, validation category and launch type. */
++extern int bindfs_getbackingvnode(vnode_t, vnode_t *);
++static vnode_t picasso_bt_runtime_vnodes[2];
++
++static int
++picasso_bt_runtime_file(vnode_t vp, unsigned index, vfs_context_t ctx)
++{
++    struct vnode_attr va;
++    VATTR_INIT(&va);
++    VATTR_WANTED(&va, va_mode); VATTR_WANTED(&va, va_uid); VATTR_WANTED(&va, va_gid);
++    VATTR_WANTED(&va, va_nlink); VATTR_WANTED(&va, va_data_size);
++    if (index >= 2 || !vp || vnode_vtype(vp) != VREG || !picasso_bt_runtime_sizes[index]) return EAUTH;
++    int error = vnode_getattr(vp, &va, ctx);
++    if (error) return error;
++    if (!VATTR_IS_SUPPORTED(&va, va_mode) || !VATTR_IS_SUPPORTED(&va, va_uid) ||
++        !VATTR_IS_SUPPORTED(&va, va_gid) || !VATTR_IS_SUPPORTED(&va, va_nlink) ||
++        !VATTR_IS_SUPPORTED(&va, va_data_size) || va.va_uid || va.va_gid ||
++        (va.va_mode & 07777) != 0755 || va.va_nlink != 1 ||
++        va.va_data_size != picasso_bt_runtime_sizes[index]) return EAUTH;
++    uint8_t *buffer = kalloc_data(4096, Z_WAITOK);
++    if (!buffer) return ENOMEM;
++    SHA256_CTX sha; uint8_t digest[32];
++    SHA256_Init(&sha);
++    for (uint64_t at = 0; !error && at < va.va_data_size; ) {
++        int count = (int)(va.va_data_size - at < 4096 ? va.va_data_size - at : 4096), resid = 0;
++        error = vn_rdwr(UIO_READ, vp, (caddr_t)buffer, count, (off_t)at, UIO_SYSSPACE,
++            IO_NOAUTH, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++        if (!error && resid) error = EIO;
++        if (!error) SHA256_Update(&sha, buffer, count);
++        at += count;
++    }
++    SHA256_Final(digest, &sha);
++    kfree_data(buffer, 4096);
++    if (!error && memcmp(digest, picasso_bt_runtime_hashes[index], sizeof(digest))) error = EAUTH;
++    return error;
++}
++
++int
++picasso_bt_runtime_auth(vnode_t vp, vfs_context_t ctx)
++{
++    if (!os_atomic_load(&picasso_bt_runtime_ready, acquire)) return EAUTH;
++    if (!vp || !ctx || vnode_vtype(vp) != VREG || native_gpu_addon_files != 19 ||
++        native_gpu_addon_failed || native_gpu_addon_error) return EAUTH;
++    mount_t mp = vnode_mount(vp), root = rootvnode ? vnode_mount(rootvnode) : NULL;
++    if (!mp || !root || !(vfs_flags(mp) & MNT_RDONLY) || !(vfs_flags(root) & MNT_RDONLY) ||
++        strcmp(vfs_statfs(mp)->f_fstypename, "bindfs") ||
++        strcmp(vfs_statfs(mp)->f_mntonname, "/usr/sbin") ||
++        strcmp(vfs_statfs(mp)->f_mntfromname, "/private/var/ngpu/bluetooth-bin") ||
++        strcmp(vfs_statfs(root)->f_fstypename, "apfs")) return EAUTH;
++    vnode_t device = vfs_devvp(root);
++    if (!device) return EAUTH;
++    dev_t dev = vnode_specrdev(device);
++    bool owner = native_verified_block_root_authorized(dev);
++    vnode_put(device);
++    if (!owner) return EAUTH;
++    vnode_t lower = NULLVP;
++    int error = bindfs_getbackingvnode(vp, &lower);
++    if (error) return error;
++    unsigned index = 0;
++    for (; index < 2; ++index) if (lower == picasso_bt_runtime_vnodes[index]) break;
++    error = index < 2 ? picasso_bt_runtime_file(lower, index, ctx) : EAUTH;
++    vnode_put(lower);
++    static unsigned reports;
++    unsigned ticket = os_atomic_inc_orig(&reports, relaxed);
++    if (ticket < 8) printf("PICASSO_BT launch identity=%u error=%d\n", index, error);
++    return error;
++}
++
+ /* The board only starts after both runtime views are installed. */
+ extern void picasso_bt_runtime_result(int) __attribute__((weak_import));
+ static void
+@@ -9943,6 +10025,20 @@
+         native_gpu_addon_mount(p,scratch,0xc00,source,sizeof(source),point,sizeof(point),
+             "/usr/sbin/notifyd","/usr/sbin/bluetoothd",&stage,&status);
+         if(stage!=5 || status)error=status?status:EIO;
++    }
++    vnode_t pinned[2] = {NULLVP, NULLVP};
++    for (unsigned i = 0; !error && i < 2; ++i) {
++        vnode_t vp = NULLVP;
++        error = vnode_lookup(paths[i+1], VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++        if (!error) error = picasso_bt_runtime_file(vp, i, ctx);
++        if (!error) { error = vnode_ref(vp); if (!error) pinned[i] = vp; }
++        if (vp) vnode_put(vp);
++    }
++    if (!error) {
++        picasso_bt_runtime_vnodes[0] = pinned[0]; picasso_bt_runtime_vnodes[1] = pinned[1];
++        os_atomic_store(&picasso_bt_runtime_ready, 1, release);
++    } else {
++        for (unsigned i = 0; i < 2; ++i) if (pinned[i]) vnode_rele(pinned[i]);
+     }
+     printf("PICASSO_BT runtime files=%d binaries=%d/%d error=%d\n",
+         native_gpu_addon_files,stage,status,error);
+--- a/bsd/miscfs/bindfs/bind_vnops.c
++++ b/bsd/miscfs/bindfs/bind_vnops.c
+@@ -78,6 +78,7 @@
+ #include <sys/ubc.h>
+ #include <sys/types.h>
+ #include <sys/dirent.h>
++#include <sys/fsctl.h>
+ 
+ #include "bindfs.h"
+ 
+@@ -646,11 +647,23 @@
+ 	return error;
+ }
+ 
++/* Only the exact loader-provided Bluetooth executables have an owner
++ * identity adapter. Other ioctl operations and files retain ENOTSUP. */
++extern int picasso_bt_runtime_auth(vnode_t, vfs_context_t) __attribute__((weak_import));
++static int
++bindfs_ioctl(struct vnop_ioctl_args *args)
++{
++    if (args->a_command != FSIOC_AUTH_FS || !args->a_data || args->a_fflag ||
++        ((fsioc_auth_fs_t *)args->a_data)->authvp || !picasso_bt_runtime_auth) return ENOTSUP;
++    return picasso_bt_runtime_auth(args->a_vp, args->a_context);
++}
++
+ /*
+  * Global vfs data structures
+  */
+ 
+ static const struct vnodeopv_entry_desc bindfs_vnodeop_entries[] = {
++	{.opve_op = &vnop_ioctl_desc, .opve_impl = (vop_t)bindfs_ioctl},
+ 	{.opve_op = &vnop_default_desc, .opve_impl = (vop_t)bindfs_default},      /* default */
+ 	{.opve_op = &vnop_getattr_desc, .opve_impl = (vop_t)bindfs_getattr},      /* getattr */
+ 	{.opve_op = &vnop_open_desc, .opve_impl = (vop_t)bindfs_open},            /* open */

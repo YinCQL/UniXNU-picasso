@@ -1,0 +1,167 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9734,20 +9734,90 @@
+     return error;
+ }
+ 
++/* launchd may reorder entries and add unrelated overrides. Accept only its
++ * bounded Boolean XML dictionary and preserve all bytes outside released jobs.
++ * Parse the whole document before changing it; duplicate keys are ambiguous. */
++static int
++picasso_jobs_space(uint8_t c)
++{
++    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
++}
++
++static int
++picasso_jobs_token(const uint8_t *bytes, size_t size, size_t *at, const char *token)
++{
++    while (*at < size && picasso_jobs_space(bytes[*at])) ++*at;
++    size_t length = strlen(token);
++    if (*at > size || length > size - *at || memcmp(bytes + *at, token, length)) return EINVAL;
++    *at += length;
++    return 0;
++}
++
++static int
++picasso_jobs_transform(uint8_t *bytes, size_t *size, unsigned *removed)
++{
++    static const char *const released[] = {
++        "com.apple.BTServer.avrcp", "com.apple.BTServer.le", "com.apple.BTServer.map",
++        "com.apple.BTServer.pbap", "com.apple.BluetoothUIService", "com.apple.bluetoothd",
++        "com.apple.bluetoothuserd"
++    };
++    struct { uint16_t start, key, length, end; bool drop; } entries[128];
++    unsigned count = 0;
++    size_t at = 0;
++    *removed = 0;
++    if (*size > 8192 ||
++        picasso_jobs_token(bytes, *size, &at, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>") ||
++        picasso_jobs_token(bytes, *size, &at, "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">") ||
++        picasso_jobs_token(bytes, *size, &at, "<plist version=\"1.0\">") ||
++        picasso_jobs_token(bytes, *size, &at, "<dict>")) return EINVAL;
++    for (;;) {
++        size_t start = at, probe = at;
++        if (!picasso_jobs_token(bytes, *size, &probe, "</dict>")) { at = probe; break; }
++        if (count == 128 || picasso_jobs_token(bytes, *size, &at, "<key>")) return EINVAL;
++        size_t key = at;
++        while (at < *size && bytes[at] != '<') {
++            uint8_t c = bytes[at++];
++            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++                (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_')) return EINVAL;
++        }
++        size_t length = at - key;
++        if (!length || length > 255 || picasso_jobs_token(bytes, *size, &at, "</key>")) return EINVAL;
++        for (unsigned i = 0; i < count; ++i)
++            if (entries[i].length == length && !memcmp(bytes + entries[i].key, bytes + key, length)) return EINVAL;
++        probe = at;
++        if (picasso_jobs_token(bytes, *size, &probe, "<true/>")) {
++            probe = at;
++            if (picasso_jobs_token(bytes, *size, &probe, "<false/>")) return EINVAL;
++        }
++        at = probe;
++        entries[count].start = (uint16_t)start;
++        entries[count].key = (uint16_t)key;
++        entries[count].length = (uint16_t)length;
++        entries[count].end = (uint16_t)at;
++        entries[count].drop = false;
++        for (unsigned i = 0; i < sizeof(released)/sizeof(released[0]); ++i)
++            if (strlen(released[i]) == length && !memcmp(bytes + key, released[i], length)) entries[count].drop = true;
++        ++count;
++    }
++    if (picasso_jobs_token(bytes, *size, &at, "</plist>")) return EINVAL;
++    while (at < *size && picasso_jobs_space(bytes[at])) ++at;
++    if (at != *size) return EINVAL;
++    while (count) {
++        --count;
++        if (!entries[count].drop) continue;
++        size_t start = entries[count].start, end = entries[count].end;
++        memmove(bytes + start, bytes + end, *size - end);
++        *size -= end - start;
++        ++*removed;
++    }
++    return 0;
++}
++
+ static int
+ picasso_jobs_enable(proc_t p, user_addr_t scratch)
+ {
+     static const char file[] = "/private/var/db/com.apple.xpc.launchd/disabled.plist";
+     static const char temp[] = "/private/var/db/com.apple.xpc.launchd/.picasso-disabled.tmp";
+-    static const char *const entries[] = {
+-        "\t<key>com.apple.BTServer.avrcp</key>\n\t<true/>\n",
+-        "\t<key>com.apple.BTServer.le</key>\n\t<true/>\n",
+-        "\t<key>com.apple.BTServer.map</key>\n\t<true/>\n",
+-        "\t<key>com.apple.BTServer.pbap</key>\n\t<true/>\n",
+-        "\t<key>com.apple.BluetoothUIService</key>\n\t<true/>\n",
+-        "\t<key>com.apple.bluetoothd</key>\n\t<true/>\n",
+-        "\t<key>com.apple.bluetoothuserd</key>\n\t<true/>\n",
+-    };
+     const char *dirs[] = {"/private/var", "/private/var/db", "/private/var/db/com.apple.xpc.launchd"};
+     vfs_context_t ctx = vfs_context_current();
+     int error = 0, changed = 0;
+@@ -9761,36 +9831,16 @@
+     if (!bytes) { error = ENOMEM; goto done; }
+     error = picasso_ifnamer_read(file, bytes, 8192, &size, ctx);
+     if (error || picasso_jobs_match(bytes, (size_t)size, picasso_jobs_after_sha)) goto done;
+-    bool legacy = picasso_jobs_match(bytes, (size_t)size, picasso_jobs_legacy_sha);
+-    if (!legacy && !picasso_jobs_match(bytes, (size_t)size, picasso_jobs_before_sha)) {
+-        /* Bounded exact policy evidence; do not rewrite an unknown plist. */
+-        printf("PICASSO_JOBS unknown size=%llu\n", (unsigned long long)size);
+-        for (size_t at = 0; at < size; at += 48) {
+-            static const char hex[] = "0123456789abcdef";
+-            char line[97];
+-            size_t count = size - at < 48 ? (size_t)size - at : 48;
+-            for (size_t j = 0; j < count; ++j) {
+-                line[j*2] = hex[bytes[at+j] >> 4];
+-                line[j*2+1] = hex[bytes[at+j] & 15];
+-            }
+-            line[count*2] = 0;
+-            printf("PICASSO_JOBS xml offset=%u hex=%s\n", (unsigned)at, line);
+-        }
+-        error = EINVAL; goto done;
+-    }
+-    for (unsigned i = 0; i < sizeof(entries)/sizeof(entries[0]); ++i) {
+-        size_t length = strlen(entries[i]), at;
+-        for (at = 0; at + length <= size; ++at)
+-            if (!memcmp(bytes + at, entries[i], length)) break;
+-        if (at + length > size) {
+-            /* v2 already removed exactly the bluetoothd override. */
+-            if (legacy && i == 5) continue;
+-            error = EINVAL; goto done;
+-        }
+-        memmove(bytes + at, bytes + at + length, (size_t)size - at - length);
+-        size -= length;
+-    }
+-    if (!picasso_jobs_match(bytes, (size_t)size, picasso_jobs_after_sha)) { error = EINVAL; goto done; }
++    bool known = picasso_jobs_match(bytes, (size_t)size, picasso_jobs_legacy_sha) ||
++        picasso_jobs_match(bytes, (size_t)size, picasso_jobs_before_sha);
++    size_t next_size = (size_t)size;
++    unsigned removed = 0;
++    error = picasso_jobs_transform(bytes, &next_size, &removed);
++    if (error || !removed) goto done;
++    size = next_size;
++    if (known && !picasso_jobs_match(bytes, (size_t)size, picasso_jobs_after_sha)) { error = EINVAL; goto done; }
++    uint8_t expected[32]; SHA256_CTX sha;
++    SHA256_Init(&sha); SHA256_Update(&sha, bytes, (size_t)size); SHA256_Final(expected, &sha);
+     /* A power loss may leave our exclusive temporary file. Never follow links. */
+     error = picasso_jobs_metadata(temp, VREG, ctx);
+     if (!error) {
+@@ -9814,7 +9864,7 @@
+     if (error) goto done;
+     uint64_t verify_size = 0;
+     error = picasso_ifnamer_read(temp, bytes, 8192, &verify_size, ctx);
+-    if (!error && (verify_size != size || !picasso_jobs_match(bytes, (size_t)verify_size, picasso_jobs_after_sha))) error = EIO;
++    if (!error && (verify_size != size || !picasso_jobs_match(bytes, (size_t)verify_size, expected))) error = EIO;
+     if (error) goto done;
+     struct rename_args args = {.from = scratch, .to = scratch + 0x200};
+     error = copyout(temp, args.from, sizeof(temp));
+@@ -9823,7 +9873,7 @@
+     if (!error) { changed = 1; error = picasso_jobs_sync(dirs[2], ctx); }
+     if (!error) {
+         error = picasso_ifnamer_read(file, bytes, 8192, &verify_size, ctx);
+-        if (!error && (verify_size != size || !picasso_jobs_match(bytes, (size_t)verify_size, picasso_jobs_after_sha))) error = EIO;
++        if (!error && (verify_size != size || !picasso_jobs_match(bytes, (size_t)verify_size, expected))) error = EIO;
+     }
+ done:
+     if (bytes) kfree_data(bytes, 8192);

@@ -382,6 +382,12 @@ int powerOn() {
     e=quiesce();if(!e)e=qbt_geni_resume(&bt.geni);if(e)return phaseResult(e,"boot-quiesce");
     native_bluetooth_stats[14]=6;bt.initializing=true;bt.discard_rx=false;
     e=qbt_boot_wcn399x(bt.core,3000000,bt.address);bt.initializing=false;
+    (void)phaseResult(e,"firmware-handshake");
+    struct qbt_stats stats;qbt_get_stats(bt.core,&stats);
+    printf("PICASSO_BT handshake tx=%llu rx=%llu irq=%llu dma=%llu/%llu pins=%x status=%x rfr=%x cfg=%x rate=%x/%x errors=%llu/%llu\n",
+        stats.tx_bytes,stats.rx_bytes,bt.geni.stats.interrupts,bt.geni.stats.tx_dma,bt.geni.stats.rx_dma,
+        linePins(),urd(nullptr,0x40),urd(nullptr,0x2ac),urd(nullptr,0x25c),urd(nullptr,0x48),urd(nullptr,0x4c),
+        bt.geni.stats.line_errors,bt.geni.stats.dma_errors);
     struct qbt_info info;qbt_get_info(bt.core,&info);
     printf("PICASSO_BT init state=%u error=%d product=%x soc=%x rom=%x patch=%x baud=%u\n",
         info.state,e,info.product,info.soc,info.rom,info.patch,info.baud);

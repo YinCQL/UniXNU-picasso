@@ -35,7 +35,15 @@ int state(unsigned i,picasso_mic_power::Rail &r) {
     Bus bus;return picasso_mic_power::read_rail(bus,i,r);
 }
 int write(unsigned i,unsigned offset,unsigned value) {
-    int e=picasso_rpmh_active_write(rails[i].address+offset,value);
+    int e=0;unsigned retries=0;
+    // EBUSY means no request was issued. The shared owner may be bringing
+    // ADSP up concurrently; yield with a bounded retry, never reset its TCS.
+    do {
+        e=picasso_rpmh_active_write(rails[i].address+offset,value);
+        if(e!=-16 || retries==20)break;
+        ++retries;IOSleep(10);
+    } while(true);
+    if(e || retries)printf("PICASSO_BT rail-write=%s offset=%u value=%u retries=%u error=%d\n",rails[i].name,offset,value,retries,e);
     if(e==-60)poisoned=true;return e;
 }
 int initialize() {
