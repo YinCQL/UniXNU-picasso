@@ -13,7 +13,7 @@
 #include <unistd.h>
 #include "PicassoAudioAbi.h"
 #include "PicassoAudioMix.h"
-enum {kPlugIn=kAudioObjectPlugInObject,kDevice=2,kOutStream=3,kVolume=4,kMute=5,kTapStream=6,kMicDevice=7,kMicStream=8};
+enum {kPlugIn=kAudioObjectPlugInObject,kDevice=2,kOutStream=3,kVolume=4,kMute=5,kTapStream=6,kMicDevice=7,kMicStream=8,kMicSource=9};
 // Legacy device aliases from CoreAudio/AudioHardware.h (not included by
 // AudioServerPlugIn.h). The host check verifies these against that SDK header.
 enum {kDeviceVolumeScalar='volm',kDeviceVolumeDecibels='vold',
@@ -21,6 +21,11 @@ enum {kDeviceVolumeScalar='volm',kDeviceVolumeDecibels='vold',
 // 20H392 VirtualAudio dispatches built-in routes by UID, not display name.
 #define kDeviceUID "Speaker"
 #define kModelUID "PicassoAudioModel"
+// 20H392 VirtualAudio dispatches the built-in input by the Codec UID and
+// creates its microphone port from the input data-source selector ('imic').
+// This single source is the implemented AMIC1 route; no other mic is exposed.
+#define kMicUID "Codec"
+enum {kMicSourceItem='imic'};
 static const Float64 kRate=48000;
 static const UInt32 kZeroPeriod=32768;
 // The worker can reserve through current time + 5120 frames. Leave another
@@ -153,6 +158,7 @@ static OSStatus micStart(UInt32 client){
     for(unsigned i=0;i<32;++i){if(gMic.clients[i]==client+1){pthread_mutex_unlock(&gMicLock);return 0;}if(!gMic.clients[i])slot=i;}
     if(slot==32 || gMic.stop || (gMic.users&&gMic.fault)){pthread_mutex_unlock(&gMicLock);return kAudioHardwareIllegalOperationError;}
     if(!gMic.users){
+        micNote(0,0);
         PicassoAudioInputState status={0};kern_return_t rc=0;bool begun=false;
         for(unsigned retry=0;retry<500;++retry){
             rc=micStatus(&status);if(rc || status.state==PicassoAudioIdle || status.state==PicassoAudioFailed)break;
@@ -271,7 +277,7 @@ static OSStatus AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d,Audi
 static UInt32 objects(AudioObjectID o, AudioObjectPropertyScope scope, AudioObjectID *list) {
     UInt32 n = 0;
     if (o == kPlugIn) {list[n++] = kDevice;list[n++] = kMicDevice;}
-    else if(o==kMicDevice && scope!=kAudioObjectPropertyScopeOutput)list[n++]=kMicStream;
+    else if(o==kMicDevice && scope!=kAudioObjectPropertyScopeOutput){list[n++]=kMicStream;list[n++]=kMicSource;}
     else if (o == kDevice) {
         if (scope != kAudioObjectPropertyScopeInput) list[n++] = kOutStream;
         if (gTapEnabled && scope != kAudioObjectPropertyScopeOutput) list[n++] = kTapStream;
@@ -286,6 +292,7 @@ static bool objectMatchesClass(AudioObjectID object, AudioClassID wanted) {
     if(wanted==kAudioObjectClassID)return true;
     if(object==kDevice || object==kMicDevice)return wanted==kAudioDeviceClassID;
     if(object==kOutStream || object==kTapStream || object==kMicStream)return wanted==kAudioStreamClassID;
+    if(object==kMicSource)return wanted==kAudioControlClassID || wanted==kAudioSelectorControlClassID || wanted==kAudioDataSourceControlClassID;
     if(object==kVolume)return wanted==kAudioControlClassID || wanted==kAudioLevelControlClassID || wanted==kAudioVolumeControlClassID;
     if(object==kMute)return wanted==kAudioControlClassID || wanted==kAudioBooleanControlClassID || wanted==kAudioMuteControlClassID;
     return false;
@@ -308,12 +315,12 @@ static OSStatus ownedObjects(AudioObjectID o,AudioObjectPropertyScope scope,UInt
 static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 inDataSize,
                              UInt32 *outDataSize, void *outData) {
     const AudioObjectPropertySelector s = a->mSelector;
-    if(s==kAudioObjectPropertyOwnedObjects && o>=kPlugIn && o<=kMicStream){
+    if(s==kAudioObjectPropertyOwnedObjects && o>=kPlugIn && o<=kMicSource){
         if(o==kTapStream && !gTapEnabled)return kAudioHardwareBadObjectError;
         return ownedObjects(o,a->mScope,qs,q,inDataSize,outDataSize,outData);
     }
     if(o==kTapStream && !gTapEnabled)return kAudioHardwareBadObjectError;
-    if (o >= kPlugIn && o <= kMicStream && (s == kAudioObjectPropertyCustomPropertyInfoList || ((s == kAudioPlugInPropertyBoxList ||
+    if (o >= kPlugIn && o <= kMicSource && (s == kAudioObjectPropertyCustomPropertyInfoList || ((s == kAudioPlugInPropertyBoxList ||
         s == kAudioPlugInPropertyClockDeviceList) && o == kPlugIn))) {
         *outDataSize = 0;
         return 0;
@@ -332,7 +339,7 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         }
         case kAudioPlugInPropertyTranslateUIDToDevice: {
             CFStringRef uid = q && qs >= sizeof(CFStringRef) ? *(const CFStringRef *)q : NULL;
-            REPLY(AudioObjectID, uid && CFStringCompare(uid, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo ? kDevice : uid && CFStringCompare(uid,CFSTR("PicassoMicrophone"),0)==kCFCompareEqualTo?kMicDevice:kAudioObjectUnknown);
+            REPLY(AudioObjectID, uid && CFStringCompare(uid, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo ? kDevice : uid && CFStringCompare(uid,CFSTR(kMicUID),0)==kCFCompareEqualTo?kMicDevice:kAudioObjectUnknown);
         }
         case kAudioPlugInPropertyResourceBundle: REPLY_STR("");
         default: return kAudioHardwareUnknownPropertyError;
@@ -345,7 +352,7 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kAudioObjectPropertyOwner: REPLY(AudioObjectID, kPlugIn);
         case kAudioObjectPropertyName: if(o==kMicDevice){REPLY_STR("Picasso Microphone");} REPLY_STR("Speaker");
         case kAudioObjectPropertyManufacturer: REPLY_STR("UniXNU");
-        case kAudioDevicePropertyDeviceUID: if(o==kMicDevice){REPLY_STR("PicassoMicrophone");} REPLY_STR(kDeviceUID);
+        case kAudioDevicePropertyDeviceUID: if(o==kMicDevice){REPLY_STR(kMicUID);} REPLY_STR(kDeviceUID);
         case kAudioDevicePropertyModelUID: REPLY_STR(kModelUID);
         case kAudioObjectPropertyModelName: if(o==kMicDevice){REPLY_STR("Picasso Microphone");} REPLY_STR("Speaker");
         case kAudioObjectPropertySerialNumber: REPLY_STR("0001");
@@ -367,7 +374,7 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
             if(s==kDeviceVolumeDecibels) {REPLY(Float32,toDb(gVolume));}
             if(s==kDeviceMute) {REPLY(UInt32,gMuted);}
             REPLY(AudioValueRange,((AudioValueRange){kMinDb,0.0}));
-        case kAudioDevicePropertyTransportType: REPLY(UInt32, o==kMicDevice?kAudioDeviceTransportTypeThunderbolt:kAudioDeviceTransportTypeBuiltIn);
+        case kAudioDevicePropertyTransportType: REPLY(UInt32, kAudioDeviceTransportTypeBuiltIn);
         case kAudioDevicePropertyRelatedDevices: REPLY(AudioObjectID, o);
         case kAudioDevicePropertyClockDomain: REPLY(UInt32, 0);
         case kAudioDevicePropertyDeviceIsAlive: REPLY(UInt32, gConnect != 0);
@@ -444,6 +451,22 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         default: return kAudioHardwareUnknownPropertyError;
         }
     }
+    case kMicSource:
+        switch(s){
+        case kAudioObjectPropertyBaseClass: REPLY(AudioClassID,kAudioSelectorControlClassID);
+        case kAudioObjectPropertyClass: REPLY(AudioClassID,kAudioDataSourceControlClassID);
+        case kAudioObjectPropertyOwner: REPLY(AudioObjectID,kMicDevice);
+        case kAudioObjectPropertyName: REPLY_STR("Microphone Source");
+        case kAudioObjectPropertyOwnedObjects: *outDataSize=0;return 0;
+        case kAudioControlPropertyScope: REPLY(AudioObjectPropertyScope,kAudioObjectPropertyScopeInput);
+        case kAudioControlPropertyElement: REPLY(AudioObjectPropertyElement,kAudioObjectPropertyElementMaster);
+        case kAudioSelectorControlPropertyCurrentItem:
+        case kAudioSelectorControlPropertyAvailableItems: REPLY(UInt32,kMicSourceItem);
+        case kAudioSelectorControlPropertyItemName:
+            if(qs!=sizeof(UInt32) || !q || *(const UInt32 *)q!=kMicSourceItem)return kAudioHardwareIllegalOperationError;
+            REPLY_STR("Bottom");
+        default: return kAudioHardwareUnknownPropertyError;
+        }
     case kMute:
         switch(s){
         case kAudioObjectPropertyBaseClass: REPLY(AudioClassID,kAudioBooleanControlClassID);
@@ -496,7 +519,7 @@ static void propertyNote(AudioObjectID o,const AudioObjectPropertyAddress *a,uns
 }
 static OSStatus queryProperty(AudioObjectID o,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 n,UInt32 *z,void *v,unsigned operation){
     if(!a||!z||(!v&&n))return kAudioHardwareIllegalOperationError;
-    bool mic=o==kMicDevice||o==kMicStream;pthread_mutex_t *lock=mic?&gMicLock:&gLock;
+    bool mic=o==kMicDevice||o==kMicStream||o==kMicSource;pthread_mutex_t *lock=mic?&gMicLock:&gLock;
     pthread_mutex_lock(lock);*z=0;OSStatus rc=propertyData(o,a,qs,q,n,z,v);
     pthread_mutex_unlock(lock);
     pthread_mutex_lock(&gLock);propertyNote(o,a,operation,rc);pthread_mutex_unlock(&gLock);return rc;
@@ -508,12 +531,14 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d,AudioObjectID o
     (void)d;(void)pid;union {uint64_t align;uint8_t b[1024];} v={0};return queryProperty(o,a,qs,q,sizeof v,z,&v,1);
 }
 static Boolean HasProperty(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a){
+    // HasProperty has no qualifier; an item-name query supplies it only to Get.
+    if(a && o==kMicSource && a->mSelector==kAudioSelectorControlPropertyItemName)return true;
     (void)d;(void)pid;UInt32 n;union {uint64_t align;uint8_t b[1024];} v={0};return !queryProperty(o,a,0,NULL,sizeof v,&n,&v,2);
 }
 static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,Boolean *set){
     if(!a||!set)return kAudioHardwareIllegalOperationError;
     bool outputMaster=o==kDevice && a->mScope==kAudioObjectPropertyScopeOutput && a->mElement==kAudioObjectPropertyElementMaster;
-    *set=(outputMaster&&(a->mSelector==kDeviceVolumeScalar||a->mSelector==kDeviceVolumeDecibels||a->mSelector==kDeviceMute))||
+    *set=(o==kMicSource&&a->mSelector==kAudioSelectorControlPropertyCurrentItem)||(outputMaster&&(a->mSelector==kDeviceVolumeScalar||a->mSelector==kDeviceVolumeDecibels||a->mSelector==kDeviceMute))||
         (o==kMute&&a->mSelector==kAudioBooleanControlPropertyValue)||
         (o==kVolume&&(a->mSelector==kAudioLevelControlPropertyScalarValue||a->mSelector==kAudioLevelControlPropertyDecibelValue))||
         ((o==kOutStream||o==kMicStream||(o==kTapStream&&gTapEnabled))&&(a->mSelector==kAudioStreamPropertyVirtualFormat||a->mSelector==kAudioStreamPropertyPhysicalFormat||a->mSelector==kAudioStreamPropertyIsActive))||
@@ -523,6 +548,11 @@ static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d,AudioObjectID o,
 static OSStatus setPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 n,const void *v){
     (void)d;(void)pid;(void)qs;(void)q;if(!a||!v)return kAudioHardwareIllegalOperationError;
     bool outputMaster=o==kDevice && a->mScope==kAudioObjectPropertyScopeOutput && a->mElement==kAudioObjectPropertyElementMaster;
+    if(o==kMicSource && a->mSelector==kAudioSelectorControlPropertyCurrentItem){
+        if(n!=sizeof(UInt32))return kAudioHardwareBadPropertySizeError;
+        // Selecting the only connected ADC route does not start acquisition.
+        return *(const UInt32 *)v==kMicSourceItem?0:kAudioHardwareIllegalOperationError;
+    }
     if((o==kMute&&a->mSelector==kAudioBooleanControlPropertyValue)||(outputMaster&&a->mSelector==kDeviceMute)){
         if(n!=sizeof(UInt32))return kAudioHardwareBadPropertySizeError;
         pthread_mutex_lock(&gLock);gMuted=*(const UInt32 *)v!=0;
