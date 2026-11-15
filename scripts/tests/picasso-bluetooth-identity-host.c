@@ -23,8 +23,10 @@ typedef void *vfs_context_t;
 struct vfsstatfs { char f_fstypename[16],f_mntonname[128],f_mntfromname[128]; };
 struct mount { unsigned flags; struct vfsstatfs stat; };typedef struct mount *mount_t;
 struct vnode_attr { unsigned va_mode,va_uid,va_gid,va_nlink;uint64_t va_data_size; };
-struct vnode { int type;mount_t mp;struct vnode_attr attr;uint8_t bytes[8193]; };typedef struct vnode *vnode_t;
+struct vnode { int type;mount_t mp;struct vnode_attr attr;uint8_t *bytes; };typedef struct vnode *vnode_t;
 static struct mount mounts[3];static struct vnode nodes[6];static vnode_t rootvnode=&nodes[0];
+static uint8_t binary_data[2][16*1024*1024];
+static size_t binary_sizes[2];
 static unsigned refs,allocs;static bool owner,device_exists,attr_supported;static int attr_error,read_error,short_read,back_error,allocation_error;
 #define VATTR_INIT(v) memset(v,0,sizeof(*(v)))
 #define VATTR_WANTED(v,f) ((void)(v))
@@ -53,6 +55,7 @@ static int vn_rdwr(int op,vnode_t v,caddr_t data,int n,off_t off,int space,int f
 }
 static vnode_t backing;
 int bindfs_getbackingvnode(vnode_t v,vnode_t *out){assert(v==&nodes[2]);if(back_error)return back_error;*out=backing;++refs;return 0;}
+#include "runtime-capture.inc"
 #include "runtime-auth.inc"
 typedef struct {vnode_t authvp;} fsioc_auth_fs_t;
 struct vnop_ioctl_args {unsigned long a_command;void *a_data;int a_fflag;vnode_t a_vp;vfs_context_t a_context;};
@@ -64,12 +67,25 @@ static void reset(void){
     nodes[2].mp=&mounts[1];nodes[2].type=VREG;mounts[1].flags=MNT_RDONLY;strcpy(mounts[1].stat.f_fstypename,"bindfs");
     strcpy(mounts[1].stat.f_mntonname,"/usr/sbin");strcpy(mounts[1].stat.f_mntfromname,"/private/var/ngpu/bluetooth-bin");
     native_gpu_addon_files=19;native_gpu_addon_failed=native_gpu_addon_error=0;picasso_bt_runtime_ready=1;
-    for(unsigned i=0;i<2;++i){vnode_t v=&nodes[3+i];v->mp=&mounts[2];v->type=VREG;v->attr.va_mode=0755;v->attr.va_nlink=1;v->attr.va_data_size=sizeof v->bytes;
-        for(unsigned k=0;k<sizeof v->bytes;++k)v->bytes[k]=(uint8_t)(k+i);SHA256(v->bytes,sizeof v->bytes,picasso_bt_runtime_hashes[i]);picasso_bt_runtime_sizes[i]=sizeof v->bytes;picasso_bt_runtime_vnodes[i]=v;}
+    for(unsigned i=0;i<2;++i){vnode_t v=&nodes[3+i];v->mp=&mounts[2];v->type=VREG;v->attr.va_mode=0755;v->attr.va_nlink=1;v->attr.va_data_size=binary_sizes[i];v->bytes=binary_data[i];
+        picasso_bt_runtime_sizes[i]=0;assert(!picasso_bt_runtime_capture(v->bytes,binary_sizes[i],19,14+i,true,true,-1));picasso_bt_runtime_vnodes[i]=v;}
     backing=&nodes[3];
 }
 static int run(void){fsioc_auth_fs_t auth={0};struct vnop_ioctl_args a={FSIOC_AUTH_FS,&auth,0,&nodes[2],(void *)1};int e=bindfs_ioctl(&a);assert(!refs && !allocs);return e;}
-int main(void){
+int main(int argc,char **argv){
+    assert(argc==3);
+    for(unsigned i=0;i<2;++i){FILE *f=fopen(argv[i+1],"rb");assert(f);assert(!fseek(f,0,SEEK_END));long n=ftell(f);assert(n>0 && n<=16*1024*1024);assert(!fseek(f,0,SEEK_SET));binary_sizes[i]=(size_t)n;assert(fread(binary_data[i],1,binary_sizes[i],f)==binary_sizes[i]);assert(!fclose(f));}
+    assert(binary_sizes[0]==8930688 && binary_sizes[0]>8*1024*1024 && binary_sizes[1]==69344);
+    for(unsigned i=0;i<2;++i){
+        assert(!picasso_bt_runtime_capture(binary_data[i],binary_sizes[i],19,14+i,true,true,0));
+        assert(picasso_bt_runtime_sizes[i]==binary_sizes[i]);
+        uint8_t digest[32];SHA256(binary_data[i],binary_sizes[i],digest);assert(!memcmp(digest,picasso_bt_runtime_hashes[i],32));
+    }
+    for(unsigned i=0;i<9;++i){picasso_bt_runtime_sizes[0]=0;const uint8_t *p=binary_data[0];uint64_t size=binary_sizes[0];unsigned count=19,index=14;bool audio=true,gpu=true;int error=0;
+        switch(i){case 0:p=NULL;break;case 1:size=0;break;case 2:size=16*1024*1024+1;break;case 3:count=13;break;case 4:index=13;break;case 5:index=16;break;case 6:audio=false;break;case 7:gpu=false;break;case 8:error=EIO;break;}
+        assert(picasso_bt_runtime_capture(p,size,count,index,audio,gpu,error)==EAUTH && !picasso_bt_runtime_sizes[0]);
+    }
+    assert(!picasso_bt_runtime_capture(binary_data[0],16*1024*1024,19,14,true,true,-1));
     reset();assert(!run());backing=&nodes[4];assert(!run());
     for(unsigned i=0;i<26;++i){reset();switch(i){
         case 0:picasso_bt_runtime_ready=0;break;case 1:native_gpu_addon_files=13;break;

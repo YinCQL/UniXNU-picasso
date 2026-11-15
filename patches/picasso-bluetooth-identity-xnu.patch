@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7579,6 +7579,10 @@
+@@ -7579,6 +7579,26 @@
  volatile int native_gpu_addon_same = 0;
  volatile int native_gpu_addon_failed = 0;
  volatile int native_gpu_addon_error = 0;
@@ -8,26 +8,40 @@
 +static uint64_t picasso_bt_runtime_sizes[2];
 +static unsigned picasso_bt_runtime_ready;
 +
++/* The pinned 20H392 daemon is larger than 8 MiB. Bound both executable
++ * identities at 16 MiB while hashing only the validated boot-addon bytes. */
++static int
++picasso_bt_runtime_capture(const uint8_t *data, uint64_t size, uint32_t count,
++    uint32_t index, bool audio, bool gpu, int write_error)
++{
++    if (!data || !size || size > 16*1024*1024 || count != 19 ||
++        index < 14 || index > 15 || !audio || !gpu || write_error > 0) return EAUTH;
++    unsigned binary = index - 14;
++    SHA256_CTX sha;
++    SHA256_Init(&sha); SHA256_Update(&sha, data, (size_t)size);
++    SHA256_Final(picasso_bt_runtime_hashes[binary], &sha);
++    picasso_bt_runtime_sizes[binary] = size;
++    return 0;
++}
++
  static int
  native_gpu_addon_equal(vnode_t vp, const uint8_t *data, uint64_t size, uint32_t mode, vfs_context_t ctx)
  {
-@@ -7794,6 +7798,15 @@
+@@ -7794,6 +7814,13 @@
  				error = native_gpu_addon_write(path, data, size, mode, ctx);
  			}
  		}
-+        /* Capture identity from the loader-owned RAM addon, after validating
-+         * the complete inventory. Never learn executable hashes from Data. */
-+        if (data && error <= 0 && audio_only == 1 && media_gpu == 1 && count == 19 &&
-+            i >= 14 && i <= 15 && size && size <= 8*1024*1024) {
-+            SHA256_CTX sha; unsigned index = i - 14;
-+            SHA256_Init(&sha); SHA256_Update(&sha, data, (size_t)size);
-+            SHA256_Final(picasso_bt_runtime_hashes[index], &sha);
-+            picasso_bt_runtime_sizes[index] = size;
++        /* Capture identity from the loader-owned RAM addon after validating
++         * the full inventory, including unchanged persistent files. */
++        if (count == 19 && i >= 14 && i <= 15) {
++            int identity_error = picasso_bt_runtime_capture(data, size, count, i,
++                audio_only == 1, media_gpu == 1, error);
++            if (error <= 0 && identity_error) error = identity_error;
 +        }
  		if (data) {
  			kfree_data(data, size ? size : 1);
  		}
-@@ -9908,6 +9921,75 @@
+@@ -9908,6 +9935,75 @@
      if (runtime) printf("PICASSO_INJECT runtime UI view stage=%d error=%d\n", stage, status);
      printf("PICASSO_INJECT view stage=%d error=%d path=%s\n", stage, status, library);
  }
@@ -103,11 +117,10 @@
  /* The board only starts after both runtime views are installed. */
  extern void picasso_bt_runtime_result(int) __attribute__((weak_import));
  static void
-@@ -9943,6 +10025,20 @@
-         native_gpu_addon_mount(p,scratch,0xc00,source,sizeof(source),point,sizeof(point),
+@@ -9944,6 +10040,24 @@
              "/usr/sbin/notifyd","/usr/sbin/bluetoothd",&stage,&status);
          if(stage!=5 || status)error=status?status:EIO;
-+    }
+     }
 +    vnode_t pinned[2] = {NULLVP, NULLVP};
 +    for (unsigned i = 0; !error && i < 2; ++i) {
 +        vnode_t vp = NULLVP;
@@ -121,9 +134,14 @@
 +        os_atomic_store(&picasso_bt_runtime_ready, 1, release);
 +    } else {
 +        for (unsigned i = 0; i < 2; ++i) if (pinned[i]) vnode_rele(pinned[i]);
-     }
++    }
++    printf("PICASSO_BT runtime identity sizes=%llu/%llu ready=%u\n",
++        (unsigned long long)picasso_bt_runtime_sizes[0],
++        (unsigned long long)picasso_bt_runtime_sizes[1],
++        os_atomic_load(&picasso_bt_runtime_ready, acquire));
      printf("PICASSO_BT runtime files=%d binaries=%d/%d error=%d\n",
          native_gpu_addon_files,stage,status,error);
+     if(picasso_bt_runtime_result)picasso_bt_runtime_result(error);
 --- a/bsd/miscfs/bindfs/bind_vnops.c
 +++ b/bsd/miscfs/bindfs/bind_vnops.c
 @@ -78,6 +78,7 @@
