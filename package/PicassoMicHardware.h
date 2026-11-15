@@ -21,7 +21,7 @@ struct PicassoMicHardwareStatus {
     int32_t error, restoreError;
     uint32_t ready, unmuted, rails, dirty, slave, swrVersion, chipId;
     uint32_t lastRegion, lastRegister, lastValue, events, activeBank;
-    uint32_t lastSlaveRegister, lastSlaveCommand;
+    uint32_t lastSlaveRegister, lastSlaveCommand, dataMismatches;
     uint64_t slaveId;
 };
 struct PicassoMicHardwareIO {

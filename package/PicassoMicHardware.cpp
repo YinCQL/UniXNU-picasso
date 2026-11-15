@@ -4,7 +4,8 @@
 namespace {
 constexpr uint64_t CodecId = 0x000d01170223ULL;
 constexpr uint32_t BusVersion = 0x01050001;
-constexpr uint32_t BusErrors = 0x133f8;
+constexpr uint32_t BusErrors = 0x131f8;
+constexpr uint32_t DataMismatch = 0x200;
 constexpr uint32_t FrameMask = 0xff07ff;
 constexpr uint32_t CaptureFrame = (5U << 16) | (1U << 3) | 7U;
 constexpr unsigned Swr = PicassoMicSwr, Tx = PicassoMicTx, Slave = PicassoMicSlave;
@@ -28,7 +29,19 @@ int wr(PicassoMicHardwareCore &h, unsigned region, uint32_t reg, uint32_t value)
 void delay(PicassoMicHardwareCore &h, unsigned us) { h.io.delay(h.io.context, us); }
 int busError(PicassoMicHardwareCore &h) {
     uint32_t v = 0; int e = rd(h, Swr, 0x200, v);
-    return e ? e : ((v & BusErrors) ? -5 : 0);
+    if (e) return e;
+    if (v & DataMismatch) {
+        ++h.status.dataMismatches;
+        // READ_EN_RD_VALID concerns the macro data path, not command FIFO
+        // responses. Stock acknowledges/masks it separately. Before AFE is
+        // consuming samples (and during teardown), it must not block the
+        // control transactions needed to finish configuration or stop ports.
+        // Once unmuted, a new mismatch still invalidates capture.
+        if (h.status.unmuted) return -5;
+        e = wr(h, Swr, 0x208, DataMismatch);
+        if (e) return e;
+    }
+    return (v & BusErrors) ? -5 : 0;
 }
 int fifoSpace(PicassoMicHardwareCore &h) {
     if (!h.writeDepth) return -19;
@@ -386,6 +399,9 @@ int unmute(PicassoMicHardwareCore &h) {
     if (!e) e = update(h, Tx, 0x418, 3, 2);
     if (!e) { delay(h, 20); e = update(h, Tx, 0x418, 3, 1); }
     if (!e) e = update(h, Tx, 0x400, 0x10, 0);
+    // Discard only the startup data-path latch after AFE has started and
+    // settling/unmute completed. Future data mismatches are capture failures.
+    if (!e) e = busError(h);
     if (!e) { h.status.unmuted = 1; stage(h, PicassoMicRunning); }
     if (e) { h.status.error = e; h.status.failedStage = h.status.stage; }
     return e;
@@ -460,8 +476,8 @@ int runtimeRails(void *, unsigned action) {
            action == 1 ? picasso_mic_rails_check() : picasso_mic_rails_release();
 }
 void runtimeNote(void *, const PicassoMicHardwareStatus *s) {
-    IOLog("PICASSO_MIC hardware stage=%u error=%d restore_error=%d dirty=%u slave=%u id=%llx ready=%u acoustic_verified=0\n",
-          s->stage, s->error, s->restoreError, s->dirty, s->slave, s->slaveId, s->ready);
+    IOLog("PICASSO_MIC hardware stage=%u error=%d restore_error=%d dirty=%u slave=%u id=%llx ready=%u data_mismatch=%u acoustic_verified=0\n",
+          s->stage, s->error, s->restoreError, s->dirty, s->slave, s->slaveId, s->ready, s->dataMismatches);
 }
 int mapRuntime(Runtime &r) {
     for (unsigned i = 0; i < PicassoMicRegionCount; ++i) {

@@ -16,7 +16,7 @@ struct Fake {
     uint32_t response = 0;
     unsigned reads = 0, commands = 0, broadcasts = 0, releases = 0;
     bool available = false, full = false, silent = false, wrongId = false;
-    bool noBankAck = false, rejectRestore = false;
+    bool noBankAck = false, rejectRestore = false, startupMismatch = false;
     int railError = 0, railCheckError = 0;
     unsigned ignoredSlave = 0;
 
@@ -66,6 +66,7 @@ struct Fake {
                 if (!f.noBankAck) {
                     f.reg[{region, 0x104c}] = (address - 0x60) / 0x10;
                     f.reg[{region, 0x200}] |= 0x400;
+                    if (f.startupMismatch) f.reg[{region, 0x200}] |= 0x200;
                 }
                 return 0;
             }
@@ -163,6 +164,32 @@ void gatesAndTransport() {
       assert(picasso_mic_hardware_action(h, 0) == -110 && !h.status.ready);
       f.noBankAck = false; assert(picasso_mic_hardware_action(h, 2) == 0); }
 }
+void dataPathStatus() {
+    Fake f; f.startupMismatch = true; auto h = f.core();
+    assert(picasso_mic_hardware_action(h, PicassoMicPrepare) == 0);
+    assert(h.status.ready && h.status.dataMismatches == 1);
+    assert(picasso_mic_hardware_action(h, PicassoMicUnmute) == 0);
+    assert(picasso_mic_hardware_action(h, PicassoMicCheck) == 0);
+    // A fresh mismatch while recording is still a failure, not hidden.
+    f.reg[{PicassoMicSwr, 0x200}] |= 0x200;
+    assert(picasso_mic_hardware_action(h, PicassoMicCheck) == -5);
+    assert(!h.status.ready && h.status.dataMismatches == 2);
+    // The latched data warning cannot prevent orderly data-port shutdown.
+    assert(picasso_mic_hardware_action(h, PicassoMicStop) == 0);
+    assert(!h.savedCount && !h.status.rails && !h.status.restoreError);
+    // Actual control/FIFO faults remain fatal even alongside data mismatch.
+    for (uint32_t bit : {8U, 16U, 32U, 64U, 128U, 256U, 4096U, 8192U, 65536U}) {
+        Fake broken; auto core = broken.core();
+        broken.reg[{PicassoMicSwr, 0x200}] = bit | 0x200;
+        // initBus clears pending status, so inject after successful prepare.
+        assert(picasso_mic_hardware_action(core, PicassoMicPrepare) == 0);
+        broken.reg[{PicassoMicSwr, 0x200}] = bit | 0x200;
+        assert(picasso_mic_hardware_action(core, PicassoMicUnmute) == -5);
+        assert(!core.status.unmuted);
+        broken.reg[{PicassoMicSwr, 0x200}] = 0;
+        assert(picasso_mic_hardware_action(core, PicassoMicStop) == 0);
+    }
+}
 void failureRestoration() {
     { Fake f; auto h = f.core(); f.ignoredSlave = 0x3022;
       assert(picasso_mic_hardware_action(h, 0) == -5 && !h.status.ready);
@@ -200,6 +227,6 @@ void failureRestoration() {
 }
 } // namespace
 int main() {
-    completeRoute(); gatesAndTransport(); failureRestoration();
+    completeRoute(); gatesAndTransport(); dataPathStatus(); failureRestoration();
     std::puts("picasso microphone hardware: route and fault-injection checks passed");
 }
