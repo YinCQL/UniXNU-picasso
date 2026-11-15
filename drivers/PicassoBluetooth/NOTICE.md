@@ -28,3 +28,8 @@ daimile2/renoir_xnu_bluethooth 2b9d59c921c9ec803462b2be8deb6980f7297c22
 (BSD-3-Clause). Picasso uses WCN399x, ordinary arm64, and iOS 16 build 20H392.
 The original Linux files in linux/ remain byte-identical; the local adapter
 adds version-envelope selection and rejected-segment error propagation.
+
+The private userland Skywalk channel and packet implementations are compiled
+from the same prepared Apple XNU xnu-10063.121.3 sources and headers as the
+kernel. Their APSL-2.0 and BSD notices remain in the generated sources. The
+bluetoothd-only entry points retain the native schema and metadata checks.

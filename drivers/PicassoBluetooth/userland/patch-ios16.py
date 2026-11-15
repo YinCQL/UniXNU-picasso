@@ -7,7 +7,8 @@ the type-0 capability logic lives in /usr/lib/PicassoBTType0.dylib (added
 LC_LOAD_DYLIB, appended so existing bind ordinals are unchanged), reached
 through an RW slot at the zero-fill tail of __DATA. Signing is done afterwards.
 """
-import hashlib,struct,sys
+import hashlib,struct,sys,json
+from pathlib import Path
 
 ORIGINAL='8b7c0a0bea51544db82269d7f2775ab7996b8740927283428c4753e032df3a8f'
 BASE=0x100000000
@@ -158,6 +159,15 @@ def patch(data):
             prologue,lambda pc,site=site:b(pc,site+4)])
         im.put(site,[b(site,entry)])
     if cave>BASE+0x6000:raise SystemExit('cave overflow')
+
+    # Replace every channel/packet/buflet import stub together. Each slot is
+    # installed by the matching-XNU library constructor before main runs.
+    # No __DATA_CONST binding or executable page is changed at runtime.
+    for entry in json.loads((Path(__file__).with_name('skywalk-imports.json')).read_text()):
+        va,slot=int(entry['stub'],0),int(entry['slot'],0)
+        if im.word(va)&0x9f00001f != 0x90000010 or im.word(va+8)!=0xd61f0200:
+            raise SystemExit('Skywalk import stub differs: '+entry['name'])
+        im.put(va,[adrp(va,16,slot),ldr_x(16,16,slot&0xfff),0xd61f0200])
 
     # 8. LC_LOAD_DYLIB /usr/lib/PicassoBTType0.dylib, appended after the last command.
     magic,cpu,sub,ft,ncmds,sizeofcmds,flags,res=struct.unpack_from('<IiiIIIII',im.d,0)

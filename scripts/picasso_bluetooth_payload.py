@@ -75,6 +75,64 @@ def paths(work):
     work=Path(work)
     return work/'bluetooth-userland',Path(os.environ.get('PICASSO_BT_STOCK',work/'bluetooth-input/bluetoothd'))
 
+def skywalk_objects(work,src,out,sdk,cc,run):
+    # Use the exact prepared kernel headers and wrappers. An SDK version of
+    # these private structures is incompatible with the shared memory map.
+    xnu=Path(os.environ.get('PICASSO_BT_XNU',work/'tree/.cache/xnu-work')).resolve()
+    private=out/'skywalk';private.mkdir(parents=True,exist_ok=True)
+    include=private/'include';(include/'skywalk').mkdir(parents=True,exist_ok=True)
+    inputs={}
+    def bind(path):
+        inputs[str(path.relative_to(xnu))]=sha(path.read_bytes())
+    for header in sorted((xnu/'bsd/skywalk').rglob('*.h')):
+        bind(header)
+        target=include/'skywalk'/header.relative_to(xnu/'bsd/skywalk')
+        target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(header,target)
+        flat=include/'skywalk'/header.name
+        if flat.exists() and flat.read_bytes()!=header.read_bytes():
+            raise ValueError('Ambiguous Skywalk exported header '+header.name)
+        shutil.copyfile(header,flat)
+    master=xnu/'bsd/kern/syscalls.master';bind(master)
+    for number,name in [(510,'open'),(511,'get_info'),(512,'sync'),(513,'get_opt'),(514,'set_opt')]:
+        if not any(line.startswith(str(number)+'\t') and 'int __channel_'+name+'(' in line for line in master.read_text().splitlines()):
+            raise ValueError('Skywalk syscall ABI differs: '+name)
+    wrappers=[]
+    for name in ['os_channel','os_packet']:
+        original=xnu/'libsyscall/wrappers/skywalk'/(name+'.c');bind(original)
+        source=original.read_text()
+        if name=='os_channel':
+            # Explicitly spell the existing uintptr conversions for modern
+            # clang. No field widths, offset computations or checks change.
+            source=source.replace('(_bft) = _CHANNEL_RING_BFT(', '(_bft) = (struct __user_buflet *)(uintptr_t)_CHANNEL_RING_BFT(')
+            source=source.replace('ubft = _CHANNEL_RING_BFT(', 'ubft = (struct __user_buflet *)(uintptr_t)_CHANNEL_RING_BFT(')
+            source=source.replace('&(pbft->buf_addr) = NULL;', '&(pbft->buf_addr) = 0;')
+            source=source.replace('init.ci_key = cha->cha_key;', 'init.ci_key = (user_addr_t)(uintptr_t)cha->cha_key;')
+            source=source.replace('prop->sp_mdata_ptr = q;', 'prop->sp_mdata_ptr = (mach_vm_address_t)(uintptr_t)q;')
+            source=source.replace('ubft = _SLOT_BFT_METADATA(', 'ubft = (struct __user_buflet *)(uintptr_t)_SLOT_BFT_METADATA(')
+            source=source.replace('*ehandle = NULL;', '*ehandle = 0;')
+        target=private/(name+'.c');target.write_text(source);wrappers.append(target)
+    # Prefix every public wrapper, including their internal cross-calls, so
+    # other processes and libraries retain their original system bindings.
+    import re
+    api=set()
+    for header in ['channel/os_channel.h','channel/os_channel_private.h','packet/os_packet.h','packet/os_packet_private.h']:
+        api.update(re.findall(r'\b(os_(?:channel|packet|buflet|inet|copy)[a-zA-Z0-9_]*)\s*\(', (xnu/'bsd/skywalk'/header).read_text()))
+    for source in wrappers:
+        api.update(re.findall(r'^((?:os_)[a-zA-Z0-9_]+)\(',source.read_text(),re.M))
+    rename=['-D'+name+'=picasso_sw_'+name for name in sorted(api)]
+    rename+=['-D__channel_'+name+'=picasso_sw___channel_'+name for name in ['open','get_info','sync','get_opt','set_opt']]
+    entries=json.loads((src/'skywalk-imports.json').read_text())
+    (private/'skywalk-slots.inc').write_text(''.join('    *(void **)((uintptr_t)'+entry['slot']+'ULL + slide) = (void *)picasso_sw_'+entry['name']+';\n' for entry in entries))
+    flags=['-target','arm64-apple-ios16.0','-isysroot',sdk,'-O2','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unused-but-set-variable','-Wno-sign-compare','-DPRIVATE=1','-DLIBSYSCALL_INTERFACE=1','-include',src/'PicassoBTSkywalk.h','-I'+str(include),'-I'+str(private),'-I'+str(xnu/'libkern'),'-idirafter',xnu/'bsd']+rename
+    objects=[]
+    for source in [*wrappers,src/'PicassoBTSkywalk.c']:
+        obj=private/(source.stem+'.o');run([cc,*flags,'-c',source,'-o',obj]);objects.append(obj)
+    obj=private/'syscalls.o';run([cc,'-target','arm64-apple-ios16.0','-c',src/'PicassoBTSkywalkSyscalls.S','-o',obj]);objects.append(obj)
+    # Include libkern dependencies in the source binding, as these supply the
+    # atomics used when the channel is shared between user and kernel.
+    for header in (xnu/'libkern/os').glob('*.h'):bind(header)
+    return objects,dict(root=str(xnu),schema_version=18,source_sha256=inputs,objects={str(p.relative_to(out)):sha(p.read_bytes()) for p in objects},imports=entries)
+
 def build(work):
     work=Path(work);out,stock=paths(work);out.mkdir(parents=True,exist_ok=True)
     original=stock.read_bytes()
@@ -94,20 +152,21 @@ def build(work):
         with (out/'build.log').open('a') as log:log.write(' '.join(cmd)+'\n'+result.stdout+result.stderr)
         result.check_returncode();return result.stdout
     (out/'build.log').write_text('')
+    sky_objects,sky_report=skywalk_objects(work,src,out,sdk,cc,run)
     # A platform service with its original launchd MachService. No sandbox
     # profile for Broadcom-specific hardware is assigned to this replacement.
     (out/'BlueTool.entitlements.plist').write_bytes(plistlib.dumps({'platform-application':True}))
     for name,source,library in [('BlueTool','BlueTool.c',False),('PicassoBTType0.dylib','PicassoBTType0.c',True)]:
         obj=out/(source+'.o')
         run([cc,'-target','arm64-apple-ios16.0','-isysroot',sdk,'-O2','-Wall','-Wextra','-Werror','-fblocks','-c',src/source,'-o',obj])
-        cmd=[ld,'-arch','arm64','-platform_version','ios','16.0','16.5','-syslibroot',sdk,'-lSystem','-adhoc_codesign','-o',out/name,obj]
+        cmd=[ld,'-arch','arm64','-platform_version','ios','16.0','16.5','-syslibroot',sdk,'-lSystem','-adhoc_codesign','-o',out/name,obj]+(sky_objects if library else [])
         if library:cmd+=['-dylib','-install_name','/usr/lib/'+name]
         run(cmd)
         entitlement='-S'+str(out/'BlueTool.entitlements.plist') if not library else '-S'
         run([signer,'-Cadhoc','-Hsha256',entitlement,out/name])
     ent=run([signer,'-e',stock]);(out/'bluetoothd.entitlements.plist').write_text(ent)
     run([signer,'-Cadhoc','-Hsha256','-S'+str(out/'bluetoothd.entitlements.plist'),'-Icom.apple.bluetoothd',out/'bluetoothd'])
-    report={'original_sha256':STOCK,'runtime_qualified':False,'source_sha256':{str(p.relative_to(ROOT)):sha(p.read_bytes()) for p in [*src.glob('*'),Path(__file__)] if p.is_file()}}
+    report={'skywalk':sky_report,'original_sha256':STOCK,'runtime_qualified':False,'source_sha256':{str(p.relative_to(ROOT)):sha(p.read_bytes()) for p in [*src.glob('*'),Path(__file__)] if p.is_file()}}
     report['identities']={name:identity((out/name).read_bytes(),original if name=='bluetoothd' else None) for name in ['BlueTool','PicassoBTType0.dylib','bluetoothd']}
     (out/'build-report.json').write_text(json.dumps(report,indent=2)+'\n')
     (out/'commands.json').write_text(json.dumps(commands,indent=2)+'\n')
@@ -118,6 +177,8 @@ def make(work):
     report=json.loads((out/'build-report.json').read_text())
     for name,digest in report['source_sha256'].items():
         if sha((ROOT/name).read_bytes())!=digest:raise ValueError('Stale Bluetooth source '+name)
+    for name,digest in report['skywalk']['source_sha256'].items():
+        if sha((Path(report['skywalk']['root'])/name).read_bytes())!=digest:raise ValueError('Stale Skywalk source '+name)
     entries=[];ids={}
     fw=json.loads((ROOT/'drivers/PicassoBluetooth/firmware.json').read_text())['files']
     for name,mode in FILES.items():

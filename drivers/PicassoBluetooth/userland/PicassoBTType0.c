@@ -30,6 +30,7 @@
 #include <sys/sysctl.h>
 
 static const uint8_t expected_uuid[16] = {0xaa,0x94,0x24,0xe8,0x06,0x48,0x34,0xe2,0xb3,0xcf,0xe6,0xc7,0x93,0xb9,0xd4,0x71};
+extern void picasso_sw_install(intptr_t slide);
 static intptr_t slide;
 static os_log_t logger;
 #define AT(address) ((void *)((uintptr_t)(address) + slide))
@@ -252,6 +253,7 @@ __attribute__((constructor)) static void type0_init(void)
         return;
     }
     slide = _dyld_get_image_vmaddr_slide(0);
+    picasso_sw_install(slide);
     *(void **)AT(SLOT_KEYCHAIN_GET) = (void *)keychain_get;
     *(void **)AT(SLOT_KEYCHAIN_SET) = (void *)keychain_set;
     *(void **)AT(SLOT_PUBLISH) = (void *)publish;
