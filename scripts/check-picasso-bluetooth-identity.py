@@ -10,7 +10,7 @@ spec=importlib.util.spec_from_file_location('extract',R/'scripts/check-picasso-b
 s=(args.xnu/'bsd/kern/kern_exec.c').read_text();v=(args.xnu/'bsd/miscfs/bindfs/bind_vnops.c').read_text()
 assert '.opve_op = &vnop_ioctl_desc, .opve_impl = (vop_t)bindfs_ioctl' in v
 install=m.extract(s,'static void\nnative_gpu_addon_install(')
-assert 'count == 19' in install and 'i >= 14 && i <= 15' in install
+assert 'count == 22' in install and 'i >= 14 && i <= 15' in install
 assert install.index('picasso_media_addon_entry(')<install.index('picasso_bt_runtime_capture(data, size, count, i,')
 assert 'native_gpu_addon_write(path, data, size, mode, ctx)' in install
 mount=m.extract(s,'static void\npicasso_bluetooth_mount(')

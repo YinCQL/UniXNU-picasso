@@ -32,4 +32,6 @@ adds version-envelope selection and rejected-segment error propagation.
 The private userland Skywalk channel and packet implementations are compiled
 from the same prepared Apple XNU xnu-10063.121.3 sources and headers as the
 kernel. Their APSL-2.0 and BSD notices remain in the generated sources. The
-bluetoothd-only entry points retain the native schema and metadata checks.
+bluetoothd and BTAudioHALPlugin private entry points retain the native schema
+and metadata checks. The exact iOS 16.7.16/20H392 BTAudioHALPlugin is adapted
+offline and retains its original UUID, API behavior and Info.plist.

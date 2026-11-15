@@ -14,7 +14,7 @@
 +picasso_bt_runtime_capture(const uint8_t *data, uint64_t size, uint32_t count,
 +    uint32_t index, bool audio, bool gpu, int write_error)
 +{
-+    if (!data || !size || size > 16*1024*1024 || count != 19 ||
++    if (!data || !size || size > 16*1024*1024 || count != 22 ||
 +        index < 14 || index > 15 || !audio || !gpu || write_error > 0) return EAUTH;
 +    unsigned binary = index - 14;
 +    SHA256_CTX sha;
@@ -33,7 +33,7 @@
  		}
 +        /* Capture identity from the loader-owned RAM addon after validating
 +         * the full inventory, including unchanged persistent files. */
-+        if (count == 19 && i >= 14 && i <= 15) {
++        if (count == 22 && i >= 14 && i <= 15) {
 +            int identity_error = picasso_bt_runtime_capture(data, size, count, i,
 +                audio_only == 1, media_gpu == 1, error);
 +            if (error <= 0 && identity_error) error = identity_error;
@@ -87,7 +87,7 @@
 +picasso_bt_runtime_auth(vnode_t vp, vfs_context_t ctx)
 +{
 +    if (!os_atomic_load(&picasso_bt_runtime_ready, acquire)) return EAUTH;
-+    if (!vp || !ctx || vnode_vtype(vp) != VREG || native_gpu_addon_files != 19 ||
++    if (!vp || !ctx || vnode_vtype(vp) != VREG || native_gpu_addon_files != 22 ||
 +        native_gpu_addon_failed || native_gpu_addon_error) return EAUTH;
 +    mount_t mp = vnode_mount(vp), root = rootvnode ? vnode_mount(rootvnode) : NULL;
 +    if (!mp || !root || !(vfs_flags(mp) & MNT_RDONLY) || !(vfs_flags(root) & MNT_RDONLY) ||

@@ -9,23 +9,24 @@
  static bool
  picasso_media_addon_entry(uint32_t count, uint32_t index, const char *name, uint32_t mode, bool gpu)
  {
-@@ -7693,9 +7693,17 @@
+@@ -7693,9 +7693,18 @@
      };
      static const uint32_t modes[] = {0644, 0755, 0644, 0755, 0755, 0755, 0644, 0644};
      if (count == 4) return picasso_audio_addon_entry(count, index, name, mode);
 -    if (gpu && count == 13 && index == 12)
-+    if (gpu && count == 19 && index >= 13 && index < 19) {
++    if (gpu && count == 22 && index >= 13 && index < 22) {
 +        static const char *const bt_names[] = {"ui/PicassoBTType0.dylib",
 +            "bluetooth-bin/bluetoothd", "bluetooth-bin/BlueTool",
 +            "bluetooth-firmware/crbtfw32.tlv", "bluetooth-firmware/crnv32.bin",
-+            "bluetooth-firmware/crnv32u.bin"};
++            "bluetooth-firmware/crnv32u.bin", "ui/PicassoBTAudio.dylib",
++            "audio/BTAudioHALPlugin.driver/Info.plist", "audio/BTAudioHALPlugin.driver/BTAudioHALPlugin"};
 +        return name && !strcmp(name, bt_names[index-13]) &&
-+            mode == ((index==14 || index==15) ? 0755U : 0644U);
++            mode == ((index==14 || index==15 || index==21) ? 0755U : 0644U);
 +    }
-+    if (gpu && (count == 13 || count == 19) && index == 12)
++    if (gpu && (count == 13 || count == 22) && index == 12)
          return name && !strcmp(name, "ui/libpicasso-sb.dylib") && mode == 0644;
 -    if (!gpu || (count != 12 && count != 13) || index >= 12) return false;
-+    if (!gpu || (count != 12 && count != 13 && count != 19) || index >= 12) return false;
++    if (!gpu || (count != 12 && count != 13 && count != 22) || index >= 12) return false;
      if (index < 4) return picasso_audio_addon_entry(4, index, name, mode);
      return name && !strcmp(name, names[index - 4]) && mode == modes[index - 4];
  }
@@ -34,7 +35,7 @@
      PE_parse_boot_argn("sheng-gpu-addon", &gpu, sizeof(gpu));
      if (!native_gpu_addon_failed && (native_gpu_addon_files == 4 ||
 -        (gpu == 1 && (native_gpu_addon_files == 12 || native_gpu_addon_files == 13))) && !status) {
-+        (gpu == 1 && (native_gpu_addon_files == 12 || (native_gpu_addon_files == 13 || native_gpu_addon_files == 19)))) && !status) {
++        (gpu == 1 && (native_gpu_addon_files == 12 || (native_gpu_addon_files == 13 || native_gpu_addon_files == 22)))) && !status) {
          picasso_audio_route_mount(p, scratch, &stage, &status);
          if (stage == 5 && !status) picasso_audio_addon_mount(p, scratch, &stage, &status);
      }
@@ -70,14 +71,15 @@
      if (uio) uio_free(uio);
      if (buffer) kfree_data(buffer, 4096);
      return error;
-@@ -9425,23 +9434,25 @@
+@@ -9425,23 +9434,26 @@
  picasso_ui_library_prepare(bool runtime)
  {
      const char *paths[] = {"/private/var/picasso", "/private/var/picasso/usr-lib",
 -        "/private/var/picasso/usr-lib/libpicasso-sb.dylib"};
-+        "/private/var/picasso/usr-lib/libpicasso-sb.dylib", "/private/var/ngpu/ui/PicassoBTType0.dylib"};
-+    const char *names[]={"libpicasso-sb.dylib","PicassoBTType0.dylib"};
-+    unsigned count=runtime && native_gpu_addon_files==19?2:1;
++        "/private/var/picasso/usr-lib/libpicasso-sb.dylib", "/private/var/ngpu/ui/PicassoBTType0.dylib",
++        "/private/var/ngpu/ui/PicassoBTAudio.dylib"};
++    const char *names[]={"libpicasso-sb.dylib","PicassoBTType0.dylib","PicassoBTAudio.dylib"};
++    unsigned count=runtime && native_gpu_addon_files==22?3:1;
      if (runtime) {
          paths[0] = "/private/var/ngpu";
          paths[1] = "/private/var/ngpu/ui";
@@ -115,7 +117,7 @@
      PE_parse_boot_argn("picasso-audio-addon", &audio, sizeof(audio));
      PE_parse_boot_argn("sheng-gpu-addon", &gpu, sizeof(gpu));
 -    bool runtime = audio == 1 && gpu == 1 && native_gpu_addon_files == 13;
-+    bool runtime = audio == 1 && gpu == 1 && (native_gpu_addon_files == 13 || native_gpu_addon_files == 19);
++    bool runtime = audio == 1 && gpu == 1 && (native_gpu_addon_files == 13 || native_gpu_addon_files == 22);
      if (runtime && (native_gpu_addon_failed || native_gpu_addon_error)) {
          printf("PICASSO_INJECT runtime UI addon failed error=%d\n", native_gpu_addon_error); return;
      }
@@ -128,7 +130,7 @@
 +static void
 +picasso_bluetooth_mount(proc_t p,user_addr_t scratch)
 +{
-+    if(native_gpu_addon_files!=19)return;
++    if(native_gpu_addon_files!=22)return;
 +    int error=native_gpu_addon_error;
 +    if(!error && native_gpu_addon_failed)error=EIO;
 +    const char *names[]={"bluetoothd","BlueTool"};

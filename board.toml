@@ -166,7 +166,7 @@ runtime_enabled_jobs = [
   "com.apple.bluetoothd",
   "com.apple.bluetoothuserd",
 ]
-# The sealed root supplies BTAudioHALPlugin; the addon supplies WCN399x UART.SK.
+# The addon supplies the pinned BTAudioHALPlugin ABI bridge and WCN399x UART.SK.
 offline_disabled_jobs = [
   "com.apple.BTServer.avrcp",
   "com.apple.BTServer.le",

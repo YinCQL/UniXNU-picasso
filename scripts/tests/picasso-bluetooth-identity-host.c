@@ -66,9 +66,9 @@ static void reset(void){
     rootvnode=&nodes[0];rootvnode->mp=&mounts[0];mounts[0].flags=MNT_RDONLY;strcpy(mounts[0].stat.f_fstypename,"apfs");
     nodes[2].mp=&mounts[1];nodes[2].type=VREG;mounts[1].flags=MNT_RDONLY;strcpy(mounts[1].stat.f_fstypename,"bindfs");
     strcpy(mounts[1].stat.f_mntonname,"/usr/sbin");strcpy(mounts[1].stat.f_mntfromname,"/private/var/ngpu/bluetooth-bin");
-    native_gpu_addon_files=19;native_gpu_addon_failed=native_gpu_addon_error=0;picasso_bt_runtime_ready=1;
+    native_gpu_addon_files=22;native_gpu_addon_failed=native_gpu_addon_error=0;picasso_bt_runtime_ready=1;
     for(unsigned i=0;i<2;++i){vnode_t v=&nodes[3+i];v->mp=&mounts[2];v->type=VREG;v->attr.va_mode=0755;v->attr.va_nlink=1;v->attr.va_data_size=binary_sizes[i];v->bytes=binary_data[i];
-        picasso_bt_runtime_sizes[i]=0;assert(!picasso_bt_runtime_capture(v->bytes,binary_sizes[i],19,14+i,true,true,-1));picasso_bt_runtime_vnodes[i]=v;}
+        picasso_bt_runtime_sizes[i]=0;assert(!picasso_bt_runtime_capture(v->bytes,binary_sizes[i],22,14+i,true,true,-1));picasso_bt_runtime_vnodes[i]=v;}
     backing=&nodes[3];
 }
 static int run(void){fsioc_auth_fs_t auth={0};struct vnop_ioctl_args a={FSIOC_AUTH_FS,&auth,0,&nodes[2],(void *)1};int e=bindfs_ioctl(&a);assert(!refs && !allocs);return e;}
@@ -77,15 +77,15 @@ int main(int argc,char **argv){
     for(unsigned i=0;i<2;++i){FILE *f=fopen(argv[i+1],"rb");assert(f);assert(!fseek(f,0,SEEK_END));long n=ftell(f);assert(n>0 && n<=16*1024*1024);assert(!fseek(f,0,SEEK_SET));binary_sizes[i]=(size_t)n;assert(fread(binary_data[i],1,binary_sizes[i],f)==binary_sizes[i]);assert(!fclose(f));}
     assert(binary_sizes[0]==8930688 && binary_sizes[0]>8*1024*1024 && binary_sizes[1]==69344);
     for(unsigned i=0;i<2;++i){
-        assert(!picasso_bt_runtime_capture(binary_data[i],binary_sizes[i],19,14+i,true,true,0));
+        assert(!picasso_bt_runtime_capture(binary_data[i],binary_sizes[i],22,14+i,true,true,0));
         assert(picasso_bt_runtime_sizes[i]==binary_sizes[i]);
         uint8_t digest[32];SHA256(binary_data[i],binary_sizes[i],digest);assert(!memcmp(digest,picasso_bt_runtime_hashes[i],32));
     }
-    for(unsigned i=0;i<9;++i){picasso_bt_runtime_sizes[0]=0;const uint8_t *p=binary_data[0];uint64_t size=binary_sizes[0];unsigned count=19,index=14;bool audio=true,gpu=true;int error=0;
+    for(unsigned i=0;i<9;++i){picasso_bt_runtime_sizes[0]=0;const uint8_t *p=binary_data[0];uint64_t size=binary_sizes[0];unsigned count=22,index=14;bool audio=true,gpu=true;int error=0;
         switch(i){case 0:p=NULL;break;case 1:size=0;break;case 2:size=16*1024*1024+1;break;case 3:count=13;break;case 4:index=13;break;case 5:index=16;break;case 6:audio=false;break;case 7:gpu=false;break;case 8:error=EIO;break;}
         assert(picasso_bt_runtime_capture(p,size,count,index,audio,gpu,error)==EAUTH && !picasso_bt_runtime_sizes[0]);
     }
-    assert(!picasso_bt_runtime_capture(binary_data[0],16*1024*1024,19,14,true,true,-1));
+    assert(!picasso_bt_runtime_capture(binary_data[0],16*1024*1024,22,14,true,true,-1));
     reset();assert(!run());backing=&nodes[4];assert(!run());
     for(unsigned i=0;i<26;++i){reset();switch(i){
         case 0:picasso_bt_runtime_ready=0;break;case 1:native_gpu_addon_files=13;break;

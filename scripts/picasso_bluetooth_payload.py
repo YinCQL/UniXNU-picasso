@@ -19,6 +19,9 @@ FILES={
     'bluetooth-firmware/crbtfw32.tlv':0o644,
     'bluetooth-firmware/crnv32.bin':0o644,
     'bluetooth-firmware/crnv32u.bin':0o644,
+    'ui/PicassoBTAudio.dylib':0o644,
+    'audio/BTAudioHALPlugin.driver/Info.plist':0o644,
+    'audio/BTAudioHALPlugin.driver/BTAudioHALPlugin':0o755,
 }
 STOCK='8b7c0a0bea51544db82269d7f2775ab7996b8740927283428c4753e032df3a8f'
 
@@ -54,19 +57,19 @@ def original_special(original, slot):
         if count>=slot:return cd[at-slot*32:at-(slot-1)*32]
     return bytes(32)
 
-def identity(data,original=None):
+def identity(data,original=None,bundle=False,retained_special=False):
     from picasso_ui_trust import library_identity
     source=inspect.getsource(library_identity)
     if source.count('kind != 6')!=1:raise ValueError('Changed code-signing verifier')
     ns=dict(library_identity.__globals__)
-    exec(source.replace('kind != 6','kind not in (2, 6)'),ns)
+    exec(source.replace('kind != 6','kind not in (2, 6, 8)' if bundle else 'kind not in (2, 6)'),ns)
     info=ns['library_identity'](data)
     parts=blobs(data);cd=parts[0]
     at,special=struct.unpack_from('>I',cd,16)[0],struct.unpack_from('>I',cd,24)[0]
     for i in range(1,special+1):
         expected=sha(parts[i]) if i in parts else (original_special(original,i).hex() if original is not None and i in (1,3) else bytes(32).hex())
         if cd[at-i*32:at-(i-1)*32].hex()!=expected:raise ValueError('Invalid signed special slot')
-    if original is not None:
+    if original is not None and not retained_special:
         if sha(original)!=STOCK or parts.get(5)!=blobs(original).get(5):
             raise ValueError('Original bluetoothd entitlements must be retained')
     return info
@@ -166,8 +169,29 @@ def build(work):
         run([signer,'-Cadhoc','-Hsha256',entitlement,out/name])
     ent=run([signer,'-e',stock]);(out/'bluetoothd.entitlements.plist').write_text(ent)
     run([signer,'-Cadhoc','-Hsha256','-S'+str(out/'bluetoothd.entitlements.plist'),'-Icom.apple.bluetoothd',out/'bluetoothd'])
-    report={'skywalk':sky_report,'original_sha256':STOCK,'runtime_qualified':False,'source_sha256':{str(p.relative_to(ROOT)):sha(p.read_bytes()) for p in [*src.glob('*'),Path(__file__)] if p.is_file()}}
-    report['identities']={name:identity((out/name).read_bytes(),original if name=='bluetoothd' else None) for name in ['BlueTool','PicassoBTType0.dylib','bluetoothd']}
+    audio_source=Path(os.environ.get('PICASSO_BT_AUDIO_STOCK',str(work/'bluetooth-input/BTAudioHALPlugin.driver')))
+    audio_original=(audio_source/'BTAudioHALPlugin').read_bytes()
+    audio_info=(audio_source/'Info.plist').read_bytes()
+    spec=importlib.util.spec_from_file_location('picasso_bt_audio_patch',src/'patch-btaudio-ios16.py')
+    audio_patcher=importlib.util.module_from_spec(spec);spec.loader.exec_module(audio_patcher)
+    if sha(audio_info)!=audio_patcher.INFO:raise ValueError('Require original BTAudioHALPlugin Info.plist')
+    audio_patched,audio_report=audio_patcher.patch(audio_original)
+    audio_bundle=out/'BTAudioHALPlugin.driver';audio_bundle.mkdir(exist_ok=True)
+    (audio_bundle/'BTAudioHALPlugin').write_bytes(audio_patched);(audio_bundle/'Info.plist').write_bytes(audio_info)
+    audio_imports=json.loads((src/'btaudio-imports.json').read_text())
+    (out/'skywalk/btaudio-slots.inc').write_text(''.join('        *(void **)((uintptr_t)'+e['slot']+'ULL + slide) = (void *)picasso_sw_'+e['name']+';\n' for e in audio_imports))
+    audio_flags=next(c[1:c.index('-c')] for c in commands if '-c' in c and str(src/'PicassoBTSkywalk.c') in c)
+    obj=out/'PicassoBTAudio.o';run([cc,*audio_flags,'-c',src/'PicassoBTAudio.c','-o',obj])
+    run([ld,'-arch','arm64','-platform_version','ios','16.0','16.5','-syslibroot',sdk,'-lSystem','-adhoc_codesign','-dylib','-install_name','/usr/lib/PicassoBTAudio.dylib','-o',out/'PicassoBTAudio.dylib',obj,*sky_objects])
+    run([signer,'-Cadhoc','-Hsha256','-S',out/'PicassoBTAudio.dylib'])
+    resources=audio_source/'_CodeSignature/CodeResources'
+    if sha(resources.read_bytes())!='3c727b0f043e463c0227db49cef54c5567715986d08a46c98923c9bb73585e5a':raise ValueError('Original BTAudio resource signature differs')
+    run([signer,'-Cadhoc','-Hsha256','-S','-Icom.apple.audio.BTAudioHALPlugin','-E1:'+str(audio_bundle/'Info.plist'),'-E3:'+str(resources),audio_bundle/'BTAudioHALPlugin'])
+    audio_report['identity']=identity((audio_bundle/'BTAudioHALPlugin').read_bytes(),audio_original,bundle=True,retained_special=True)
+    audio_report['info_sha256']=sha(audio_info)
+    report={'audio':audio_report,'skywalk':sky_report,'original_sha256':STOCK,'runtime_qualified':False,'source_sha256':{str(p.relative_to(ROOT)):sha(p.read_bytes()) for p in [*src.glob('*'),Path(__file__)] if p.is_file()}}
+    report['identities']={name:identity((out/name).read_bytes(),original if name=='bluetoothd' else None) for name in ['BlueTool','PicassoBTType0.dylib','bluetoothd','PicassoBTAudio.dylib']}
+    report['identities']['BTAudioHALPlugin']=audio_report['identity']
     (out/'build-report.json').write_text(json.dumps(report,indent=2)+'\n')
     (out/'commands.json').write_text(json.dumps(commands,indent=2)+'\n')
     return report
@@ -183,11 +207,15 @@ def make(work):
     fw=json.loads((ROOT/'drivers/PicassoBluetooth/firmware.json').read_text())['files']
     for name,mode in FILES.items():
         base=name.split('/')[-1]
-        data=(work/'bluetooth-firmware'/base if base in fw else out/base).read_bytes()
+        path=out/'BTAudioHALPlugin.driver'/base if 'BTAudioHALPlugin.driver/' in name else out/base
+        data=(work/'bluetooth-firmware'/base if base in fw else path).read_bytes()
         if base in fw:
             if len(data)!=fw[base]['size'] or sha(data)!=fw[base]['sha256']:raise ValueError('Wrong firmware '+base)
+        elif base=='Info.plist':
+            if sha(data)!=report['audio']['info_sha256']:raise ValueError('Stale BTAudio Info.plist')
         else:
-            ids[base]=identity(data,original if base=='bluetoothd' else None)
+            audio_original=(Path(os.environ.get('PICASSO_BT_AUDIO_STOCK',str(work/'bluetooth-input/BTAudioHALPlugin.driver')))/'BTAudioHALPlugin').read_bytes() if base=='BTAudioHALPlugin' else None
+            ids[base]=identity(data,original if base=='bluetoothd' else audio_original,bundle=base=='BTAudioHALPlugin',retained_special=base=='BTAudioHALPlugin')
             if ids[base]!=report['identities'][base]:raise ValueError('Stale signed Bluetooth executable')
         entries.append((name,mode,data))
     from picasso_media_payload import modules

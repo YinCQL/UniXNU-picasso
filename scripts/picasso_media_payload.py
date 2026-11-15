@@ -185,7 +185,7 @@ def make(work):
     addon, trust = pack(files), bundle(audio_modules + [gpu_module, bt_module])
     report = dict(passed=True, runtime_qualified=False, addon_sha256=digest(addon), trust_sha256=digest(trust),
         gpu_release_sha256=GPU_SHA, gpu_release_trust_sha256=GPU_TRUST_SHA, gpu_identities=identities, nativegl=gl_report,
-        original_modules_unchanged=True, audio_module_unchanged=True, exact_owned_entries=10, runtime_ui=runtime_report, bluetooth=bt_report,
+        original_modules_unchanged=True, audio_module_unchanged=True, exact_owned_entries=12, runtime_ui=runtime_report, bluetooth=bt_report,
         excluded_release_files=[n for n, _, _ in all_gpu if n not in GPU_FILES],
         files={n:dict(mode=m, bytes=len(data), sha256=digest(data)) for n, m, data in files})
     return addon, trust, report, ui, audio_identity
