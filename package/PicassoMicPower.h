@@ -70,16 +70,26 @@ inline int validate(unsigned endpoint,const Rail &r) {
         // PMIC5 HFSMPS shares the unified 1 mV layout from major revision 4.
         if(r.type!=3 || r.subtype!=0x0a || r.major<4 || r.major==0xff)return Unsupported;
     } else if(endpoint==BobC) {
-        // BOB major 1 uses 32 mV steps; it is not the PM8150L profile below.
-        if(r.type!=41 || r.subtype!=3 || r.major<2 || r.major==0xff)return Unsupported;
+        // The board has PM8150L BOB510_CONFIG (subtype 5, revision 0).
+        // Its unified voltage registers use mV, independently of the older
+        // BOB_CONFIG revision numbering. Do not accept the old PMIC4 block.
+        if(r.type!=41 || r.subtype!=5 || r.major!=0)return Unsupported;
     } else return Invalid;
     if(!(r.status&0x80) || !(r.enable&0x80) || (r.follow&0x0f))return NotReady;
     unsigned mode=r.mode&7;
     // PMIC5 PFM/AUTO/PWM are 4/6/7. Retention and BOB pass-through do not
     // qualify a regulated voltage for the codec, even if a request is cached.
     if(mode!=4 && mode!=6 && mode!=7)return NotReady;
-    uint16_t target=endpoint==S4A?1800:3296;
-    return r.requestedMv==target && r.validMv==target?0:Voltage;
+    if(endpoint==S4A)
+        return r.requestedMv==1800 && r.validMv==1800?0:Voltage;
+    // Stock lito audio votes 3296 mV on shared bobc1. RPMh takes the maximum
+    // of consumer requests; the board limits this rail to 3960 mV. A codec
+    // vote therefore does not imply that the aggregate must equal 3296 mV.
+    // Check both the requested and accepted settings within that envelope.
+    // READY plus repeated identical snapshots qualify the observed setting;
+    // do not infer a DAC step or an analog measurement from their difference.
+    return r.requestedMv>=3296 && r.requestedMv<=3960 &&
+        r.validMv>=3296 && r.validMv<=3960?0:Voltage;
 }
 template<class Bus> int qualify(Bus &bus,Status &s) {
     s.qualified=0;s.error=0;s.stage=PmicIdentity;++s.checks;

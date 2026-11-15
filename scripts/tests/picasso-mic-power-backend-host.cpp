@@ -42,12 +42,15 @@ void reset() {
     registers[PmicA][4]=registers[PmicC][4]=0x51;
     registers[PmicA][5]=0x1e;registers[PmicC][5]=0x1f;
     registers[S4A][1]=5;registers[S4A][4]=3;registers[S4A][5]=0x0a;
-    registers[BobC][1]=3;registers[BobC][4]=41;registers[BobC][5]=3;
+    registers[BobC][1]=0;registers[BobC][4]=41;registers[BobC][5]=5;
     for(unsigned e=S4A;e<=BobC;++e) {
         registers[e][8]=registers[e][0x46]=0x80;registers[e][0x45]=6;
-        unsigned mv=e==S4A?1800:3296;
+        unsigned mv=e==S4A?1800:3496;
         registers[e][0x40]=registers[e][0x42]=uint8_t(mv);
         registers[e][0x41]=registers[e][0x43]=uint8_t(mv>>8);
+        if(e==BobC) {
+            registers[e][0x42]=uint8_t(3520);registers[e][0x43]=uint8_t(3520>>8);
+        }
     }
 }
 }
@@ -136,7 +139,7 @@ int main(int argc,char **argv) {
         assert(picasso_mic_rails_check()==-5 && !snapshot().qualified);
         assert(picasso_mic_rails_release()==0 && !fake::liveMaps);
     } else if(scenario=="qualification") {
-        fake::registers[BobC][0x42]^=1;clean_failure(Voltage);
+        fake::registers[BobC][0x42]=uint8_t(3295);fake::registers[BobC][0x43]=uint8_t(3295>>8);clean_failure(Voltage);
         fake::reset();assert(picasso_mic_rails_acquire()==0);
         fake::registers[S4A][8]=0;
         assert(picasso_mic_rails_check()==NotReady && !snapshot().qualified);

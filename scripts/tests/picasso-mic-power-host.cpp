@@ -12,7 +12,7 @@ struct Fake {
         reg[PmicA][4]=reg[PmicC][4]=0x51;
         reg[PmicA][5]=0x1e;reg[PmicC][5]=0x1f;
         reg[S4A][1]=5;reg[S4A][4]=3;reg[S4A][5]=0x0a;
-        reg[BobC][1]=3;reg[BobC][4]=41;reg[BobC][5]=3;
+        reg[BobC][1]=0;reg[BobC][4]=41;reg[BobC][5]=5;
         for(unsigned e=S4A;e<=BobC;++e) {
             reg[e][8]=reg[e][0x46]=0x80;reg[e][0x45]=6;
             voltage(e,e==S4A?1800:3296);
@@ -79,13 +79,40 @@ int main() {
             assert(qualify(b,s)==((mode==4||mode==6||mode==7)?0:NotReady));
         }
         unsigned target=endpoint==S4A?1800:3296;
-        for(unsigned mv:{0U,target-1,target+1,65535U}) {
+        for(unsigned mv:{0U,target-1,endpoint==S4A?1801U:3961U,65535U}) {
             b=Fake{};b.voltage(endpoint,mv);
             assert(qualify(b,s)==Voltage && !s.qualified);
         }
-        // An exact requested setting cannot qualify an old accepted setting.
-        b=Fake{};b.reg[endpoint][0x42]^=1;
+        // An in-range request cannot qualify an out-of-range accepted value.
+        b=Fake{};unsigned below=target-1;
+        b.reg[endpoint][0x42]=uint8_t(below);b.reg[endpoint][0x43]=uint8_t(below>>8);
         assert(qualify(b,s)==Voltage && !s.qualified);
+    }
+    // Captured PM8150/PM8150L register values from the first board boot.
+    // The shared BOB request need not equal its accepted setting or the
+    // microphone consumer's minimum. Neither readback is an ADC sample.
+    Fake board;board.reg[S4A][1]=4;board.reg[S4A][8]=0x96;
+    board.reg[BobC][8]=0x86;board.voltage(BobC,3496);
+    board.reg[BobC][0x42]=uint8_t(3520);board.reg[BobC][0x43]=uint8_t(3520>>8);
+    assert(qualify(board,s)==0 && s.qualified && s.rail[1].validMv==3520);
+    for(unsigned requested:{3296U,3496U,3960U})for(unsigned accepted:{3296U,3520U,3960U}) {
+        Fake b;b.voltage(BobC,requested);
+        b.reg[BobC][0x42]=uint8_t(accepted);b.reg[BobC][0x43]=uint8_t(accepted>>8);
+        assert(qualify(b,s)==0 && s.qualified);
+    }
+    // Independently reject either side of an unsafe or stale transition.
+    for(unsigned mv:{3008U,3295U,3961U,65535U})for(bool accepted:{false,true}) {
+        Fake b;b.voltage(BobC,3520);unsigned reg=accepted?0x42:0x40;
+        b.reg[BobC][reg]=uint8_t(mv);b.reg[BobC][reg+1]=uint8_t(mv>>8);
+        assert(qualify(b,s)==Voltage && !s.qualified);
+    }
+    for(unsigned subtype:{3U,4U,6U,255U}) {
+        Fake b;b.reg[BobC][5]=uint8_t(subtype);
+        assert(qualify(b,s)==Unsupported && !s.qualified);
+    }
+    for(unsigned revision:{1U,2U,3U,255U}) {
+        Fake b;b.reg[BobC][1]=uint8_t(revision);
+        assert(qualify(b,s)==Unsupported && !s.qualified);
     }
     Table table;uint8_t ee=0;
     assert(table.find(0x11d,ee)==Unavailable);
