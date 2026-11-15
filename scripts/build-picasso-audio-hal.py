@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and audit the iOS16 output HAL using real SDK headers and an actual signature.
+"""Build and audit the iOS16 playback/capture HAL using real SDK headers and an actual signature.
 
 Linux: PICASSO_AUDIO_SDK, PICASSO_AUDIO_HEADERS, PICASSO_AUDIO_CC and
 PICASSO_AUDIO_LD select explicitly prepared SDK/header/tool inputs. There is no

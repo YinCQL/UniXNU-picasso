@@ -56,6 +56,16 @@ extern "C" void picasso_audio_static_init(){++metaCalls;}
 static void IOLog(const char *fmt,...) {
     char b[1024];va_list a;va_start(a,fmt);int n=vsnprintf(b,sizeof b,fmt,a);va_end(a);assert(n>0 && n<256);
 }
+#include "PicassoAudioInput.h"
+static PicassoAudioInput inputQueue;
+extern "C" int picasso_mic_service_call(uint64_t owner,unsigned selector,const void *in,unsigned bytes,void *out,unsigned size) {
+    if(selector==PicassoAudioInputStatus && !bytes && out && size==sizeof(PicassoAudioInputState)) {*(PicassoAudioInputState *)out=inputQueue.status;return 0;}
+    if(selector==PicassoAudioInputBegin && in && bytes==sizeof(PicassoAudioFormat) && !out)return picasso_input_begin(inputQueue,owner,*(const PicassoAudioFormat *)in);
+    if(selector==PicassoAudioInputRead && !bytes && out && size==sizeof(PicassoAudioInputData))return picasso_input_read(inputQueue,owner,*(PicassoAudioInputData *)out);
+    if(selector==PicassoAudioInputStop && !bytes && !out)return picasso_input_stop(inputQueue,owner);
+    return -22;
+}
+extern "C" void picasso_mic_service_close(uint64_t owner) {if(inputQueue.owner==owner)(void)picasso_input_stop(inputQueue,owner);}
 #include "PicassoAudioService-body.inc"
 static uint32_t pin[4][2];static unsigned copies;static uint64_t copied;
 static int pinRead(void *,unsigned i,unsigned reg,uint32_t *v){*v=pin[i][reg/4];return 0;}
@@ -155,7 +165,19 @@ int main(int argc,char **) {
     assert(call(c,PicassoAudioNote,&note,sizeof note)==kIOReturnBadArgument);
     assert(call(c,PicassoAudioNote,&note,sizeof note-4)==kIOReturnBadArgument);
     assert(!call(c,1,&format,sizeof format));assert(call(other,1,&format,sizeof format)==kIOReturnBusy);
+    const PicassoAudioFormat micFormat={1,48000,1,16};inputQueue.ready=true;
+    assert(!call(c,PicassoAudioInputBegin,&micFormat,sizeof micFormat));
+    assert(call(other,PicassoAudioInputBegin,&micFormat,sizeof micFormat)==kIOReturnBusy);
+    PicassoAudioInputState inputState;PicassoAudioInputData packet;
+    assert(call(c,PicassoAudioInputStatus,nullptr,0,&inputState,sizeof inputState-1)==kIOReturnBadArgument);
+    assert(!call(c,PicassoAudioInputStatus,nullptr,0,&inputState,sizeof inputState));
+    assert(call(other,PicassoAudioInputRead,nullptr,0,&packet,sizeof packet)==kIOReturnNotPermitted);
     static uint8_t data[4096];memset(data,0x25,sizeof data);
+    assert(!picasso_input_append(inputQueue,data,384,100000,0x80000000,500));
+    assert(!call(c,PicassoAudioInputRead,nullptr,0,&packet,sizeof packet)&&packet.bytes==384);
+    assert(!call(c,PicassoAudioInputStop)&&inputQueue.cancel&&!queue.cancel);
+    picasso_input_retire(inputQueue,true,0);
+    assert(!call(c,PicassoAudioInputBegin,&micFormat,sizeof micFormat));
     assert(call(other,2,data,4096)==kIOReturnNotPermitted);
     for(unsigned i=0;i<32;++i)assert(!call(c,2,data,4096));
     assert(call(c,2,data,4096)==kIOReturnNoSpace);
@@ -166,7 +188,7 @@ int main(int argc,char **) {
     for(unsigned i=0;i<40;++i)cycle(p,q);assert(!active && queue.returned==4096 && queue.drained);
     // Close while a real stream runs: stop and release only on DSP close ACK.
     assert(!call(c,1,&format,sizeof format));for(unsigned i=0;i<8;++i)assert(!call(c,2,data,4096));
-    for(unsigned i=0;i<7;++i)cycle(p,q);assert(active);assert(!c.clientDied());
+    for(unsigned i=0;i<7;++i)cycle(p,q);assert(active);assert(!c.clientDied());assert(inputQueue.cancel);
     for(unsigned i=0;i<40;++i)cycle(p,q);
     assert(!active && queue.state==PicassoAudioIdle && !queue.cancel && !queue.drained && !p.pcm.busyMask && !p.play.complete);
     assert(call(c,1,&format,sizeof format)==kIOReturnNotOpen);

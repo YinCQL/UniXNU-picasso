@@ -70,7 +70,7 @@ def check(tree, work, kernelcache, output):
         'hid-original-bindings.o', 'NativeGOPPresenter.late.o', 'NativeGOPGlue.o',
         'PicassoPr13.o', 'PicassoButtons.o', 'PicassoBacklight.o', 'PicassoBrightness.late.o',
         'PicassoSpmi.o', 'PicassoPower.o', 'PicassoBattery.o', 'PicassoAdsp.o', 'PicassoAdspFirmware.o', 'PicassoFat.o',
-        'PicassoAudioService.late.o', 'PicassoQmp.o', 'PicassoAop.o', 'PicassoSmp2p.o', 'PicassoSmp2pDevice.o', 'PicassoAdspBoot.o', 'PicassoGlink.o', 'PicassoRpcDma.o', 'PicassoRpcFs.o'}, 'Wrong display/state/input archive members')
+        'PicassoAudioService.late.o', 'PicassoMicService.o', 'PicassoMicHardware.o', 'PicassoMicPower.o', 'PicassoQmp.o', 'PicassoAop.o', 'PicassoSmp2p.o', 'PicassoSmp2pDevice.o', 'PicassoAdspBoot.o', 'PicassoGlink.o', 'PicassoRpcDma.o', 'PicassoRpcFs.o'}, 'Wrong display/state/input archive members')
     kernel = work / 'kernel/kernel.macho'
     plan = json.loads(kernel.with_suffix('.json').read_text())
     report = builder.verify_kernel(aes, native, original, kernel.read_bytes(), plan, audit)
@@ -94,6 +94,11 @@ def check(tree, work, kernelcache, output):
     builder.require({'_picasso_audio_service_tick', '__GLOBAL__sub_I_PicassoAudioService.cpp',
                      '__ZN12PicassoAudio10gMetaClassE', '__ZN22PicassoAudioUserClient10gMetaClassE'} <= linked_names,
                     'Missing PCM worker, audio-service initializer or client metaclasses')
+    builder.require({'_picasso_mic_service_init', '_picasso_mic_service_call', '_picasso_mic_service_close', '_picasso_mic_service_tick', '_picasso_mic_hardware',
+                     '_picasso_mic_rails_acquire', '_picasso_mic_rails_release'} <= linked_names,
+                    'Missing microphone capture worker, codec or power qualification')
+    report['microphone_capture'] = {'linked': True, 'automatic_capture': False,
+                                    'default_enabled': False, 'os_input_published': True, 'runtime_qualified': False}
     report['audio_service'] = {'worker_linked': True, 'late_initializer_verified': True,
                                'classes_linked': True, 'hal_payload_checked_separately': True, 'runtime_qualified': False}
     report['hid'] = hid.verify(platform, aes, native, OriginalReference(kernelcache, board),

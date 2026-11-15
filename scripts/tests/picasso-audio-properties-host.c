@@ -49,11 +49,35 @@ static int writeResult;static bool *workerStop;static int16_t accepted[2048];
 static PicassoAudioStatus fakeStatus={.version=1,.state=PicassoAudioRunning};
 static unsigned statusCalls,sleeps,runningAfter,statusSize=sizeof(PicassoAudioStatus),writeCalls;
 static int statusResult;static bool inCallback;
+static PicassoAudioInputState fakeInput={.version=1,.state=PicassoAudioIdle};
+static unsigned inputBegins,inputStops,inputFrames,inputStatusCalls;
+static bool inputFailure;
+static unsigned threadCreates,threadJoins;
+static int fakeThreadCreate(pthread_t *t,const pthread_attr_t *a,void *(*fn)(void *),void *arg){(void)a;(void)fn;(void)arg;*t=(pthread_t)++threadCreates;return 0;}
+static int fakeThreadJoin(pthread_t t,void **result){(void)t;(void)result;++threadJoins;return 0;}
+#define pthread_create fakeThreadCreate
+#define pthread_join fakeThreadJoin
 static void (*sleepHook)(unsigned);static int (*writeHook)(const int16_t *);
 static int fakeSleep(unsigned us){++sleeps;if(sleepHook)sleepHook(us);return 0;}
 #define usleep fakeSleep
 static int IOConnectCallStructMethod(unsigned c,unsigned s,const void *in,size_t n,void *out,size_t *z){
     (void)c;assert(!inCallback);
+    if(s==PicassoAudioInputStatus){
+        ++inputStatusCalls;assert(out&&z&&*z==sizeof fakeInput);
+        if(fakeInput.state==PicassoAudioStarting){fakeInput.state=inputFailure?PicassoAudioFailed:PicassoAudioRunning;fakeInput.capturedFrames=6144;fakeInput.firstHostTime=1000;}
+        memcpy(out,&fakeInput,sizeof fakeInput);return 0;
+    }
+    if(s==PicassoAudioInputBegin){
+        assert(in&&n==sizeof(PicassoAudioFormat));const PicassoAudioFormat *f=in;assert(f->version==1&&f->channels==1&&f->bits==16&&f->rate==48000);
+        assert(fakeInput.state==PicassoAudioIdle);++inputBegins;++fakeInput.epoch;fakeInput.state=PicassoAudioStarting;inputFrames=0;return 0;
+    }
+    if(s==PicassoAudioInputRead){
+        assert(out&&z&&*z==sizeof(PicassoAudioInputData));
+        if(inputFrames==6144)return kIOReturnNoSpace;
+        PicassoAudioInputData *p=out;memset(p,0,sizeof *p);p->version=1;p->epoch=fakeInput.epoch;p->bytes=384;p->flags=0x80000000;p->firstFrame=inputFrames;
+        for(unsigned i=0;i<192;++i)p->data[i*2+1]=0x20;inputFrames+=192;return 0;
+    }
+    if(s==PicassoAudioInputStop){++inputStops;fakeInput.state=PicassoAudioIdle;return 0;}
     if(s==PicassoAudioGetStatus){
         ++statusCalls;if(runningAfter&&statusCalls>=runningAfter)fakeStatus.state=PicassoAudioRunning;
         assert(out&&z&&*z==sizeof fakeStatus);memcpy(out,&fakeStatus,sizeof fakeStatus);*z=statusSize;return statusResult;
@@ -278,7 +302,7 @@ static void ownedFilters(void){
     assert(GetPropertyDataSize(NULL,kDevice,0,&a,3,&cls,&n)==(OSStatus)kAudioHardwareBadPropertySizeError&&n==0);
     assert(GetPropertyDataSize(NULL,kDevice,0,&a,4,NULL,&n)==(OSStatus)kAudioHardwareBadPropertySizeError&&n==0);
     cls=kAudioDeviceClassID;
-    assert(!GetPropertyData(NULL,kPlugIn,0,&a,4,&cls,sizeof list,&n,list)&&n==4&&list[0]==kDevice);
+    assert(!GetPropertyData(NULL,kPlugIn,0,&a,4,&cls,sizeof list,&n,list)&&n==8&&list[0]==kDevice&&list[1]==kMicDevice);
     cls=kAudioStreamClassID;
     assert(!GetPropertyData(NULL,kPlugIn,0,&a,4,&cls,sizeof list,&n,list)&&n==0);
     assert(!GetPropertyData(NULL,kOutStream,0,&a,0,NULL,sizeof list,&n,list)&&n==0);
@@ -454,10 +478,95 @@ static void timeline(void){
     continuousTimeline(256,0);continuousTimeline(384,1536);continuousTimeline(1024,2048);continuousTimeline(8192,2048);
 }
 
+static void microphoneRoute(void){
+    AudioObjectPropertyAddress a={kAudioDevicePropertyDeviceUID,kAudioObjectPropertyScopeGlobal,0};
+    UInt32 n,v,list[4];CFStringRef uid;
+    unsigned starts=inputBegins,stops=inputStops;bool set=false;
+    assert(!GetPropertyData(NULL,kMicDevice,0,&a,0,NULL,sizeof uid,&n,&uid)&&!strcmp(uid,"Codec"));
+    a.mSelector=kAudioPlugInPropertyTranslateUIDToDevice;
+    assert(!GetPropertyData(NULL,kPlugIn,0,&a,sizeof uid,&uid,4,&n,&v)&&v==kMicDevice);
+    uid="PicassoMicrophone";
+    assert(!GetPropertyData(NULL,kPlugIn,0,&a,sizeof uid,&uid,4,&n,&v)&&v==kAudioObjectUnknown);
+    a=(AudioObjectPropertyAddress){kAudioObjectPropertyOwnedObjects,kAudioObjectPropertyScopeInput,0};
+    AudioClassID wanted=kAudioSelectorControlClassID;
+    assert(!GetPropertyData(NULL,kMicDevice,0,&a,sizeof wanted,&wanted,sizeof list,&n,list)&&n==4&&list[0]==kMicSource);
+    wanted=kAudioControlClassID;
+    assert(!GetPropertyData(NULL,kMicDevice,0,&a,sizeof wanted,&wanted,sizeof list,&n,list)&&n==4&&list[0]==kMicSource);
+    a.mSelector=kAudioObjectPropertyControlList;
+    assert(!GetPropertyData(NULL,kMicDevice,0,&a,0,NULL,sizeof list,&n,list)&&n==4&&list[0]==kMicSource);
+    a.mScope=kAudioObjectPropertyScopeOutput;
+    assert(!GetPropertyData(NULL,kMicDevice,0,&a,0,NULL,sizeof list,&n,list)&&n==0);
+    a=(AudioObjectPropertyAddress){kAudioObjectPropertyClass,kAudioObjectPropertyScopeGlobal,0};
+    assert(!GetPropertyData(NULL,kMicSource,0,&a,0,NULL,4,&n,&v)&&v==kAudioDataSourceControlClassID);
+    a.mSelector=kAudioControlPropertyScope;
+    assert(!GetPropertyData(NULL,kMicSource,0,&a,0,NULL,4,&n,&v)&&v==kAudioObjectPropertyScopeInput);
+    a.mSelector=kAudioSelectorControlPropertyAvailableItems;
+    assert(!GetPropertyData(NULL,kMicSource,0,&a,0,NULL,sizeof list,&n,list)&&n==4&&list[0]=='imic');
+    assert(GetPropertyData(NULL,kMicSource,0,&a,0,NULL,3,&n,list)==(OSStatus)kAudioHardwareBadPropertySizeError);
+    a.mSelector=kAudioSelectorControlPropertyCurrentItem;
+    assert(!IsPropertySettable(NULL,kMicSource,0,&a,&set)&&set);
+    v='imic';assert(!SetPropertyData(NULL,kMicSource,0,&a,0,NULL,4,&v));
+    v='emic';assert(SetPropertyData(NULL,kMicSource,0,&a,0,NULL,4,&v)==(OSStatus)kAudioHardwareIllegalOperationError);
+    assert(SetPropertyData(NULL,kMicSource,0,&a,0,NULL,3,&v)==(OSStatus)kAudioHardwareBadPropertySizeError);
+    assert(!GetPropertyData(NULL,kMicSource,0,&a,0,NULL,4,&n,&v)&&v=='imic');
+    a.mSelector=kAudioSelectorControlPropertyItemName;
+    assert(HasProperty(NULL,kMicSource,0,&a));
+    assert(!IsPropertySettable(NULL,kMicSource,0,&a,&set)&&!set);
+    assert(!GetPropertyDataSize(NULL,kMicSource,0,&a,4,&v,&n)&&n==sizeof(CFStringRef));
+    assert(!GetPropertyData(NULL,kMicSource,0,&a,4,&v,sizeof uid,&n,&uid)&&!strcmp(uid,"Bottom"));
+    assert(GetPropertyData(NULL,kMicSource,0,&a,3,&v,sizeof uid,&n,&uid)==(OSStatus)kAudioHardwareIllegalOperationError);
+    v='emic';assert(GetPropertyData(NULL,kMicSource,0,&a,4,&v,sizeof uid,&n,&uid)==(OSStatus)kAudioHardwareIllegalOperationError);
+    assert(inputBegins==starts&&inputStops==stops);
+}
+static void microphoneLifecycle(void){
+    gMic.users=0;memset(gMic.clients,0,sizeof gMic.clients);fakeInput.state=PicassoAudioIdle;
+    unsigned speakerUsers=gIoUsers,writes=writeCalls,starts=inputBegins,stops=inputStops;
+    assert(!StartIO(NULL,kMicDevice,8)&&gMic.users==1&&gMic.live&&gMic.received==6144);
+    assert(inputBegins==starts+1&&inputStops==stops&&gIoUsers==speakerUsers&&writeCalls==writes);
+    assert(!StartIO(NULL,kMicDevice,8)&&gMic.users==1&&inputBegins==starts+1);
+    assert(!StartIO(NULL,kMicDevice,9)&&gMic.users==2&&inputBegins==starts+1);
+    assert(!StopIO(NULL,kMicDevice,8)&&gMic.users==1&&inputStops==stops);
+    assert(!StopIO(NULL,kMicDevice,9)&&!gMic.users&&!gMic.live&&inputStops==stops+1&&threadJoins==1);
+    for(unsigned i=0;i<kMicRingFrames;++i)assert(!gMic.pcm[i]&&!gMic.tag[i]);
+    assert(!StartIO(NULL,kMicDevice,8)&&inputBegins==starts+2&&gMic.epoch==fakeInput.epoch);
+    assert(!StopIO(NULL,kMicDevice,8)&&threadJoins==2);
+    inputFailure=true;assert(StartIO(NULL,kMicDevice,8)==(OSStatus)kAudioHardwareNotRunningError);
+    assert(!gMic.users&&!gMic.live&&inputStops==stops+3&&writeCalls==writes&&gIoUsers==speakerUsers);inputFailure=false;
+}
+static void microphone(void){
+    AudioObjectPropertyAddress a={kAudioPlugInPropertyDeviceList,kAudioObjectPropertyScopeGlobal,0};UInt32 n,v,list[4];
+    assert(!GetPropertyData(NULL,kPlugIn,0,&a,0,NULL,sizeof list,&n,list)&&n==8&&list[1]==kMicDevice);
+    a.mSelector=kAudioDevicePropertyTransportType;assert(!GetPropertyData(NULL,kMicDevice,0,&a,0,NULL,4,&n,&v)&&v==kAudioDeviceTransportTypeBuiltIn);
+    a.mSelector=kAudioDevicePropertyStreams;a.mScope=kAudioObjectPropertyScopeInput;
+    assert(!GetPropertyData(NULL,kMicDevice,0,&a,0,NULL,sizeof list,&n,list)&&n==4&&list[0]==kMicStream);
+    a.mScope=kAudioObjectPropertyScopeOutput;assert(!GetPropertyData(NULL,kMicDevice,0,&a,0,NULL,sizeof list,&n,list)&&n==0);
+    a.mSelector=kAudioStreamPropertyVirtualFormat;a.mScope=kAudioObjectPropertyScopeGlobal;AudioStreamBasicDescription f;
+    assert(!GetPropertyData(NULL,kMicStream,0,&a,0,NULL,sizeof f,&n,&f)&&f.mChannelsPerFrame==1&&f.mBytesPerFrame==4);
+    a.mSelector='taps';assert(!GetPropertyData(NULL,kMicStream,0,&a,0,NULL,4,&n,&v)&&v==0);
+    Boolean will,inPlace;assert(!WillDoIOOperation(NULL,kMicDevice,0,kAudioServerPlugInIOOperationWriteMix,&will,&inPlace)&&!will);
+    assert(!WillDoIOOperation(NULL,kMicDevice,0,kAudioServerPlugInIOOperationReadInput,&will,&inPlace)&&will);
+    gMic.users=1;gMic.epoch=4;gMic.active=true;gMic.fault=0;gMic.stop=false;gMic.reads=gMic.missing=0;
+    PicassoAudioInputData p={.version=1,.epoch=4,.bytes=384,.flags=0x80000000};float out[192];
+    for(unsigned i=0;i<192;++i){p.data[i*2]=0;p.data[i*2+1]=0x20;}
+    uint64_t oldSent=gSent;unsigned oldWrites=writeCalls;UInt32 users=gIoUsers;
+    for(unsigned block=0;block<3000;++block){ // Twelve seconds across ring wraps.
+        p.firstFrame=(uint64_t)block*192;assert(!micStore(&p));
+        AudioServerPlugInIOCycleInfo info={.mInputTime={.mSampleTime=(double)p.firstFrame},.mOutputTime={.mSampleTime=9999999}};
+        inCallback=true;assert(!DoIOOperation(NULL,kMicDevice,kMicStream,1,kAudioServerPlugInIOOperationReadInput,192,&info,out,NULL));inCallback=false;
+        for(unsigned i=0;i<192;++i)assert(out[i]==0.25f);
+    }
+    assert(gMic.reads==3000&&!gMic.missing&&gSent==oldSent&&writeCalls==oldWrites&&gIoUsers==users);
+    AudioServerPlugInIOCycleInfo gap={.mInputTime={.mSampleTime=600000}};assert(!micRead(192,&gap,out));assert(gMic.missing==192);
+    for(unsigned i=0;i<192;++i)assert(out[i]==0);
+    p.epoch=3;assert(micStore(&p)==-1);p.epoch=4;p.bytes=4096;assert(micStore(&p)==-1);
+    gHostTicksPerFrame=1;gMic.origin=1000;gMic.seed=9;fakeTime=10000;Float64 sample;UInt64 host,seed;
+    assert(!GetZeroTimeStamp(NULL,kMicDevice,0,&sample,&host,&seed)&&sample==8192&&host==9192&&seed==9);
+    gMic.users=0;assert(micRead(192,&gap,out)==(OSStatus)kAudioHardwareNotRunningError);
+}
 int main(int argc,char **argv){
     // Match the timebase initialization performed by the plugin factory.
     gOrigin=1000;gHostTicksPerFrame=1;
-    properties();speakerReference();ownedFilters();routing();timeline();
+    properties();speakerReference();ownedFilters();routing();timeline();microphoneRoute();microphone();microphoneLifecycle();
     if(argc==2){
         FILE *f=fopen(argv[1],"rb");assert(f);assert(!fseek(f,0,SEEK_END));long bytes=ftell(f);assert(bytes>0x634000);rewind(f);
         unsigned char *file=malloc((size_t)bytes);assert(file);assert(fread(file,1,(size_t)bytes,f)==(size_t)bytes);fclose(f);

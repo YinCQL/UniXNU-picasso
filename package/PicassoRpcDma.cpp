@@ -6,6 +6,7 @@
 #include "PicassoRpcDma.h"
 #include "PicassoFastrpc.h"
 #include "PicassoPcm.h"
+#include "PicassoCaptureDma.h"
 namespace {
 struct RpcMemory {
     IOMemoryMap *map;
@@ -98,6 +99,14 @@ extern "C" void picasso_rpc_device_prepare(PicassoFastrpc *f) {
 
 namespace {
 static RpcMemory pcmMemory;
+struct CaptureMemory {
+    IOBufferMemoryDescriptor *allocation;
+    uint8_t *data;
+    uint64_t physical;
+    PicassoPcm *playback;
+    PicassoCaptureDma *dma;
+};
+static CaptureMemory captureMemory;
 uint32_t pcmRead(unsigned at) { return *reinterpret_cast<volatile uint32_t *>(pcmMemory.map->getVirtualAddress()+at); }
 void pcmWrite(unsigned at,uint32_t v) { barrier();*reinterpret_cast<volatile uint32_t *>(pcmMemory.map->getVirtualAddress()+at)=v;barrier(); }
 void pcmWrite64(unsigned at,uint64_t v) { barrier();*reinterpret_cast<volatile uint64_t *>(pcmMemory.map->getVirtualAddress()+at)=v;barrier(); }
@@ -111,6 +120,54 @@ int pcmCheck(PicassoPcm &o) {
     }
     barrier();return e;
 }
+}
+static int captureCheck(PicassoCaptureDma &o) {
+    auto &m=captureMemory;
+    if(o.context!=&m || m.dma!=&o || !o.ready || !m.data || !m.playback ||
+       !m.playback->prepared || o.address!=PicassoCaptureAddress ||
+       o.bytes!=PicassoCapturePoolBytes || o.slotBytes!=PicassoCaptureSlotBytes)return -22;
+    int e=pcmCheck(*m.playback);if(e)return e;
+    return picasso_capture_dma_verify(reinterpret_cast<const uint64_t *>(pcmMemory.data[0]+32768),
+        m.physical,pcmMemory.physical[0]);
+}
+static int capturePrepare(PicassoCaptureDma &o,unsigned slot) {
+    if(slot>=2 || (o.busyMask&(1U<<slot)))return -16;
+    int e=captureCheck(o);if(e)return e;
+    auto *data=captureMemory.data+slot*PicassoCaptureSlotBytes;
+    rpcZero(data,PicassoCaptureSlotBytes);
+    cache(data,PicassoCaptureSlotBytes,true);
+    return captureCheck(o);
+}
+static int captureComplete(PicassoCaptureDma &o,unsigned slot,unsigned offset,unsigned bytes) {
+    if(slot>=2 || !(o.busyMask&(1U<<slot)) || (offset&1) || (bytes&1) ||
+       offset>PicassoCaptureSlotBytes || bytes>PicassoCaptureSlotBytes-offset)return -22;
+    int e=captureCheck(o);if(e)return e;
+    auto *data=captureMemory.data+slot*PicassoCaptureSlotBytes;
+    // The entire slot is cache-line aligned and no longer written by the DSP.
+    // Invalidate before observing only the byte range returned by READ_DONE.
+    cache(data,PicassoCaptureSlotBytes,false);
+    e=captureCheck(o);if(e)return e;
+    return o.sink?o.sink(data+offset,bytes,o.timestamp,o.flags):-6;
+}
+static void captureAllocate(PicassoPcm &playback) {
+    auto &m=captureMemory;auto &o=*playback.capture;
+    o.context=&m;m.playback=&playback;m.dma=&o;o.error=-12;
+    auto *a=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+        static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous)|
+        static_cast<IOOptionBits>(kIOMemoryMapperNone),PicassoCapturePoolBytes,4096);
+    m.allocation=a;o.retained=a!=nullptr;if(!a)return;
+    IOByteCount bytes=0;m.physical=a->getPhysicalSegment(0,&bytes,kIOMemoryMapperNone);
+    m.data=static_cast<uint8_t *>(a->getBytesNoCopy());
+    if(!m.data || (uintptr_t(m.data)&4095) || bytes<PicassoCapturePoolBytes) {o.error=-22;return;}
+    auto *tables=reinterpret_cast<uint64_t *>(pcmMemory.data[0]+32768);
+    o.error=picasso_capture_dma_add(tables,m.physical,pcmMemory.physical[0]);
+    if(o.error)return;
+    rpcZero(m.data,PicassoCapturePoolBytes);cache(m.data,PicassoCapturePoolBytes,true);
+    // Added only before the sole SID1401 context is enabled. Playback's first
+    // eight leaves, its IOVA and its allocation stay unchanged.
+    cache(pcmMemory.data[0]+32768,12288,true);
+    o.address=PicassoCaptureAddress;o.bytes=PicassoCapturePoolBytes;o.slotBytes=PicassoCaptureSlotBytes;
+    o.check=captureCheck;o.prepare=capturePrepare;o.complete=captureComplete;
 }
 static int pcmSilence(PicassoPcm &o) {
     if(!o.prepared || o.address!=0x180000000ULL || o.bytes!=32768 || !pcmMemory.data[0])return -22;
@@ -161,11 +218,19 @@ extern "C" void picasso_pcm_device_prepare(PicassoPcm &o) {
             }
         }
     }
+    if(!e && o.capture)captureAllocate(o);
     if(!e)e=picasso_rpc_dma_program(p,0,pcmMemory.physical[0],pcmRead,pcmWrite,pcmWrite64);
     if(!e)e=pcmCheck(o);
     o.dmaError=e;o.prepared=!e;o.physical=pcmMemory.physical[0];o.sid=0x1401;
     o.slot=p.slot[0];o.bank=p.bank[0];o.asid=p.asid[0];
     if(!e) { o.address=0x180000000ULL;o.bytes=PicassoRpcDmaBytes;o.check=pcmCheck;o.silence=pcmSilence;o.tone=pcmTone;o.copy=pcmCopy; }
+    if(o.capture) {
+        auto &c=*o.capture;c.ready=!e && !c.error;
+        if(c.ready) {c.error=captureCheck(c);c.ready=!c.error;}
+        else if(!c.error)c.error=e?e:-6;
+        IOLog("PICASSO_MIC dma ready=%u error=%d sid=1401 address=%08x%08x bytes=%u slot_bytes=%u retained=%u\n",
+            c.ready,c.error,uint32_t(c.address>>32),uint32_t(c.address),c.bytes,c.slotBytes,c.retained);
+    }
     const auto &d=p.diagnostic;
     IOLog("PICASSO_ADSP pcm-dma prepared=%u error=%d slot=%u bank=%u asid=%u sid=1401 address=%08x%08x bytes=%u retained=%u\n",
         o.prepared,e,o.slot,o.bank,o.asid,uint32_t(o.address>>32),uint32_t(o.address),o.bytes,o.retained);

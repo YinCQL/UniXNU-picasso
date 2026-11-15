@@ -144,7 +144,11 @@ int start(Boot &b) {
         if(snapshots<2 && mach_absolute_time()>=next) {
             b.events->snapshot(b.events->context);++snapshots;next=bootDeadline(25);
         }
-        IOSleep(20);
+        uint64_t deadline;clock_interval_to_deadline(20,kMillisecondScale,&deadline);
+        do {
+            bool fast=e.hasValue && (e.value&2) && b.events->fast && b.events->fast(b.events->context);
+            IOSleep(fast?1:20);
+        } while(mach_absolute_time()<deadline);
     }
 }
 void stop(Boot &b,int error) {

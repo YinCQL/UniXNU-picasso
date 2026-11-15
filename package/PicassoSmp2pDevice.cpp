@@ -14,6 +14,7 @@
 #include "PicassoAdsp.h"
 #include "PicassoGlink.h"
 #include "PicassoRpcDma.h"
+#include "PicassoMicService.h"
 extern "C" void picasso_audio_service_tick(PicassoAprProbe &,bool);
 
 // Display also builds without the optional Adreno archive. A missing shared
@@ -52,6 +53,12 @@ int smemWrite(void *ctx, uint32_t at, uint32_t value) {
 void smpKick(SmemDevice *d) {
     smemBarrier(d);
     *reinterpret_cast<volatile uint32_t *>(d->ipcc + 0x0c) = (3U << 16) | 2;
+    smemBarrier(d);
+}
+void glinkKick(SmemDevice *d) {
+    // lito: LPASS client 3, GLINK signal 0; SMP2P uses signal 2.
+    smemBarrier(d);
+    *reinterpret_cast<volatile uint32_t *>(d->ipcc + 0x0c) = 3U << 16;
     smemBarrier(d);
 }
 IOMemoryMap *smemMap(uint64_t base, uint64_t bytes) {
@@ -350,6 +357,15 @@ int bootPoll(void *context, PicassoSmp2pEvent *event) {
     if(!error && event->kick)smpKick(b->device);
     return error;
 }
+bool bootFast(void *context) {
+    auto *b=static_cast<BootEvents *>(context);auto *g=b->glink;
+    const auto &v=g->apr.capture;
+    if(g->failed || !v.streaming || !v.enabled || !v.attempted || v.done || v.firstError ||
+       v.phase<PicassoCapturePrime || v.phase>PicassoCaptureRead)return false;
+    bool kick=false;(void)picasso_glink_service(b->io,g,&kick,false);
+    if(kick)glinkKick(b->device);
+    return !g->failed;
+}
 void bootService(void *context) {
     auto *b=static_cast<BootEvents *>(context);
     // The coordinator calls here only after its own PAS AUTH and fresh ready;
@@ -359,11 +375,7 @@ void bootService(void *context) {
         for(const auto &c:g->channel)if(c.used && c.local==3 && c.up && !g->fastrpc.bound && !g->fastrpc.stopped)
             picasso_rpc_device_prepare(&g->fastrpc);
         int transport=picasso_glink_service(b->io,g,&kick);
-        if(kick) {
-            smemBarrier(b->device);
-            *reinterpret_cast<volatile uint32_t *>(b->device->ipcc+0x0c)=3U<<16;
-            smemBarrier(b->device);
-        }
+        if(kick)glinkKick(b->device);
         if(g->sent && !b->sentLogged) {
             b->sentLogged=true;
             IOLog("PICASSO_ADSP glink stage=version-sent version=1 features=0 signal=3/0\n");
@@ -460,6 +472,7 @@ void bootService(void *context) {
             else if(kind==PlayLogProgress)logPlayProgress(a);
         }
         picasso_audio_service_tick(a,g->failed);
+        picasso_mic_service_tick(a,g->failed);
         if(a.pcm.events!=b->pcmEvents) { b->pcmEvents=a.pcm.events;logPcm(a); }
         if(a.stream.events!=b->streamEvents) { b->streamEvents=a.stream.events;logStream(a); }
         if(q.locator.events!=b->locatorEvents && b->locatorLogs<32) {
@@ -552,6 +565,7 @@ extern "C" void picasso_smp2p_start(void) {
     logAudit(s);
     if (error) return;
     glink.apr.pins.read=audioPinRead;glink.apr.pins.write=audioPinWrite;glink.apr.tfa.probe=tfaProbe;glink.apr.pcm.prepare=picasso_pcm_device_prepare;uint32_t audioTest=0;PE_parse_boot_argn("picasso-audio-test",&audioTest,sizeof audioTest);glink.apr.play.enabled=audioTest==1;glink.apr.play.amplifier=tfaPlayback;
+    picasso_mic_service_init(glink.apr);
     smpKick(&d);
     IOLog("PICASSO_ADSP glink stage=prepared descriptor=%x/%x tx=%x/%x remote_pid=2\n",
         glink.desc.offset,glink.desc.size,glink.tx.offset,glink.tx.size);
@@ -560,10 +574,11 @@ extern "C" void picasso_smp2p_start(void) {
     IOLog("PICASSO_ADSP rpc-socinfo error=%d format=%u id=%u revision=%x platform=%u version=%u subtype=%u files=%u\n",
         socError,soc[0],soc[1],soc[2],soc[3],soc[4],soc[5],socError?0:6);
     BootEvents boot={&d,&io,&s,&glink,false,false,false};
-    PicassoAdspEvents events={&boot,bootPoll,bootSnapshot,bootService};
+    PicassoAdspEvents events={&boot,bootPoll,bootSnapshot,bootFast,bootService};
     picasso_adsp_boot(&events);
     picasso_glink_stop(&glink);
     picasso_audio_service_tick(glink.apr,true);
+    picasso_mic_service_tick(glink.apr,true);
     unsigned missing = 0, logs = 0;
     bool wasOpen = false, hadValue = false;
     for (;;) {

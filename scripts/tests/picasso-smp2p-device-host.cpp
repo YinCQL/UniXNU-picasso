@@ -88,6 +88,8 @@ static void IODelay(unsigned) {}
 static bool PE_parse_boot_argn(const char *,void *,int){return false;}
 #include "PicassoSmp2pDevice-body.inc"
 extern "C" void picasso_audio_service_tick(PicassoAprProbe &,bool) {}
+extern "C" void picasso_mic_service_init(PicassoAprProbe &) {}
+extern "C" void picasso_mic_service_tick(PicassoAprProbe &,bool) {}
 extern "C" { volatile uint32_t native_novatek_touch_stage=0; }
 extern "C" void picasso_pcm_device_prepare(PicassoPcm &) { assert(false && "unexpected PCM DMA without ASM completion"); }
 extern "C" void picasso_rpc_device_prepare(PicassoFastrpc *) { assert(false && "unexpected RPC DMA without an open channel"); }
@@ -144,6 +146,19 @@ extern "C" void picasso_adsp_boot(const PicassoAdspEvents *e) {
     ram[g->desc.offset/4]=g->txHead;tx=g->txHead;e->service(e->context);
     assert(ram[(g->tx.offset+tx)/4]==0x1000e && ram[(g->tx.offset+tx+4)/4]==1);
     assert(g->localReuse==1 && g->localIntent[0].id==1 && g->localIntent[0].advertised);ipccRam[3]=0;
+    // A fast committed GLINK RX must notify signal 0 even if no slow service
+    // runs afterwards. Signal 2 wakes SMP2P and cannot wake the GLINK reader.
+    auto &v=g->apr.capture;v.enabled=v.attempted=v.streaming=true;v.phase=PicassoCaptureRead;
+    v.pending=true;g->apr.fw.valid=true;g->qrtr.qmi.bound=true;g->qrtr.qmi.round=1;
+    for(auto &d:g->qrtr.qmi.domains){d.completed=d.stateValid=true;d.state=0x1fffffff;d.error=0;}
+    const uint32_t notify[2]={13,0};append(notify,sizeof notify);
+    unsigned ticks=g->apr.ticks,head=g->txHead;
+    assert(e->fast && e->fast(e->context));
+    assert(g->rxTail==cursor && ipccRam[3]==0x30000);
+    assert(g->apr.ticks==ticks && g->txHead==head);
+    ipccRam[3]=0;assert(e->fast(e->context) && !ipccRam[3]);
+    v.enabled=false;assert(!e->fast(e->context) && !ipccRam[3]);
+    puts("PASS fast GLINK adapter uses LPASS signal 0 and leaves SMP2P signal 2 separate");
 }
 extern "C" int picasso_rpmh_adsp_plan(){assert(!preempt && !allocations);++plans;return 0;}
 int main(int argc,char **argv) {
