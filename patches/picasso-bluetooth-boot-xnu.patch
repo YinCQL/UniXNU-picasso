@@ -1,0 +1,44 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9762,7 +9762,11 @@
+     error = picasso_ifnamer_read(file, bytes, 8192, &size, ctx);
+     if (error || picasso_jobs_match(bytes, (size_t)size, picasso_jobs_after_sha)) goto done;
+     bool legacy = picasso_jobs_match(bytes, (size_t)size, picasso_jobs_legacy_sha);
+-    if (!legacy && !picasso_jobs_match(bytes, (size_t)size, picasso_jobs_before_sha)) { error = EINVAL; goto done; }
++    if (!legacy && !picasso_jobs_match(bytes, (size_t)size, picasso_jobs_before_sha)) {
++        printf("PICASSO_JOBS unknown size=%llu header=%02x%02x%02x%02x%02x%02x%02x%02x\n",
++            (unsigned long long)size, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
++        error = EINVAL; goto done;
++    }
+     for (unsigned i = 0; i < sizeof(entries)/sizeof(entries[0]); ++i) {
+         size_t length = strlen(entries[i]), at;
+         for (at = 0; at + length <= size; ++at)
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2475,6 +2475,26 @@
+ 	task_t task = proc_task(p);
+ 
+ 
++#if __arm64__ && (DEVELOPMENT || DEBUG)
++    /* First failures remain observable with normal quiet-boot arguments. */
++    static const char *const bt_boot_names[] = {"backboardd", "SpringBoard", "bluetoothd", "BlueTool", "bluetoothuserd"};
++    static unsigned bt_boot_exits[5];
++    for (unsigned i = 0; i < 5; ++i) {
++        if (strcmp(p->p_name, bt_boot_names[i])) continue;
++        unsigned ticket = os_atomic_load(&bt_boot_exits[i], relaxed);
++        while (ticket < 4 && !os_atomic_cmpxchg(&bt_boot_exits[i], ticket, ticket + 1, relaxed))
++            ticket = os_atomic_load(&bt_boot_exits[i], relaxed);
++        if (ticket < 4) {
++            printf("PICASSO_BT_EXIT pid=%d name=%s rv=%x namespace=%u code=%llx cs=%llx\n",
++                proc_getpid(p), p->p_name, rv, p->p_exit_reason ? p->p_exit_reason->osr_namespace : 0,
++                p->p_exit_reason ? (unsigned long long)p->p_exit_reason->osr_code : 0ULL, (unsigned long long)proc_getcsflags(p));
++            picasso_service_description(p, rv, ticket + 1);
++            picasso_report_user_fault(p, rv, ticket + 1, "BTBOOT");
++        }
++        break;
++    }
++#endif
++
+ 	boot_progress_exit(proc_getpid(p),p->p_name,rv,
+ 	    p->p_exit_reason ? p->p_exit_reason->osr_namespace : 0,
+ 	    p->p_exit_reason ? p->p_exit_reason->osr_code : 0);

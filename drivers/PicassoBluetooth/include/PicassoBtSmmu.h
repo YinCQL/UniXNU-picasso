@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Pass-through stream mapping in the firmware-managed apps SMMU, for a device whose DMA must reach physical memory
 // (not a page-table mapping, not an Adreno context). This is the sequence Linux's qcom_smmu bypass quirk describes and the
-// UFS driver already uses on this board: the last context bank (SCTLR=0, CBAR.TYPE=S1_TRANS_S2_BYPASS,
+// UFS driver already uses on this board: its selected context bank (SCTLR=0, CBAR.TYPE=S1_TRANS_S2_BYPASS,
 // CBA2R.VA64=1) is shared by every bypass stream; a stream maps to it with S2CR TYPE=TRANSLATE (a TYPE=BYPASS S2CR reads
 // back as FAULT on this firmware) and S2CR is written before SMR. Unlike the UFS planner this one lets several streams share
 // the bank. Pure planning/configuration over register callbacks.
@@ -39,8 +39,22 @@ static inline struct smmu_plan smmu_plan_bypass(const struct smmu_io *io, uint16
         p.error = "unsupported SMMU geometry"; return p;
     }
     if (count > 128) count = 128;   // the firmware's reliably accessible groups only
-    p.bank = banks - 1;
-    unsigned matches = 0, sharing = 0;
+    /* UFS may select a lower bank when firmware owns the last one. Resolve
+     * its exact SID instead of assuming its context-bank number. */
+    unsigned ufs_matches = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        uint32_t smr = io->rd(io->ctx, 0x800 + 4 * i);
+        if (!(smr & 0x80000000u)) continue;
+        uint32_t mask = (smr >> 16) & 0x7fff;
+        if (((smr ^ 0x60u) & 0xffff & ~mask) != 0) continue;
+        uint32_t s2cr = io->rd(io->ctx, 0xc00 + 4 * i);
+        if (++ufs_matches != 1 || mask || (s2cr & ~255u) || (s2cr & 255u) >= banks) {
+            p.error = "invalid UFS bypass stream"; return p;
+        }
+        p.bank = s2cr & 255u;
+    }
+    if (ufs_matches != 1) {p.error = "UFS bypass stream missing"; return p;}
+    unsigned matches = 0;
     for (unsigned i = 0; i < count; ++i) {
         uint32_t smr = io->rd(io->ctx, 0x800 + 4 * i);
         if (!(smr & 0x80000000u)) {if (p.slot == 0xffffffffu) p.slot = i; continue;}
@@ -50,25 +64,19 @@ static inline struct smmu_plan smmu_plan_bypass(const struct smmu_io *io, uint16
         if (((smr ^ stream) & 0xffff & ~mask) == 0) {
             if (++matches > 1 || mask || !ourBank) {p.slot = i; p.error = "conflicting stream mapping"; return p;}
             p.reuse = 1; p.slot = i;
-        } else if (ourBank) {
-            ++sharing;
         }
     }
     uint32_t sctlr = io->rd(io->ctx, (p.pages + p.bank) * 4096u);
     uint32_t cbar = io->rd(io->ctx, 0x1000 + 4 * p.bank), cba2r = io->rd(io->ctx, 0x1800 + 4 * p.bank);
     p.bank_ready = (sctlr == 0 && cbar == 0x10000 && (cba2r & ~1u) == 0 && (cba2r & 1u));
-    if ((sctlr & 1) || ((sharing || p.reuse) && !p.bank_ready)) {p.error = "reserved context bank is not a bypass bank"; return p;}
+    if (!p.bank_ready) {p.error = "reserved context bank is not a bypass bank"; return p;}
     if (p.slot == 0xffffffffu) p.error = "no free stream-match group";
     return p;
 }
 static inline const char *smmu_configure_bypass(const struct smmu_io *io, const struct smmu_plan *p, uint16_t stream) {
     if (p->error) return p->error;
     unsigned cb = (p->pages + p->bank) * 4096u;
-    if (!p->bank_ready) {
-        io->wr(io->ctx, cb, 0);
-        io->wr(io->ctx, 0x1800 + 4 * p->bank, 1);
-        io->wr(io->ctx, 0x1000 + 4 * p->bank, 0x10000);
-    }
+    if (!p->bank_ready) return "UFS bypass bank not initialized";
     if (io->rd(io->ctx, cb) != 0 || io->rd(io->ctx, 0x1800 + 4 * p->bank) != 1 || io->rd(io->ctx, 0x1000 + 4 * p->bank) != 0x10000)
         return "SMMU bypass bank readback";
     if (!p->reuse) {

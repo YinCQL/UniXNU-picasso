@@ -129,9 +129,18 @@ def make(work):
             ids[base]=identity(data,original if base=='bluetoothd' else None)
             if ids[base]!=report['identities'][base]:raise ValueError('Stale signed Bluetooth executable')
         entries.append((name,mode,data))
-    hashes=sorted(bytes.fromhex(v['cdhash']) for v in ids.values())
+    from picasso_media_payload import modules
+    original_hash=hashlib.sha256(blobs(original)[0]).digest()[:20]
+    stock_entries=[module[at:at+24]
+        for module in modules((work/'audio-hal/audio-trust.bundle').read_bytes())[:2]
+        for at in range(24,len(module),24) if module[at:at+20]==original_hash]
+    if len(stock_entries)!=1 or stock_entries[0][20:]!=bytes([2,0,1,0]):
+        raise ValueError('Original bluetoothd trust metadata differs')
+    metadata={bytes.fromhex(v['cdhash']):(stock_entries[0][20:] if name=='bluetoothd' else bytes([2,0,0,0]))
+              for name,v in ids.items()}
+    hashes=sorted(metadata)
     module=struct.pack('<I16sI',2,uuid.uuid5(uuid.NAMESPACE_URL,'picasso:bluetooth:'+':'.join(h.hex() for h in hashes)).bytes,len(hashes))
-    module+=b''.join(h+bytes([2,0,0,0]) for h in hashes)
+    module+=b''.join(h+metadata[h] for h in hashes)
     return entries,module,report
 
 if __name__=='__main__':
