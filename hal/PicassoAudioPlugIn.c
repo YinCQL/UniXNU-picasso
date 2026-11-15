@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Public HAL object/property pattern adapted from UniXNU-sheng 4601795.
-// Picasso speaker and software playback reference; no microphone capture.
+// Picasso speaker, software playback reference and independent AMIC1 input.
 // No shared kernel memory or clock patching.
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -13,7 +13,7 @@
 #include <unistd.h>
 #include "PicassoAudioAbi.h"
 #include "PicassoAudioMix.h"
-enum {kPlugIn=kAudioObjectPlugInObject,kDevice=2,kOutStream=3,kVolume=4,kMute=5,kTapStream=6};
+enum {kPlugIn=kAudioObjectPlugInObject,kDevice=2,kOutStream=3,kVolume=4,kMute=5,kTapStream=6,kMicDevice=7,kMicStream=8};
 // Legacy device aliases from CoreAudio/AudioHardware.h (not included by
 // AudioServerPlugIn.h). The host check verifies these against that SDK header.
 enum {kDeviceVolumeScalar='volm',kDeviceVolumeDecibels='vold',
@@ -28,6 +28,7 @@ static const UInt32 kZeroPeriod=32768;
 static const UInt32 kSafetyFrames=8192;
 static AudioServerPlugInHostRef gHost;
 static pthread_mutex_t gLock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t gMicLock=PTHREAD_MUTEX_INITIALIZER;
 static atomic_uint gRefs=1;
 static io_connect_t gConnect;
 static UInt32 gIoUsers;
@@ -47,6 +48,13 @@ static uint64_t gTapReads,gTapMissing;
 static uint64_t gSent,gMissing,gReservedEnd;
 static uint32_t gCalls,gPropertyNotes;
 static bool gStreamActive=true;
+enum {kMicRingFrames=65536,kMicSafety=4096,kMicZeroPeriod=4096};
+static struct {
+    int16_t pcm[kMicRingFrames];uint64_t tag[kMicRingFrames];
+    uint32_t clients[32],users,epoch;uint64_t origin,seed,reads,missing,received;
+    int fault;bool stop,live,active;pthread_t thread;
+} gMic={.active=true};
+
 // Bounded snapshots copied under the mix lock, flushed by the worker. No
 // kernel logging or status query is performed by the realtime callback.
 static struct {
@@ -99,6 +107,107 @@ static AudioStreamBasicDescription format(UInt32 channels){
     AudioStreamBasicDescription f={0};f.mSampleRate=kRate;f.mFormatID=kAudioFormatLinearPCM;
     f.mFormatFlags=kAudioFormatFlagIsFloat|kAudioFormatFlagsNativeEndian|kAudioFormatFlagIsPacked;
     f.mBytesPerPacket=f.mBytesPerFrame=4*channels;f.mFramesPerPacket=1;f.mChannelsPerFrame=channels;f.mBitsPerChannel=32;return f;
+}
+static kern_return_t micStatus(PicassoAudioInputState *s){
+    size_t z=sizeof *s;kern_return_t rc=method(PicassoAudioInputStatus,NULL,0,s,&z);
+    return rc?rc:z!=sizeof *s||s->version!=1?kIOReturnBadArgument:0;
+}
+static int micStore(const PicassoAudioInputData *p){
+    if(p->version!=1 || p->epoch!=gMic.epoch || !p->bytes || p->bytes>sizeof p->data || (p->bytes&1) ||
+       p->flags!=0x80000000U || p->firstFrame>UINT64_MAX-p->bytes/2-1)return -1;
+    for(unsigned i=0;i<p->bytes/2;++i){
+        uint64_t frame=p->firstFrame+i;unsigned at=frame%kMicRingFrames;
+        gMic.pcm[at]=(int16_t)((uint16_t)p->data[2*i]|((uint16_t)p->data[2*i+1]<<8));
+        gMic.tag[at]=frame+1;
+    }
+    gMic.received+=p->bytes/2;return 0;
+}
+static void micNote(int error,unsigned phase){
+    PicassoAudioClientNote n={1,6,error,16,phase,0,gMic.reads,gMic.received,gMic.missing};
+    (void)method(PicassoAudioNote,&n,sizeof n,NULL,NULL);
+}
+static void *micWorker(void *arg){
+    (void)arg;PicassoAudioInputData packet;unsigned idle=0;
+    for(;;){
+        pthread_mutex_lock(&gMicLock);bool stop=gMic.stop;pthread_mutex_unlock(&gMicLock);if(stop)break;
+        size_t z=sizeof packet;kern_return_t rc=method(PicassoAudioInputRead,NULL,0,&packet,&z);
+        if(rc==kIOReturnNoSpace){
+            if(++idle>=100){PicassoAudioInputState status;rc=micStatus(&status);idle=0;
+                if(!rc && (status.state==PicassoAudioRunning || status.state==PicassoAudioStarting)){usleep(1000);continue;}
+                if(!rc)rc=kIOReturnNotReady;
+            }else {usleep(1000);continue;}
+        }
+        pthread_mutex_lock(&gMicLock);
+        if(!rc && z==sizeof packet && !gMic.stop)rc=micStore(&packet)?kIOReturnBadArgument:0;
+        else if(!rc && z!=sizeof packet)rc=kIOReturnBadArgument;
+        if(rc){gMic.fault=(int)rc;micNote(gMic.fault,3);pthread_mutex_unlock(&gMicLock);
+            (void)method(PicassoAudioInputStop,NULL,0,NULL,NULL);break;}
+        pthread_mutex_unlock(&gMicLock);idle=0;
+    }return NULL;
+}
+static OSStatus micStart(UInt32 client){
+    if(client==UINT32_MAX)return kAudioHardwareBadObjectError;
+    pthread_mutex_lock(&gLock);int connected=connectService();pthread_mutex_unlock(&gLock);
+    if(connected)return kAudioHardwareNotRunningError;
+    pthread_mutex_lock(&gMicLock);unsigned slot=32;
+    for(unsigned i=0;i<32;++i){if(gMic.clients[i]==client+1){pthread_mutex_unlock(&gMicLock);return 0;}if(!gMic.clients[i])slot=i;}
+    if(slot==32 || gMic.stop || (gMic.users&&gMic.fault)){pthread_mutex_unlock(&gMicLock);return kAudioHardwareIllegalOperationError;}
+    if(!gMic.users){
+        PicassoAudioInputState status={0};kern_return_t rc=0;bool begun=false;
+        for(unsigned retry=0;retry<500;++retry){
+            rc=micStatus(&status);if(rc || status.state==PicassoAudioIdle || status.state==PicassoAudioFailed)break;
+            usleep(10000);
+        }
+        if(!rc && status.state!=PicassoAudioIdle)rc=kIOReturnNotReady;
+        const PicassoAudioFormat f={1,48000,1,16};
+        if(!rc){rc=method(PicassoAudioInputBegin,&f,sizeof f,NULL,NULL);begun=!rc;}
+        if(!rc)for(unsigned retry=0;retry<500;++retry){
+            rc=micStatus(&status);
+            if(rc || status.state==PicassoAudioFailed || (status.state==PicassoAudioRunning && status.capturedFrames>=kMicSafety))break;
+            usleep(10000);
+        }
+        if(!rc && (status.state!=PicassoAudioRunning || status.capturedFrames<kMicSafety))rc=kIOReturnNotReady;
+        if(rc){if(begun)(void)method(PicassoAudioInputStop,NULL,0,NULL,NULL);
+            micNote((int)rc,1);pthread_mutex_unlock(&gMicLock);return kAudioHardwareNotRunningError;}
+        memset(gMic.pcm,0,sizeof gMic.pcm);memset(gMic.tag,0,sizeof gMic.tag);
+        gMic.origin=status.firstHostTime;gMic.epoch=status.epoch;++gMic.seed;
+        gMic.reads=gMic.missing=gMic.received=0;gMic.fault=0;
+        // Preload already captured packets before the first callback. This is
+        // bounded by the kernel ring capacity and runs on the control thread.
+        for(unsigned i=0;i<PicassoAudioInputPackets*2;++i){
+            PicassoAudioInputData data;size_t z=sizeof data;
+            rc=method(PicassoAudioInputRead,NULL,0,&data,&z);
+            if(rc==kIOReturnNoSpace){rc=0;break;}
+            if(rc || z!=sizeof data || micStore(&data)){rc=kIOReturnBadArgument;break;}
+        }
+        if(!rc)rc=pthread_create(&gMic.thread,NULL,micWorker,NULL);
+        if(rc){(void)method(PicassoAudioInputStop,NULL,0,NULL,NULL);pthread_mutex_unlock(&gMicLock);return kAudioHardwareUnspecifiedError;}
+        gMic.live=true;micNote(0,1);
+    }
+    gMic.clients[slot]=client+1;++gMic.users;pthread_mutex_unlock(&gMicLock);return 0;
+}
+static OSStatus micStop(UInt32 client){
+    pthread_mutex_lock(&gMicLock);unsigned slot=32;
+    for(unsigned i=0;i<32;++i)if(gMic.clients[i]&&gMic.clients[i]==client+1)slot=i;
+    if(slot==32){pthread_mutex_unlock(&gMicLock);return 0;}
+    gMic.clients[slot]=0;if(--gMic.users){pthread_mutex_unlock(&gMicLock);return 0;}
+    gMic.stop=true;bool join=gMic.live;pthread_mutex_unlock(&gMicLock);if(join)pthread_join(gMic.thread,NULL);
+    pthread_mutex_lock(&gMicLock);(void)method(PicassoAudioInputStop,NULL,0,NULL,NULL);micNote(0,2);
+    memset(gMic.pcm,0,sizeof gMic.pcm);memset(gMic.tag,0,sizeof gMic.tag);
+    gMic.live=gMic.stop=false;pthread_mutex_unlock(&gMicLock);return 0;
+}
+static OSStatus micRead(UInt32 frames,const AudioServerPlugInIOCycleInfo *info,void *data){
+    if(!info || !data || !frames || frames>8192)return kAudioHardwareIllegalOperationError;
+    double sample=info->mInputTime.mSampleTime;
+    if(!isfinite(sample)||sample<0||sample>9007199254740991.0||floor(sample)!=sample)return kAudioHardwareIllegalOperationError;
+    if(pthread_mutex_trylock(&gMicLock))return kAudioHardwareNotRunningError;
+    if(!gMic.users || gMic.stop || gMic.fault){pthread_mutex_unlock(&gMicLock);return kAudioHardwareNotRunningError;}
+    float *out=data;uint64_t start=(uint64_t)sample;
+    for(unsigned i=0;i<frames;++i){uint64_t frame=start+i;unsigned at=frame%kMicRingFrames;
+        bool present=gMic.active&&gMic.tag[at]==frame+1;out[i]=present?gMic.pcm[at]/32768.0f:0;
+        gMic.missing+=!present;
+    }
+    ++gMic.reads;pthread_mutex_unlock(&gMicLock);return 0;
 }
 #define REPLY(type,value) do {if(inDataSize<sizeof(type))return kAudioHardwareBadPropertySizeError;*(type *)outData=(value);*outDataSize=sizeof(type);return 0;} while(0)
 #define REPLY_STR(s) REPLY(CFStringRef,CFSTR(s))
@@ -154,14 +263,15 @@ static OSStatus Initialize(AudioServerPlugInDriverRef d,AudioServerPlugInHostRef
 }
 static OSStatus CreateDevice(AudioServerPlugInDriverRef d,CFDictionaryRef a,const AudioServerPlugInClientInfo *b,AudioObjectID *c){(void)d;(void)a;(void)b;(void)c;return kAudioHardwareUnsupportedOperationError;}
 static OSStatus DestroyDevice(AudioServerPlugInDriverRef d,AudioObjectID o){(void)d;(void)o;return kAudioHardwareUnsupportedOperationError;}
-static OSStatus AddDeviceClient(AudioServerPlugInDriverRef d,AudioObjectID o,const AudioServerPlugInClientInfo *c){(void)d;(void)c;pthread_mutex_lock(&gLock);note(8,0,1,o);pthread_mutex_unlock(&gLock);return o==kDevice?0:kAudioHardwareBadObjectError;}
+static OSStatus AddDeviceClient(AudioServerPlugInDriverRef d,AudioObjectID o,const AudioServerPlugInClientInfo *c){(void)d;(void)c;pthread_mutex_lock(&gLock);note(8,0,1,o);pthread_mutex_unlock(&gLock);return o==kDevice||o==kMicDevice?0:kAudioHardwareBadObjectError;}
 static OSStatus StopIO(AudioServerPlugInDriverRef,AudioObjectID,UInt32);
 static OSStatus RemoveDeviceClient(AudioServerPlugInDriverRef d,AudioObjectID o,const AudioServerPlugInClientInfo *c){return c?StopIO(d,o,c->mClientID):kAudioHardwareIllegalOperationError;}
 static OSStatus PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d,AudioObjectID o,UInt64 a,void *i){(void)d;(void)o;(void)a;(void)i;return kAudioHardwareUnsupportedOperationError;}
 static OSStatus AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d,AudioObjectID o,UInt64 a,void *i){(void)d;(void)o;(void)a;(void)i;return kAudioHardwareUnsupportedOperationError;}
 static UInt32 objects(AudioObjectID o, AudioObjectPropertyScope scope, AudioObjectID *list) {
     UInt32 n = 0;
-    if (o == kPlugIn) list[n++] = kDevice;
+    if (o == kPlugIn) {list[n++] = kDevice;list[n++] = kMicDevice;}
+    else if(o==kMicDevice && scope!=kAudioObjectPropertyScopeOutput)list[n++]=kMicStream;
     else if (o == kDevice) {
         if (scope != kAudioObjectPropertyScopeInput) list[n++] = kOutStream;
         if (gTapEnabled && scope != kAudioObjectPropertyScopeOutput) list[n++] = kTapStream;
@@ -174,8 +284,8 @@ static UInt32 objects(AudioObjectID o, AudioObjectPropertyScope scope, AudioObje
 // independent of the stream/control list selectors.
 static bool objectMatchesClass(AudioObjectID object, AudioClassID wanted) {
     if(wanted==kAudioObjectClassID)return true;
-    if(object==kDevice)return wanted==kAudioDeviceClassID;
-    if(object==kOutStream || object==kTapStream)return wanted==kAudioStreamClassID;
+    if(object==kDevice || object==kMicDevice)return wanted==kAudioDeviceClassID;
+    if(object==kOutStream || object==kTapStream || object==kMicStream)return wanted==kAudioStreamClassID;
     if(object==kVolume)return wanted==kAudioControlClassID || wanted==kAudioLevelControlClassID || wanted==kAudioVolumeControlClassID;
     if(object==kMute)return wanted==kAudioControlClassID || wanted==kAudioBooleanControlClassID || wanted==kAudioMuteControlClassID;
     return false;
@@ -198,12 +308,12 @@ static OSStatus ownedObjects(AudioObjectID o,AudioObjectPropertyScope scope,UInt
 static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 inDataSize,
                              UInt32 *outDataSize, void *outData) {
     const AudioObjectPropertySelector s = a->mSelector;
-    if(s==kAudioObjectPropertyOwnedObjects && o>=kPlugIn && o<=kTapStream){
+    if(s==kAudioObjectPropertyOwnedObjects && o>=kPlugIn && o<=kMicStream){
         if(o==kTapStream && !gTapEnabled)return kAudioHardwareBadObjectError;
         return ownedObjects(o,a->mScope,qs,q,inDataSize,outDataSize,outData);
     }
     if(o==kTapStream && !gTapEnabled)return kAudioHardwareBadObjectError;
-    if (o >= kPlugIn && o <= kTapStream && (s == kAudioObjectPropertyCustomPropertyInfoList || ((s == kAudioPlugInPropertyBoxList ||
+    if (o >= kPlugIn && o <= kMicStream && (s == kAudioObjectPropertyCustomPropertyInfoList || ((s == kAudioPlugInPropertyBoxList ||
         s == kAudioPlugInPropertyClockDeviceList) && o == kPlugIn))) {
         *outDataSize = 0;
         return 0;
@@ -217,25 +327,27 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kAudioObjectPropertyManufacturer: REPLY_STR("UniXNU");
         case kAudioPlugInPropertyDeviceList: {
             if (inDataSize < sizeof(AudioObjectID)) {*outDataSize = 0; return 0;}
-            ((AudioObjectID *)outData)[0] = kDevice; *outDataSize = sizeof(AudioObjectID); return 0;
+            AudioObjectID list[2]={kDevice,kMicDevice};UInt32 count=inDataSize/sizeof(AudioObjectID);if(count>2)count=2;
+            memcpy(outData,list,count*sizeof(AudioObjectID));*outDataSize=count*sizeof(AudioObjectID);return 0;
         }
         case kAudioPlugInPropertyTranslateUIDToDevice: {
             CFStringRef uid = q && qs >= sizeof(CFStringRef) ? *(const CFStringRef *)q : NULL;
-            REPLY(AudioObjectID, uid && CFStringCompare(uid, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo ? kDevice : kAudioObjectUnknown);
+            REPLY(AudioObjectID, uid && CFStringCompare(uid, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo ? kDevice : uid && CFStringCompare(uid,CFSTR("PicassoMicrophone"),0)==kCFCompareEqualTo?kMicDevice:kAudioObjectUnknown);
         }
         case kAudioPlugInPropertyResourceBundle: REPLY_STR("");
         default: return kAudioHardwareUnknownPropertyError;
         }
     case kDevice:
+    case kMicDevice:
         switch (s) {
         case kAudioObjectPropertyBaseClass: REPLY(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass: REPLY(AudioClassID, kAudioDeviceClassID);
         case kAudioObjectPropertyOwner: REPLY(AudioObjectID, kPlugIn);
-        case kAudioObjectPropertyName: REPLY_STR("Speaker");
+        case kAudioObjectPropertyName: if(o==kMicDevice){REPLY_STR("Picasso Microphone");} REPLY_STR("Speaker");
         case kAudioObjectPropertyManufacturer: REPLY_STR("UniXNU");
-        case kAudioDevicePropertyDeviceUID: REPLY_STR(kDeviceUID);
+        case kAudioDevicePropertyDeviceUID: if(o==kMicDevice){REPLY_STR("PicassoMicrophone");} REPLY_STR(kDeviceUID);
         case kAudioDevicePropertyModelUID: REPLY_STR(kModelUID);
-        case kAudioObjectPropertyModelName: REPLY_STR("Speaker");
+        case kAudioObjectPropertyModelName: if(o==kMicDevice){REPLY_STR("Picasso Microphone");} REPLY_STR("Speaker");
         case kAudioObjectPropertySerialNumber: REPLY_STR("0001");
         case kAudioObjectPropertyFirmwareVersion: REPLY_STR("1.0");
         case kAudioObjectPropertyIdentify: REPLY(UInt32, 0);
@@ -249,52 +361,52 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kDeviceVolumeDecibels:
         case kDeviceVolumeRangeDecibels:
         case kDeviceMute:
-            if(a->mScope!=kAudioObjectPropertyScopeOutput || a->mElement!=kAudioObjectPropertyElementMaster)
+            if(o==kMicDevice || a->mScope!=kAudioObjectPropertyScopeOutput || a->mElement!=kAudioObjectPropertyElementMaster)
                 return kAudioHardwareUnknownPropertyError;
             if(s==kDeviceVolumeScalar) {REPLY(Float32,gVolume);}
             if(s==kDeviceVolumeDecibels) {REPLY(Float32,toDb(gVolume));}
             if(s==kDeviceMute) {REPLY(UInt32,gMuted);}
             REPLY(AudioValueRange,((AudioValueRange){kMinDb,0.0}));
-        case kAudioDevicePropertyTransportType: REPLY(UInt32, kAudioDeviceTransportTypeBuiltIn);
-        case kAudioDevicePropertyRelatedDevices: REPLY(AudioObjectID, kDevice);
+        case kAudioDevicePropertyTransportType: REPLY(UInt32, o==kMicDevice?kAudioDeviceTransportTypeThunderbolt:kAudioDeviceTransportTypeBuiltIn);
+        case kAudioDevicePropertyRelatedDevices: REPLY(AudioObjectID, o);
         case kAudioDevicePropertyClockDomain: REPLY(UInt32, 0);
         case kAudioDevicePropertyDeviceIsAlive: REPLY(UInt32, gConnect != 0);
-        case kAudioDevicePropertyDeviceIsRunning: REPLY(UInt32, gIoUsers > 0 && !gFault);
-        case kAudioDevicePropertyDeviceCanBeDefaultDevice: REPLY(UInt32, a->mScope != kAudioObjectPropertyScopeInput);
-        case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: REPLY(UInt32, a->mScope != kAudioObjectPropertyScopeInput);
-        case kAudioDevicePropertyLatency: REPLY(UInt32, latencyFrames());
+        case kAudioDevicePropertyDeviceIsRunning: REPLY(UInt32, o==kMicDevice?gMic.users>0&&!gMic.fault:gIoUsers>0&&!gFault);
+        case kAudioDevicePropertyDeviceCanBeDefaultDevice: REPLY(UInt32, o==kMicDevice?a->mScope==kAudioObjectPropertyScopeInput:a->mScope!=kAudioObjectPropertyScopeInput);
+        case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: REPLY(UInt32, o==kMicDevice?a->mScope==kAudioObjectPropertyScopeInput:a->mScope!=kAudioObjectPropertyScopeInput);
+        case kAudioDevicePropertyLatency: REPLY(UInt32, o==kMicDevice?0:latencyFrames());
         // The input is already-accepted software PCM, not delayed capture DMA.
-        case kAudioDevicePropertySafetyOffset: REPLY(UInt32, a->mScope==kAudioObjectPropertyScopeInput?0:kSafetyFrames);
+        case kAudioDevicePropertySafetyOffset: REPLY(UInt32, o==kMicDevice?kMicSafety:a->mScope==kAudioObjectPropertyScopeInput?0:kSafetyFrames);
         case kAudioDevicePropertyNominalSampleRate: REPLY(Float64, kRate);
         case kAudioDevicePropertyAvailableNominalSampleRates: REPLY(AudioValueRange, ((AudioValueRange){kRate, kRate}));
         case kAudioDevicePropertyIsHidden: REPLY(UInt32, 0);
-        case kAudioDevicePropertyZeroTimeStampPeriod: REPLY(UInt32, kZeroPeriod);
+        case kAudioDevicePropertyZeroTimeStampPeriod: REPLY(UInt32, o==kMicDevice?kMicZeroPeriod:kZeroPeriod);
         case kAudioDevicePropertyClockIsStable: REPLY(UInt32, 0);
         case kAudioDevicePropertyClockAlgorithm: REPLY(UInt32, kAudioDeviceClockAlgorithmRaw);
         case kAudioDevicePropertyPreferredChannelsForStereo: {
             if (inDataSize < 2 * sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
-            ((UInt32 *)outData)[0] = 1; ((UInt32 *)outData)[1] = a->mScope == kAudioObjectPropertyScopeInput && !gTapEnabled ? 0 : 2;
+            ((UInt32 *)outData)[0] = 1; ((UInt32 *)outData)[1] = o==kMicDevice?(a->mScope==kAudioObjectPropertyScopeOutput?0:1):a->mScope == kAudioObjectPropertyScopeInput && !gTapEnabled ? 0 : 2;
             *outDataSize = 2 * sizeof(UInt32); return 0;
         }
         case kAudioDevicePropertyPreferredChannelLayout: {
-            const UInt32 channels = a->mScope == kAudioObjectPropertyScopeInput && !gTapEnabled ? 0 : 2;
+            const UInt32 channels = o==kMicDevice?(a->mScope==kAudioObjectPropertyScopeOutput?0:1):a->mScope == kAudioObjectPropertyScopeInput && !gTapEnabled ? 0 : 2;
             const UInt32 bytes = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions) + channels * sizeof(AudioChannelDescription));
             if (inDataSize < bytes) return kAudioHardwareBadPropertySizeError;
             AudioChannelLayout *l = outData;
             memset(l, 0, bytes);
             l->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
             l->mNumberChannelDescriptions = channels;
-            if (channels) l->mChannelDescriptions[0].mChannelLabel = kAudioChannelLabel_Left;
+            if (channels) l->mChannelDescriptions[0].mChannelLabel = o==kMicDevice?kAudioChannelLabel_Center:kAudioChannelLabel_Left;
             if (channels == 2) l->mChannelDescriptions[1].mChannelLabel = kAudioChannelLabel_Right;
             *outDataSize = bytes; return 0;
         }
         case kAudioDevicePropertyStreams:
         case kAudioObjectPropertyControlList: {
             AudioObjectID list[4];
-            UInt32 n = objects(kDevice, a->mScope, list), out = 0;
+            UInt32 n = objects(o, a->mScope, list), out = 0;
             for (UInt32 i = 0; i < n; ++i) {
-                if (s == kAudioDevicePropertyStreams && list[i] != kOutStream && list[i] != kTapStream) continue;
-                if (s == kAudioObjectPropertyControlList && (list[i] == kOutStream || list[i] == kTapStream)) continue;
+                if (s == kAudioDevicePropertyStreams && list[i] != kOutStream && list[i] != kTapStream && list[i] != kMicStream) continue;
+                if (s == kAudioObjectPropertyControlList && (list[i] == kOutStream || list[i] == kTapStream || list[i]==kMicStream)) continue;
                 if ((out + 1) * sizeof(AudioObjectID) > inDataSize) break;
                 ((AudioObjectID *)outData)[out++] = list[i];
             }
@@ -304,21 +416,22 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         }
     case kOutStream:
     case kTapStream:
+    case kMicStream:
     {
-        const UInt32 channels = 2;
+        const UInt32 channels = o==kMicStream?1:2;
         switch (s) {
         case kAudioObjectPropertyBaseClass: REPLY(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass: REPLY(AudioClassID, kAudioStreamClassID);
-        case kAudioObjectPropertyOwner: REPLY(AudioObjectID, kDevice);
-        case kAudioObjectPropertyName: if(o==kTapStream){REPLY_STR("Picasso Playback Reference");} REPLY_STR("Picasso Speaker");
+        case kAudioObjectPropertyOwner: REPLY(AudioObjectID, o==kMicStream?kMicDevice:kDevice);
+        case kAudioObjectPropertyName: if(o==kMicStream){REPLY_STR("Picasso AMIC1");} if(o==kTapStream){REPLY_STR("Picasso Playback Reference");} REPLY_STR("Picasso Speaker");
         // Native UInt32 stream property in iOS16 CoreAudio (not a custom CF value).
         case 'taps':
             if(a->mScope!=kAudioObjectPropertyScopeGlobal || a->mElement!=0)return kAudioHardwareUnknownPropertyError;
             REPLY(UInt32,o==kTapStream);
         case kAudioObjectPropertyOwnedObjects: *outDataSize = 0; return 0;
-        case kAudioStreamPropertyIsActive: REPLY(UInt32, o==kTapStream?gTapActive:gStreamActive);
-        case kAudioStreamPropertyDirection: REPLY(UInt32, o==kTapStream);
-        case kAudioStreamPropertyTerminalType: REPLY(UInt32, o==kTapStream?kAudioStreamTerminalTypeLine:kAudioStreamTerminalTypeSpeaker);
+        case kAudioStreamPropertyIsActive: REPLY(UInt32, o==kMicStream?gMic.active:o==kTapStream?gTapActive:gStreamActive);
+        case kAudioStreamPropertyDirection: REPLY(UInt32, o==kTapStream||o==kMicStream);
+        case kAudioStreamPropertyTerminalType: REPLY(UInt32, o==kMicStream?kAudioStreamTerminalTypeMicrophone:o==kTapStream?kAudioStreamTerminalTypeLine:kAudioStreamTerminalTypeSpeaker);
         case kAudioStreamPropertyStartingChannel: REPLY(UInt32, 1);
         case kAudioStreamPropertyLatency: REPLY(UInt32, 0);
         case kAudioStreamPropertyVirtualFormat:
@@ -346,7 +459,7 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         switch (s) {
         case kAudioObjectPropertyBaseClass: REPLY(AudioClassID, kAudioLevelControlClassID);
         case kAudioObjectPropertyClass: REPLY(AudioClassID, kAudioVolumeControlClassID);
-        case kAudioObjectPropertyOwner: REPLY(AudioObjectID, kDevice);
+        case kAudioObjectPropertyOwner: REPLY(AudioObjectID, o==kMicStream?kMicDevice:kDevice);
         case kAudioObjectPropertyOwnedObjects: *outDataSize = 0; return 0;
         case kAudioControlPropertyScope: REPLY(AudioObjectPropertyScope, kAudioObjectPropertyScopeOutput);
         case kAudioControlPropertyElement: REPLY(AudioObjectPropertyElement, kAudioObjectPropertyElementMaster);
@@ -383,8 +496,10 @@ static void propertyNote(AudioObjectID o,const AudioObjectPropertyAddress *a,uns
 }
 static OSStatus queryProperty(AudioObjectID o,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 n,UInt32 *z,void *v,unsigned operation){
     if(!a||!z||(!v&&n))return kAudioHardwareIllegalOperationError;
-    pthread_mutex_lock(&gLock);*z=0;OSStatus rc=propertyData(o,a,qs,q,n,z,v);
-    propertyNote(o,a,operation,rc);pthread_mutex_unlock(&gLock);return rc;
+    bool mic=o==kMicDevice||o==kMicStream;pthread_mutex_t *lock=mic?&gMicLock:&gLock;
+    pthread_mutex_lock(lock);*z=0;OSStatus rc=propertyData(o,a,qs,q,n,z,v);
+    pthread_mutex_unlock(lock);
+    pthread_mutex_lock(&gLock);propertyNote(o,a,operation,rc);pthread_mutex_unlock(&gLock);return rc;
 }
 static OSStatus GetPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 n,UInt32 *z,void *v){
     (void)d;(void)pid;return queryProperty(o,a,qs,q,n,z,v,0);
@@ -401,8 +516,8 @@ static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d,AudioObjectID o,
     *set=(outputMaster&&(a->mSelector==kDeviceVolumeScalar||a->mSelector==kDeviceVolumeDecibels||a->mSelector==kDeviceMute))||
         (o==kMute&&a->mSelector==kAudioBooleanControlPropertyValue)||
         (o==kVolume&&(a->mSelector==kAudioLevelControlPropertyScalarValue||a->mSelector==kAudioLevelControlPropertyDecibelValue))||
-        ((o==kOutStream||(o==kTapStream&&gTapEnabled))&&(a->mSelector==kAudioStreamPropertyVirtualFormat||a->mSelector==kAudioStreamPropertyPhysicalFormat||a->mSelector==kAudioStreamPropertyIsActive))||
-        (o==kDevice&&a->mSelector==kAudioDevicePropertyNominalSampleRate);
+        ((o==kOutStream||o==kMicStream||(o==kTapStream&&gTapEnabled))&&(a->mSelector==kAudioStreamPropertyVirtualFormat||a->mSelector==kAudioStreamPropertyPhysicalFormat||a->mSelector==kAudioStreamPropertyIsActive))||
+        ((o==kDevice||o==kMicDevice)&&a->mSelector==kAudioDevicePropertyNominalSampleRate);
     return HasProperty(d,o,pid,a)?0:kAudioHardwareUnknownPropertyError;
 }
 static OSStatus setPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 n,const void *v){
@@ -431,22 +546,23 @@ static OSStatus setPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid
             gHost->PropertiesChanged(gHost,kDevice,2,changed);}
         return 0;
     }
-    if((o==kOutStream||(o==kTapStream&&gTapEnabled))&&a->mSelector==kAudioStreamPropertyIsActive){
+    if((o==kOutStream||o==kMicStream||(o==kTapStream&&gTapEnabled))&&a->mSelector==kAudioStreamPropertyIsActive){
         if(n!=sizeof(UInt32))return kAudioHardwareBadPropertySizeError;
-        pthread_mutex_lock(&gLock);bool active=*(const UInt32 *)v!=0;
-        bool *state=o==kTapStream?&gTapActive:&gStreamActive,changed=active!=*state;
+        pthread_mutex_t *lock=o==kMicStream?&gMicLock:&gLock;
+        pthread_mutex_lock(lock);bool active=*(const UInt32 *)v!=0;
+        bool *state=o==kMicStream?&gMic.active:o==kTapStream?&gTapActive:&gStreamActive,changed=active!=*state;
         *state=active;
         // Disabling the stream discards queued software mixes; DMA already
         // submitted remains owned by the worker and completes normally.
         if(!active && o==kOutStream)memset(&gMix,0,sizeof gMix);
-        pthread_mutex_unlock(&gLock);
+        pthread_mutex_unlock(lock);
         if(changed&&gHost)gHost->PropertiesChanged(gHost,o,1,a);
         return 0;
     }
-    if((o==kOutStream||(o==kTapStream&&gTapEnabled))&&(a->mSelector==kAudioStreamPropertyVirtualFormat||a->mSelector==kAudioStreamPropertyPhysicalFormat)){
-        AudioStreamBasicDescription f=format(2);return n==sizeof f&&!memcmp(v,&f,sizeof f)?0:kAudioDeviceUnsupportedFormatError;
+    if((o==kOutStream||o==kMicStream||(o==kTapStream&&gTapEnabled))&&(a->mSelector==kAudioStreamPropertyVirtualFormat||a->mSelector==kAudioStreamPropertyPhysicalFormat)){
+        AudioStreamBasicDescription f=format(o==kMicStream?1:2);return n==sizeof f&&!memcmp(v,&f,sizeof f)?0:kAudioDeviceUnsupportedFormatError;
     }
-    if(o==kDevice&&a->mSelector==kAudioDevicePropertyNominalSampleRate)return n==sizeof(Float64)&&*(const Float64 *)v==kRate?0:kAudioDeviceUnsupportedFormatError;
+    if((o==kDevice||o==kMicDevice)&&a->mSelector==kAudioDevicePropertyNominalSampleRate)return n==sizeof(Float64)&&*(const Float64 *)v==kRate?0:kAudioDeviceUnsupportedFormatError;
     return kAudioHardwareUnknownPropertyError;
 }
 static OSStatus SetPropertyData(AudioServerPlugInDriverRef d,AudioObjectID o,pid_t pid,const AudioObjectPropertyAddress *a,UInt32 qs,const void *q,UInt32 n,const void *v){
@@ -532,7 +648,7 @@ static kern_return_t waitRunning(void){
     return kIOReturnBusy;
 }
 static OSStatus StartIO(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 client){
-    (void)d;if(o!=kDevice||client==UINT32_MAX)return kAudioHardwareBadObjectError;
+    (void)d;if(o==kMicDevice)return micStart(client);if(o!=kDevice||client==UINT32_MAX)return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gLock);unsigned slot=32;
     for(unsigned i=0;i<32;i++){if(gClients[i]==client+1){pthread_mutex_unlock(&gLock);return 0;}if(!gClients[i])slot=i;}
     if(slot==32||gStop||(gIoUsers&&gFault)){pthread_mutex_unlock(&gLock);return kAudioHardwareIllegalOperationError;}
@@ -554,7 +670,7 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 clie
     gClients[slot]=client+1;++gIoUsers;pthread_mutex_unlock(&gLock);return 0;
 }
 static OSStatus StopIO(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 client){
-    (void)d;if(o!=kDevice)return kAudioHardwareBadObjectError;
+    (void)d;if(o==kMicDevice)return micStop(client);if(o!=kDevice)return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gLock);unsigned slot=32;for(unsigned i=0;i<32;i++)if(gClients[i]&&gClients[i]==client+1)slot=i;
     if(slot==32){pthread_mutex_unlock(&gLock);return 0;}gClients[slot]=0;--gIoUsers;
     if(gIoUsers){pthread_mutex_unlock(&gLock);return 0;}
@@ -566,17 +682,21 @@ static OSStatus StopIO(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 clien
     gStop=false;pthread_mutex_unlock(&gLock);return 0;
 }
 static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 client,Float64 *sample,UInt64 *host,UInt64 *seed){
-    (void)d;(void)client;if(o!=kDevice||!sample||!host||!seed)return kAudioHardwareIllegalOperationError;
-    pthread_mutex_lock(&gLock);uint64_t now=mach_absolute_time(),elapsed=now>gOrigin?now-gOrigin:0;
-    uint64_t period=(uint64_t)(elapsed/(gHostTicksPerFrame*kZeroPeriod));*sample=(Float64)(period*kZeroPeriod);
-    *host=gOrigin+(uint64_t)(*sample*gHostTicksPerFrame);*seed=gSeed;pthread_mutex_unlock(&gLock);return 0;
+    (void)d;(void)client;if((o!=kDevice&&o!=kMicDevice)||!sample||!host||!seed)return kAudioHardwareIllegalOperationError;
+    pthread_mutex_t *lock=o==kMicDevice?&gMicLock:&gLock;
+    pthread_mutex_lock(lock);uint64_t origin=o==kMicDevice?gMic.origin:gOrigin;
+    UInt32 zero=o==kMicDevice?kMicZeroPeriod:kZeroPeriod;
+    uint64_t now=mach_absolute_time(),elapsed=now>origin?now-origin:0;
+    uint64_t period=(uint64_t)(elapsed/(gHostTicksPerFrame*zero));*sample=(Float64)(period*zero);
+    *host=origin+(uint64_t)(*sample*gHostTicksPerFrame);*seed=o==kMicDevice?gMic.seed:gSeed;pthread_mutex_unlock(lock);return 0;
 }
 static OSStatus WillDoIOOperation(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 client,UInt32 op,Boolean *will,Boolean *inPlace){
-    (void)d;(void)client;if(o!=kDevice||!will||!inPlace)return kAudioHardwareIllegalOperationError;*will=op==kAudioServerPlugInIOOperationWriteMix || (gTapEnabled&&op==kAudioServerPlugInIOOperationReadInput);*inPlace=true;return 0;
+    (void)d;(void)client;if((o!=kDevice&&o!=kMicDevice)||!will||!inPlace)return kAudioHardwareIllegalOperationError;*will=o==kMicDevice?op==kAudioServerPlugInIOOperationReadInput:op==kAudioServerPlugInIOOperationWriteMix || (gTapEnabled&&op==kAudioServerPlugInIOOperationReadInput);*inPlace=true;return 0;
 }
 static OSStatus BeginIOOperation(AudioServerPlugInDriverRef d,AudioObjectID o,UInt32 c,UInt32 op,UInt32 n,const AudioServerPlugInIOCycleInfo *i){(void)d;(void)o;(void)c;(void)op;(void)n;(void)i;return 0;}
 static OSStatus DoIOOperation(AudioServerPlugInDriverRef d,AudioObjectID o,AudioObjectID stream,UInt32 client,UInt32 op,UInt32 frames,const AudioServerPlugInIOCycleInfo *info,void *main,void *secondary){
     (void)d;(void)client;(void)secondary;
+    if(o==kMicDevice && stream==kMicStream && op==kAudioServerPlugInIOOperationReadInput)return micRead(frames,info,main);
     bool read=op==kAudioServerPlugInIOOperationReadInput && stream==kTapStream && gTapEnabled;
     bool write=op==kAudioServerPlugInIOOperationWriteMix && stream==kOutStream;
     if(o!=kDevice||(!read&&!write)||!info||!main||!frames||frames>8192)return kAudioHardwareIllegalOperationError;

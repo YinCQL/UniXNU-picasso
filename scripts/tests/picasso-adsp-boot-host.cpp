@@ -20,7 +20,7 @@ static unsigned commands[8],commandCount,addresses[32],values[32];
 static bool is(const char *s){return !strcmp(mode,s);}
 struct boot_args { uint64_t physBase,memSize; } args={0xc007c000,0x13ca00000};
 struct {void *bootArgs;} PE_state={&args};
-enum {kIOMapAnywhere=1,kIOMapInhibitCache=2,kSecondScale=1};
+enum {kIOMapAnywhere=1,kIOMapInhibitCache=2,kSecondScale=1000,kMillisecondScale=1};
 class IOMemoryMap {
 public:
     uintptr_t address;
@@ -47,7 +47,7 @@ public:
 static void IOLog(const char *fmt,...) {va_list a;va_start(a,fmt);vprintf(fmt,a);va_end(a);}
 static void IOSleep(unsigned ms){ticks+=ms;assert(ticks<45000);}
 static uint64_t mach_absolute_time(){return ticks;}
-static void clock_interval_to_deadline(unsigned n,unsigned scale,uint64_t *out){assert(scale==1);*out=ticks+n*1000;}
+static void clock_interval_to_deadline(unsigned n,unsigned scale,uint64_t *out){assert(scale==1||scale==1000);*out=ticks+n*scale;}
 #include "PicassoAdspBoot-body.inc"
 extern "C" int picasso_pas_acquire(){++leases;assert(!owned);if(is("lease") || (is("reacquire")&&leases>1))return -16;owned=true;return 0;}
 extern "C" void picasso_pas_release(bool uncertain){assert(owned);owned=false;poison=uncertain;++releases;}
@@ -106,12 +106,17 @@ static void service(void *) {
     assert(latest.hasValue && (latest.value&2) && !(latest.value&1) && !latest.restart);
     ++services;
 }
+static unsigned fastCalls;
+static bool fast(void *) {
+    assert(services && latest.hasValue && (latest.value&2) && !(latest.value&1));
+    ++fastCalls;return is("fast");
+}
 static int snapshot(void *){++snapshots;return -2;}
 int main(int argc,char **argv){
     assert(argc==2);mode=argv[1];memset(expected,0x5a,sizeof expected);
     if(is("memory-overlap"))args.physBase=0x89200000;
     if(is("memory-missing"))PE_state.bootArgs=nullptr;
-    PicassoAdspEvents events={nullptr,poll,snapshot,service};picasso_adsp_boot(&events);picasso_adsp_boot(&events);
+    PicassoAdspEvents events={nullptr,poll,snapshot,fast,service};picasso_adsp_boot(&events);picasso_adsp_boot(&events);
     assert(!owned && opens<=1 && closes==(opens && !is("firmware")));
     assert(releases==(is("lease")?0U:is("reacquire")?1U:leases));
     bool quarantine=is("interrupted")||is("shutdown")||is("aop-uncertain")||is("off")||is("close")||is("shutdown-vote")||is("reacquire")||is("vote1")||is("vote2")||is("vote3");
@@ -128,6 +133,7 @@ int main(int argc,char **argv){
     for(unsigned i=0;i<writes;++i)assert(values[i]==(addresses[i]==0x30050?3U:addresses[i]==0x30030?7U:6U));
     if(is("memory-overlap")||is("memory-missing"))assert(!maps&&!on&&!writes&&!commandCount);
     if(is("initial-restart")||is("restart-no-entry")||is("lost-ready"))assert(polls<=4 && shutdowns==1);
+    if(is("fast"))assert(services==2 && fastCalls==40 && ticks==40);
     if(is("long-ready"))assert(snapshots==4 && ticks==31000 && shutdowns==1);
     puts("PASS production ADSP transaction ordering, failure cleanup, ownership and stale/ready/fatal handling");
 }

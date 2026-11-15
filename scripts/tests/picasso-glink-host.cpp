@@ -51,6 +51,7 @@ static void playTests();
 static void continuousPlayTests();
 static void controlContinuationTests();
 static void captureIntentTests();
+static void captureFastTests();
 int main(){
     PicassoGlink s={};PicassoSmemAudit audit={};bool kick;
     setup();held=false;assert(picasso_glink_prepare(&io,&s,&audit)==-16 && !writes);
@@ -136,7 +137,7 @@ int main(){
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==8);
     assert(!picasso_glink_service(&io,&s,&kick) && s.commands==16);
     assert(picasso_glink_service(&io,&s,&kick)==-71 && s.commands==16);
-    audioPinTests();afePortTests();tfaPortTests();streamTests();pcmTests();playTests();continuousPlayTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();controlContinuationTests();captureIntentTests();channelTests();qrtrTests();
+    audioPinTests();afePortTests();tfaPortTests();streamTests();pcmTests();playTests();continuousPlayTests();afeClockTests();afeConfigureTests();registryQmiTests();afeTests();tftpTests();fastrpcTests();local187Tests();build186Tests();build185Tests();build184Tests();controlContinuationTests();captureIntentTests();captureFastTests();channelTests();qrtrTests();
     printf("PASS GLINK fresh allocation, %u write/%u read failures, version/ACK, late peer, wrap, variable RX, pressure, incomplete OPEN, malformed cursor and deadline\n",maxWrites,maxReads);
 }
 // Synthetic remote encodes wire bytes independently of the implementation.
@@ -1980,4 +1981,33 @@ static void captureIntentTests() {
     message(s,rx,8,7,1);step(s);
     assert(s.apr.capture.pending && !s.apr.intentGranted && !s.apr.intentAsked);
     puts("PASS APR intent ownership: independent capture/playback refusal, stale phase/sequence ACK and grant ordering");
+}
+
+static void captureFastTests() {
+    static PicassoGlink s;unsigned rx=playReady(s);s.apr.play.enabled=false;
+    captureReady(s,PicassoCaptureRead);auto &v=s.apr.capture;v.streaming=true;
+    s.remoteIntent[0].busy=false;s.apr.intentAsked=s.apr.intentGranted=false;
+    offer(s,rx,92);step(s);drain(s);
+    assert(v.readSent==2&&v.inflight==3);
+    unsigned ticks=s.apr.ticks,wait=v.readWait[1],reuse=s.localReuse;bool kick=false;
+    uint32_t token=picasso_capture_read_token(v,v.readSequence[0]);
+    uint32_t reply[]={0x00400050,0x02010407,0x02010507,token,0x10d9a,
+        0,0x80008000,1,0x7788,384,0,100000,0,0x80000000,1,v.readSequence[0]};
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(reply),sizeof reply);message(s,rx,14,7,91);
+    assert(!picasso_glink_service(&io,&s,&kick,false));drain(s);
+    assert(kick&&v.readDone==1&&v.readSent==3&&v.inflight==3&&s.localReuse==reuse+1);
+    assert(s.apr.ticks==ticks&&v.readWait[1]==wait);
+    for(unsigned i=0;i<200;++i) {assert(!picasso_glink_service(&io,&s,&kick,false));drain(s);}
+    assert(v.readWait[1]==wait&&s.apr.ticks==ticks&&!v.error);
+    // Both slot ownership and remote intent ownership are necessary to refill.
+    reply[3]=picasso_capture_read_token(v,v.readSequence[0]);reply[15]=v.readSequence[0];reply[11]=104000;
+    packet(s,rx,1,reinterpret_cast<uint8_t *>(reply),sizeof reply);
+    assert(!picasso_glink_service(&io,&s,&kick,false));drain(s);
+    assert(v.readDone==2&&v.readSent==3&&v.inflight==2&&v.prepared);
+    message(s,rx,14,7,91);assert(!picasso_glink_service(&io,&s,&kick,false));drain(s);
+    assert(v.readSent==4&&v.inflight==3);
+    // The other stream still gets an available intent while capture is active.
+    s.apr.play.enabled=true;message(s,rx,14,7,92);
+    assert(!picasso_glink_service(&io,&s,&kick,false));drain(s);assert(s.apr.play.pending);
+    puts("PASS fast capture refill, committed receive reuse, real intents, playback progress and unchanged deadlines");
 }

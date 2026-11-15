@@ -9,6 +9,7 @@
 #include <sys/proc.h>
 #include <sys/codesign.h>
 #include "PicassoAudioQueue.h"
+#include "PicassoMicService.h"
 #include "PicassoApr.h"
 extern "C" kmod_info_t g_kernel_kmod_info;
 extern "C" void picasso_audio_static_init(void) __asm__("__GLOBAL__sub_I_PicassoAudioService.cpp");
@@ -25,7 +26,9 @@ static int audioCall(uint64_t owner,unsigned selector,const void *input,unsigned
     if(!queueLock)return -6;
     IOLockLock(queueLock);int e=-22;
     if(closed && *closed) {IOLockUnlock(queueLock);return -1;}
-    if(selector==PicassoAudioGetStatus && !bytes && output && outBytes && *outBytes==sizeof(PicassoAudioStatus)) {
+    if(selector>=PicassoAudioInputStatus && selector<=PicassoAudioInputStop)
+        e=picasso_mic_service_call(owner,selector,input,bytes,output,outBytes?*outBytes:0);
+    else if(selector==PicassoAudioGetStatus && !bytes && output && outBytes && *outBytes==sizeof(PicassoAudioStatus)) {
         *static_cast<PicassoAudioStatus *>(output)=picasso_audio_status(queue);e=0;
     } else if(selector==PicassoAudioBegin && input && bytes==sizeof format && !output)
         e=picasso_audio_begin(queue,owner,*static_cast<const PicassoAudioFormat *>(input));
@@ -89,6 +92,7 @@ public:
     IOReturn clientClose() override {
         if(queueLock) {IOLockLock(queueLock);closed=true;
             if(queue.owner==reinterpret_cast<uintptr_t>(this))queue.cancel=true;
+            picasso_mic_service_close(reinterpret_cast<uintptr_t>(this));
             IOLockUnlock(queueLock);}
         terminate();return kIOReturnSuccess;
     }
@@ -101,12 +105,15 @@ public:
         if(!queueLock)return kIOReturnNotReady;
         IOLockLock(queueLock);bool wasClosed=closed;IOLockUnlock(queueLock);
         if(wasClosed)return kIOReturnNotOpen;
-        if(selector==PicassoAudioGetStatus) {
-            if(a->structureInputSize || !a->structureOutput || a->structureOutputSize!=sizeof(PicassoAudioStatus))return kIOReturnBadArgument;
+        unsigned expected=selector==PicassoAudioGetStatus?sizeof(PicassoAudioStatus):
+            selector==PicassoAudioInputStatus?sizeof(PicassoAudioInputState):
+            selector==PicassoAudioInputRead?sizeof(PicassoAudioInputData):0;
+        if(expected) {
+            if(a->structureInputSize || !a->structureOutput || a->structureOutputSize!=expected)return kIOReturnBadArgument;
         } else if(a->structureOutputSize)return kIOReturnBadArgument;
         unsigned size=a->structureOutputSize;
         int e=audioCall(reinterpret_cast<uintptr_t>(this),selector,a->structureInput,a->structureInputSize,
-            selector==PicassoAudioGetStatus?a->structureOutput:nullptr,&size,&closed);
+            expected?a->structureOutput:nullptr,&size,&closed);
         return !e?kIOReturnSuccess:e==-22?kIOReturnBadArgument:e==-1?kIOReturnNotPermitted:e==-11?kIOReturnNoSpace:e==-16?kIOReturnBusy:kIOReturnNotReady;
     }
 };
@@ -124,7 +131,7 @@ static void publishAudio() {
     published=attached && service->start(provider);
     if(!published) {registrationFailed=true;if(attached)service->detach(provider);}
     if(service)service->release();
-    IOLog("PICASSO_AUDIO published=%u output=1 input=0 rate=48000 bits=16 channels=2 hal_client=awaiting\n",published);
+    IOLog("PICASSO_AUDIO published=%u output=1 input=1 rate=48000 bits=16 channels=2 hal_client=awaiting\n",published);
 }
 static int audioSource(PicassoPlayback &,PicassoPcm &pcm,unsigned slot,unsigned *bytes) {
     *bytes=0;IOLockLock(queueLock);

@@ -8,6 +8,7 @@ struct PicassoAdspEvents {
     void *context;
     int (*poll)(void *, PicassoSmp2pEvent *);
     int (*snapshot)(void *); // Bounded crash/GLINK observations after startup/failure.
+    bool (*fast)(void *); // Active PCM pump only; never advances deadline ticks.
     void (*service)(void *); // Only after PAS AUTH + fresh ready, never preflight/fatal.
 };
 struct PicassoAdspImage;

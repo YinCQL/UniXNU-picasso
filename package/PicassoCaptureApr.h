@@ -62,7 +62,7 @@ inline unsigned picasso_capture_request(const PicassoCapture &v,uint32_t (&w)[18
     } else if(n==PicassoCaptureRun) {
         bytes=32;w[4]=0x10daa;
     } else if(picasso_capture_data_phase(n)) {
-        bytes=40;w[4]=0x10dac;w[3]=picasso_capture_base(v)+0x1000+v.readSent;
+        bytes=40;w[4]=0x10dac;w[3]=picasso_capture_read_token(v,v.readSent);
         uint64_t address=v.dma.address+uint64_t(v.preparedSlot)*v.dma.slotBytes;
         w[5]=uint32_t(address);w[6]=uint32_t(address>>32);w[7]=v.handle;
         w[8]=v.dma.slotBytes;w[9]=v.readSent;
@@ -108,13 +108,13 @@ inline void picasso_capture_tick(PicassoCapture &v,bool transportReady,bool elap
         }
         v.attempted=true;v.wait=0;
         if(!v.targetFrames)v.targetFrames=PicassoCaptureDefaultFrames;
-        int e=!v.hardware || v.targetFrames>PicassoCaptureRate*10U ? -22:picasso_capture_dma_check(v);
+        int e=!v.hardware || (!v.streaming && v.targetFrames>PicassoCaptureRate*10U) ? -22:picasso_capture_dma_check(v);
         if(e) {v.firstError=v.error=e;v.dmaError=e;v.done=true;++v.events;return;}
         ++v.events;
     }
     if(!transportReady) {picasso_capture_stop(v,-104);return;}
     if(elapsed && v.phase>=PicassoCapturePrime && v.phase<=PicassoCaptureRead) {
-        if(++v.streamTicks>1000)picasso_capture_fail(v,-60);
+        if(!v.streaming && ++v.streamTicks>1000)picasso_capture_fail(v,-60);
         for(unsigned slot=0;slot<2;++slot)
             if((v.inflight&(1U<<slot)) && ++v.readWait[slot]>100) {picasso_capture_fail(v,-60);break;}
     }
@@ -125,14 +125,18 @@ inline void picasso_capture_tick(PicassoCapture &v,bool transportReady,bool elap
     if(v.healthPending || (v.phase==PicassoCaptureRead && v.readDone>=v.healthDone+8)) {
         if(!v.healthPending) {v.healthPending=true;v.healthWait=0;}
         int e=elapsed && ++v.healthWait>100 ? -60:v.hardware(v.context,3);
-        if(e==-11)return;
-        v.healthPending=false;v.healthWait=0;v.healthDone=v.readDone;++v.events;
-        if(e) {
-            if(v.phase<PicassoCaptureClose)picasso_capture_fail(v,e);
-            else if(!v.cleanupError)v.cleanupError=e;
+        if(e!=-11) {
+            v.healthPending=false;v.healthWait=0;v.healthDone=v.readDone;++v.events;
+            if(e) {
+                if(v.phase<PicassoCaptureClose)picasso_capture_fail(v,e);
+                else if(!v.cleanupError)v.cleanupError=e;
+            }
         }
+        // An asynchronous health read must not starve the two PCM slots.
+        // Cleanup still waits before requesting another hardware action.
+        if(v.healthPending && v.phase>=PicassoCaptureClose)return;
     }
-    if(v.phase==PicassoCaptureRead && v.bytesDone>=uint64_t(v.targetFrames)*2 && !v.inflight)
+    if(!v.streaming && v.phase==PicassoCaptureRead && v.bytesDone>=uint64_t(v.targetFrames)*2 && !v.inflight)
         picasso_capture_advance(v);
     // Skip only objects that were never acquired, or cannot be addressed safely.
     // Timed-out MAP/COPP OPEN keeps ownership visible even if no handle arrived.
@@ -168,12 +172,13 @@ inline void picasso_capture_tick(PicassoCapture &v,bool transportReady,bool elap
     if(!picasso_capture_data_phase(v.phase) && elapsed && ++v.wait>(v.pending?100U:250U))picasso_capture_fail(v,-60);
 }
 inline bool picasso_capture_due(PicassoCapture &v) {
-    if(!v.enabled || !v.attempted || v.done || v.pending || v.sent || v.healthPending)return false;
+    if(!v.enabled || !v.attempted || v.done || v.pending || v.sent || (v.healthPending && v.phase>=PicassoCaptureClose))return false;
     if(v.phase==PicassoCapturePrepare || v.phase==PicassoCaptureUnmute || v.phase==PicassoCaptureHardwareStop)return false;
     if(picasso_capture_data_phase(v.phase)) {
         if(v.phase==PicassoCapturePrime && v.readSent>=2)return false;
-        if(v.bytesDone>=uint64_t(v.targetFrames)*2 || v.inflight==3)return false;
-        if(v.readSent>=PicassoCaptureMaxReads) {picasso_capture_fail(v,-75);return false;}
+        if((!v.streaming && v.bytesDone>=uint64_t(v.targetFrames)*2) || v.inflight==3)return false;
+        if(v.streaming ? v.readSent>=UINT32_MAX-(v.readTokenBase?v.readTokenBase:0x80000000U):
+           v.readSent>=PicassoCaptureMaxReads) {picasso_capture_fail(v,-75);return false;}
         if(!v.prepared) {
             unsigned slot=(v.inflight&1)?1:0;
             if(v.dma.busyMask&(1U<<slot)) {picasso_capture_fail(v,-16);return false;}
@@ -193,7 +198,7 @@ inline bool picasso_capture_receive(PicassoCapture &v,const uint8_t *b,unsigned 
     if(!v.attempted || v.done)return false;
     unsigned slot=2;
     for(unsigned i=0;i<2;++i)
-        if((v.inflight&(1U<<i)) && token==picasso_capture_base(v)+0x1000+v.readSequence[i])slot=i;
+        if((v.inflight&(1U<<i)) && token==picasso_capture_read_token(v,v.readSequence[i]))slot=i;
     bool control=v.pending && token==v.token;
     if(slot==2 && !control)return false;
     v.replyPhase=v.phase;v.replyOpcode=opcode;v.replyType=type;v.replyBytes=bytes;
@@ -235,6 +240,7 @@ inline bool picasso_capture_receive(PicassoCapture &v,const uint8_t *b,unsigned 
         // Once cleanup starts, completion retires ownership but cannot publish data.
         if(v.phase>=PicassoCaptureClose) {retire();return true;}
         int e=picasso_capture_dma_check(v);
+        v.dma.timestamp=v.lastTimestamp;v.dma.flags=flags;
         if(!e)e=v.dma.complete(v.dma,slot,offset,size);
         retire();
         if(e) {v.dmaError=e;picasso_capture_fail(v,e);return true;}
@@ -281,10 +287,15 @@ inline bool picasso_capture_rearm(PicassoCapture &v) {
     bool cancelled=v.cancelled && v.firstError==-125 && !v.cleanupError && !v.dmaError;
     if(!v.done || (!v.complete && !cancelled) || v.owned || v.inflight || v.dma.busyMask ||
        picasso_capture_base(v)>=0x7ffe0000U)return false;
+    bool streaming=v.streaming;
+    uint32_t readBase=(v.readTokenBase?v.readTokenBase:0x80000000U);
+    if(streaming && v.readSent>=UINT32_MAX-readBase)return false;
+    if(streaming)readBase+=v.readSent;
     auto dma=v.dma;auto hardware=v.hardware;void *context=v.context;
     uint32_t base=picasso_capture_base(v)+0x10000,frames=v.targetFrames,events=v.events+1;
     auto *bytes=reinterpret_cast<uint8_t *>(&v);for(unsigned i=0;i<sizeof v;++i)bytes[i]=0;
     v.dma=dma;v.hardware=hardware;v.context=context;v.tokenBase=base;
+    v.streaming=streaming;v.readTokenBase=readBase;
     v.targetFrames=frames;v.events=events;v.enabled=true;return true;
 }
 #endif

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-"""Verify default-off diagnostic capture and loss-detecting PCM log export."""
+"""Verify on-demand input service, independent ownership and timestamped PCM."""
 import argparse
 import hashlib
-import importlib.util
 import json
 from pathlib import Path
 import re
@@ -24,32 +23,18 @@ def main():
         (out/(name+'.log')).write_text(result.stdout+result.stderr)
         if result.returncode:raise RuntimeError(result.stdout+result.stderr)
         runs.append({'name':name,'passed':True});return result.stdout
-    exported=''
     for sanitizer in (False,True):
         suffix='-asan' if sanitizer else '';exe=out/('mic-service'+suffix)
         flags=['-fsanitize=address,undefined','-fno-omit-frame-pointer'] if sanitizer else []
         run('compile'+suffix,[args.cxx,'-std=c++17','-O1','-Wall','-Wextra','-Werror',*flags,*includes,
             str(ROOT/'scripts/tests/picasso-mic-service-host.cpp'),'-o',str(exe)])
-        for mode in range(4):
-            result=run(str(mode)+suffix,[str(exe),str(mode)])
-            if mode==2:exported=result
-    spec=importlib.util.spec_from_file_location('decode_mic',ROOT/'scripts/decode-picasso-mic.py')
-    decoder=importlib.util.module_from_spec(spec);spec.loader.exec_module(decoder)
-    assert decoder.decode(exported)==[bytes(range(130))]
-    first=next(line for line in exported.splitlines() if 'pcm offset=0 ' in line)
-    malformed=[exported.replace(first,first+'\n'+first),exported.replace('offset=64','offset=62'),exported.replace('bytes=64','bytes=63',1),
-               exported.replace('offset=0 bytes=64','offset=2 bytes=64',1),
-               re.sub(r'fnv1a=[0-9a-f]+','fnv1a=00000000',exported),
-               '\n'.join(line for line in exported.splitlines() if 'pcm-end' not in line)]
-    for text in malformed:
-        try:decoder.decode(text)
-        except ValueError:pass
-        else:raise AssertionError('Accepted damaged capture')
-    run('decode-wave',['python3','-B',str(ROOT/'scripts/decode-picasso-mic.py'),str(out/'2-asan.log'),'--output',str(out/'capture.wav')])
-    runs.append({'name':'decode-loss-and-corruption','passed':True})
-    names=['package/PicassoMicService.cpp','package/PicassoMicService.h','package/PicassoCaptureDma.h',
-           'scripts/decode-picasso-mic.py','scripts/tests/picasso-mic-service-host.cpp','scripts/check-picasso-mic-service.py']
+        run('service'+suffix,[str(exe)])
+    for name in ['package/PicassoMicService.cpp','package/PicassoSmp2pDevice.cpp']:
+        source=(ROOT/name).read_text()
+        assert 'picasso-mic-test' not in source and 'pcm offset=' not in source
+    names=['package/PicassoSmp2pDevice.cpp','package/PicassoMicService.cpp','package/PicassoMicService.h','package/PicassoCaptureDma.h',
+           'package/PicassoAudioInput.h','package/PicassoAudioAbi.h','scripts/tests/picasso-mic-service-host.cpp','scripts/check-picasso-mic-service.py']
     (out/'results.json').write_text(json.dumps({'passed':True,'hardware_tested':False,'runs':runs,
         'inputs':{n:hashlib.sha256((ROOT/n).read_bytes()).hexdigest() for n in names}},indent=2)+'\n')
-    print('PASS capture diagnostic service and checked WAV reconstruction')
+    print('PASS on-demand capture service and bounded timestamped input')
 if __name__=='__main__':main()

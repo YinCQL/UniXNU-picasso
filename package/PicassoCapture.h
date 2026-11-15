@@ -9,6 +9,10 @@ struct PicassoCaptureDma {
     int (*check)(PicassoCaptureDma &);
     int (*prepare)(PicassoCaptureDma &,unsigned); // invalidate/prepare a free slot
     int (*complete)(PicassoCaptureDma &,unsigned,unsigned,unsigned); // slot, offset, bytes
+    // Worker-only PCM sink; the DMA allocation and client buffers never alias.
+    int (*sink)(const uint8_t *,unsigned,uint64_t,uint32_t);
+    uint64_t timestamp;
+    uint32_t flags;
     uint64_t address;
     uint32_t bytes,slotBytes,busyMask;
     bool ready,retained;
@@ -42,6 +46,8 @@ struct PicassoCapture {
     uint32_t handle,copp,hwHandle[2],targetFrames,readSent,readDone,inflight;
     uint32_t readSequence[2],readWait[2],preparedSlot,streamTicks,healthDone,healthWait;
     uint64_t bytesDone;
+    uint32_t readTokenBase;
+    bool streaming;
     uint32_t lastOffset,lastBytes,lastFlags,lastFrames,lastSequence;
     uint64_t lastTimestamp;
     uint32_t rejected,replyReject,replyPhase,replyOpcode,replyType,replyBytes;
@@ -57,6 +63,10 @@ enum {
 };
 inline uint32_t picasso_capture_base(const PicassoCapture &v) {
     return v.tokenBase?v.tokenBase:0x30570000U;
+}
+inline uint32_t picasso_capture_read_token(const PicassoCapture &v,uint32_t sequence) {
+    return v.streaming?(v.readTokenBase?v.readTokenBase:0x80000000U)+sequence:
+        picasso_capture_base(v)+0x1000+sequence;
 }
 inline uint32_t picasso_capture_le32(const uint8_t *b) {
     return uint32_t(b[0])|(uint32_t(b[1])<<8)|(uint32_t(b[2])<<16)|(uint32_t(b[3])<<24);

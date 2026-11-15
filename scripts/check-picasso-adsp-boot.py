@@ -31,7 +31,7 @@ def main():
     cases=['normal','lease','firmware','plan','alloc1','alloc2','map1','map2','zero1','zero2','crypto',
         'aop','aop-uncertain','vote1','vote2','vote3','init','setup','load','auth','stale','pre-auth-peer',
         'timeout','fatal','interrupted','shutdown','off','close','memory-overlap','memory-missing','shutdown-vote','reacquire',
-        'restart','missing','missing-entry','no-handover','initial-restart','restart-no-entry','lost-ready','long-ready']
+        'restart','missing','missing-entry','no-handover','initial-restart','restart-no-entry','lost-ready','long-ready','fast']
     for sanitized in (False,True):
         suffix='-asan' if sanitized else ''
         flags=(['-fsanitize=address' if os.name=='nt' else '-fsanitize=address,undefined','-fno-omit-frame-pointer'] if sanitized else [])
@@ -39,7 +39,7 @@ def main():
             exe=out/(fixture+suffix+('.exe' if os.name=='nt' else ''))
             run(fixture+'-compile'+suffix,[a.cxx,'-std=c++17','-O1','-Wall','-Wextra','-Werror',*flags,*includes,str(ROOT/f'scripts/tests/picasso-{fixture}-host.cpp'),'-o',str(exe)])
             for case in cases if fixture=='adsp-boot' else ['normal']:run(fixture+'-'+case+suffix,[str(exe),case])
-    api='#include "picasso-wlan-kernel-api.h"\nextern "C" {void IOLog(const char *,...) __attribute__((format(printf,1,2)));void IOSleep(unsigned);uint64_t mach_absolute_time();void clock_interval_to_deadline(unsigned,unsigned,uint64_t *);}\nenum {kSecondScale=1};\n'
+    api='#include "picasso-wlan-kernel-api.h"\nextern "C" {void IOLog(const char *,...) __attribute__((format(printf,1,2)));void IOSleep(unsigned);uint64_t mach_absolute_time();void clock_interval_to_deadline(unsigned,unsigned,uint64_t *);}\nenum {kSecondScale=1000,kMillisecondScale=1};\n'
     boot_api='struct boot_args {uint64_t physBase,memSize;}; extern struct PeState {void *bootArgs;} PE_state;\n'
     (out/'boot-arm.cpp').write_text(api+boot_api+body,encoding='utf8',newline='\n')
     # Compile the production SMC register wrapper and shared lease exports too.

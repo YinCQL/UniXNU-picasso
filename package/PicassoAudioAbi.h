@@ -2,7 +2,7 @@
 #ifndef PICASSO_AUDIO_ABI_H
 #define PICASSO_AUDIO_ABI_H
 #include <stdint.h>
-// Output-only transport for a future iOS HAL client. No capture or mapped DMA.
+// Inline PCM transport; playback and capture have independent owners and queues.
 #define PICASSO_AUDIO_CLASS "PicassoAudio"
 enum { PicassoAudioVersion=1, PicassoAudioRate=48000, PicassoAudioChannels=2,
     PicassoAudioBits=16, PicassoAudioWriteMax=4096, PicassoAudioRingBytes=131072 };
@@ -30,4 +30,19 @@ typedef struct PicassoAudioClientNote {
     uint32_t selector,value,reserved;
     uint64_t calls,sentFrames,missingFrames;
 } PicassoAudioClientNote;
+// Input selectors preserve every existing playback selector and layout.
+enum { PicassoAudioInputStatus=16, PicassoAudioInputBegin, PicassoAudioInputRead, PicassoAudioInputStop };
+enum { PicassoAudioInputReadBytes=3840, PicassoAudioInputPacketBytes=4096, PicassoAudioInputPackets=32 };
+typedef struct PicassoAudioInputState {
+    uint32_t version,state,epoch,queuedBytes;
+    uint64_t capturedFrames,deliveredFrames,gapFrames,overruns;
+    uint64_t firstHostTime,lastTimestamp;
+    int32_t error;
+    uint32_t peak;
+} PicassoAudioInputState;
+typedef struct PicassoAudioInputData {
+    uint32_t version,epoch,bytes,flags;
+    uint64_t firstFrame;
+    uint8_t data[PicassoAudioInputReadBytes];
+} PicassoAudioInputData;
 #endif

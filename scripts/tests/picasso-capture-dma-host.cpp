@@ -44,6 +44,11 @@ static void dmaBarrier() {
     for(unsigned b=0;b<62;++b) {auto &f=registers[((128+b)*4096+0x58)/4];if(f==0xffffffff)f=0;}
 }
 #include "PicassoRpcDma-body.inc"
+static unsigned sinkCalls,sinkBytes;static uint8_t delivered[4096];
+static int pcmSink(const uint8_t *data,unsigned bytes,uint64_t timestamp,uint32_t flags) {
+    assert(bytes<=sizeof delivered && timestamp==1234000 && flags==0x80000000);
+    ++sinkCalls;sinkBytes=bytes;memcpy(delivered,data,bytes);return 0;
+}
 int main(int argc,char **argv) {
     assert(argc==2);mode=unsigned(atoi(argv[1]));assert(mode<8);
     registers[8]=0x4c017e51;registers[9]=0x6000003e;registers[10]=0x5111;
@@ -51,7 +56,7 @@ int main(int argc,char **argv) {
     registers[0x800/4]=0x80001403;registers[0xc00/4]=61;registers[(189*4096+0x24)/4]=0x1880000;
     registers[0x804/4]=0x80001404;registers[0xc04/4]=60;registers[(188*4096+0x24)/4]=0x1890000;
     memset(playback,0xa5,sizeof playback);memset(captured,0xa5,sizeof captured);
-    PicassoPcm p={};PicassoCaptureDma c={};p.capture=&c;picasso_pcm_device_prepare(p);
+    PicassoPcm p={};PicassoCaptureDma c={};c.sink=pcmSink;c.timestamp=1234000;c.flags=0x80000000;p.capture=&c;picasso_pcm_device_prepare(p);
     assert(p.prepared && !p.dmaError && p.address==0x180000000ULL && p.bytes==32768);
     assert(p.bank==59 && p.sid==0x1401 && allocations==2 && !p.check(p));
     auto *tables=reinterpret_cast<uint64_t *>(playback+32768);
@@ -76,13 +81,8 @@ int main(int argc,char **argv) {
         assert(c.complete(c,1,0,4)==-22 && c.complete(c,0,4094,4)==-22 && c.complete(c,0,1,2)==-22);
         captured[128]=0;captured[129]=0x80;captured[130]=0;captured[131]=0;captured[132]=0xff;captured[133]=0x7f;
         assert(!c.complete(c,0,128,6));
-        const auto &samples=*picasso_capture_samples_snapshot();
-        assert(samples.saved==6 && samples.totalBytes==6 && samples.nonzero==2 && samples.peak==32768 && samples.clipped==2 && samples.sum==-1 && samples.absoluteSum==65535);
-        assert(!memcmp(samples.data,captured+128,6));
-        static uint8_t chunk[4096];memset(chunk,0x7f,sizeof chunk);
-        for(unsigned i=0;i<50;++i)assert(!picasso_capture_samples_append(captureMemory.samples,chunk,sizeof chunk));
-        assert(samples.saved==192000 && samples.totalBytes==204806);
-        unsigned prior=samples.saved;assert(picasso_capture_samples_append(captureMemory.samples,chunk,4097)==-22 && samples.saved==prior);
+        assert(sinkCalls==1&&sinkBytes==6&&!memcmp(delivered,captured+128,6));
+        c.sink=nullptr;assert(c.complete(c,0,128,6)==-6&&sinkCalls==1);c.sink=pcmSink;
         assert(c.complete(c,2,0,4)==-22);
         c.busyMask=0;assert(c.complete(c,0,128,6)==-22);
         // Verify failed map extension is transactional and keeps all old leaves.

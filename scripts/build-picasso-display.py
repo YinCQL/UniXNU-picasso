@@ -287,7 +287,7 @@ def main():
     objects += hid_objects
     sources += hid_sources
     sources += [ROOT / 'drivers/NativeNovatekTouch/TouchPublish.h']
-    sources += [ROOT / 'kits/picasso/PicassoAudioAbi.h', ROOT / 'kits/picasso/PicassoAudioQueue.h']
+    sources += [ROOT / 'kits/picasso/PicassoAudioAbi.h', ROOT / 'kits/picasso/PicassoAudioQueue.h', ROOT / 'kits/picasso/PicassoAudioInput.h']
     sources += [ROOT / 'kits/picasso' / name for name in ('PicassoCapture.h', 'PicassoCaptureApr.h',
                 'PicassoCaptureDma.h', 'PicassoMicService.h', 'PicassoMicHardware.h', 'PicassoMicPower.h')]
     sources += [ROOT / 'kits/picasso/PicassoBacklightCore.h', ROOT / 'kits/picasso/PicassoButtonsCore.h',

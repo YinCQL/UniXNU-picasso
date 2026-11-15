@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Direct capture qualification precedes publication of any OS input stream.
+// Capture starts exclusively on an authenticated input client's Begin request.
 #include <IOKit/IOLib.h>
 #include <kern/thread_call.h>
+#include <kern/clock.h>
 #include "PicassoGlink.h"
-#include "PicassoCaptureDma.h"
+#include "PicassoCaptureApr.h"
+#include "PicassoAudioInput.h"
 #include "PicassoMicService.h"
 extern "C" int picasso_mic_hardware(unsigned);
 namespace {
-struct MicReport {
-    uint32_t mode,events,readDone,phase,dumpOffset,dumpHash;
-    bool configured,summary,dumpDone;
-};
-static MicReport report;
+static PicassoAudioInput input;
+static IOLock *inputLock;
+static bool configured,active;
+static uint32_t lastPhase,reportTicks;
 struct HardwareWork {
     unsigned action;
     int result;
@@ -38,65 +39,79 @@ int hardware(void *,unsigned action) {
     work.action=action;work.busy=true;work.complete=false;
     IOLockUnlock(actionLock);thread_call_enter(actionCall);return -11;
 }
-void dumpPcm(const PicassoCaptureSamples &s) {
-    if(report.dumpDone)return;
-    if(report.dumpOffset==s.saved) {
-        IOLog("PICASSO_MIC pcm-end bytes=%u fnv1a=%08x rate=48000 channels=1 bits=16 little_endian=1\n",s.saved,report.dumpHash);
-        report.dumpDone=true;return;
-    }
-    unsigned bytes=s.saved-report.dumpOffset;if(bytes>64)bytes=64;
-    char hex[129];const char alphabet[]="0123456789abcdef";
-    for(unsigned i=0;i<bytes;++i) {
-        unsigned b=s.data[report.dumpOffset+i];hex[2*i]=alphabet[b>>4];hex[2*i+1]=alphabet[b&15];
-        report.dumpHash=(report.dumpHash^b)*16777619U;
-    }
-    hex[bytes*2]=0;
-    // One small row per existing 20ms worker tick, after the DSP stream closes.
-    IOLog("PICASSO_MIC pcm offset=%u bytes=%u hex=%s\n",report.dumpOffset,bytes,hex);
-    report.dumpOffset+=bytes;
+int sink(const uint8_t *data,unsigned bytes,uint64_t timestamp,uint32_t flags) {
+    uint64_t duration;nanoseconds_to_absolutetime(uint64_t(bytes/2)*1000000000ULL/48000,&duration);
+    uint64_t now=mach_absolute_time(),host=now>duration?now-duration:0;
+    IOLockLock(inputLock);int e=picasso_input_append(input,data,bytes,timestamp,flags,host);
+    IOLockUnlock(inputLock);return e;
 }
 }
-extern "C" void picasso_mic_service_configure(PicassoAprProbe &a,uint32_t mode) {
-    if(report.configured)return;
-    report.configured=true;
-    // Mode 1 records two seconds and statistics; mode 2 also emits finite PCM.
-    // No capture, register accesses or new OS input on a normal silent boot.
-    if(mode!=1 && mode!=2)return;
-    report.mode=mode;report.dumpHash=2166136261U;
-    actionLock=IOLockAlloc();
+extern "C" void picasso_mic_service_init(PicassoAprProbe &a) {
+    if(configured)return;configured=true;
+    inputLock=IOLockAlloc();actionLock=IOLockAlloc();
     if(actionLock)actionCall=thread_call_allocate(performHardware,nullptr);
-    if(!actionCall) {
-        a.capture.enabled=a.capture.done=true;a.capture.firstError=a.capture.error=-12;++a.capture.events;
-        return;
-    }
-    a.capture.enabled=true;a.capture.targetFrames=PicassoCaptureDefaultFrames;
-    a.capture.hardware=hardware;a.pcm.capture=&a.capture.dma;
-    IOLog("PICASSO_MIC configured=1 mode=%u route=amic1 rate=48000 channels=1 bits=16 frames=96000 os_input=0\n",mode);
+    input.status.version=1;
+    if(!inputLock || !actionCall) {input.status.state=PicassoAudioFailed;input.status.error=-12;return;}
+    // Reserve the independent DMA mapping before SID1401 is enabled. This
+    // does not vote clocks, enable bias, start a port, or issue a capture READ.
+    a.capture.hardware=hardware;a.capture.dma.sink=sink;a.pcm.capture=&a.capture.dma;
+    a.capture.streaming=true;
+    IOLog("PICASSO_MIC initialized=1 automatic_capture=0 route=amic1 rate=48000 channels=1 bits=16\n");
+}
+extern "C" int picasso_mic_service_call(uint64_t owner,unsigned selector,const void *in,unsigned bytes,void *out,unsigned size) {
+    if(!inputLock)return -6;
+    IOLockLock(inputLock);int e=-22;
+    if(selector==PicassoAudioInputStatus && !bytes && out && size==sizeof(PicassoAudioInputState)) {
+        *static_cast<PicassoAudioInputState *>(out)=input.status;e=0;
+    } else if(selector==PicassoAudioInputBegin && in && bytes==sizeof(PicassoAudioFormat) && !out)
+        e=picasso_input_begin(input,owner,*static_cast<const PicassoAudioFormat *>(in));
+    else if(selector==PicassoAudioInputRead && !bytes && out && size==sizeof(PicassoAudioInputData))
+        e=picasso_input_read(input,owner,*static_cast<PicassoAudioInputData *>(out));
+    else if(selector==PicassoAudioInputStop && !bytes && !out)e=picasso_input_stop(input,owner);
+    IOLockUnlock(inputLock);return e;
+}
+extern "C" void picasso_mic_service_close(uint64_t owner) {
+    if(!inputLock)return;IOLockLock(inputLock);
+    if(owner && input.owner==owner)(void)picasso_input_stop(input,owner);
+    IOLockUnlock(inputLock);
 }
 extern "C" void picasso_mic_service_tick(PicassoAprProbe &a,bool failed) {
-    if(!report.mode)return;
-    auto &v=a.capture;
-    if(failed && !v.done) {
-        if(v.attempted)picasso_capture_stop(v,-104);
-        else {v.done=true;v.error=v.firstError=-104;++v.events;}
-    }
-    if(v.events!=report.events) {
-        bool progress=v.phase!=report.phase || v.readDone!=report.readDone || v.error || v.done;
-        report.events=v.events;report.phase=v.phase;report.readDone=v.readDone;
-        if(progress) {
-            IOLog("PICASSO_MIC state phase=%u token=%x owned=%x inflight=%x pending=%u reads=%u/%u bytes=%llu error=%d first=%d cleanup=%d\n",
-                v.phase,v.token,v.owned,v.inflight,v.pending,v.readDone,v.readSent,v.bytesDone,v.error,v.firstError,v.cleanupError);
-            if(v.readDone || v.rejected)
-                IOLog("PICASSO_MIC reply opcode=%x status=%u offset=%u bytes=%u flags=%x timestamp=%llu rejected=%u reason=%u\n",
-                    v.replyOpcode,v.status,v.lastOffset,v.lastBytes,v.lastFlags,v.lastTimestamp,v.rejected,v.replyReject);
+    if(!inputLock || !actionCall)return;
+    auto &v=a.capture;IOLockLock(inputLock);
+    if(failed) {
+        input.ready=false;
+        if(active && !v.done) {
+            if(v.attempted)picasso_capture_stop(v,-104);
+            else {v.done=true;v.error=v.firstError=-104;}
+        }
+        input.status.state=PicassoAudioFailed;input.status.error=-104;
+    } else if(!active && input.status.state!=PicassoAudioFailed)
+        input.ready=a.ready && a.fw.valid && a.pcm.done && a.pcm.complete && v.dma.ready;
+    if(active) {
+        if(input.cancel && !v.done) {
+            if(v.attempted)picasso_capture_cancel(v);
+            else {v.cancelled=v.done=true;v.firstError=v.error=-125;}
+        }
+        if(v.phase!=lastPhase || ++reportTicks>=50 || v.done) {
+            lastPhase=v.phase;reportTicks=0;
+            IOLog("PICASSO_MIC session=%u phase=%u reads=%u bytes=%llu gaps=%llu overruns=%llu peak=%u error=%d\n",
+                input.status.epoch,v.phase,v.readDone,v.bytesDone,input.status.gapFrames,input.status.overruns,input.status.peak,v.error);
+        }
+        if(v.done) {
+            bool clean=!v.owned && !v.inflight && !v.dma.busyMask && !v.cleanupError && !v.dmaError &&
+                (v.complete || (v.cancelled && v.firstError==-125));
+            int error=v.firstError?v.firstError:v.cleanupError;
+            IOLog("PICASSO_MIC stopped epoch=%u frames=%llu delivered=%llu gaps=%llu clean=%u error=%d\n",
+                input.status.epoch,input.status.capturedFrames,input.status.deliveredFrames,input.status.gapFrames,clean,error);
+            picasso_input_retire(input,clean,error);active=false;
         }
     }
-    if(!v.done)return;
-    const auto &samples=*picasso_capture_samples_snapshot();
-    if(!report.summary) {
-        report.summary=true;
-        IOLog("PICASSO_MIC capture complete=%u periods=%u bytes=%llu saved=%u nonzero=%u peak=%u clipped=%u sum=%lld abs_sum=%llu os_input=0\n",
-            v.complete,samples.periods,samples.totalBytes,samples.saved,samples.nonzero,samples.peak,samples.clipped,samples.sum,samples.absoluteSum);
+    if(!active && input.cancel)picasso_input_retire(input,true,0);
+    if(!failed && !active && input.status.state==PicassoAudioStarting) {
+        bool ready=!v.enabled && !v.attempted;
+        if(v.done)ready=picasso_capture_rearm(v);
+        if(ready) {v.enabled=v.streaming=true;active=true;lastPhase=UINT32_MAX;reportTicks=0;}
+        else picasso_input_retire(input,false,-16);
     }
-    if(report.mode==2 && !v.owned && !v.inflight && !v.dma.busyMask)dumpPcm(samples);
+    IOLockUnlock(inputLock);
 }

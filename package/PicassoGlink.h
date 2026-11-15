@@ -116,7 +116,7 @@ int picasso_glink_prepare(const PicassoSmemIo *, PicassoGlink *, PicassoSmemAudi
 // Serialized ADSP worker, only while this boot's fresh slave-kernel is ready.
 // At most eight RX commands and a bounded channel/TX pass per call. No waits.
 // Kick IPCC client3/signal0 if set, including when returning TX backpressure.
-int picasso_glink_service(const PicassoSmemIo *, PicassoGlink *, bool *kick);
+int picasso_glink_service(const PicassoSmemIo *, PicassoGlink *, bool *kick, bool elapsed=true);
 // Invalidate all session readiness after fatal/SSR/shutdown; never reset SMEM.
 void picasso_glink_stop(PicassoGlink *);
 #endif

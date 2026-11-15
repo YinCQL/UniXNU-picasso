@@ -105,7 +105,6 @@ struct CaptureMemory {
     uint64_t physical;
     PicassoPcm *playback;
     PicassoCaptureDma *dma;
-    PicassoCaptureSamples samples;
 };
 static CaptureMemory captureMemory;
 uint32_t pcmRead(unsigned at) { return *reinterpret_cast<volatile uint32_t *>(pcmMemory.map->getVirtualAddress()+at); }
@@ -148,7 +147,7 @@ static int captureComplete(PicassoCaptureDma &o,unsigned slot,unsigned offset,un
     // Invalidate before observing only the byte range returned by READ_DONE.
     cache(data,PicassoCaptureSlotBytes,false);
     e=captureCheck(o);if(e)return e;
-    return picasso_capture_samples_append(captureMemory.samples,data+offset,bytes);
+    return o.sink?o.sink(data+offset,bytes,o.timestamp,o.flags):-6;
 }
 static void captureAllocate(PicassoPcm &playback) {
     auto &m=captureMemory;auto &o=*playback.capture;
@@ -169,10 +168,6 @@ static void captureAllocate(PicassoPcm &playback) {
     cache(pcmMemory.data[0]+32768,12288,true);
     o.address=PicassoCaptureAddress;o.bytes=PicassoCapturePoolBytes;o.slotBytes=PicassoCaptureSlotBytes;
     o.check=captureCheck;o.prepare=capturePrepare;o.complete=captureComplete;
-}
-extern "C" const PicassoCaptureSamples *picasso_capture_samples_snapshot() {
-    // Worker-only reader: publication/logging runs on the same ADSP thread.
-    return &captureMemory.samples;
 }
 static int pcmSilence(PicassoPcm &o) {
     if(!o.prepared || o.address!=0x180000000ULL || o.bytes!=32768 || !pcmMemory.data[0])return -22;

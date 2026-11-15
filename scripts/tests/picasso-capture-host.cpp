@@ -60,7 +60,7 @@ struct Fixture {
     }
     bool deliver(unsigned slot,uint32_t (&b)[11],unsigned bytes=44,uint32_t token=0,uint32_t source=0x02010407) {
         return picasso_capture_receive(v,reinterpret_cast<uint8_t *>(b),bytes,0,source,0x02010507,
-            token?token:picasso_capture_base(v)+0x1000+v.readSequence[slot],0x10d9a);
+            token?token:picasso_capture_read_token(v,v.readSequence[slot]),0x10d9a);
     }
     void step(bool dataReplies=true) {
         picasso_capture_tick(v,true);
@@ -177,11 +177,11 @@ static void health() {
         if(i<7) {picasso_capture_tick(f.v,true);if(picasso_capture_due(f.v))picasso_capture_sent(f.v);}
     }
     assert(f.v.readDone==8);f.healthPendingReturns=2;
-    picasso_capture_tick(f.v,true);assert(f.v.healthPending && f.hwHealth==1 && !picasso_capture_due(f.v));
+    picasso_capture_tick(f.v,true);assert(f.v.healthPending && f.hwHealth==1 && picasso_capture_due(f.v));
     // A queued READ_DONE is still delivered while health waits asynchronously.
     assert(f.v.inflight);unsigned slot=(f.v.inflight&1)?0:1;uint32_t b[11];f.payload(slot,b);assert(f.deliver(slot,b));
     assert(f.v.readDone==9 && f.hwHealth==1);
-    picasso_capture_tick(f.v,true);assert(f.v.healthPending && f.hwHealth==2 && !picasso_capture_due(f.v));
+    picasso_capture_tick(f.v,true);assert(f.v.healthPending && f.hwHealth==2 && picasso_capture_due(f.v));
     picasso_capture_tick(f.v,true);assert(!f.v.healthPending && f.hwHealth==3 && f.v.healthDone==9);
     f.finish();assert(f.v.complete && !f.v.owned);
     Fixture failed;failed.until(PicassoCaptureRead);failed.v.readDone=8;failed.healthError=-19;
@@ -199,4 +199,20 @@ static void health() {
     assert(cancel.v.phase==PicassoCaptureClose && cancel.v.firstError==-125 && cancel.v.cleanupError==-5);
     cancel.finish();assert(!cancel.v.owned);
 }
-int main() {health();scheduling();wire();lifecycle();malformed();controlQualification();failures();puts("capture wire, lifecycle, short periods, ownership, malformed replies and failures PASS");}
+static void streaming() {
+    Fixture f;f.v.streaming=true;f.until(PicassoCaptureRead);
+    for(unsigned i=0;i<1600;++i)f.step(); // More than the former 20s deadline.
+    assert(!f.v.done && f.v.bytesDone>48000*2*10 && !f.v.firstError);
+    unsigned wait=f.v.readWait[0],ticks=f.v.streamTicks;
+    for(unsigned i=0;i<1000;++i)picasso_capture_tick(f.v,true,false);
+    assert(f.v.readWait[0]==wait && f.v.streamTicks==ticks);
+    uint32_t old=picasso_capture_read_token(f.v,f.v.readSent-1);
+    picasso_capture_cancel(f.v);f.finish();assert(picasso_capture_rearm(f.v));
+    assert(f.v.streaming && picasso_capture_read_token(f.v,0)>old);
+    f.until(PicassoCaptureRead);uint32_t b[11];f.payload(0,b);
+    assert(!f.deliver(0,b,44,old));assert(f.deliver(0,b));
+    f.v.readSent=UINT32_MAX-f.v.readTokenBase;
+    assert(!picasso_capture_due(f.v) && f.v.firstError==-75);
+    f.finish();assert(!f.v.owned);
+}
+int main() {streaming();health();scheduling();wire();lifecycle();malformed();controlQualification();failures();puts("capture wire, lifecycle, short periods, ownership, malformed replies and failures PASS");}

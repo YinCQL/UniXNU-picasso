@@ -162,22 +162,22 @@ void aprIntentRefused(PicassoAprProbe &a) {
 }
 // Submit at most one APR request. A post-receive playback continuation may
 // use only an already-open audio channel and actual reusable remote intents.
-int aprWork(const PicassoSmemIo *io,PicassoGlink *s,PicassoGlinkChannel &c,bool *kick,bool playbackOnly=false) {
+int aprWork(const PicassoSmemIo *io,PicassoGlink *s,PicassoGlinkChannel &c,bool *kick,bool playbackOnly=false,bool audioOnly=false) {
     auto &a=s->apr;int error;
     // Stock q6core queries FWK_VERSION only after real CORE readiness. This
     // discovers AFE/ASM/ADM APIs without starting audio or assuming versions.
-    bool version=!playbackOnly && a.ready && !a.fw.sent && !a.fw.error;
-    bool afe=!playbackOnly && picasso_afe_due(&a);
-    bool clock=!playbackOnly && picasso_clock_due(a);
-    bool port=!playbackOnly && picasso_port_due(a);
-    bool stream=!playbackOnly && picasso_stream_due(a);
-    bool pcm=!playbackOnly && picasso_pcm_due(a);
+    bool version=!playbackOnly && !audioOnly && a.ready && !a.fw.sent && !a.fw.error;
+    bool afe=!playbackOnly && !audioOnly && picasso_afe_due(&a);
+    bool clock=!playbackOnly && !audioOnly && picasso_clock_due(a);
+    bool port=!playbackOnly && !audioOnly && picasso_port_due(a);
+    bool stream=!playbackOnly && !audioOnly && picasso_stream_due(a);
+    bool pcm=!playbackOnly && !audioOnly && picasso_pcm_due(a);
     bool play=picasso_play_due(a);
     bool capture=!playbackOnly && picasso_capture_due(a.capture);
     // Both streams keep their prepared buffers while awaiting a remote intent.
     // Alternate only successful submissions so capture cannot starve playback.
     if(play && capture) {if(a.captureTurn)play=false;else capture=false;}
-    if(playbackOnly && !play)return 0;
+    if((playbackOnly && !play) || (audioOnly && !play && !capture))return 0;
     if ((a.ready && !version && !afe && !clock && !port && !stream && !pcm && !play && !capture) || a.error) return 0;
     if (!version && !afe && !clock && !port && !stream && !pcm && !play && !capture && (a.pending || a.ticks < a.next)) return 0;
     uint32_t playRequest[18];unsigned playBytes=play?picasso_play_request(a,playRequest):
@@ -625,11 +625,11 @@ int picasso_glink_prepare(const PicassoSmemIo *io, PicassoGlink *s, PicassoSmemA
     s->nextIntent = 1; s->apr.token = 0x18300000;
     s->prepared = true; return 0;
 }
-int picasso_glink_service(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) {
+int picasso_glink_service(const PicassoSmemIo *io, PicassoGlink *s, bool *kick,bool elapsed) {
     if (!io || !io->reader.read || !io->write32 || !io->barrier || !s || !kick) return -22;
     *kick = false;
     if (!s->prepared || s->failed) return s->error ? s->error : -22;
-    if (!s->ready && ++s->steps > 500) return fail(s, -60);
+    if (elapsed && !s->ready && ++s->steps > 500) return fail(s, -60);
     int error = 0;
     if (!s->sent) {
         if ((error = send(io, s, 0, kick))) return error;
@@ -641,7 +641,7 @@ int picasso_glink_service(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) 
     // Only work already due at entry is sent here. Newly received OPENs are
     // acknowledged on the next service tick, after the command is committed.
     // Descriptors from a partially parsed command are not eligible for TX.
-    if (!s->intentProgress) for (auto &c:s->channel) if (c.used && c.supported) {
+    if (elapsed && !s->intentProgress) for (auto &c:s->channel) if (c.used && c.supported) {
         error=channelWork(io,s,c,kick); if (s->failed) return error;
     }
     unsigned intentBudget = 16;
@@ -694,6 +694,25 @@ int picasso_glink_service(const PicassoSmemIo *io, PicassoGlink *s, bool *kick) 
     // Advance one successful source control ACK without waiting another 20ms
     // tick. Do not age deadlines twice or accelerate WRITE/DMA completions.
     auto &a=s->apr;auto &v=a.play;
+    if(!s->intentProgress && a.capture.streaming && a.capture.enabled && a.capture.attempted && !a.capture.done && !a.capture.firstError) {
+        for(auto &c:s->channel)if(c.used && c.local==1 && c.up && !c.closing) {
+            // Return completed receive intents before issuing more READs. This
+            // path never advances the transport's 20 ms deadline counters.
+            for(unsigned n=0;n<localCount(c);++n) {
+                auto &i=locals(s,c)[n];if(!i.done)continue;
+                const uint32_t words[2]={14U|(uint32_t(c.local)<<16),i.id};
+                if((error=transmit(io,s,words,sizeof words,kick)))return error;
+                uint32_t id=i.id;resetIntent(i);i.id=id;i.advertised=true;++s->localReuse;
+            }
+            for(unsigned budget=0;budget<4;++budget) {
+                picasso_play_tick(a,s->qrtr.qmi,false);
+                picasso_capture_tick(a.capture,a.ready && a.fw.valid && picasso_afe_domains_up(s->qrtr.qmi),false);
+                error=aprWork(io,s,c,kick,false,true);
+                if(error || s->failed)return error;
+            }
+            break;
+        }
+    }
     if(!s->intentProgress && v.source && v.enabled && v.attempted && !v.done &&
        v.phase<PicassoPlayWrite && v.responded && !v.pending && !v.error && !v.firstError) {
         for(auto &c:s->channel)if(c.used && c.local==1 && c.up && !c.closing) {

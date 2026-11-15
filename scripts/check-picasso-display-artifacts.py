@@ -94,11 +94,11 @@ def check(tree, work, kernelcache, output):
     builder.require({'_picasso_audio_service_tick', '__GLOBAL__sub_I_PicassoAudioService.cpp',
                      '__ZN12PicassoAudio10gMetaClassE', '__ZN22PicassoAudioUserClient10gMetaClassE'} <= linked_names,
                     'Missing PCM worker, audio-service initializer or client metaclasses')
-    builder.require({'_picasso_mic_service_configure', '_picasso_mic_service_tick', '_picasso_mic_hardware',
-                     '_picasso_mic_rails_acquire', '_picasso_mic_rails_release', '_picasso_capture_samples_snapshot'} <= linked_names,
+    builder.require({'_picasso_mic_service_init', '_picasso_mic_service_call', '_picasso_mic_service_close', '_picasso_mic_service_tick', '_picasso_mic_hardware',
+                     '_picasso_mic_rails_acquire', '_picasso_mic_rails_release'} <= linked_names,
                     'Missing microphone capture worker, codec or power qualification')
-    report['microphone_capture'] = {'linked': True, 'diagnostic_argument': 'picasso-mic-test',
-                                    'default_enabled': False, 'os_input_published': False, 'runtime_qualified': False}
+    report['microphone_capture'] = {'linked': True, 'automatic_capture': False,
+                                    'default_enabled': False, 'os_input_published': True, 'runtime_qualified': False}
     report['audio_service'] = {'worker_linked': True, 'late_initializer_verified': True,
                                'classes_linked': True, 'hal_payload_checked_separately': True, 'runtime_qualified': False}
     report['hid'] = hid.verify(platform, aes, native, OriginalReference(kernelcache, board),
