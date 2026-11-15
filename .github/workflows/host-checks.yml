@@ -2,12 +2,15 @@ name: Picasso host regressions
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main-ios16]
   push:
-    branches: [main-ios16, feat/ios16, feat/ios16-gpu, feat/ios16-dsp, feat/fix-v1]
+    branches: [main-ios16, feat/ios16, feat/ios16-gpu, feat/ios16-dsp, feat/fix-v1, feat/fix-v2]
     paths:
       - '.github/workflows/host-checks.yml'
       - 'scripts/**'
       - 'drivers/**'
+      - 'hal/**'
       - 'package/**'
       - 'board.toml'
       - 'configs/**'
@@ -51,7 +54,7 @@ jobs:
       - name: Install host compilers
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld libssl-dev
+          sudo apt-get install -y clang clang-18 lld libssl-dev
 
       - name: Prepare the isolated upstream source
         run: |
@@ -85,7 +88,6 @@ jobs:
           cp out/picasso/host-checks/ui-trust/results.json out/picasso/logs/ui-trust-host.json
 
       - name: Check PR13 GPU firmware and staged probe
-        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp' || github.ref_name == 'feat/fix-v1'
         run: |
           python3 scripts/check-picasso-gpu-firmware.py --output out/picasso/host-checks/gpu-firmware
           cp out/picasso/host-checks/gpu-firmware/results.json out/picasso/logs/gpu-firmware-host.json
@@ -97,8 +99,42 @@ jobs:
           python3 scripts/check-picasso-gpu-maintenance.py --output out/picasso/host-checks/gpu-maintenance
           cp out/picasso/host-checks/gpu-maintenance/results.json out/picasso/logs/gpu-maintenance-host.json
 
+      - name: Check CPU frequency demand and boost bounds
+        run: |
+          python3 scripts/check-picasso-cpufreq.py --output out/picasso/host-checks/cpufreq
+          cp out/picasso/host-checks/cpufreq/results.json out/picasso/logs/cpufreq-host.json
+
+      - name: Check GPU frequency votes, hysteresis and idle wakeups
+        run: |
+          python3 scripts/check-picasso-gpu-dvfs.py --output out/picasso/host-checks/gpu-dvfs
+          cp out/picasso/host-checks/gpu-dvfs/results.json out/picasso/logs/gpu-dvfs-host.json
+
+      - name: Check APR microphone capture state and packet bounds
+        run: |
+          python3 scripts/check-picasso-capture.py --output out/picasso/host-checks/capture
+          cp out/picasso/host-checks/capture/results.json out/picasso/logs/capture-host.json
+
+      - name: Check Independent capture DMA ownership and failures
+        run: |
+          python3 scripts/check-picasso-capture-dma.py --output out/picasso/host-checks/capture-dma
+          cp out/picasso/host-checks/capture-dma/results.json out/picasso/logs/capture-dma-host.json
+
+      - name: Check AMIC1 hardware setup and ordered restoration
+        run: |
+          python3 scripts/check-picasso-mic-hardware.py --output out/picasso/host-checks/mic-hardware
+          cp out/picasso/host-checks/mic-hardware/results.json out/picasso/logs/mic-hardware-host.json
+
+      - name: Check Microphone supply readiness and read failures
+        run: |
+          python3 scripts/check-picasso-mic-power.py --output out/picasso/host-checks/mic-power
+          cp out/picasso/host-checks/mic-power/results.json out/picasso/logs/mic-power-host.json
+
+      - name: Check Application-demand capture and timestamped input
+        run: |
+          python3 scripts/check-picasso-mic-service.py --output out/picasso/host-checks/mic-service
+          cp out/picasso/host-checks/mic-service/results.json out/picasso/logs/mic-service-host.json
+
       - name: Check bounded DC ZVA fallback
-        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp' || github.ref_name == 'feat/fix-v1'
         run: |
           python3 scripts/check-picasso-zva.py --output out/picasso/host-checks/zva
           cp out/picasso/host-checks/zva/results.json out/picasso/logs/zva-host.json
@@ -109,13 +145,11 @@ jobs:
           cp out/picasso/host-checks/astc-guard/results.json out/picasso/logs/astc-guard-host.json
 
       - name: Check PR13 WLAN firmware and handshake
-        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp' || github.ref_name == 'feat/fix-v1'
         run: |
           python3 scripts/check-picasso-wlan.py --output out/picasso/host-checks/wlan
           cp out/picasso/host-checks/wlan/results.json out/picasso/logs/wlan-host.json
 
       - name: Check Picasso ADSP survey and firmware inputs
-        if: github.ref_name == 'feat/ios16-dsp' || github.ref_name == 'feat/fix-v1'
         run: |
           python3 scripts/check-picasso-adsp.py --output out/picasso/host-checks/adsp
           cp out/picasso/host-checks/adsp/results.json out/picasso/logs/adsp-host.json
@@ -131,7 +165,6 @@ jobs:
           cp out/picasso/host-checks/adsp-boot/results.json out/picasso/logs/adsp-boot-host.json
 
       - name: Check GOP import and completion ownership
-        if: github.ref_name == 'main-ios16' || github.ref_name == 'feat/ios16-gpu' || github.ref_name == 'feat/ios16-dsp' || github.ref_name == 'feat/fix-v1'
         run: |
           python3 scripts/check-picasso-gop-handoff.py --output out/picasso/host-checks/gop-handoff
           cp out/picasso/host-checks/gop-handoff/results.json out/picasso/logs/gop-handoff-host.json
@@ -235,6 +268,13 @@ jobs:
             device/out/picasso/host-checks/novatek/*.log
             device/out/picasso/host-checks/linux-host/*.log
             device/out/picasso/host-checks/linux-host/*.json
+            device/out/picasso/host-checks/cpufreq/*.log
+            device/out/picasso/host-checks/gpu-dvfs/*.log
+            device/out/picasso/host-checks/capture/*.log
+            device/out/picasso/host-checks/capture-dma/*.log
+            device/out/picasso/host-checks/mic-hardware/*.log
+            device/out/picasso/host-checks/mic-power/*.log
+            device/out/picasso/host-checks/mic-service/*.log
           if-no-files-found: warn
           retention-days: 7
 
