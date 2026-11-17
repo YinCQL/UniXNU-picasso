@@ -1,5 +1,24 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
+@@ -9700,12 +9700,15 @@
+-/* Release the seven Bluetooth launchd jobs before launchd opens its persistent
++/* Release Bluetooth and its stock device-name owner before launchd opens its
++ * persistent overrides. lockdownd initializes and applies ComputerName using
++ * the original SystemConfiguration APIs; do not synthesize name values here.
+  * overrides. The seed recipe/UUID stays stable. Unknown contents are preserved;
+  * only the seed, previous bluetoothd-only result and final XML are accepted. This does not
+  * provide Bluetooth hardware. Atomic rename leaves old or new policy on disk.
+  */
+ static const uint8_t picasso_jobs_before_sha[32] = {0xc5,0x49,0xe5,0x7f,0x02,0x60,0xf4,0x82,0x98,0x95,0x3f,0xa2,0x14,0xff,0x2e,0x73,0x2a,0xe9,0xa3,0xd8,0x4d,0x57,0x5c,0x74,0xea,0x16,0xd6,0xbc,0xb3,0xce,0x4e,0x17};
+ static const uint8_t picasso_jobs_legacy_sha[32] = {0x78,0x53,0xda,0x13,0x46,0x3f,0x30,0x91,0x2b,0x95,0x19,0x31,0xe7,0xed,0xc3,0xdc,0x31,0xc2,0xd3,0xf9,0xed,0x64,0x70,0x62,0x08,0xdb,0x43,0x34,0x14,0x83,0x11,0x50};
+-static const uint8_t picasso_jobs_after_sha[32] = {0x34,0x02,0xf0,0xbe,0x6b,0xb1,0x16,0x4d,0x62,0xb1,0xb2,0xcb,0x88,0x21,0x58,0x3d,0xc4,0x45,0x34,0xd3,0x16,0x33,0x31,0x56,0x88,0xeb,0x7d,0x84,0xcb,0xd2,0x4e,0xfe};
++static const uint8_t picasso_jobs_bluetooth_sha[32] = {0x34,0x02,0xf0,0xbe,0x6b,0xb1,0x16,0x4d,0x62,0xb1,0xb2,0xcb,0x88,0x21,0x58,0x3d,0xc4,0x45,0x34,0xd3,0x16,0x33,0x31,0x56,0x88,0xeb,0x7d,0x84,0xcb,0xd2,0x4e,0xfe};
++static const uint8_t picasso_jobs_after_sha[32] = {0xf1,0xdc,0xb9,0x0b,0xcb,0x09,0xd7,0x12,0x52,0xd6,0x54,0x7a,0xcf,0xde,0x6e,0xde,0xa2,0x6a,0xd7,0xc6,0xa5,0xca,0x4a,0x3b,0x30,0x14,0xa3,0x24,0x8b,0xf2,0xba,0xe0};
+-
++
+ static int
+ picasso_jobs_match(const uint8_t *bytes, size_t size, const uint8_t expected[32])
+ {
 @@ -9734,20 +9734,90 @@
      return error;
  }
@@ -29,7 +48,7 @@
 +    static const char *const released[] = {
 +        "com.apple.BTServer.avrcp", "com.apple.BTServer.le", "com.apple.BTServer.map",
 +        "com.apple.BTServer.pbap", "com.apple.BluetoothUIService", "com.apple.bluetoothd",
-+        "com.apple.bluetoothuserd"
++        "com.apple.bluetoothuserd", "com.apple.mobile.lockdown"
 +    };
 +    struct { uint16_t start, key, length, end; bool drop; } entries[128];
 +    unsigned count = 0;
@@ -100,7 +119,7 @@
      const char *dirs[] = {"/private/var", "/private/var/db", "/private/var/db/com.apple.xpc.launchd"};
      vfs_context_t ctx = vfs_context_current();
      int error = 0, changed = 0;
-@@ -9761,36 +9831,16 @@
+@@ -9761,36 +9831,17 @@
      if (!bytes) { error = ENOMEM; goto done; }
      error = picasso_ifnamer_read(file, bytes, 8192, &size, ctx);
      if (error || picasso_jobs_match(bytes, (size_t)size, picasso_jobs_after_sha)) goto done;
@@ -135,7 +154,8 @@
 -    }
 -    if (!picasso_jobs_match(bytes, (size_t)size, picasso_jobs_after_sha)) { error = EINVAL; goto done; }
 +    bool known = picasso_jobs_match(bytes, (size_t)size, picasso_jobs_legacy_sha) ||
-+        picasso_jobs_match(bytes, (size_t)size, picasso_jobs_before_sha);
++        picasso_jobs_match(bytes, (size_t)size, picasso_jobs_before_sha) ||
++        picasso_jobs_match(bytes, (size_t)size, picasso_jobs_bluetooth_sha);
 +    size_t next_size = (size_t)size;
 +    unsigned removed = 0;
 +    error = picasso_jobs_transform(bytes, &next_size, &removed);

@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -4355,3 +4355,77 @@
+@@ -4355,3 +4355,119 @@
  	kfree_data(rows, 256 * sizeof *rows);
  }
  #endif
@@ -8,26 +8,68 @@
 +/* PICASSO_SETTINGS_DIAG_BSD_BEGIN */
 +#if __arm64__ && (DEVELOPMENT || DEBUG)
 +/* Explicit CDC request only. A worker keeps VM reads off the USB drain thread.
-+ * Three task references are acquired under the process-list lock; no printing,
++ * Four task references are acquired under the process-list lock; no printing,
 + * task locks or VM accesses occur there. No user configuration is modified. */
 +extern void picasso_settings_task_snapshot(task_t, int, uint64_t, unsigned, const char *);
 +static unsigned settings_diag_busy, settings_diag_sample;
 +static uint64_t settings_diag_last;
 +static thread_call_t settings_diag_call;
 +
++/* Four exact successful exec identities only, never a PID-only fallback.
++ * Publish immutable rows last so an explicit sampler cannot see half a row. */
++struct picasso_settings_service_identity { unsigned ready; int pid; uint64_t unique; };
++static struct picasso_settings_service_identity settings_service_ids[4];
++static unsigned settings_service_count;
++void picasso_settings_service_exec(proc_t);
++void
++picasso_settings_service_exec(proc_t p)
++{
++    unsigned index = __atomic_load_n(&settings_service_count, __ATOMIC_RELAXED);
++    while (index < 4 && !__atomic_compare_exchange_n(&settings_service_count,
++        &index, index + 1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
++    if (index >= 4) return;
++    struct picasso_settings_service_identity *row = &settings_service_ids[index];
++    row->pid = proc_getpid(p);
++    row->unique = proc_uniqueid(p);
++    __atomic_store_n(&row->ready, 1, __ATOMIC_RELEASE);
++    printf("PICASSO_SETTINGS service_exec index=%u pid=%d unique=%llu name=%.31s\n",
++        index, row->pid, (unsigned long long)row->unique, p->p_name);
++    printf("PICASSO_SETTINGS service_uuid pid=%d %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
++        row->pid, p->p_uuid[0], p->p_uuid[1], p->p_uuid[2], p->p_uuid[3],
++        p->p_uuid[4], p->p_uuid[5], p->p_uuid[6], p->p_uuid[7],
++        p->p_uuid[8], p->p_uuid[9], p->p_uuid[10], p->p_uuid[11],
++        p->p_uuid[12], p->p_uuid[13], p->p_uuid[14], p->p_uuid[15]);
++}
++int picasso_settings_service_match(proc_t);
++int
++picasso_settings_service_match(proc_t p)
++{
++    for (unsigned index = 0; index < 4; ++index) {
++        const struct picasso_settings_service_identity *row = &settings_service_ids[index];
++        if (__atomic_load_n(&row->ready, __ATOMIC_ACQUIRE) &&
++            row->pid == proc_getpid(p) && row->unique == proc_uniqueid(p)) return 1;
++    }
++    return 0;
++}
++
 +static void
 +picasso_settings_diag_fire(thread_call_param_t unused, thread_call_param_t argument)
 +{
 +    (void)unused;
 +    (void)argument;
-+    static const char *const names[] = {"Preferences", "configd", "lockdownd"};
-+    struct { task_t task; int pid; uint64_t unique; } rows[3] = {0};
++    static const char *const names[] = {"Preferences", "configd", "lockdownd", "fairplayd.H2"};
++    struct { task_t task; int pid; uint64_t unique; } rows[4] = {0};
++    /* Stock 20H392 executable identity survives process display-name changes. */
++    static const uint8_t fairplay_uuid[16] = { 0x30, 0x68, 0x88, 0xad, 0xfb, 0xc4, 0x39, 0xc4, 0x96, 0x1c, 0x72, 0x1c, 0x7f, 0xf2, 0x30, 0xd1 };
 +    proc_t p;
 +    unsigned sample = settings_diag_sample;
 +    proc_list_lock();
 +    ALLPROC_FOREACH(p) {
-+        for (unsigned i = 0; i < 3; ++i) {
-+            if (rows[i].task || strcmp(p->p_name, names[i])) continue;
++        for (unsigned i = 0; i < 4; ++i) {
++            if (rows[i].task) continue;
++            if (i == 3 ? (memcmp(p->p_uuid, fairplay_uuid, sizeof(fairplay_uuid)) &&
++                !picasso_settings_service_match(p)) :
++                strcmp(p->p_name, names[i])) continue;
 +            task_t task = proc_task(p);
 +            if (!task) continue;
 +            task_reference(task);
@@ -38,7 +80,7 @@
 +    }
 +    proc_list_unlock();
 +    printf("PICASSO_SETTINGS begin sample=%u coherent=0 readonly=1\n", sample);
-+    for (unsigned i = 0; i < 3; ++i) {
++    for (unsigned i = 0; i < 4; ++i) {
 +        if (rows[i].task) {
 +            picasso_settings_task_snapshot(rows[i].task, rows[i].pid, rows[i].unique, sample, names[i]);
 +            task_deallocate(rows[i].task);
@@ -819,3 +861,614 @@
  
  	unix_syscall_kprintf("code %d, error %d, results %x, %x (pid %d - %s, tid %lld)\n", code, error,
  	    uthread->uu_rval[0], uthread->uu_rval[1],
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2070,8 +2070,15 @@
+ 	task_importance_update_owner_info(task);
+ #endif
+ 
+ 	proc_setexecutableuuid(p, &load_result.uuid[0]);
++#if DEVELOPMENT || DEBUG
++	/* This is the new proc after activation, before its first user code. */
++	if (!strcmp(p->p_name, "fairplayd.H2")) {
++		extern void picasso_settings_service_exec(proc_t);
++		picasso_settings_service_exec(p);
++	}
++#endif
+ 
+ #if CONFIG_DTRACE
+ 	dtrace_proc_exec(p);
+ #endif
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2478,9 +2478,11 @@
+ #if __arm64__ && (DEVELOPMENT || DEBUG)
+     /* First failures remain observable with normal quiet-boot arguments. */
+-    static const char *const bt_boot_names[] = {"backboardd", "SpringBoard", "bluetoothd", "BlueTool", "bluetoothuserd", "mediaserverd", "audiomxd", "Preferences"};
+-    static unsigned bt_boot_exits[8];
+-    for (unsigned i = 0; i < 8; ++i) {
+-        if (strcmp(p->p_name, bt_boot_names[i])) continue;
++    static const char *const bt_boot_names[] = {"backboardd", "SpringBoard", "bluetoothd", "BlueTool", "bluetoothuserd", "mediaserverd", "audiomxd", "Preferences", "fairplayd.H2"};
++    static unsigned bt_boot_exits[9];
++    extern int picasso_settings_service_match(proc_t);
++    for (unsigned i = 0; i < 9; ++i) {
++        if (strcmp(p->p_name, bt_boot_names[i]) ||
++            (i == 8 && !picasso_settings_service_match(p))) continue;
+         unsigned ticket = os_atomic_load(&bt_boot_exits[i], relaxed);
+         while (ticket < 4 && !os_atomic_cmpxchg(&bt_boot_exits[i], ticket, ticket + 1, relaxed))
+             ticket = os_atomic_load(&bt_boot_exits[i], relaxed);
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -100,8 +100,13 @@
+ 	/* Bounded observation of configd directory calls before VFS entry. This
+ 	 * reports dispatch/rejection outcomes only; no argument strings or file
+ 	 * data are read and no filter, credentials or result is changed. */
+ 	static unsigned picasso_configd_syscall_count;
++	/* First stock FairPlay syscalls only. No file content or IPC is read. */
++	static unsigned picasso_fairplay_syscall_count, picasso_fairplay_main_started;
++	unsigned picasso_fairplay_ticket = 0;
++	uint64_t picasso_fairplay_pc = 0;
++	char picasso_fairplay_path[128] = {0};
+ 	unsigned picasso_configd_ticket = 0, picasso_configd_args_ok = 1;
+ 	unsigned picasso_configd_filtered = 0, picasso_configd_dispatched = 0;
+ 	uint64_t picasso_configd_pc = 0;
+ #endif
+@@ -131,8 +136,54 @@
+ 			}
+ 			value = os_atomic_load(&picasso_configd_syscall_count, relaxed);
+ 		}
+ 		if (picasso_configd_ticket) picasso_configd_pc = get_saved_state_pc(state);
++	}
++	if (!strcmp(proc->p_name, "fairplayd.H2")) {
++		extern int picasso_settings_service_match(proc_t);
++		if (picasso_settings_service_match(proc)) {
++			/* Stock LC_MAIN begins with PT_DENY_ATTACH; skip dyld/setup calls. */
++			if (code == SYS_ptrace && get_saved_state_reg(state, 0) == 31) {
++				extern void picasso_fairplay_mach_start(proc_t);
++				picasso_fairplay_mach_start(proc);
++				os_atomic_store(&picasso_fairplay_main_started, 1, release);
++			}
++			unsigned value = os_atomic_load(&picasso_fairplay_main_started, acquire) ?
++			    os_atomic_load(&picasso_fairplay_syscall_count, relaxed) : 48;
++			while (value < 48) {
++				if (os_atomic_cmpxchg(&picasso_fairplay_syscall_count, value, value + 1, relaxed)) {
++					picasso_fairplay_ticket = value + 1; break;
++				}
++				value = os_atomic_load(&picasso_fairplay_syscall_count, relaxed);
++			}
++		}
++	}
++	if (picasso_fairplay_ticket) {
++		user_addr_t path = 0;
++		if (code == SYS_open || code == SYS_open_nocancel || code == SYS_open_dprotected_np ||
++		    code == SYS_access || code == SYS_stat || code == SYS_stat64 || code == SYS_lstat ||
++		    code == SYS_lstat64 || code == SYS_mkdir || code == SYS_chdir || code == SYS_readlink ||
++		    code == SYS_unlink || code == SYS_getattrlist) path = get_saved_state_reg(state, 0);
++		if (code == SYS_openat || code == SYS_openat_nocancel || code == SYS_openat_dprotected_np)
++			path = get_saved_state_reg(state, 1);
++		if (path) {
++			size_t length = 0;
++			int copied = copyinstr(path, picasso_fairplay_path, sizeof(picasso_fairplay_path), &length);
++			if (copied) picasso_fairplay_path[0] = 0;
++			for (unsigned j = 0; j < sizeof(picasso_fairplay_path) && picasso_fairplay_path[j]; ++j)
++				if ((uint8_t)picasso_fairplay_path[j] < 32 || (uint8_t)picasso_fairplay_path[j] > 126) picasso_fairplay_path[j] = '?';
++			printf("PICASSO_FAIRPLAY path sample=%u pid=%d code=%u copied=%d path=%.127s\n",
++			    picasso_fairplay_ticket, proc_getpid(proc), code, copied, picasso_fairplay_path);
++		}
++		picasso_fairplay_pc = get_saved_state_pc(state);
++		printf("PICASSO_FAIRPLAY enter sample=%u pid=%d tid=%llu code=%u pc=%llx\n",
++		    picasso_fairplay_ticket, proc_getpid(proc), (unsigned long long)thread_tid(thread_act),
++		    code, (unsigned long long)picasso_fairplay_pc);
++		printf("PICASSO_FAIRPLAY args sample=%u x0=%llx x1=%llx x2=%llx x3=%llx\n",
++		    picasso_fairplay_ticket, (unsigned long long)get_saved_state_reg(state, 0),
++		    (unsigned long long)get_saved_state_reg(state, 1),
++		    (unsigned long long)get_saved_state_reg(state, 2),
++		    (unsigned long long)get_saved_state_reg(state, 3));
+ 	}
+ #endif
+ 
+ 	/*
+@@ -221,8 +260,14 @@
+ 		printf("PICASSO_CONFIGD_SYSCALL sample=%u pid=%d tid=%llu code=%u mapped=%u args_ok=%u filter=%u dispatched=%u error=%d result=%d pc=%llx\n",
+ 		    picasso_configd_ticket, pid, (unsigned long long)thread_tid(thread_act), code, syscode,
+ 		    picasso_configd_args_ok, picasso_configd_filtered, picasso_configd_dispatched,
+ 		    error, uthread->uu_rval[0], (unsigned long long)picasso_configd_pc);
++	}
++	if (picasso_fairplay_ticket) {
++		printf("PICASSO_FAIRPLAY result sample=%u pid=%d code=%u args_ok=%u filter=%u dispatched=%u error=%d result=%d\n",
++		    picasso_fairplay_ticket, pid, code, picasso_configd_args_ok,
++		    picasso_configd_filtered, picasso_configd_dispatched,
++		    error, uthread->uu_rval[0]);
+ 	}
+ #endif
+ 
+ 	unix_syscall_kprintf("code %d, error %d, results %x, %x (pid %d - %s, tid %lld)\n", code, error,
+--- a/osfmk/arm64/bsd_arm64.c
++++ b/osfmk/arm64/bsd_arm64.c
+@@ -170,10 +172,198 @@
+ 
+ #if CONFIG_DEBUG_SYSCALL_REJECTION
+ extern int debug_syscall_rejection_mode;
+ extern bool debug_syscall_rejection_handle(int syscall_mach_trap_number);
+ #endif /* CONFIG_DEBUG_SYSCALL_REJECTION */
++
++
++/* PICASSO_FAIRPLAY_MACH_BEGIN */
++#if DEVELOPMENT || DEBUG
++/* Select one immutable stock main identity. No message bodies are read. */
++extern void proc_getexecutableuuid(struct proc *, unsigned char *, unsigned long);
++extern uint64_t proc_uniqueid(struct proc *);
++static unsigned picasso_fairplay_mach_ready;
++static int picasso_fairplay_mach_pid;
++static uint64_t picasso_fairplay_mach_unique;
++static unsigned picasso_fairplay_mach_entries, picasso_fairplay_mach_returns;
++void picasso_fairplay_mach_start(struct proc *);
++void
++picasso_fairplay_mach_start(struct proc * p)
++{
++    static const unsigned char uuid[16] = {0x30,0x68,0x88,0xad,0xfb,0xc4,0x39,0xc4,
++        0x96,0x1c,0x72,0x1c,0x7f,0xf2,0x30,0xd1};
++    unsigned char observed[16] = {0};
++    if (!p) return;
++    proc_getexecutableuuid(p, observed, sizeof observed);
++    if (memcmp(uuid, observed, sizeof uuid) ||
++        !os_atomic_cmpxchg(&picasso_fairplay_mach_ready, 0, 1, relaxed)) return;
++    picasso_fairplay_mach_pid = proc_pid(p);
++    picasso_fairplay_mach_unique = proc_uniqueid(p);
++    os_atomic_store(&picasso_fairplay_mach_ready, 2, release);
++    printf("PICASSO_FAIRPLAY_MACH start pid=%d unique=%llu readonly=1 limit=96\n",
++        picasso_fairplay_mach_pid, (unsigned long long)picasso_fairplay_mach_unique);
++}
++static unsigned
++picasso_fairplay_mach_ticket(unsigned *counter)
++{
++    struct proc * p = current_proc();
++    if (os_atomic_load(&picasso_fairplay_mach_ready, acquire) != 2 || !p ||
++        proc_pid(p) != picasso_fairplay_mach_pid ||
++        proc_uniqueid(p) != picasso_fairplay_mach_unique) return 0;
++    unsigned n = os_atomic_load(counter, relaxed);
++    while (n < 96) {
++        if (os_atomic_cmpxchg(counter, n, n + 1, relaxed)) return n + 1;
++        n = os_atomic_load(counter, relaxed);
++    }
++    return 0;
++}
++static void
++picasso_fairplay_mach_enter(struct arm_saved_state *state, int code)
++{
++    unsigned n = picasso_fairplay_mach_ticket(&picasso_fairplay_mach_entries);
++    if (!n || !is_saved_state64(state)) return;
++    uint64_t tid = thread_tid(current_thread());
++    printf("PICASSO_FAIRPLAY_MACH enter sample=%u pid=%d tid=%llu code=%d pc=%llx lr=%llx\n",
++        n, picasso_fairplay_mach_pid, (unsigned long long)tid, code,
++        (unsigned long long)get_saved_state_pc(state),
++        (unsigned long long)get_saved_state_lr(state));
++    printf("PICASSO_FAIRPLAY_MACH args sample=%u x0=%llx x1=%llx x2=%llx x3=%llx x4=%llx x5=%llx\n",
++        n, (unsigned long long)get_saved_state_reg(state, 0),
++        (unsigned long long)get_saved_state_reg(state, 1),
++        (unsigned long long)get_saved_state_reg(state, 2),
++        (unsigned long long)get_saved_state_reg(state, 3),
++        (unsigned long long)get_saved_state_reg(state, 4),
++        (unsigned long long)get_saved_state_reg(state, 5));
++    uint64_t fp = get_saved_state_fp(state), sp = get_saved_state_sp(state);
++    for (unsigned depth = 0; depth < 8; ++depth) {
++        uint64_t pair[2] = {0};
++        if ((fp & 15) || fp < sp || fp - sp > 0x10000 || fp > UINT64_MAX - 16) break;
++        int error = copyin((user_addr_t)fp, pair, sizeof pair);
++        printf("PICASSO_FAIRPLAY_MACH frame sample=%u tid=%llu depth=%u fp=%llx next=%llx lr=%llx error=%d\n",
++            n, (unsigned long long)tid, depth, (unsigned long long)fp,
++            (unsigned long long)pair[0], (unsigned long long)pair[1], error);
++        if (error || pair[0] <= fp) break;
++        fp = pair[0];
++    }
++}
++void picasso_fairplay_mach_return(struct arm_saved_state *, int, unsigned);
++void
++picasso_fairplay_mach_return(struct arm_saved_state *state, int result, unsigned continuation)
++{
++    int code = get_saved_state_svc_number(state);
++    if (code >= 0) return;
++    unsigned n = picasso_fairplay_mach_ticket(&picasso_fairplay_mach_returns);
++    if (!n) return;
++    printf("PICASSO_FAIRPLAY_MACH result sample=%u pid=%d tid=%llu code=%d result=%x continuation=%u pc=%llx\n",
++        n, picasso_fairplay_mach_pid, (unsigned long long)thread_tid(current_thread()),
++        -code, (unsigned)result, continuation, (unsigned long long)get_saved_state_pc(state));
++}
++#endif
++/* PICASSO_FAIRPLAY_MACH_END */
++
++/* PICASSO_LOCKDOWN_VERSION_WAIT_BEGIN */
++#if DEVELOPMENT || DEBUG
++/* Bound only the two exact stock initialization queries which wait after FairPlay
++ * exits. The normal Mach receive produces its own timeout or real reply. */
++static void
++picasso_lockdown_version_wait(struct arm_saved_state *state, int code,
++    struct mach_call_args *args)
++{
++    static const unsigned char expected[16] = {0x7d,0x41,0x06,0x82,0x74,0x7b,0x32,0x6c,
++        0x8e,0xbc,0xe8,0x66,0xe8,0xa9,0xb7,0x4e};
++    /* PICASSO_LOCKDOWN_WAIT_DIAGNOSTIC_BEGIN */
++    if (code == 47 && is_saved_state64(state) && ((args->arg5 >> 32) == 1203 || (args->arg5 >> 32) == 1200)) {
++        struct proc *observed_p = current_proc();
++        unsigned char observed_uuid[16] = {0};
++        if (observed_p) proc_getexecutableuuid(observed_p, observed_uuid, sizeof(observed_uuid));
++        static unsigned diagnostic_count;
++        unsigned n = os_atomic_load(&diagnostic_count, relaxed);
++        while (observed_p && !memcmp(observed_uuid, expected, sizeof(expected)) && n < 8) {
++            if (os_atomic_cmpxchg(&diagnostic_count, n, n + 1, relaxed)) {
++                printf("PICASSO_LOCKDOWN_WAIT_ARGS sample=%u flags=%llx bits=%x send=%u remote=%u local=%u voucher=%u id=%u desc=%u recv=%u size=%u priority=%u timeout=%llu\n",
++                    n + 1, (unsigned long long)args->arg2, (unsigned)args->arg3,
++                    (unsigned)(args->arg3 >> 32), (unsigned)args->arg4, (unsigned)(args->arg4 >> 32),
++                    (unsigned)args->arg5, (unsigned)(args->arg5 >> 32), (unsigned)args->arg6,
++                    (unsigned)(args->arg6 >> 32), (unsigned)args->arg7, (unsigned)(args->arg7 >> 32),
++                    (unsigned long long)args->arg8);
++                if (args->arg2 & MACH64_MSG_VECTOR) {
++                    mach_msg_vector_t v[2] = {};
++                    int error = copyin((user_addr_t)args->arg1, v, sizeof(v));
++                    printf("PICASSO_LOCKDOWN_WAIT_VECTOR sample=%u error=%d send0=%u recv0=%u send1=%u recv1=%u data0=%u\n",
++                        n + 1, error, v[0].msgv_send_size, v[0].msgv_rcv_size,
++                        v[1].msgv_send_size, v[1].msgv_rcv_size, v[0].msgv_data != 0);
++                }
++                break;
++            }
++            n = os_atomic_load(&diagnostic_count, relaxed);
++        }
++    }
++    /* PICASSO_LOCKDOWN_WAIT_DIAGNOSTIC_END */
++    const uint32_t rpc = (uint32_t)(args->arg5 >> 32);
++    const bool init = rpc == 1200;
++    const uint32_t base_bits = init ? 0x80001513 : 0x1513;
++    const uint32_t send_size = init ? 64 : 24;
++    const uint32_t receive_size = init ? 220 : 60;
++    const uint64_t return_offset = init ? 0x2b154 : 0x2b6e8;
++    if (code != 47 || !is_saved_state64(state) ||
++        (uint32_t)args->arg2 != (MACH_SEND_MSG | MACH_RCV_MSG) ||
++        !(((uint32_t)args->arg3 == base_bits && (uint32_t)args->arg5 == 0) ||
++          ((uint32_t)args->arg3 == (base_bits | 0x130000) && (uint32_t)args->arg5 != 0)) ||
++        (rpc != 1203 && rpc != 1200) ||
++        !((uint32_t)args->arg4) || !(args->arg4 >> 32) ||
++        (uint32_t)args->arg6 != (init ? 1u : 0u) ||
++        (args->arg6 >> 32) != (args->arg4 >> 32) ||
++        args->arg8 != 0) return;
++    if (args->arg2 & MACH64_MSG_VECTOR) {
++        mach_msg_vector_t vectors[2] = {};
++        if ((args->arg3 >> 32) != 2 || args->arg7 != 2 ||
++            copyin((user_addr_t)args->arg1, vectors, sizeof(vectors)) ||
++            vectors[0].msgv_send_size != send_size || vectors[0].msgv_rcv_size != receive_size ||
++            !vectors[0].msgv_data || vectors[1].msgv_send_size != 0 ||
++            vectors[1].msgv_rcv_size != 128) return;
++    } else if ((args->arg3 >> 32) != send_size || args->arg7 != receive_size) return;
++    struct proc *p = current_proc();
++    unsigned char uuid[16] = {0};
++    if (!p) return;
++    proc_getexecutableuuid(p, uuid, sizeof(uuid));
++    if (memcmp(uuid, expected, sizeof(uuid))) return;
++    task_t task = current_task();
++    uint64_t header = 0;
++    if (task_lock_try(task)) {
++        if (task->active) header = task->mach_header_vm_address;
++        task_unlock(task);
++    }
++    if (!header || header > UINT64_MAX - return_offset) return;
++    uint64_t fp = get_saved_state_fp(state), sp = get_saved_state_sp(state);
++    bool matched = false;
++    for (unsigned depth = 0; depth < 6; ++depth) {
++        uint64_t pair[2] = {0};
++        if ((fp & 15) || fp < sp || fp - sp > 0x10000 || fp > UINT64_MAX - 16 ||
++            copyin((user_addr_t)fp, pair, sizeof(pair))) break;
++        if (pair[1] == header + return_offset) { matched = true; break; }
++        if (pair[0] <= fp) break;
++        fp = pair[0];
++    }
++    if (!matched) return;
++    args->arg2 |= MACH_RCV_TIMEOUT;
++    args->arg8 = 5000;
++    static unsigned notes;
++    unsigned n = os_atomic_load(&notes, relaxed);
++    while (n < 8) {
++        if (os_atomic_cmpxchg(&notes, n, n + 1, relaxed)) {
++            if (init) {
++                printf("PICASSO_LOCKDOWN_INIT_WAIT pid=%d timeout_ms=5000 rpc=1200 native_receive=1\n", proc_pid(p));
++            } else {
++                printf("PICASSO_LOCKDOWN_VERSION_WAIT pid=%d timeout_ms=5000 rpc=1203 native_receive=1\n", proc_pid(p));
++            }
++            break;
++        }
++        n = os_atomic_load(&notes, relaxed);
++    }
++}
++#endif
++/* PICASSO_LOCKDOWN_VERSION_WAIT_END */
+ 
+ void
+ mach_syscall(struct arm_saved_state *state)
+ {
+ 	kern_return_t retval;
+@@ -201,10 +286,14 @@
+ 
+ 	if (call_number >= MACH_TRAP_TABLE_COUNT) {
+ 		goto bad;
+ 	}
+ 
++#if DEVELOPMENT || DEBUG
++	picasso_fairplay_mach_enter(state, call_number);
++#endif
++
+ 	DEBUG_KPRINT_SYSCALL_MACH(
+ 		"mach_syscall: code=%d(%s) (pid %d, tid %lld)\n",
+ 		call_number, mach_syscall_name_table[call_number],
+ 		proc_pid(current_proc()), thread_tid(current_thread()));
+ 
+@@ -222,10 +311,13 @@
+ 
+ 	argc = mach_trap_table[call_number].mach_trap_arg_count;
+ 	if (argc) {
+ 		retval = arm_get_mach_syscall_args(state, &args, &mach_trap_table[call_number]);
+ 		if (retval != KERN_SUCCESS) {
++#if DEVELOPMENT || DEBUG
++			picasso_fairplay_mach_return(state, retval, 0);
++#endif
+ 			arm_set_mach_syscall_ret(state, retval);
+ 
+ 			DEBUG_KPRINT_SYSCALL_MACH(
+ 				"mach_syscall: retval=0x%x\n", retval);
+ 			return;
+@@ -287,10 +379,13 @@
+ 
+ 	KERNEL_DEBUG_CONSTANT_IST(KDEBUG_TRACE,
+ 	    MACHDBG_CODE(DBG_MACH_EXCP_SC, (call_number)) | DBG_FUNC_END,
+ 	    retval, 0, 0, 0, 0);
+ 
++#if DEVELOPMENT || DEBUG
++	picasso_fairplay_mach_return(state, retval, 0);
++#endif
+ 	arm_set_mach_syscall_ret(state, retval);
+ 
+ 	throttle_lowpri_io(1);
+ 
+ #if DEBUG || DEVELOPMENT
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -2365,10 +2365,15 @@
+ 	thread = current_thread();
+ 	state = get_user_regs(thread);
+ 
+ 	assert(is_saved_state64(state));
+ 	saved_state64(state)->x[0] = error;
++#if DEVELOPMENT || DEBUG
++	extern void picasso_fairplay_mach_return(struct arm_saved_state *, int, unsigned);
++	picasso_fairplay_mach_return(state, error, 1);
++#endif
++
+ 
+ #if MACH_ASSERT
+ 	kern_allocation_name_t
+ 	prior __assert_only = thread_get_kernel_state(thread)->allocation_name;
+ 	assertf(prior == NULL, "thread_set_allocation_name(\"%s\") not cleared", kern_allocation_get_name(prior));
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -2819,10 +2819,43 @@
+ 	    (unsigned)rpc, (unsigned)result, object ? 1u : 0u);
+ }
+ #endif
+ /* PICASSO_SERVICE_TRACE_END */
+ 
++/* PICASSO_FAIRPLAY_MATCH_BEGIN */
++#if DEVELOPMENT || DEBUG
++extern int picasso_settings_service_match(proc_t);
++static unsigned
++picasso_fairplay_match_ticket(void)
++{
++    if (!picasso_settings_service_match(current_proc())) return 0;
++    static unsigned counter;
++    unsigned value = __atomic_load_n(&counter, __ATOMIC_RELAXED);
++    while (value < 12) {
++        if (__atomic_compare_exchange_n(&counter, &value, value + 1, false,
++            __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return value + 1;
++    }
++    return 0;
++}
++static void
++picasso_fairplay_match_log(unsigned ticket, OSDictionary *dict, unsigned stage,
++    unsigned size, IOReturn result, bool object)
++{
++    if (!ticket) return;
++    char provider[64], name[64], resource[64];
++    picasso_trace_property(dict, "IOProviderClass", provider, sizeof(provider));
++    picasso_trace_property(dict, "IONameMatch", name, sizeof(name));
++    picasso_trace_property(dict, "IOResourceMatch", resource, sizeof(resource));
++    int pid = proc_selfpid();
++    printf("PICASSO_FAIRPLAY_MATCH result sample=%u pid=%d stage=%u size=%u result=%x object=%u\n",
++        ticket, pid, stage, size, (unsigned)result, object ? 1u : 0u);
++    printf("PICASSO_FAIRPLAY_MATCH labels sample=%u pid=%d provider=%s name=%s resource=%s\n",
++        ticket, pid, provider, name, resource);
++}
++#endif
++/* PICASSO_FAIRPLAY_MATCH_END */
++
+ static kern_return_t
+ internal_io_service_get_matching_services(
+ 	mach_port_t main_port,
+ 	const char * matching,
+ 	mach_msg_type_number_t matching_size,
+@@ -2830,11 +2863,18 @@
+ {
+ 	kern_return_t       kr;
+ 	OSObject *          obj;
+ 	OSDictionary *      dict;
+ 
++#if DEVELOPMENT || DEBUG
++    unsigned fairplay_ticket = picasso_fairplay_match_ticket();
++#endif
+ 	if (main_port != main_device_port) {
++#if DEVELOPMENT || DEBUG
++        picasso_fairplay_match_log(fairplay_ticket, NULL, 0, matching_size,
++            kIOReturnNotPrivileged, false);
++#endif
+ 		return kIOReturnNotPrivileged;
+ 	}
+ 
+ 	assert(matching_size);
+ 	obj = OSUnserializeXML(matching, matching_size);
+@@ -2846,17 +2886,24 @@
+ #endif
+ /* PICASSO_SERVICE_TRACE_END */
+ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
+ 		*existing = IOUserIterator::withIterator(IOService::getMatchingServices( dict ));
+ 		kr = kIOReturnSuccess;
++#if DEVELOPMENT || DEBUG
++        picasso_fairplay_match_log(fairplay_ticket, dict, 2, matching_size, kr,
++            *existing != NULL);
++#endif
+ /* PICASSO_SERVICE_TRACE_BEGIN */
+ #if DEVELOPMENT || DEBUG
+ 		picasso_service_end(trace, kr, kr, *existing != NULL);
+ #endif
+ /* PICASSO_SERVICE_TRACE_END */
+ 	} else {
+ 		kr = kIOReturnBadArgument;
++#if DEVELOPMENT || DEBUG
++        picasso_fairplay_match_log(fairplay_ticket, NULL, 1, matching_size, kr, false);
++#endif
+ 	}
+ 
+ 	if (obj) {
+ 		obj->release();
+ 	}
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4716,10 +4716,40 @@
+         identity && !strcmp(identity, "com.apple.mediaserverd");
+     if (process) proc_rele(process);
+     return grant;
+ }
+ 
++/* PICASSO_FAIRPLAY_OPEN_HELPER_BEGIN */
++#if DEVELOPMENT || DEBUG
++static unsigned
++picasso_fairplay_open_ticket(void)
++{
++    if (!picasso_settings_service_match(current_proc())) return 0;
++    static unsigned counter;
++    unsigned value = __atomic_load_n(&counter, __ATOMIC_RELAXED);
++    while (value < 12) {
++        if (__atomic_compare_exchange_n(&counter, &value, value + 1, false,
++            __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return value + 1;
++    }
++    return 0;
++}
++static void
++picasso_fairplay_open_log(unsigned ticket, unsigned stage, IOService *service,
++    uint32_t type, IOReturn rpc, IOReturn result, bool client)
++{
++    if (!ticket) return;
++    char provider[64];
++    picasso_trace_text(provider, sizeof(provider),
++        service ? service->getMetaClass()->getClassName() : NULL);
++    int pid = proc_selfpid();
++    printf("PICASSO_FAIRPLAY_OPEN result sample=%u pid=%d stage=%u type=%u rpc=%x result=%x client=%u\n",
++        ticket, pid, stage, type, (unsigned)rpc, (unsigned)result, client ? 1u : 0u);
++    printf("PICASSO_FAIRPLAY_OPEN provider sample=%u pid=%d class=%s\n", ticket, pid, provider);
++}
++#endif
++/* PICASSO_FAIRPLAY_OPEN_HELPER_END */
++
+ kern_return_t
+ is_io_service_open_extended(
+ 	io_object_t _service,
+ 	task_t owningTask,
+ 	uint32_t connect_type,
+@@ -4743,17 +4773,28 @@
+ 	assert(owningTask == current_task());
+ 	if (owningTask != current_task()) {
+ 		return kIOReturnBadArgument;
+ 	}
+ 
++/* PICASSO_FAIRPLAY_OPEN_OBSERVE_BEGIN */
++#if DEVELOPMENT || DEBUG
++    unsigned fairplay_open_ticket = picasso_fairplay_open_ticket();
++#endif
++/* PICASSO_FAIRPLAY_OPEN_OBSERVE_END */
+ /* PICASSO_SERVICE_TRACE_BEGIN */
+ #if DEVELOPMENT || DEBUG
+ 	picasso_service_trace trace = picasso_service_begin(3, NULL, service->getMetaClass()->getClassName(), connect_type);
+ #endif
+ /* PICASSO_SERVICE_TRACE_END */
+ #if CONFIG_MACF
+ 	if (!native_sandbox_grant(service) && mac_iokit_check_open_service(kauth_cred_get(), service, connect_type) != 0) {
++/* PICASSO_FAIRPLAY_OPEN_OBSERVE_BEGIN */
++#if DEVELOPMENT || DEBUG
++        picasso_fairplay_open_log(fairplay_open_ticket, 1, service, connect_type,
++            kIOReturnNotPermitted, kIOReturnNotPermitted, false);
++#endif
++/* PICASSO_FAIRPLAY_OPEN_OBSERVE_END */
+ /* PICASSO_SERVICE_TRACE_BEGIN */
+ #if DEVELOPMENT || DEBUG
+ 		picasso_service_end(trace, kIOReturnNotPermitted, kIOReturnNotPermitted, false);
+ #endif
+ /* PICASSO_SERVICE_TRACE_END */
+@@ -4762,10 +4803,16 @@
+ 		return kIOReturnNotPermitted;
+ 	}
+ #endif
+ 	do{
+ 		if (properties) {
++/* PICASSO_FAIRPLAY_OPEN_OBSERVE_BEGIN */
++#if DEVELOPMENT || DEBUG
++        picasso_fairplay_open_log(fairplay_open_ticket, 4, service, connect_type,
++            kIOReturnUnsupported, kIOReturnUnsupported, false);
++#endif
++/* PICASSO_FAIRPLAY_OPEN_OBSERVE_END */
+ /* PICASSO_SERVICE_TRACE_BEGIN */
+ #if DEVELOPMENT || DEBUG
+ 		picasso_service_end(trace, kIOReturnUnsupported, kIOReturnUnsupported, false);
+ #endif
+ /* PICASSO_SERVICE_TRACE_END */
+@@ -4801,10 +4848,16 @@
+ 			}
+ 		}
+ #endif
+ 		res = service->newUserClient( owningTask, (void *) owningTask,
+ 		    connect_type, propertiesDict, &client );
++/* PICASSO_FAIRPLAY_OPEN_OBSERVE_BEGIN */
++#if DEVELOPMENT || DEBUG
++        picasso_fairplay_open_log(fairplay_open_ticket, 2, service, connect_type,
++            err, res, client != NULL);
++#endif
++/* PICASSO_FAIRPLAY_OPEN_OBSERVE_END */
+ 
+ 		if (propertiesDict) {
+ 			propertiesDict->release();
+ 		}
+ 
+@@ -4975,10 +5028,16 @@
+ 		}
+ 	}while (false);
+ 
+ 	*connection = client;
+ 	*result = res;
++/* PICASSO_FAIRPLAY_OPEN_OBSERVE_BEGIN */
++#if DEVELOPMENT || DEBUG
++    picasso_fairplay_open_log(fairplay_open_ticket, 3, service, connect_type,
++        err, res, client != NULL);
++#endif
++/* PICASSO_FAIRPLAY_OPEN_OBSERVE_END */
+ 	if (!strcmp(service->getMetaClass()->getClassName(), "IONetworkStack"))
+ 		IOLog("PICASSO_NETWORK stack_open pid=%d type=%u error=%x result=%x client=%u\n",
+ 		    proc_selfpid(), connect_type, err, res, client != nullptr);
+ 
+ /* PICASSO_SERVICE_TRACE_BEGIN */
+--- a/osfmk/arm64/bsd_arm64.c
++++ b/osfmk/arm64/bsd_arm64.c
+@@ -373,7 +373,11 @@
+ #endif /* CONFIG_DEBUG_SYSCALL_REJECTION */
+ 
+ 
++#if DEVELOPMENT || DEBUG
++	picasso_lockdown_version_wait(state, call_number, &args);
++#endif
++
+ 	retval = mach_call(&args);
+ 
+ skip_machcall:
+ 

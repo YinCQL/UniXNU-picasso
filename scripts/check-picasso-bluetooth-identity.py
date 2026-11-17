@@ -30,15 +30,15 @@ parser='\n'.join(m.extract(s,n) for n in ['static int\npicasso_jobs_space(', 'st
 (out/'parser.c').write_text('#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\n#include <string.h>\n#include <errno.h>\n'+parser+'\nint transform(uint8_t *b,size_t *n,unsigned *r){return picasso_jobs_transform(b,n,r);}\n')
 subprocess.run(['/usr/bin/clang','-shared','-fPIC','-O1',str(out/'parser.c'),'-o',str(out/'parser.so')],check=True)
 lib=ctypes.CDLL(str(out/'parser.so'));fn=lib.transform;fn.argtypes=[ctypes.c_void_p,ctypes.POINTER(ctypes.c_size_t),ctypes.POINTER(ctypes.c_uint)]
-raw=(R/'scripts/tests/picasso-bluetooth-disabled.plist').read_bytes();actual=plistlib.loads(raw);released={'com.apple.BTServer.avrcp','com.apple.BTServer.le','com.apple.BTServer.map','com.apple.BTServer.pbap','com.apple.BluetoothUIService','com.apple.bluetoothd','com.apple.bluetoothuserd'}
+raw=(R/'scripts/tests/picasso-bluetooth-disabled.plist').read_bytes();actual=plistlib.loads(raw);released={'com.apple.BTServer.avrcp','com.apple.BTServer.le','com.apple.BTServer.map','com.apple.BTServer.pbap','com.apple.BluetoothUIService','com.apple.bluetoothd','com.apple.bluetoothuserd','com.apple.mobile.lockdown'}
 def transform(b):
  buf=ctypes.create_string_buffer(b,8192);n=ctypes.c_size_t(len(b));r=ctypes.c_uint();err=fn(buf,ctypes.byref(n),ctypes.byref(r));return err,buf.raw[:n.value],r.value
-expected={k:v for k,v in actual.items() if k not in released};err,result,removed=transform(raw);assert not err and removed==6 and plistlib.loads(result)==expected
+expected={k:v for k,v in actual.items() if k not in released};err,result,removed=transform(raw);assert not err and removed==7 and plistlib.loads(result)==expected
 assert transform(result)==(0,result,0)
 (out/'device-disabled-after.plist').write_bytes(result)
 rng=random.Random(0x20261115)
 for _ in range(100):
  pairs=list(actual.items());rng.shuffle(pairs);sample=plistlib.dumps(dict(pairs),sort_keys=False)
- err,result,removed=transform(sample);assert not err and removed==6 and plistlib.loads(result)==expected and transform(result)==(0,result,0)
+ err,result,removed=transform(sample);assert not err and removed==7 and plistlib.loads(result)==expected and transform(result)==(0,result,0)
 (out/'report.json').write_text(json.dumps(dict(passed=True,identity_cases=44,actual_daemon_bytes=8930688,capture_max_bytes=16*1024*1024,parser_permutations=100,device_policy_sha256=hashlib.sha256(raw).hexdigest(),preserved_extra_keys=['com.apple.dhcp6d','com.apple.bootpd','com.apple.ftp-proxy-embedded'],inputs={n:hashlib.sha256((R/n).read_bytes()).hexdigest() for n in ['patches/picasso-bluetooth-identity-xnu.patch','patches/picasso-bluetooth-policy-xnu.patch','scripts/check-picasso-bluetooth-identity.py','scripts/tests/picasso-bluetooth-identity-host.c','scripts/tests/picasso-bluetooth-disabled.plist']}),indent=2)+'\n')
 print('PASS runtime identity and actual-device policy permutations')

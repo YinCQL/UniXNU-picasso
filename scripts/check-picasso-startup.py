@@ -71,18 +71,19 @@ def main():
     assert entry.index('picasso_iokit_set_properties_check') < entry.index('entry->setProperties( obj )')
     # Keep seed identity unchanged while applying only the approved runtime job release.
     board = tomllib.loads((ROOT / 'board.toml').read_text())['payload']
-    assert board['runtime_enabled_jobs'] == ['com.apple.BTServer.avrcp', 'com.apple.BTServer.le', 'com.apple.BTServer.map', 'com.apple.BTServer.pbap', 'com.apple.BluetoothUIService', 'com.apple.bluetoothd', 'com.apple.bluetoothuserd']
+    assert board['runtime_enabled_jobs'] == ['com.apple.BTServer.avrcp', 'com.apple.BTServer.le', 'com.apple.BTServer.map', 'com.apple.BTServer.pbap', 'com.apple.BluetoothUIService', 'com.apple.bluetoothd', 'com.apple.bluetoothuserd', 'com.apple.mobile.lockdown']
     before = plistlib.dumps({job: True for job in board['offline_disabled_jobs']})
     legacy = plistlib.dumps({job: True for job in board['offline_disabled_jobs'] if job != 'com.apple.bluetoothd'})
+    bluetooth = plistlib.dumps({job: True for job in board['offline_disabled_jobs'] if job not in board['runtime_enabled_jobs'] or job == 'com.apple.mobile.lockdown'})
     after = plistlib.dumps({job: True for job in board['offline_disabled_jobs'] if job not in board['runtime_enabled_jobs']})
     constants = source[source.index('static const uint8_t picasso_jobs_before_sha'):source.index('static int\npicasso_jobs_match(')]
-    for name, data in [('before', before), ('legacy', legacy), ('after', after)]:
+    for name, data in [('before', before), ('legacy', legacy), ('bluetooth', bluetooth), ('after', after)]:
         literal = re.search('picasso_jobs_' + name + r'_sha\[32\] = \{(.*?)\}', constants)[1]
         assert bytes(int(n, 16) for n in literal.split(',')) == hashlib.sha256(data).digest()
     policy = constants + '\n'.join(module.extract(source, name) for name in
         ('static int\npicasso_jobs_match(', 'static int\npicasso_jobs_space(', 'static int\npicasso_jobs_token(', 'static int\npicasso_jobs_transform(', 'static int\npicasso_jobs_metadata(', 'static int\npicasso_jobs_sync(', 'static int\npicasso_jobs_enable('))
     (out / 'runtime-jobs.inc').write_text(policy, newline='\n')
-    (out / 'jobs-data.inc').write_text('\n'.join('static const unsigned char jobs_' + name + '[] = {' + ','.join(str(n) for n in data) + '};' for name, data in [('before', before), ('legacy', legacy), ('after', after)]), newline='\n')
+    (out / 'jobs-data.inc').write_text('\n'.join('static const unsigned char jobs_' + name + '[] = {' + ','.join(str(n) for n in data) + '};' for name, data in [('before', before), ('legacy', legacy), ('bluetooth', bluetooth), ('after', after)]), newline='\n')
     device = (ROOT / 'scripts/tests/picasso-bluetooth-disabled.plist').read_bytes()
     # Match the production removal extent while retaining the captured order.
     device_after = device

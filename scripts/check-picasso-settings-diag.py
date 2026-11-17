@@ -21,9 +21,9 @@ def main():
     assert 'settings_diag_pending, 0, acquire) && normal' in poll
     vm=(a.xnu/'osfmk/vm/vm_fault.c').read_text()
     assert 'return KERN_FAILURE;' in vm.split('if (get_preemption_level() != 0)',1)[1].split('\n\t}',1)[0]
-    report=dict(passed=False,scope=__doc__,cases=30,runs=[],source_sha256={n:hashlib.sha256(s.encode()).hexdigest() for n,s in sources.items()})
+    report=dict(passed=False,scope=__doc__,cases=40,runs=[],source_sha256={n:hashlib.sha256(s.encode()).hexdigest() for n,s in sources.items()})
     try:
-        for group,cases in [('task',20),('bsd',10)]:
+        for group,cases in [('task',20),('bsd',20)]:
             fixture=Path(__file__).parent/('tests/picasso-settings-diag-'+group+'.c')
             if not fixture.is_file():fixture=Path(__file__).parent/('test-settings-'+group+'.c')
             shutil.copyfile(fixture,a.output/(group+'.c'))
@@ -38,6 +38,6 @@ def main():
                         r=subprocess.run([str(a.output/name),str(i)],stdout=log,stderr=subprocess.STDOUT);r.check_returncode();entry['passed_cases'].append(i)
         report['passed']=True
     finally:(a.output/'results.json').write_text(json.dumps(report,indent=2)+'\n')
-    print('PASS 30 normal + 30 ASan/UBSan worker/lifecycle/locks/maps/frames cases')
+    print('PASS 40 normal + 40 ASan/UBSan worker/lifecycle/locks/maps/frames cases')
 
 if __name__=='__main__':main()
