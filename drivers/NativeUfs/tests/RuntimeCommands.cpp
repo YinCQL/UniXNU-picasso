@@ -15,10 +15,12 @@ constexpr IOReturn kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnBusy=2,kIO
 constexpr unsigned kMicrosecondScale=1;
 constexpr int THREAD_UNINT=0;
 #include "../RootDiagnostics.h"
+#include "../RuntimeMetrics.h"
 #include "../TransferPoll.h"
 #include "../RootTransportLayout.h"
 #include "../PollPause.h"
 struct IOLock{std::mutex mutex;std::condition_variable changed;};
+static bool IOLockTryLock(IOLock*l){return l->mutex.try_lock();}
 static void IOLockLock(IOLock*l){l->mutex.lock();}static void IOLockUnlock(IOLock*l){l->mutex.unlock();}
 static void IOLockSleep(IOLock*l,void*,int){std::unique_lock<std::mutex>g(l->mutex,std::adopt_lock);l->changed.wait(g);g.release();}
 static void IOLockWakeup(IOLock*l,void*,bool){l->changed.notify_all();}
@@ -67,6 +69,7 @@ static bool hostInWindow(uint64_t lba,uint32_t blocks){return lba>=100&&lba+bloc
 static void IOLog(const char*,...){}
 #define NATIVE_UFS_HOST_RUNTIME_PLATFORM 1
 static IOReturn runtimeRead4k(uint8_t,uint64_t,uint32_t,void*,bool=false);
+static bool preemption_enabled(){return true;}
 #include "../RuntimeSlots.h"
 static uint32_t rtCompletionCount(unsigned s){return gSlotGen[s];}
 static bool rtInterruptMode(){return false;}
@@ -75,6 +78,8 @@ static void rtWaitCompletion(unsigned slot,uint32_t,uint64_t,uint64_t){
   else ufsPollPause(hostCpuRelax);
 }
 static void rtWaitDone(uint64_t){}
+
+static void rtLogTableStats(){}
 static uint64_t rtDmaAddress(const void *p){
   auto at=static_cast<const uint8_t*>(p);
   if (!directFixture || at < directFixture || at >= directFixture+directFixtureBytes) return 0;
@@ -203,5 +208,14 @@ int main(){
   {reset();failResidual=true;std::vector<uint8_t>out(4096,0xa5);assert(runtimeRead4k(0,1,1,out.data())==3&&gHost.poisoned&&out[0]==0xa5);}
   {reset(3);bool a,b;auto x=rtSlotTake(&a),y=rtSlotTake(&b);std::atomic<bool>taken{false};std::thread waiter([&]{bool p;auto z=rtSlotTake(&p);assert(!p);taken=true;(void)z;});
     for (;;) { IOLockLock (&pool); bool waiting = gWaitHead != nullptr; IOLockUnlock (&pool); if (waiting) break; std::this_thread::yield (); }rtQuarantine();waiter.join();assert(taken);rtSlotGive(x,a);rtSlotGive(y,b);}
+  {reset();char text[1536];assert(!native_ufs_stats_text(nullptr,sizeof(text))&&!native_ufs_stats_text(text,0));
+    assert(native_ufs_stats_text(text,sizeof(text))>0&&strstr(text,"pool_snapshot=1"));
+    char shortText[8];assert(native_ufs_stats_text(shortText,sizeof(shortText))>7&&shortText[7]==0);
+    bool a;auto slot=rtSlotTake(&a);std::atomic<bool>locked{false},release{false};
+    std::thread holder([&]{IOLockLock(&pool);locked=true;while(!release)std::this_thread::yield();IOLockUnlock(&pool);});
+    while(!locked)std::this_thread::yield();native_ufs_stats_text(text,sizeof(text));assert(strstr(text,"pool_snapshot=0"));
+    release=true;holder.join();rtSlotGive(slot,a);
+    gPoisonReason=0;rtQuarantine(3,0x28);rtQuarantine(5,0x2a);assert(gPoisonReason==3&&gPoisonOpcode==0x28);
+  }
   puts("PASS runtime multi-slot DMA isolation, BUSY retry, FUA/flush, firmware slot, final deadline read, quarantine and waiter wakeup");
 }

@@ -80,6 +80,8 @@ struct NativeUfsBlock {
   uint8_t *verifiedCacheStorage=nullptr;
   IOReturn doAsyncReadWrite(IOMemoryDescriptor *,UInt64,UInt64,IOStorageAttributes *,IOStorageCompletion *);
 };
+#include "../RuntimeMetrics.h"
+static uint64_t ufsMetricsClock () { return timerTicks (); }
 #include "actual-read.inc"
 static IOReturn completedStatus; static uint64_t completedBytes;
 static void complete (void *,void *,IOReturn status,uint64_t bytes) {

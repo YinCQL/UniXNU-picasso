@@ -98,7 +98,7 @@ API int window(const uint8_t *hashes,uint64_t bytes,uint64_t absolute,uint64_t b
 '''
     (out / 'bridge.cpp').write_text(wrapper, encoding='utf-8')
     library = out / ('bridge.dll' if os.name == 'nt' else 'bridge.so')
-    report = dict(scope=__doc__, passed=False, cases=[], runs=[], source_sha256=hashlib.sha256(source.read_bytes()).hexdigest())
+    report = dict(scope=__doc__, passed=False, cases=[], runs=[], source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(), inputs={str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in (source.parent / 'RuntimeMetrics.h', source.parent / 'tests/RootReadCallback.cpp')})
 
     def run(name, command):
         result = subprocess.run(command, capture_output=True, text=True, timeout=60)

@@ -39,6 +39,8 @@ extern const uint8_t verified_root_key[];
 #include <pexpert/pexpert.h>
 #include <kern/debug.h>
 #include "GccUfs.h"
+#include "RuntimeMetrics.h"
+static uint64_t ufsMetricsClock (void) { return mach_absolute_time (); }
 #include "RootDiagnostics.h"
 #include "RootReadDiagnostics.h"
 #include "TransferPoll.h"
@@ -1295,6 +1297,7 @@ extern "C" int native_ufs_store_open (uint64_t blocks, uint64_t *firstLba, const
 extern "C" int native_ufs_store_read (uint64_t rel, uint32_t blocks, void *dst)
 {
   if (!gStoreRegionBlocks || !dst || !blocks || rel >= gStoreRegionBlocks || blocks > gStoreRegionBlocks - rel) return 0;
+  UfsMetricSpan span (gStoreReadMetrics, ufsMetricsClock, uint64_t (blocks) * 4096);
   while (blocks) {
     uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
     if (hostRead4k (0, gStoreRegionFirst + rel, chunk, dst) != kIOReturnSuccess) return 0;
@@ -1302,13 +1305,14 @@ extern "C" int native_ufs_store_read (uint64_t rel, uint32_t blocks, void *dst)
     rel += chunk;
     blocks -= chunk;
   }
-  return 1;
+  span.success = true; return 1;
 }
 
 extern "C" int native_ufs_store_write (uint64_t rel, uint32_t blocks, const void *src)
 {
   if (storeMode () != 2 || !gStoreRegionBlocks || !src || !blocks || rel >= gStoreRegionBlocks ||
       blocks > gStoreRegionBlocks - rel) return 0;
+  UfsMetricSpan span (gStoreWriteMetrics, ufsMetricsClock, uint64_t (blocks) * 4096);
   while (blocks) {
     uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
     // Forced unit access: the block is on the medium when the command completes, so the overlay needs no cache flush.
@@ -1317,12 +1321,14 @@ extern "C" int native_ufs_store_write (uint64_t rel, uint32_t blocks, const void
     rel += chunk;
     blocks -= chunk;
   }
-  return 1;
+  span.success = true; return 1;
 }
 
 extern "C" int native_ufs_store_sync (void)
 {
-  return storeMode () == 2 && gStoreRegionBlocks && hostSyncCache () == kIOReturnSuccess;
+  UfsMetricSpan span (gStoreSyncMetrics, ufsMetricsClock, 0);
+  span.success = storeMode () == 2 && gStoreRegionBlocks && hostSyncCache () == kIOReturnSuccess;
+  return span.success;
 }
 
 // ---- Board auxiliary window (directly below the Data store) -----------------------------------------
@@ -1509,6 +1515,7 @@ extern "C" unsigned native_ufs_store_gpt_check (void)
 #include "ConcurrentRecords.h"
 static VrootTableCache gTableCache = {};
 static IOLock *gTableLock = nullptr;
+static bool gTableStatsReady = false;
 static IOBufferMemoryDescriptor *gTablePages = nullptr;
 struct EmbeddedTableOps {
   void lock () { IOLockLock (gTableLock); }
@@ -1523,6 +1530,16 @@ struct EmbeddedTableOps {
   }
   bool sha256 (const void *data, size_t bytes, uint8_t out[32]) { return vr_xnu_crypto.sha256 (data, bytes, out); }
 };
+namespace {
+static void rtLogTableStats (void)
+{
+  VrootCacheStats stats={}; unsigned pages=0;
+  const bool valid=__atomic_load_n (&gTableStatsReady, __ATOMIC_ACQUIRE) && IOLockTryLock (gTableLock);
+  if (valid) { stats=gTableCache.stats; pages=gTableCache.count; IOLockUnlock (gTableLock); }
+  IOLog ("NATIVE_UFS_TABLE_STATS snapshot=%u pages=%u hits=%llu misses=%llu reads=%llu evictions=%llu waits=%llu failures=%llu source=protected-embedded-table\n",
+    valid,pages,stats.hits,stats.misses,stats.reads,stats.evictions,stats.waits,stats.failures);
+}
+}
 static bool prepareTableCache (void)
 {
   if (gTableLock) return true;
@@ -1545,9 +1562,12 @@ static bool prepareTableCache (void)
   gTableCache.pages = static_cast<uint8_t *> (gTablePages->getBytesNoCopy ());
   gTableCache.entries = entries;
   bzero (entries, gTableCache.count * sizeof (*entries));
+  __atomic_store_n (&gTableStatsReady, true, __ATOMIC_RELEASE);
   IOLog ("NATIVE_UFS_TABLE_CACHE configured mib=%u pages=%u source=protected-embedded-table\n", mib, gTableCache.count);
   return true;
 }
+#else
+namespace { static void rtLogTableStats (void) {} }
 #endif
 class NativeUfsBlock : public IOBlockStorageDevice {
   OSDeclareDefaultStructors (NativeUfsBlock)
@@ -2234,6 +2254,7 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
   if (!online) {
     return kIOReturnNotReady;
   }
+  UfsMetricSpan requestSpan (gWindowMetrics, ufsMetricsClock, count * 512);
   struct Operations {
     IOLock *mutex;
     IOMemoryDescriptor *buffer;
@@ -2250,7 +2271,11 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     UfsRecordFailure failure = {};
     void lock () { IOLockLock (mutex); }
     void unlock () { IOLockUnlock (mutex); }
-    void sleep (void *event) { IOLockSleep (mutex, event, THREAD_UNINT); }
+    void sleep (void *event) {
+      const uint64_t start = ufsMetricsClock (); IOLockSleep (mutex, event, THREAD_UNINT);
+      __atomic_fetch_add (&gSnapshotWaits, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add (&gSnapshotWaitTicks, ufsElapsedTicks (start, ufsMetricsClock ()), __ATOMIC_RELAXED);
+    }
     void wakeup (void *event) { IOLockWakeup (mutex, event, false); }
     IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
       phase = "transport";
@@ -2340,6 +2365,10 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     gRootDiagnostic.result = static_cast<uint32_t> (result);
     rootDiagnosticFailure ("root window read failed");
   }
+  requestSpan.success = result == kIOReturnSuccess;
+  // Account entry through completion dispatch, excluding callback execution.
+  ufsMetricAccount (gWindowMetrics, requestSpan.bytes, ufsElapsedTicks (requestSpan.started, ufsMetricsClock ()), requestSpan.success);
+  requestSpan.active = false;
   completion->action (completion->target, completion->parameter, result, done);
   return kIOReturnSuccess;
 }
@@ -2779,6 +2808,7 @@ bool NativeUfs::startRoot (IOService *provider)
     return false;
   }
   IOLog ("NATIVE_UFS_START host_bringup end result=ready\n");
+  runtimeStartStats ();
   native_ufs_root_step = 2;
   IOLog ("NATIVE_UFS_START root_layout begin\n");
   RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));

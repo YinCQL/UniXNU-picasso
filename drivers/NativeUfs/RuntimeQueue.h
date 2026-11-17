@@ -2,7 +2,11 @@
 static unsigned gSlotCount = 1;
 static uint32_t gSlotFree = 1;
 static uint32_t gSlotsBusy = 0, gSlotsPeak = 0;
-static uint64_t gSlotWaits = 0;
+static uint64_t gSlotWaits = 0, gSlotWaitTicks = 0;
+static unsigned gSlotWaitersNow = 0;
+static uint32_t gPoisonReason = 0, gPoisonOpcode = 0;
+static void rtLogRuntimeStats (void);
+static void rtLogTableStats (void);
 struct RuntimeWaiter { RuntimeWaiter *next; int slot; };
 static RuntimeWaiter *gWaitHead = nullptr, *gWaitTail = nullptr;
 static IOLock *gWriteLock = nullptr;
@@ -14,8 +18,12 @@ static uint64_t gSpinTicks = 0;
 static uint32_t gSpinUs = 200;
 static volatile uint64_t gIrqs = 0, gIrqSleeps = 0;
 
-static void rtQuarantineLocked (void)
+static void rtQuarantineLocked (uint32_t reason, uint32_t opcode)
 {
+  if (!__atomic_load_n (&gPoisonReason, __ATOMIC_RELAXED)) {
+    __atomic_store_n (&gPoisonOpcode, opcode, __ATOMIC_RELAXED);
+    __atomic_store_n (&gPoisonReason, reason, __ATOMIC_RELEASE);
+  }
   __atomic_store_n (&gHost.poisoned, true, __ATOMIC_RELEASE);
   __atomic_store_n (&gHost.ready, false, __ATOMIC_RELEASE);
   if (!gSlotLock) return;
@@ -28,10 +36,10 @@ static void rtQuarantineLocked (void)
   IOLockUnlock (gSlotLock);
 }
 
-static void rtQuarantine (void)
+static void rtQuarantine (uint32_t reason, uint32_t opcode)
 {
   IOLockLock (gSubmitLock);
-  rtQuarantineLocked ();
+  rtQuarantineLocked (reason, opcode);
   IOLockUnlock (gSubmitLock);
 }
 
@@ -47,12 +55,14 @@ static UfsSlot rtSlotTake (bool *pooled)
   if (gSlotFree) {
     index = __builtin_ctz (gSlotFree); gSlotFree &= ~(1U << index);
   } else {
-    ++gSlotWaits;
+    ++gSlotWaits; ++gSlotWaitersNow;
+    const uint64_t start = mach_absolute_time ();
     RuntimeWaiter waiter = { nullptr, -1 };
     if (gWaitTail) gWaitTail->next = &waiter; else gWaitHead = &waiter;
     gWaitTail = &waiter;
     while (waiter.slot == -1) IOLockSleep (gSlotLock, &waiter, THREAD_UNINT);
-    index = waiter.slot;
+    index = waiter.slot; --gSlotWaitersNow;
+    gSlotWaitTicks += ufsElapsedTicks (start, mach_absolute_time ());
   }
   if (index >= 0) { *pooled = true; if (++gSlotsBusy > gSlotsPeak) gSlotsPeak = gSlotsBusy; }
   IOLockUnlock (gSlotLock);
@@ -110,17 +120,6 @@ static IOReturn rtScsiRetry (const UfsSlot &slot, uint8_t lun, const uint8_t *cd
     while (mach_absolute_time () < pause && mach_absolute_time () < totalDeadline) ufsPollPause (hostCpuRelax);
   }
 }
-static void rtLogRuntimeStats (void)
-{
-  IOLockLock (gSlotLock);
-  const unsigned peak = gSlotsPeak;
-  const uint64_t waits = gSlotWaits;
-  IOLockUnlock (gSlotLock);
-  IOLog ("NATIVE_UFS_RUNTIME_STATS slots=%u peak=%u waits=%llu irq=%u irqs=%llu sleeps=%llu direct=%llu staged=%llu\n",
-    gSlotCount, peak, waits, rtInterruptMode (),
-    __atomic_load_n (&gIrqs, __ATOMIC_RELAXED), __atomic_load_n (&gIrqSleeps, __ATOMIC_RELAXED),
-    __atomic_load_n (&gDirectCommands, __ATOMIC_RELAXED), __atomic_load_n (&gStagedCommands, __ATOMIC_RELAXED));
-}
 static IOReturn runtimeRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst, bool owned)
 {
   if (!dst || !blocks || blocks > kDataMax / 4096 || lba > 0xffffffffULL - (blocks - 1)) return kIOReturnBadArgument;
@@ -139,7 +138,6 @@ static IOReturn runtimeRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void 
   if (trace < 8) IOLog ("NATIVE_UFS_RUNTIME_READ end sample=%u result=%08x scsi=%x polls=%u db=%x is=%x\n", trace + 1, static_cast<unsigned> (result), rtDiagnostic (slot).scsi, rtDiagnostic (slot).polls, rtDiagnostic (slot).dbLast, rtDiagnostic (slot).isLast);
   if (result == kIOReturnSuccess && !prds) memcpy (dst, slot.data, blocks * 4096U);
   rtSlotGive (slot, pooled);
-  if (trace >= 4095 && !((trace + 1) & trace)) rtLogRuntimeStats ();
   return result;
 }
 static IOReturn runtimeWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua)
@@ -179,21 +177,39 @@ static IOReturn runtimeSyncCache (void)
   IOLockUnlock (gWriteLock); return result;
 }
 #include "RuntimeFirmware.h"
+// Pool data is copied only under its lock; reject a busy snapshot without
+// blocking an I/O thread. The rest uses atomic loads and is approximate.
 extern "C" int native_ufs_stats_text (char *out, size_t bytes)
 {
-  IOLockLock (gSlotLock);
-  const unsigned peak = gSlotsPeak;
-  const uint64_t waits = gSlotWaits;
-  IOLockUnlock (gSlotLock);
-  return snprintf (out, bytes, "UFS slots=%u peak=%u waits=%llu irq=%u irqs=%llu sleeps=%llu direct=%llu staged=%llu busy=%llu r/w/s=%llu/%llu/%llu ticks=%llu",
-    gSlotCount, peak, static_cast<unsigned long long> (waits), rtInterruptMode (),
-    static_cast<unsigned long long> (__atomic_load_n (&gIrqs, __ATOMIC_RELAXED)),
-    static_cast<unsigned long long> (__atomic_load_n (&gIrqSleeps, __ATOMIC_RELAXED)),
-    static_cast<unsigned long long> (__atomic_load_n (&gDirectCommands, __ATOMIC_RELAXED)),
-    static_cast<unsigned long long> (__atomic_load_n (&gStagedCommands, __ATOMIC_RELAXED)),
-    static_cast<unsigned long long> (__atomic_load_n (&gBusyRetries, __ATOMIC_RELAXED)),
-    static_cast<unsigned long long> (__atomic_load_n (&gRuntimeReads, __ATOMIC_RELAXED)),
-    static_cast<unsigned long long> (__atomic_load_n (&gRuntimeWrites, __ATOMIC_RELAXED)),
-    static_cast<unsigned long long> (__atomic_load_n (&gRuntimeSyncs, __ATOMIC_RELAXED)),
-    static_cast<unsigned long long> (__atomic_load_n (&gRuntimeTicks, __ATOMIC_RELAXED)));
+  if (!out || !bytes) return 0;
+  unsigned peak=0, takers=0, busyNow=0; uint64_t waits=0, waitTicks=0;
+  const bool pool = preemption_enabled () && gSlotLock && IOLockTryLock (gSlotLock);
+  if (pool) {
+    peak=gSlotsPeak; takers=gSlotWaitersNow; busyNow=gSlotsBusy; waits=gSlotWaits; waitTicks=gSlotWaitTicks;
+    IOLockUnlock (gSlotLock);
+  }
+  const auto count = [] (const volatile uint64_t &v) { return static_cast<unsigned long long> (__atomic_load_n (&v, __ATOMIC_RELAXED)); };
+  const auto us = [] (uint64_t ticks) { uint64_t ns=0; absolutetime_to_nanoseconds (ticks, &ns); return static_cast<unsigned long long> (ns / 1000); };
+  uint64_t oldest=0; unsigned oldSlot=0, oldOpcode=0; const uint64_t now=mach_absolute_time ();
+  for (unsigned i=0;i<gSlotCount;++i) {
+    const uint64_t at=__atomic_load_n (&gSlotIssuedAt[i], __ATOMIC_RELAXED);
+    if (at && ufsElapsedTicks (at, now)>oldest) { oldest=ufsElapsedTicks (at, now); oldSlot=i; oldOpcode=__atomic_load_n (&gSlotOpcode[i], __ATOMIC_RELAXED); }
+  }
+  const uint32_t poison=__atomic_load_n (&gPoisonReason, __ATOMIC_ACQUIRE);
+  return snprintf (out, bytes,
+    "NATIVE_UFS_RUNTIME_STATS slots=%u pool_snapshot=%u peak=%u waits=%llu irq=%u irqs=%llu sleeps=%llu direct=%llu staged=%llu busy=%llu r/w/s=%llu/%llu/%llu ticks=%llu\n"
+    "NATIVE_UFS_WAIT done_lt50_100_200_400_ge400_us=%llu/%llu/%llu/%llu/%llu pauses=%llu pause_us=%llu wakes=%llu wake_us=%llu wake_max_us=%llu sleep_timeouts=%llu takers=%u inuse=%u slot_wait_us=%llu old_us=%llu old_op=%x old_slot=%u poison=%u poison_op=%x\n"
+    "NATIVE_UFS_API rd=%llu/%llu/%llu/%llu/%llu wr=%llu/%llu/%llu/%llu/%llu sync=%llu/%llu/%llu/%llu/%llu win=%llu/%llu/%llu/%llu/%llu snapshot_wait=%llu/%llu units=ops/bytes/us/max_us/failures\n",
+    gSlotCount,pool,peak,static_cast<unsigned long long>(waits),rtInterruptMode(),count(gIrqs),count(gIrqSleeps),count(gDirectCommands),count(gStagedCommands),count(gBusyRetries),count(gRuntimeReads),count(gRuntimeWrites),count(gRuntimeSyncs),count(gRuntimeTicks),
+    count(gWaitRanges[0]),count(gWaitRanges[1]),count(gWaitRanges[2]),count(gWaitRanges[3]),count(gWaitRanges[4]),count(gWaitPauses),us(count(gWaitPauseTicks)),count(gIrqWakes),us(count(gIrqWakeTicks)),us(count(gIrqWakeMax)),count(gIrqTimeouts),takers,busyNow,us(waitTicks),us(oldest),oldOpcode,oldSlot,poison,poison?__atomic_load_n(&gPoisonOpcode,__ATOMIC_RELAXED):0,
+    count(gStoreReadMetrics.ops),count(gStoreReadMetrics.bytes),us(count(gStoreReadMetrics.ticks)),us(count(gStoreReadMetrics.maximum)),count(gStoreReadMetrics.failures),
+    count(gStoreWriteMetrics.ops),count(gStoreWriteMetrics.bytes),us(count(gStoreWriteMetrics.ticks)),us(count(gStoreWriteMetrics.maximum)),count(gStoreWriteMetrics.failures),
+    count(gStoreSyncMetrics.ops),count(gStoreSyncMetrics.bytes),us(count(gStoreSyncMetrics.ticks)),us(count(gStoreSyncMetrics.maximum)),count(gStoreSyncMetrics.failures),
+    count(gWindowMetrics.ops),count(gWindowMetrics.bytes),us(count(gWindowMetrics.ticks)),us(count(gWindowMetrics.maximum)),count(gWindowMetrics.failures),count(gSnapshotWaits),us(count(gSnapshotWaitTicks)));
+}
+// Only this dedicated, finite worker formats the larger snapshot on its stack.
+static void rtLogRuntimeStats (void)
+{
+  char text[1536]; native_ufs_stats_text (text, sizeof (text)); IOLog ("%s", text);
+  rtLogTableStats ();
 }

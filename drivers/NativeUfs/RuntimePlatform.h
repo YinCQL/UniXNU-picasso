@@ -1,42 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 #include "../ArmCpu/ArmCpuSpi.h"
-static uint32_t rtCompletionCount (unsigned slot) { return __atomic_load_n (&gSlotGen[slot], __ATOMIC_ACQUIRE); }
-static bool rtInterruptMode (void) { return __atomic_load_n (&gIrqMode, __ATOMIC_ACQUIRE); }
-#include "RuntimeCompletionWait.h"
-struct RuntimeCompletionPort {
-  unsigned slot;
-  uint64_t now () { return mach_absolute_time (); }
-  bool interruptMode () { return __atomic_load_n (&gIrqMode, __ATOMIC_ACQUIRE); }
-  bool canBlock () { return preemption_enabled (); } // XNU also checks CPU interrupts.
-  uint64_t spinTicks () { return gSpinTicks; }
-  uint64_t nanoseconds (uint64_t ticks) { uint64_t ns = 0; absolutetime_to_nanoseconds (ticks, &ns); return ns; }
-  void pause () { ufsPollPause (hostCpuRelax); }
-  void relax () { hostCpuRelax (); }
-  bool arm (uint32_t us) {
-    return assert_wait_timeout ((event_t) (uintptr_t) &gSlotGen[slot], THREAD_UNINT, us, NSEC_PER_USEC) == THREAD_WAITING;
-  }
-  uint32_t generation () { return rtCompletionCount (slot); }
-  void cancel () { clear_wait (current_thread (), THREAD_AWAKENED); }
-  void block () { __atomic_fetch_add (&gIrqSleeps, 1, __ATOMIC_RELAXED); thread_block (THREAD_CONTINUE_NULL); }
-};
-static void rtWaitCompletion (unsigned slot, uint32_t seen, uint64_t started, uint64_t deadline)
-{
-  RuntimeCompletionPort port = { slot };
-  ufsRuntimeWaitCompletion (port, seen, started, deadline);
-}
-static void rtWaitDone (uint64_t started) { __atomic_fetch_add (&gRuntimeTicks, mach_absolute_time () - started, __ATOMIC_RELAXED); }
-static void runtimeInterrupt (void *)
-{
-  if (read32 (gHost.hc, 0x20) & 1) hostWrite (0x20, 1);
-  __atomic_fetch_add (&gIrqs, 1, __ATOMIC_RELAXED);
-  uint32_t done = __atomic_load_n (&gOutstanding, __ATOMIC_ACQUIRE) & ~read32 (gHost.hc, 0x58);
-  while (done) {
-    const unsigned entry = __builtin_ctz (done); done &= done - 1;
-    const int slot = gEntrySlot[entry]; if (slot < 0) continue;
-    __atomic_add_fetch (&gSlotGen[slot], 1, __ATOMIC_RELEASE);
-    thread_wakeup ((event_t) (uintptr_t) &gSlotGen[slot]);
-  }
-}
+#include "RuntimeInterruptWait.h"
 extern "C" IOReturn armcpu_spi_attach (uint32_t, bool, void (*) (void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
 extern "C" IOReturn armcpu_spi_mask (uint32_t, bool) __attribute__((weak_import));
 // A bring-up caller may run before ArmCpu publishes GIC readiness. Retry
@@ -79,6 +43,18 @@ static void runtimeInterruptThread (void *, wait_result_t)
   thread_terminate (current_thread ());
 }
 static void runtimeReportLink (void);
+static void runtimeStatsThread (void *, wait_result_t)
+{
+  for (unsigned sample=0;sample<8;++sample) { IOSleep (15000); rtLogRuntimeStats (); }
+  thread_terminate (current_thread ());
+}
+static void runtimeStartStats (void)
+{
+  thread_t thread=nullptr;
+  const kern_return_t result=kernel_thread_start (runtimeStatsThread, nullptr, &thread);
+  if (result==KERN_SUCCESS) thread_deallocate (thread);
+  IOLog ("NATIVE_UFS_STATS scheduled result=%d samples=8 interval_ms=15000\n", result);
+}
 static void runtimeEnableInterrupt (void)
 {
   runtimeReportLink ();

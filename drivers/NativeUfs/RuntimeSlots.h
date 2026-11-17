@@ -3,12 +3,12 @@
 static UfsRootDiagnostics gSlotDiagnostics[kSlots];
 static volatile uint32_t gCommandSequence = 0;
 static IOLock *gSlotLock = nullptr, *gSubmitLock = nullptr;
-static void rtQuarantineLocked (void);
+static void rtQuarantineLocked (uint32_t reason = 6, uint32_t opcode = 0);
 struct RuntimeSubmitGuard {
   RuntimeSubmitGuard () { IOLockLock (gSubmitLock); }
   ~RuntimeSubmitGuard () { IOLockUnlock (gSubmitLock); }
 };
-static void rtQuarantine (void);
+static void rtQuarantine (uint32_t reason = 6, uint32_t opcode = 0);
 static uint32_t rtCompletionCount (unsigned);
 static bool rtInterruptMode (void);
 static void rtWaitCompletion (unsigned, uint32_t, uint64_t, uint64_t);
@@ -45,6 +45,7 @@ static int8_t gEntrySlot[32] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
 // interrupt has seen (what a waiting command sleeps on).
 static volatile uint32_t gOutstanding = 0;
 static volatile uint32_t gSlotGen[kSlots] = {};
+static uint64_t gSlotDoneAt[kSlots] = {};
 
 static void rtSlotGeometry (unsigned index, uint8_t *utrd, uint32_t entry, uint8_t *ucd, uint64_t ucdPhys, uint8_t *data,
                               uint64_t dataPhys)
@@ -134,11 +135,11 @@ static IOReturn rtIssue (const UfsSlot &slot, uint32_t direction, uint32_t dataB
       (dataBytes ? (direction != 1 && direction != 2) : direction != 0)) return kIOReturnBadArgument;
   if (__atomic_load_n (&gHost.poisoned, __ATOMIC_ACQUIRE)) return kIOReturnNotReady;
   if (read32 (gHost.hc, 0x58) & slot.bit) {
-    rtQuarantineLocked ();
+    rtQuarantineLocked (1, slot.ucd[16]);
     return rtRecord (slot, kIOReturnBusy, *ocs);
   }
   if (read32 (gHost.hc, 0x20) & kUfsFatalStatus) {
-    rtQuarantineLocked ();
+    rtQuarantineLocked (2, slot.ucd[16]);
     return rtRecord (slot, kIOReturnIOError, *ocs);
   }
   rtDiagnostic (slot).command = __atomic_add_fetch (&gCommandSequence, 1, __ATOMIC_RELAXED);
@@ -185,7 +186,7 @@ static IOReturn rtIssue (const UfsSlot &slot, uint32_t direction, uint32_t dataB
   if (!rtInterruptMode ()) hostWrite (0x20, 1);  // Acknowledge completion only; preserve error evidence. With interrupts the handler does.
   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, deadline);
   __atomic_or_fetch (&gOutstanding, slot.bit, __ATOMIC_RELEASE);
-  gSlotOpcode[slot.index] = slot.ucd[slot.ucd[0] == 1 ? 16 : 12];
+  __atomic_store_n (&gSlotOpcode[slot.index], slot.ucd[slot.ucd[0] == 1 ? 16 : 12], __ATOMIC_RELAXED);
   __atomic_store_n (&gSlotIssuedAt[slot.index], mach_absolute_time (), __ATOMIC_RELAXED);
   hostWrite (0x58, slot.bit);
   return kIOReturnSuccess;
@@ -201,8 +202,8 @@ static IOReturn rtAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t deadl
   RuntimeTransferPort port = { slot, deadline, 0 };
   UfsTransferPoll state;
   UfsTransferEnd end = pollUfsTransfer (port, state);
-  __atomic_store_n (&gSlotIssuedAt[slot.index], 0, __ATOMIC_RELAXED);
   if (end == UfsTransferEnd::Completed) {
+    __atomic_store_n (&gSlotIssuedAt[slot.index], 0, __ATOMIC_RELAXED);
     __atomic_and_fetch (&gOutstanding, ~slot.bit, __ATOMIC_RELEASE);
     rtWaitDone (port.started);
   }
@@ -220,7 +221,7 @@ static IOReturn rtAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t deadl
   if (end != UfsTransferEnd::Completed) {
     // No cancel/reset/retry: the controller may still own the buffer, even
     // with DB=0. Keep it allocated and prohibit all subsequent CPU writes.
-    rtQuarantine ();
+    rtQuarantine (end == UfsTransferEnd::Timeout ? 3 : 4, rtDiagnostic (slot).opcode);
     return rtRecord (slot, end == UfsTransferEnd::Timeout ? kIOReturnTimeout : kIOReturnIOError, *ocs);
   }
   cacheInvalidate (slot.ucd, kPrdtOffset);
@@ -242,12 +243,12 @@ static bool rtClearUcd (const UfsSlot &slot)
   if (__atomic_load_n (&gHost.poisoned, __ATOMIC_ACQUIRE)) return false;
   // Check before touching the command/response area, not just before ringing.
   if (read32 (gHost.hc, 0x58) & slot.bit) {
-    rtQuarantineLocked ();
+    rtQuarantineLocked (1, 0);
     rtRecord (slot, kIOReturnBusy, 15);
     return false;
   }
   if (read32 (gHost.hc, 0x20) & kUfsFatalStatus) {
-    rtQuarantineLocked ();
+    rtQuarantineLocked (2, 0);
     rtRecord (slot, kIOReturnIOError, 15);
     return false;
   }
@@ -262,7 +263,7 @@ static bool rtClearUcd (const UfsSlot &slot)
 static IOReturn rtProtocolError (const UfsSlot &slot, uint32_t reason)
 {
   rtDiagnostic (slot).protocol = reason;
-  rtQuarantine ();
+  rtQuarantine (5, rtDiagnostic (slot).opcode);
   return rtRecord (slot, kIOReturnIOError, rtDiagnostic (slot).ocs);
 }
 
