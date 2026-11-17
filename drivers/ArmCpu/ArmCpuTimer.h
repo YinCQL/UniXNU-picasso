@@ -24,9 +24,9 @@ static inline bool ArmCpuTimerIntid(const void *property, size_t bytes,
     return true;
 }
 
-// Only call with a validated PPI. Retain upstream's SGI enable policy.
+// Only call with a validated PPI. SGI 0 is the registered kernel IPI.
 static inline uint32_t ArmCpuSgiPpiEnable(uint32_t intid)
 {
-    return 0xffffU | (uint32_t(1) << intid);
+    return 1U | (uint32_t(1) << intid);
 }
 #endif
