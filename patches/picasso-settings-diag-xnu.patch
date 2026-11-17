@@ -291,3 +291,193 @@
  	}
  	if (os_atomic_xchg(&ud.save_ls_pending, 0, relaxed) && !ud.panic_mode) {
  		extern int picasso_ls_export(void);
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -4607,6 +4607,106 @@
+ 	return 0;
+ }
+ #endif
++
++
++/* PICASSO_CONFIGD_VFS_BEGIN */
++#if DEVELOPMENT || DEBUG
++/* Observe configd's real bundle discovery and preference-file operations.
++ * Only fixed SystemConfiguration paths are accepted. No file data is printed,
++ * authorization and syscall results are preserved, and tickets saturate. */
++static unsigned picasso_configd_vfs_count;
++
++static unsigned
++picasso_configd_vfs_path(vfs_context_t ctx, user_addr_t path, char buffer[256])
++{
++    static const char *const roots[] = {"/System/Library/SystemConfiguration",
++        "/Library/Preferences/SystemConfiguration",
++        "/private/var/preferences/SystemConfiguration"};
++    proc_t p = vfs_context_proc(ctx);
++    if (!p || strcmp(p->p_name, "configd")) return 0;
++    size_t length = 0;
++    if (copyinstr(path, buffer, 256, &length) || !length) return 0;
++    for (unsigned i = 0; i < sizeof(roots) / sizeof(roots[0]); ++i) {
++        size_t n = strlen(roots[i]);
++        if (!strncmp(buffer, roots[i], n) && (!buffer[n] || buffer[n] == '/')) {
++            if (i || !buffer[n]) return 1;
++            static const char bundle[] = "/InterfaceNamer.bundle";
++            return !strncmp(buffer + n, bundle, sizeof(bundle) - 1) &&
++                (!buffer[n + sizeof(bundle) - 1] || buffer[n + sizeof(bundle) - 1] == '/');
++        }
++    }
++    return 0;
++}
++
++static unsigned
++picasso_configd_vfs_ticket(void)
++{
++    unsigned value = os_atomic_load(&picasso_configd_vfs_count, relaxed);
++    while (value < 96) {
++        if (os_atomic_cmpxchg(&picasso_configd_vfs_count, value, value + 1, relaxed)) return value + 1;
++        value = os_atomic_load(&picasso_configd_vfs_count, relaxed);
++    }
++    return 0;
++}
++
++void picasso_configd_vfs_event(vfs_context_t, user_addr_t, unsigned, int, uint64_t, uint64_t);
++void
++picasso_configd_vfs_event(vfs_context_t ctx, user_addr_t path, unsigned op, int error,
++    uint64_t a, uint64_t b)
++{
++    char buffer[256];
++    if (!picasso_configd_vfs_path(ctx, path, buffer)) return;
++    unsigned ticket = picasso_configd_vfs_ticket();
++    if (ticket) printf("PICASSO_CONFIGD_VFS sample=%u pid=%d op=%u error=%d a=%llx b=%llx path=%s\n",
++        ticket, proc_getpid(vfs_context_proc(ctx)), op, error,
++        (unsigned long long)a, (unsigned long long)b, buffer);
++}
++
++static void
++picasso_configd_vfs_directory(vfs_context_t ctx, const char *path, user_addr_t address,
++    size_t size, int error, int flags)
++{
++    unsigned ticket = picasso_configd_vfs_ticket();
++    if (!ticket) return;
++    /* Parse a bounded prefix of the actual returned direntries. Only the two
++     * known names are reported; offsets/types describe what configd received. */
++    uint8_t bytes[1024];
++    size_t used = MIN(size, sizeof(bytes)), at = 0;
++    unsigned entries = 0, found = 0, info_type = 0, bundle_type = 0, partial = size > used;
++    int copied = error ? error : copyin(address, bytes, used);
++    while (!copied && at < used && entries < 32) {
++        size_t header = flags & VNODE_READDIR_EXTENDED ? offsetof(struct direntry, d_name) : offsetof(struct dirent, d_name);
++        if (used - at < header) { partial = 1; break; }
++        uint16_t reclen, namlen;
++        unsigned type;
++        size_t record_offset = flags & VNODE_READDIR_EXTENDED ? offsetof(struct direntry, d_reclen) : offsetof(struct dirent, d_reclen);
++        size_t name_offset = flags & VNODE_READDIR_EXTENDED ? offsetof(struct direntry, d_namlen) : offsetof(struct dirent, d_namlen);
++        size_t type_offset = flags & VNODE_READDIR_EXTENDED ? offsetof(struct direntry, d_type) : offsetof(struct dirent, d_type);
++        memcpy(&reclen, bytes + at + record_offset, sizeof(reclen));
++        namlen = 0;
++        memcpy(&namlen, bytes + at + name_offset, flags & VNODE_READDIR_EXTENDED ? sizeof(namlen) : 1);
++        type = bytes[at + type_offset];
++        if (!reclen || reclen < header + namlen + 1 || reclen > used - at) { partial = 1; break; }
++        const char *name = (const char *)bytes + at + header;
++        if (name[namlen]) { partial = 1; break; }
++        if (namlen == sizeof("Info.plist") - 1 && !memcmp(name, "Info.plist", namlen)) {
++            found |= 1; info_type = type;
++        }
++        if (namlen == sizeof("InterfaceNamer.bundle") - 1 && !memcmp(name, "InterfaceNamer.bundle", namlen)) {
++            found |= 2; bundle_type = type;
++        }
++        at += reclen; ++entries;
++    }
++    printf("PICASSO_CONFIGD_VFS sample=%u pid=%d op=4 error=%d bytes=%llu inspected=%llu entries=%u found=%x info_type=%u bundle_type=%u partial=%u copy_error=%d path=%s\n",
++        ticket, proc_getpid(vfs_context_proc(ctx)), error, (unsigned long long)size,
++        (unsigned long long)at, entries, found, info_type, bundle_type, partial, copied, path);
++}
++#else
++void picasso_configd_vfs_event(vfs_context_t, user_addr_t, unsigned, int, uint64_t, uint64_t);
++void picasso_configd_vfs_event(vfs_context_t ctx, user_addr_t path, unsigned op, int error, uint64_t a, uint64_t b)
++{ (void)ctx; (void)path; (void)op; (void)error; (void)a; (void)b; }
++#endif
++/* PICASSO_CONFIGD_VFS_END */
+ 
+ int
+ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
+@@ -5113,6 +5213,7 @@
+ 
+ 	error = open1at(vfs_context_current(), &nd, flags, &va,
+ 	    NULL, NULL, retval, fd, authfd);
++	picasso_configd_vfs_event(ctx, path, 1, error, (uint64_t)(unsigned)flags, error ? 0 : (uint64_t)*retval);
+ 
+ 	return error;
+ }
+@@ -5166,6 +5267,7 @@
+ 	    segflg, path, ctx);
+ 
+ 	error = open1at(ctx, ndp, flags, vap, NULL, NULL, retval, fd, AUTH_OPEN_NOAUTHFD);
++	picasso_configd_vfs_event(ctx, path, 1, error, (uint64_t)(unsigned)flags, error ? 0 : (uint64_t)*retval);
+ 
+ 	kfree_type(typeof(*__open_data), __open_data);
+ 
+@@ -7171,6 +7273,10 @@
+ 		}
+ 	}
+ out:
++	if (!(flag & AT_FDONLY) && UIO_SEG_IS_USER_SPACE(segflg))
++		picasso_configd_vfs_event(ctx, path, 2, error,
++		    isstat64 ? source.sb64.st_mode : source.sb.st_mode,
++		    isstat64 ? source.sb64.st_size : source.sb.st_size);
+ 	if (ndp) {
+ 		kfree_type(struct nameidata, ndp);
+ 	}
+@@ -10473,6 +10579,14 @@
+ 	}
+ #endif /* MAC */
+ 
++#if DEVELOPMENT || DEBUG
++	char configd_directory[256] = {0};
++	int configd_len = sizeof(configd_directory);
++	unsigned configd_trace = !strcmp(vfs_context_proc(&context)->p_name, "configd") &&
++	    !vn_getpath(vp, configd_directory, &configd_len) &&
++	    (!strcmp(configd_directory, "/System/Library/SystemConfiguration") ||
++	     !strcmp(configd_directory, "/System/Library/SystemConfiguration/InterfaceNamer.bundle"));
++#endif
+ 	loff = fp->fp_glob->fg_offset;
+ 	auio = uio_createwithbuffer(1, loff, spacetype, UIO_READ, &uio_buf[0], sizeof(uio_buf));
+ 	uio_addiov(auio, bufp, bufsize);
+@@ -10484,6 +10598,10 @@
+ 		error = VNOP_READDIR(vp, auio, 0, eofflag, &numdirent, &context);
+ 		fp->fp_glob->fg_offset = uio_offset(auio);
+ 	}
++#if DEVELOPMENT || DEBUG
++	if (configd_trace) picasso_configd_vfs_directory(&context, configd_directory, bufp,
++	    error ? 0 : bufsize - uio_resid(auio), error, flags);
++#endif
+ 	if (error) {
+ 		(void)vnode_put(vp);
+ 		goto out;
+--- a/bsd/vfs/vfs_attrlist.c
++++ b/bsd/vfs/vfs_attrlist.c
+@@ -3402,6 +3402,8 @@
+ 	return error;
+ }
+ 
++extern void picasso_configd_vfs_event(vfs_context_t, user_addr_t, unsigned, int, uint64_t, uint64_t);
++
+ static int
+ getattrlistat_internal(vfs_context_t ctx, user_addr_t path,
+     struct attrlist *alp, user_addr_t attributeBuffer, size_t bufferSize,
+@@ -3430,6 +3432,7 @@
+ 	error = nameiat(&nd, fd);
+ 
+ 	if (error) {
++		if (UIO_SEG_IS_USER_SPACE(pathsegflg)) picasso_configd_vfs_event(ctx, path, 3, error, alp->commonattr, options);
+ 		return error;
+ 	}
+ 
+@@ -3437,6 +3440,8 @@
+ 
+ 	error = getattrlist_internal(ctx, vp, alp, attributeBuffer,
+ 	    bufferSize, options, segflg, NULL, NOCRED);
++
++	if (UIO_SEG_IS_USER_SPACE(pathsegflg)) picasso_configd_vfs_event(ctx, path, 3, error, alp->commonattr, options);
+ 
+ 	/* Retain the namei reference until the getattrlist completes. */
+ 	nameidone(&nd);
