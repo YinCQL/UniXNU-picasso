@@ -312,6 +312,30 @@ int main(int argc,char **argv) {
         assert(playLogKind(last,a)==PlayLogProgress);
         puts("PASS playback log rate, session/phase transitions, immediate faults and counter wrap");
     }
+    {
+        PicassoGlink g={};BootEvents b={};b.glink=&g;
+        assert(!fastrpcLogDue(&b));
+        for(unsigned i=1;i<=8;++i) {g.fastrpc.received=i;++g.fastrpc.events;assert(fastrpcLogDue(&b));}
+        for(unsigned i=9;i<2000;++i) {g.fastrpc.received=i;++g.fastrpc.events;assert(!fastrpcLogDue(&b));}
+        g.fastrpc.bound=true;assert(fastrpcLogDue(&b));assert(!fastrpcLogDue(&b));
+        g.fastrpc.domain[1].stage=5;assert(fastrpcLogDue(&b));
+        g.fastrpc.domain[1].error=-60;assert(fastrpcLogDue(&b));assert(!fastrpcLogDue(&b));
+        ++g.fastrpc.malformed;assert(fastrpcLogDue(&b));
+        ++g.fastrpc.unclaimed;assert(fastrpcLogDue(&b));
+        g.fastrpc.stopped=true;assert(fastrpcLogDue(&b));
+        for(unsigned i=0;i<8;++i)assert(rpcDetailDue(&b,1,true,false));
+        for(unsigned i=0;i<1000;++i)assert(!rpcDetailDue(&b,1,true,false));
+        ++g.fastrpc.domain[1].reverseErrors;assert(rpcDetailDue(&b,1,false,false));
+        assert(!rpcDetailDue(&b,1,false,false));assert(rpcDetailDue(&b,1,false,true));
+        assert(rpcDetailDue(&b,0,true,false)); // independent PD quotas
+        auto &w=b.rpcWork;w.slow=~0ULL;w.fast=~0ULL;w.slowMax=w.fastMax=~0ULL;
+        w.diagnostic=~0ULL;w.slowCalls=w.fastCalls=w.diagnosticGroups=0xffffffffU;
+        g.fastrpc.domain[1].requests=g.fastrpc.domain[1].pd=0xffffffffU;
+        logRpcWork(&b,1);
+        uint64_t before=mach_absolute_time();++sleeps;accountRpcDiagnostic(&b,before);
+        assert(w.diagnostic==19999999ULL && !w.diagnosticGroups);
+        puts("PASS normal RPC log quotas, independent PDs, late lifecycle/fault/error bypass and bounded device cost records");
+    }
     PicassoRpcDomain record={};record.pd=record.requests=record.lastHandle=record.lastScalar=0xffffffffU;
     record.wireBytes=record.decodeResult=record.previousResult=0xffffffffU;
     memset(record.name,'n',127);memset(record.fs.target,'t',127);

@@ -281,7 +281,16 @@ struct BootEvents {
     struct RpcProgress { uint64_t first,last;uint32_t count,checkpoint;bool seen; };
     RpcProgress rpcProgress[2]={};
     uint32_t rpcFastReceived=0,rpcFastBudget=0,rpcFastCalls=0;
-    uint32_t fastrpcReceived = 0, fastrpcLogs = 0, fastrpcEvents = 0;
+    uint32_t rpcDetailLogs[2]={},rpcLogErrors[2]={};
+    struct RpcTransportLog {
+        uint32_t emitted=0,stage[2]={},malformed=0,unclaimed=0;
+        int domainError[2]={};bool up=false,bound=false,stopped=false;
+    } rpcTransportLog={};
+    struct RpcWork {
+        uint64_t slow=0,fast=0,diagnostic=0,slowMax=0,fastMax=0;
+        uint32_t slowCalls=0,fastCalls=0,diagnosticGroups=0;
+    } rpcWork={};
+    uint32_t fastrpcReceived = 0, fastrpcEvents = 0;
     int fastrpcError = 0;
     uint32_t reuseLogs = 0, remoteReuse = 0, localReuse = 0;
     uint32_t qmiEvents = 0, qmiLogs = 0;
@@ -379,6 +388,54 @@ void logRpcProgress(BootEvents *b,unsigned n) {
         d.pd,d.requests,d.reverseErrors,d.notFound,d.decodeErrors,d.firstFailure,d.firstFailureScalar);
     if(d.firstFailure)IOLog("PICASSO_ADSP rpc-first-error pd=%u path=%.127s\n",d.pd,d.firstFailureName);
 }
+// Only normal traffic details are sampled. Lifecycle/fault changes bypass
+// the quota, even after a long registry run; counters advance without logging.
+bool fastrpcLogDue(BootEvents *b) {
+    const auto &g=*b->glink;const auto &f=g.fastrpc;auto &last=b->rpcTransportLog;
+    bool up=false;for(const auto &c:g.channel)if(c.used && c.local==3)up=c.up;
+    bool changed=f.received!=b->fastrpcReceived || f.events!=b->fastrpcEvents;
+    bool critical=f.error!=b->fastrpcError || f.malformed!=last.malformed || f.unclaimed!=last.unclaimed;
+    bool transition=up!=last.up || f.bound!=last.bound || f.stopped!=last.stopped;
+    for(unsigned n=0;n<2;++n) {
+        transition|=f.domain[n].stage!=last.stage[n];
+        critical|=f.domain[n].error!=last.domainError[n];
+        last.stage[n]=f.domain[n].stage;last.domainError[n]=f.domain[n].error;
+    }
+    bool due=critical || transition || (changed && last.emitted<8);
+    last.up=up;last.bound=f.bound;last.stopped=f.stopped;
+    last.malformed=f.malformed;last.unclaimed=f.unclaimed;
+    b->fastrpcReceived=f.received;b->fastrpcEvents=f.events;b->fastrpcError=f.error;
+    if(due)++last.emitted;
+    return due;
+}
+bool rpcDetailDue(BootEvents *b,unsigned n,bool trace,bool idle) {
+    const auto &d=b->glink->fastrpc.domain[n];
+    bool error=d.reverseErrors!=b->rpcLogErrors[n];b->rpcLogErrors[n]=d.reverseErrors;
+    if(error || idle)return true;
+    if(trace && b->rpcDetailLogs[n]<8) {++b->rpcDetailLogs[n];return true;}
+    return false;
+}
+int serviceGlink(BootEvents *b,bool *kick,bool elapsed) {
+    uint64_t before=mach_absolute_time();
+    int error=picasso_glink_service(b->io,b->glink,kick,elapsed);
+    uint64_t duration=mach_absolute_time()-before;auto &w=b->rpcWork;
+    if(elapsed) {w.slow+=duration;++w.slowCalls;if(duration>w.slowMax)w.slowMax=duration;}
+    else {w.fast+=duration;++w.fastCalls;if(duration>w.fastMax)w.fastMax=duration;}
+    return error;
+}
+void accountRpcDiagnostic(BootEvents *b,uint64_t before) {
+    b->rpcWork.diagnostic+=mach_absolute_time()-before;++b->rpcWork.diagnosticGroups;
+}
+uint64_t rpcMicros(uint64_t ticks) {uint64_t ns=0;absolutetime_to_nanoseconds(ticks,&ns);return ns/1000;}
+void logRpcWork(const BootEvents *b,unsigned n) {
+    const auto &w=b->rpcWork;
+    IOLog("PICASSO_ADSP rpc-work pd=%u count=%u scope=boot slow_calls=%u slow_us=%llu slow_max_us=%llu\n",
+        b->glink->fastrpc.domain[n].pd,b->glink->fastrpc.domain[n].requests,w.slowCalls,
+        (unsigned long long)rpcMicros(w.slow),(unsigned long long)rpcMicros(w.slowMax));
+    IOLog("PICASSO_ADSP rpc-work-fast calls=%u us=%llu max_us=%llu diag_groups=%u diag_us=%llu scope=boot\n",
+        w.fastCalls,(unsigned long long)rpcMicros(w.fast),(unsigned long long)rpcMicros(w.fastMax),
+        w.diagnosticGroups,(unsigned long long)rpcMicros(w.diagnostic));
+}
 bool bootFast(void *context) {
     auto *b=static_cast<BootEvents *>(context);auto *g=b->glink;
     const auto &v=g->apr.capture;
@@ -392,7 +449,7 @@ bool bootFast(void *context) {
     if(!rpc)b->rpcFastBudget=0;
     if(!capture && !b->rpcFastBudget)return false;
     if(b->rpcFastBudget)--b->rpcFastBudget;
-    bool kick=false;(void)picasso_glink_service(b->io,g,&kick,false);
+    bool kick=false;(void)serviceGlink(b,&kick,false);
     if(kick)glinkKick(b->device);
     ++b->rpcFastCalls;observeRpc(b);
     if(f.received!=b->rpcFastReceived) {b->rpcFastReceived=f.received;b->rpcFastBudget=8;}
@@ -406,7 +463,7 @@ void bootService(void *context) {
         bool kick=false;auto *g=b->glink;
         for(const auto &c:g->channel)if(c.used && c.local==3 && c.up && !g->fastrpc.bound && !g->fastrpc.stopped)
             picasso_rpc_device_prepare(&g->fastrpc);
-        int transport=picasso_glink_service(b->io,g,&kick);
+        int transport=serviceGlink(b,&kick,true);
         observeRpc(b);
         if(kick)glinkKick(b->device);
         if(g->sent && !b->sentLogged) {
@@ -453,19 +510,20 @@ void bootService(void *context) {
             }
             b->aprAttempts=a.attempts; b->aprReceived=a.received; b->aprError=a.error;
         }
-        if(((g->fastrpc.received!=b->fastrpcReceived || g->fastrpc.events!=b->fastrpcEvents) && b->fastrpcLogs<64) || g->fastrpc.error!=b->fastrpcError) {
-            logFastrpc(*g);b->fastrpcReceived=g->fastrpc.received;
-            b->fastrpcEvents=g->fastrpc.events;
-            b->fastrpcError=g->fastrpc.error;++b->fastrpcLogs;
+        if(fastrpcLogDue(b)) {
+            uint64_t before=mach_absolute_time();logFastrpc(*g);accountRpcDiagnostic(b,before);
         }
         for(unsigned n=0;n<2;++n) {
             const auto &d=g->fastrpc.domain[n];
             bool trace=picasso_rpc_trace(b->rpcTrace[n],d);
             bool idle=picasso_rpc_idle(b->rpcIdle[n],d.requests);
-            if(trace || idle)logRpcRequest(d,b->rpcTrace[n].repeated);
+            uint64_t diagnosticStart=mach_absolute_time();
+            bool detail=rpcDetailDue(b,n,trace,idle);
+            if(detail)logRpcRequest(d,b->rpcTrace[n].repeated);
             auto &progress=b->rpcProgress[n];
-            if(idle || (d.requests>>8)!=progress.checkpoint) {
-                progress.checkpoint=d.requests>>8;logRpcProgress(b,n);
+            bool checkpoint=idle || (d.requests>>8)!=progress.checkpoint;
+            if(checkpoint) {
+                progress.checkpoint=d.requests>>8;logRpcProgress(b,n);logRpcWork(b,n);
             }
             if(idle) {
                 if(n==1 && d.stage==5 && !d.error && !g->fastrpc.stopped)
@@ -476,6 +534,7 @@ void bootService(void *context) {
                 IOLog("PICASSO_ADSP rpc-idle-transport pd=%u count=%u received=%u sent=%u completed=%u malformed=%u stopped=%u error=%d\n",
                     d.pd,d.requests,g->fastrpc.received,g->fastrpc.sent,g->fastrpc.completed,g->fastrpc.malformed,g->fastrpc.stopped,g->fastrpc.error);
             }
+            if(detail || checkpoint)accountRpcDiagnostic(b,diagnosticStart);
         }
         auto &q=g->qrtr;
         if(q.tftp.events!=b->tftpEvents && b->tftpLogs<48) {
