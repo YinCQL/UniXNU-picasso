@@ -7,6 +7,8 @@ using IOReturn=unsigned;
 constexpr unsigned kIOReturnSuccess=0,kUcdOffset=4096,kRspOffset=512,kDataOffset=8192;
 struct FirmwareHostApi {void *lock;bool ready,poisoned;uint8_t *virt;};
 extern FirmwareHostApi gHost;
+extern bool gRuntimeSlots;
+int runtimeFirmwareGeometry(uint8_t,uint64_t *);
 struct FirmwareDiagnosticApi {unsigned sense;};
 extern FirmwareDiagnosticApi gRootDiagnostic;
 extern "C" {

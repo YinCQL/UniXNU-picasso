@@ -14,6 +14,9 @@ constexpr uint64_t kDataMax=131072;
 constexpr unsigned kIODirectionIn=1, VR_BLOCK=9;
 #include "RootReadDiagnostics.h"
 #include "RootWindowRead.h"
+#include "ConcurrentRecords.h"
+struct VrootTable {void *where=nullptr;};
+struct VrootTableCache {};
 #include "RootDiagnostics.h"
 #define NATIVE_VERIFIED_BLOCK 1
 static bool held;
@@ -41,23 +44,29 @@ static void progress () {}
 static void (*boot_progress_poll)()=progress;
 struct vr_view {};
 static bool verifyEmbeddedRecord (const vr_view *,uint32_t,uint64_t index,const void *,size_t length,
-                                  UfsRecordFailure *failure) {
-  assert(held); ++integrity;
+                                  UfsRecordFailure *failure, const uint8_t * = nullptr) {
+  assert(!held); ++integrity;
   return verifyFail ? ufsRejectRecord(failure,"hash_mismatch",index,length,length) : true;
 }
-static IOReturn hostRead4k (unsigned,uint64_t,uint32_t blocks,void *data) {
-  assert(held); ++reads; memset(data,0x5a,blocks*4096); return transportFail?kIOReturnIOError:0;
+static IOReturn runtimeRead4k (unsigned,uint64_t,uint32_t blocks,void *data, bool) {
+  assert(!held); ++reads; memset(data,0x5a,blocks*4096); return transportFail?kIOReturnIOError:0;
 }
 struct IOMemoryDescriptor {
   uint8_t output[4096]={}; unsigned direction=kIODirectionIn;
   uint64_t getLength () {return sizeof(output);}
   unsigned getDirection () {return direction;}
   uint64_t writeBytes (uint64_t offset,const void *data,uint64_t length) {
-    assert(held && offset+length<=sizeof(output));
+    assert(!held && offset+length<=sizeof(output));
     if(shortCopy)length=17;
     memcpy(output+offset,data,size_t(length)); return length;
   }
 };
+constexpr int THREAD_UNINT=0;
+static void IOLockSleep(IOLock*,void*,int){assert(false);}
+static void IOLockWakeup(IOLock*,void*,bool){}
+struct EmbeddedTableOps{};
+static VrootTableCache gTableCache{};
+template<class T> static bool vrootTableEntry(VrootTableCache&,T&,const VrootTable&,uint64_t,uint8_t*){assert(false);return false;}
 struct IOStorageAttributes {};
 struct IOStorageCompletion { void *target,*parameter; void (*action)(void *,void *,IOReturn,uint64_t); };
 struct NativeUfsBlock {
@@ -65,7 +74,10 @@ struct NativeUfsBlock {
   char label[32]="SystemOS";
   uint8_t bounce[kDataMax]={}; IOLock mutex,*windowLock=&mutex;
   bool online=true; uint32_t readFailureReports=0;
-  vr_view verified; uint32_t verifiedRecordBytes=kDataMax; UfsVerifiedRecordCache verifiedCache;
+  vr_view verified; uint32_t verifiedRecordBytes=kDataMax;
+  UfsConcurrentCache concurrentCache;
+  VrootTable verifiedTable{}; void *snapshotDma=nullptr;
+  uint8_t *verifiedCacheStorage=nullptr;
   IOReturn doAsyncReadWrite(IOMemoryDescriptor *,UInt64,UInt64,IOStorageAttributes *,IOStorageCompletion *);
 };
 #include "actual-read.inc"
@@ -79,7 +91,7 @@ int main () {
   verifyFail=true;
   for(unsigned i=0;i<6;++i) {
     assert(device.doAsyncReadWrite(&buffer,0,8,nullptr,&callback)==0);
-    assert(completedStatus==kIOReturnNotPrivileged && !completedBytes && !device.verifiedCache.entries[0].valid);
+    assert(completedStatus==kIOReturnNotPrivileged && !completedBytes && !device.concurrentCache.entries[0].state);
   }
   assert(completions==6 && faults==6 && reads==6 && integrity==6 && device.readFailureReports==4);
   assert(strstr(logs,"window=SystemOS phase=verification block=0 count=8 done=0 result=00000003 lba=410000 blocks=32"));
@@ -88,28 +100,28 @@ int main () {
   puts("PASS failed authentication refuses bytes and completes outside the lock; reports saturate");
   verifyFail=false;
   assert(!device.doAsyncReadWrite(&buffer,0,8,nullptr,&callback));
-  assert(!completedStatus && completedBytes==4096 && device.verifiedCache.entries[0].valid);
+  assert(!completedStatus && completedBytes==4096 && device.concurrentCache.entries[0].state);
   unsigned before=reads;
   assert(!device.doAsyncReadWrite(&buffer,8,8,nullptr,&callback));
   assert(reads==before && !completedStatus && completedBytes==4096);
   puts("PASS valid reads and cache hits preserve original completion behavior");
-  device.verifiedCache={};device.readFailureReports=0;logs[0]=0;transportFail=true;
+  device.concurrentCache={};device.readFailureReports=0;logs[0]=0;transportFail=true;
   assert(!device.doAsyncReadWrite(&buffer,0,8,nullptr,&callback));
   assert(completedStatus==kIOReturnIOError && !completedBytes && strstr(logs,"phase=transport"));
-  assert(!strstr(logs,"read_failed") && !device.verifiedCache.entries[0].valid);
+  assert(!strstr(logs,"read_failed") && !device.concurrentCache.entries[0].state);
   transportFail=false;shortCopy=true;logs[0]=0;
   assert(!device.doAsyncReadWrite(&buffer,0,8,nullptr,&callback));
   assert(completedStatus==kIOReturnIOError && completedBytes==17 && strstr(logs,"phase=copy"));
   assert(!strstr(logs,"read_failed"));
   puts("PASS transport and short-copy failures remain distinct from authentication");
-  shortCopy=false;logs[0]=0;device.bytes=2*kDataMax;device.verifiedCache={};
-  uint8_t extra[kDataMax];device.verifiedCache.extraBuffer=extra;device.verifiedCache.extraBytes=sizeof(extra);
+  shortCopy=false;logs[0]=0;device.bytes=2*kDataMax;device.concurrentCache={};
+  uint8_t extra[kDataMax];device.verifiedCacheStorage=extra;device.concurrentCache.count=2;
   before=reads;
   for(unsigned i=0;i<4;++i) {
     assert(!device.doAsyncReadWrite(&buffer,(i%2)*256,8,nullptr,&callback));
     assert(!completedStatus && completedBytes==4096);
   }
-  assert(reads==before+2 && device.verifiedCache.stats.hits==2);
+  assert(reads==before+2 && device.concurrentCache.stats.hits==2);
   puts("PASS production IOKit callback serves interleaved records from separate authenticated slots");
   before=completions;
   assert(device.doAsyncReadWrite(nullptr,0,8,nullptr,&callback)==kIOReturnBadArgument);

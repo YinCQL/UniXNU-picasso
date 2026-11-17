@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Native UFS bring-up derived from sheng's SM8550 implementation. Hardware
+// Native UFS bring-up adapted for Picasso SM7250 from ShengUfs. Hardware
 // access stays off unless a native-ufs boot argument requests it; requested
 // modes can inspect, diagnose, or publish the root block-device windows.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
+#include <IOKit/storage/IOStorageDeviceCharacteristics.h>
+#include <IOKit/storage/IOStorageProtocolCharacteristics.h>
+#include <libkern/c++/OSDictionary.h>
+#include <kern/sched_prim.h>
+#include <kern/ast.h>
+#include <machine/machine_routines.h>
 #include <libkern/crypto/sha2.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_map.h>
@@ -178,9 +184,8 @@ bool NativeUfs::waitSet (uintptr_t base, unsigned offset, uint32_t mask, unsigne
 }
 
 // Read-only inspection (native-ufs-probe=2): reports what firmware left behind.
-// The physical windows are the sheng board DT's own GCC (0x100000) and UFS host
-// (0x1d84000, 0x3000) ranges. The controller is read only if the GCC says its
-// GDSC is powered and the AXI/AHB branches are running; nothing is written.
+// SM7250 lito.dtsi/lito-gdsc.dtsi resources: GCC 0x100000 and UFS
+// 0x1d84000/0x3000. The passive probe requires power and enabled bus clocks.
 static uintptr_t mapPhys (uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMap> &keep)
 {
   IODeviceMemory *memory = IODeviceMemory::withRange (phys, length);
@@ -194,12 +199,9 @@ static uintptr_t mapPhys (uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMa
 
 void NativeUfs::inspect (void)
 {
-  OSSharedPtr<IOMemoryMap> gccMap, memPhyMap, hcMap;
+  OSSharedPtr<IOMemoryMap> gccMap, hcMap;
   uintptr_t gcc = mapPhys (GCC_BASE + 0x77000, 0x1000, gccMap);
-  uintptr_t memPhy = mapPhys (GCC_BASE + 0x9e000, 0x1000, memPhyMap);
-  if (!gcc || !memPhy) {
-    panic ("NATIVE_UFS inspect: GCC map failed gcc=%p memphy=%p", (void *) gcc, (void *) memPhy);
-  }
+  if (!gcc) panic ("NATIVE_UFS inspect: GCC map failed");
   uint32_t gdsc = read32 (gcc, GCC_UFS_PHY_GDSCR - 0x77000);
   uint32_t axi = read32 (gcc, GCC_UFS_PHY_AXI_ENABLE - 0x77000);
   uint32_t ahb = read32 (gcc, GCC_UFS_PHY_AHB_ENABLE - 0x77000);
@@ -207,12 +209,16 @@ void NativeUfs::inspect (void)
   uint32_t txs = read32 (gcc, GCC_UFS_PHY_TX_SYMBOL0_ENABLE - 0x77000);
   uint32_t rxs = read32 (gcc, GCC_UFS_PHY_RX_SYMBOL0_ENABLE - 0x77000);
   uint32_t aux = read32 (gcc, GCC_UFS_PHY_PHY_AUX_ENABLE - 0x77000);
-  uint32_t memGdsc = read32 (memPhy, 0);
+  uint32_t ice = read32 (gcc, GCC_UFS_PHY_ICE_CORE_ENABLE - 0x77000);
+  uint32_t rx1 = read32 (gcc, GCC_UFS_PHY_RX_SYMBOL1_ENABLE - 0x77000);
+  uint32_t aggre = read32 (gcc, GCC_AGGRE_UFS_PHY_AXI_ENABLE - 0x77000);
   // GDSCR bit31 PWR_ON; CBCR bit31 CLK_OFF.
   bool powered = (gdsc & 0x80000000U) != 0;
-  // Hardware 2026-10-17: AXI running, AHB enabled but CLK_OFF (bit31). With bit1 (HW gating)
-  // set the branch wakes on access, so enable bits, not CLK_OFF, gate the read-only probe.
-  bool busClocks = !(axi & 0x80000000U) && (ahb & 0x1U) && (axi & 0x1U);
+  // Both branches have hardware gating at bit 1 in gcc-lito.c. Enabled
+  // hardware-gated branches may report CLK_OFF while idle.
+  bool busClocks = (axi & 1) && (ahb & 1) &&
+                   (!(axi & 0x80000000U) || (axi & 2)) &&
+                   (!(ahb & 0x80000000U) || (ahb & 2));
   uint32_t cap = 0, ver = 0, hcs = 0, hce = 0, utrlba = 0, is = 0;
   unsigned readHc = 0;
   if (powered && busClocks) {
@@ -228,12 +234,12 @@ void NativeUfs::inspect (void)
     }
   }
   panic ("NATIVE_UFS inspect\n"
-         "gdsc=%08x memphygdsc=%08x\n"
+         "gdsc=%08x ice=%08x rx1=%08x aggre=%08x\n"
          "axi=%08x ahb=%08x unipro=%08x\n"
          "txsym=%08x rxsym=%08x aux=%08x\n"
          "hc_read=%u cap=%08x ver=%08x\n"
          "is=%08x hcs=%08x hce=%08x utrlba=%08x",
-         gdsc, memGdsc, axi, ahb, unipro, txs, rxs, aux, readHc, cap, ver, is, hcs, hce, utrlba);
+         gdsc, ice, rx1, aggre, axi, ahb, unipro, txs, rxs, aux, readHc, cap, ver, is, hcs, hce, utrlba);
 }
 
 // Adopt the controller the firmware left running (native-ufs-probe=3) and issue
@@ -864,10 +870,13 @@ struct UfsHost {
   bool ready;
   bool poisoned = false;
   uintptr_t smmu = 0, cb = 0;
+  uint32_t dmaBytes = 0;
 };
 UfsHost gHost = { OSSharedPtr<IOMemoryMap> (), OSSharedPtr<IOMemoryMap> (), 0, nullptr, nullptr, 0, nullptr, false };
 
+static IOLock *gDiagnosticLock = nullptr;
 #include "RootTransportDiagnostics.h"
+static uint64_t gUtrlPhys = 0;
 
 static void cacheCivac (const void *start, size_t length)
 {
@@ -912,7 +921,12 @@ static bool gRootBringupTrace = false;
 #define NATIVE_UFS_TRACE(...) do { if (gRootDiagnosticEnabled || gRootBringupTrace) IOLog(__VA_ARGS__); } while (0)
 #include "RootQueue.h"
 #define NATIVE_UFS_READ_TRACE(...) IOLog(__VA_ARGS__)
+static bool gRuntimeSlots = false;
+static IOReturn runtimeRead4k (uint8_t, uint64_t, uint32_t, void *, bool = false);
+static IOReturn runtimeWrite4k (uint8_t, uint64_t, uint32_t, const void *, bool);
+static IOReturn runtimeSyncCache (void);
 #include "RootCommands.h"
+#include "RuntimeSlots.h"
 #include "FirmwareCommands.h"
 #undef NATIVE_UFS_READ_TRACE
 #undef NATIVE_UFS_TRACE
@@ -997,35 +1011,40 @@ static bool hostBringUp (const char **why)
   if (gRootDiagnosticEnabled) {
     IOLog ("NATIVE_UFS_BRINGUP dma=begin\n");
   }
-  gHost.dma = IOBufferMemoryDescriptor::inTaskWithOptions (
-    kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
-    static_cast<IOOptionBits> (kIOMemoryMapperNone),
-    kDmaBytes, 4096);
+  const bool wide = (read32 (gHost.hc, 0) & 0x01000000) != 0;
+  const unsigned entries = (read32 (gHost.hc, 0) & 31) + 1;
+  const unsigned sizes[] = { kDmaBytes, kDmaBytesEightSlots, kDmaBytesOneSlot };
+  const unsigned counts[] = { 16, 8, 1 };
+  uint32_t requestedSlots = 1;
+  PE_parse_boot_argn ("native-ufs-slots", &requestedSlots, sizeof (requestedSlots));
+  if (!requestedSlots) requestedSlots = 1;
+  if (requestedSlots > kSlots) requestedSlots = kSlots;
+  unsigned regionSlots = 1;
   gHost.lock = IOLockAlloc ();
-  if (!gHost.dma || !gHost.lock) {
-    *why = "dma buffer";
-    return false;
+  gDiagnosticLock = IOLockAlloc ();
+  for (unsigned attempt = 0; attempt < 3 && !gHost.dma; ++attempt) {
+    if (counts[attempt] > requestedSlots) continue;
+    if (counts[attempt] > (entries + 1) / 2 && counts[attempt] > 1) continue;
+    auto *dma = IOBufferMemoryDescriptor::inTaskWithOptions (
+      kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) |
+      static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
+      static_cast<IOOptionBits> (kIOMemoryMapperNone), sizes[attempt], 4096);
+    if (!dma) continue;
+    IOByteCount contiguous = 0;
+    auto *virt = static_cast<uint8_t *> (dma->getBytesNoCopy ());
+    const uint64_t phys = dma->getPhysicalSegment (0, &contiguous, kIOMemoryMapperNone);
+    if (!virt || !phys || (phys & 4095) || contiguous < sizes[attempt] ||
+        (!wide && (phys >= 0x100000000ULL || sizes[attempt] > 0x100000000ULL - phys))) {
+      dma->release (); continue;
+    }
+    gHost.dma = dma; gHost.virt = virt; gHost.phys = phys; gHost.dmaBytes = sizes[attempt];
+    regionSlots = counts[attempt];
+    gRootDiagnostic.dma = phys; gRootDiagnostic.contiguous = contiguous;
   }
-  if (gRootDiagnosticEnabled) {
-    IOLog ("NATIVE_UFS_BRINGUP dma=end\n");
-  }
-  gHost.virt = static_cast<uint8_t *> (gHost.dma->getBytesNoCopy ());
-  IOByteCount contiguous = 0;
-  gHost.phys = gHost.dma->getPhysicalSegment (0, &contiguous, kIOMemoryMapperNone);
-  gRootDiagnostic.dma = gHost.phys;
-  gRootDiagnostic.contiguous = contiguous;
-  if (!gHost.virt || !gHost.phys || (gHost.phys & 4095) || contiguous < kDmaBytes ||
-      (!(read32 (gHost.hc, 0) & 0x01000000) && gHost.phys + kDmaBytes > 0x100000000ULL)) {
-    *why = "DMA address/contiguity";
-    return false;
-  }
-  IOLog ("NATIVE_UFS_BRINGUP dma ready phys=%llx bytes=%llx\n",
-         gHost.phys, contiguous);
-  if (gRootDiagnosticEnabled) {
-    IOLog ("NATIVE_UFS_BRINGUP dma phys=%llx bytes=%llx\n", gHost.phys, contiguous);
-  }
-  bzero (gHost.virt, kDmaBytes);
-  cacheCivac (gHost.virt, kDmaBytes);
+  if (!gHost.dma || !gHost.lock || !gDiagnosticLock) { *why = "DMA allocation"; return false; }
+  gUtrlPhys = gHost.phys;
+  bzero (gHost.virt, gHost.dmaBytes);
+  cacheCivac (gHost.virt, gHost.dmaBytes);
   uint32_t report[3] = { 0, 0, 0 };
   gRootDiagnostic.stage = "SMMU and request list";
   if (gRootDiagnosticEnabled) {
@@ -1039,7 +1058,7 @@ static bool hostBringUp (const char **why)
   if (gRootDiagnosticEnabled) {
     IOLog ("NATIVE_UFS_BRINGUP smmu=begin\n");
   }
-  smmuBypassStream (0x60, gHost.smmuMap, report, gHost.phys, kDmaBytes);
+  smmuBypassStream (0x60, gHost.smmuMap, report, gHost.phys, gHost.dmaBytes);
   IOLog ("NATIVE_UFS_BRINGUP smmu ready slot=%x bank=%u\n",
          report[0] & 0xffff, report[0] >> 16);
   if (gRootDiagnosticEnabled) {
@@ -1140,7 +1159,12 @@ static bool hostBringUp (const char **why)
            readyCommandStarted ? gRootDiagnostic.polls : 0U,
            readyCommandStarted ? gRootDiagnostic.ocs : 15U);
     if (readyResult == kIOReturnSuccess) {
-      gHost.ready = true;
+      // Upgrade only after the original slot has completed every wake command.
+      if (!hostStopQueue (why) || !runtimeSlotsPrepare (regionSlots, entries, wide) ||
+          !hostStartQueue (why)) return false;
+      gRuntimeSlots = true;
+      __atomic_store_n (&gHost.ready, true, __ATOMIC_RELEASE);
+      runtimeEnableInterrupt ();
       if (gRootDiagnosticEnabled) {
         IOLog ("NATIVE_UFS_BRINGUP lun_ready=ok attempt=%u\n", attempt);
       }
@@ -1480,6 +1504,51 @@ extern "C" unsigned native_ufs_store_gpt_check (void)
 // One read-only window of the root image as a block device: 512-byte sectors on top of 4096-byte
 // UFS blocks, so the unchanged dmg disk images (GPT with 512-byte sectors) parse as they do on
 // the virtio path.
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+#include "VerifiedTableCache.h"
+#include "ConcurrentRecords.h"
+static VrootTableCache gTableCache = {};
+static IOLock *gTableLock = nullptr;
+static IOBufferMemoryDescriptor *gTablePages = nullptr;
+struct EmbeddedTableOps {
+  void lock () { IOLockLock (gTableLock); }
+  void unlock () { IOLockUnlock (gTableLock); }
+  void sleep (void *event) { IOLockSleep (gTableLock, event, THREAD_UNINT); }
+  void wakeup (void *event) { IOLockWakeup (gTableLock, event, false); }
+  bool readPage (const VrootTable &table, uint64_t page, void *dst) {
+    const uint64_t at = page * 4096, left = table.tableBytes - at;
+    bzero (dst, 4096);
+    memcpy (dst, reinterpret_cast<const uint8_t *> (table.firstLba) + at, left < 4096 ? left : 4096);
+    return true;
+  }
+  bool sha256 (const void *data, size_t bytes, uint8_t out[32]) { return vr_xnu_crypto.sha256 (data, bytes, out); }
+};
+static bool prepareTableCache (void)
+{
+  if (gTableLock) return true;
+  uint32_t mib = 8;
+  PE_parse_boot_argn ("native-vroot-cache", &mib, sizeof (mib));
+  if (!mib) return true;
+  if (mib > 64) mib = 64;
+  gTableLock = IOLockAlloc ();
+  if (!gTableLock) return false;
+  gTablePages = IOBufferMemoryDescriptor::inTaskWithOptions (kernel_task,
+    static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryMapperNone), size_t (mib) << 20, 4096);
+  auto *entries = static_cast<VrootCacheEntry *> (IOMalloc (size_t (mib) * 256 * sizeof (VrootCacheEntry)));
+  if (!gTablePages || !entries) {
+    if (gTablePages) { gTablePages->release (); gTablePages = nullptr; }
+    if (entries) IOFree (entries, size_t (mib) * 256 * sizeof (VrootCacheEntry));
+    IOLockFree (gTableLock); gTableLock = nullptr;
+    return false;
+  }
+  gTableCache.count = mib * 256;
+  gTableCache.pages = static_cast<uint8_t *> (gTablePages->getBytesNoCopy ());
+  gTableCache.entries = entries;
+  bzero (entries, gTableCache.count * sizeof (*entries));
+  IOLog ("NATIVE_UFS_TABLE_CACHE configured mib=%u pages=%u source=protected-embedded-table\n", mib, gTableCache.count);
+  return true;
+}
+#endif
 class NativeUfsBlock : public IOBlockStorageDevice {
   OSDeclareDefaultStructors (NativeUfsBlock)
   uint64_t absolute = 0;      // byte offset of the window on LUN 0
@@ -1495,6 +1564,10 @@ class NativeUfsBlock : public IOBlockStorageDevice {
   vm_offset_t verifiedStorage = 0;
   vm_size_t verifiedStorageBytes = 0;
   UfsVerifiedRecordCache verifiedCache = {};
+  UfsConcurrentCache concurrentCache = {};
+  IOBufferMemoryDescriptor *snapshotDma = nullptr;
+  VrootTable verifiedTable = {};
+  uint32_t *tableWhere = nullptr;
   uint8_t *verifiedCacheStorage = nullptr;
   bool configureVerification ();
 #endif
@@ -1615,7 +1688,7 @@ static bool equalDigest (const uint8_t *a, const uint8_t *b, size_t length)
 
 static bool verifyEmbeddedRecord (const vr_view *view, uint32_t recordBytes,
                                   uint64_t index, const void *data, size_t length,
-                                  UfsRecordFailure *failure = nullptr)
+                                  UfsRecordFailure *failure = nullptr, const uint8_t *expectedDigest = nullptr)
 {
   if (!view || !view->hashes || !data || !recordBytes || !vr_xnu_crypto.sha256 ||
       index >= view->block_count) {
@@ -1628,7 +1701,7 @@ static bool verifyEmbeddedRecord (const vr_view *view, uint32_t recordBytes,
   uint64_t remaining = view->image_bytes - offset;
   size_t expected = remaining < recordBytes ? static_cast<size_t> (remaining) : recordBytes;
   uint8_t digest[32];
-  const uint8_t *wanted = view->hashes + index * 32;
+  const uint8_t *wanted = expectedDigest ? expectedDigest : view->hashes + index * 32;
   if (length != expected)
     return ufsRejectRecord (failure, "record_length", index, length, expected, wanted);
   if (!vr_xnu_crypto.sha256 (data, length, digest))
@@ -1747,7 +1820,8 @@ bool NativeUfsBlock::configureVerification ()
     IOLog ("NATIVE_UFS_VERIFY rejected window=%s reason=%s\n", label, gRootDiagnostic.stage);
     return false;
   }
-  verifiedStorageBytes = tableBytes + 4096;
+  const uint64_t tablePages = (blockCount * 32 + 4095) / 4096;
+  verifiedStorageBytes = tableBytes + 4096 + round_page (tablePages * 32);
   gRootDiagnostic.stage = "policy allocation";
   IOLog ("NATIVE_UFS_VERIFY allocate begin window=%s bytes=%llu records=%llu table=%llu\n",
          label, bytes, blockCount, blockCount * 32);
@@ -1774,6 +1848,18 @@ bool NativeUfsBlock::configureVerification ()
   }
   IOLog ("NATIVE_UFS_VERIFY table_sha256 end window=%s result=ok\n", label);
 
+  uint8_t *pageHashes = reinterpret_cast<uint8_t *> (verifiedStorage + tableBytes + 4096);
+  for (uint64_t page = 0; page < tablePages; ++page) {
+    const uint64_t left = blockCount * 32 - page * 4096;
+    if (!vr_xnu_crypto.sha256 (hashes + page * 4096, left < 4096 ? left : 4096, pageHashes + page * 32)) return false;
+  }
+  if (!prepareTableCache ()) return false;
+  if (gTableCache.count) {
+    tableWhere = static_cast<uint32_t *> (IOMalloc (tablePages * sizeof (uint32_t)));
+    if (!tableWhere) return false;
+    bzero (tableWhere, tablePages * sizeof (uint32_t));
+    verifiedTable = { pageHashes, tableWhere, blockCount * 32, tablePages, reinterpret_cast<uint64_t> (hashes) };
+  }
   gRootDiagnostic.stage = "policy read-only protection";
   IOLog ("NATIVE_UFS_VERIFY protect begin window=%s\n", label);
   if (vm_map_protect (kernel_map, verifiedStorage, verifiedStorage + verifiedStorageBytes,
@@ -1789,16 +1875,21 @@ bool NativeUfsBlock::configureVerification ()
   memcpy (verified.volume_uuid, manifest + 40, sizeof (verified.volume_uuid));
   memcpy (verified.image_sha256, manifest + 56, sizeof (verified.image_sha256));
   verifiedRecordBytes = kEmbeddedAuthRecordBytes;
-  constexpr size_t cacheBytes = (kUfsVerifiedCacheRecords - 1) * kDataMax;
-  verifiedCacheStorage = static_cast<uint8_t *> (IOMalloc (cacheBytes));
-  if (verifiedCacheStorage) {
-    verifiedCache.extraBuffer = verifiedCacheStorage;
-    verifiedCache.extraBytes = cacheBytes;
+  constexpr size_t snapshotBytes = kUfsVerifiedCacheRecords * kDataMax;
+  snapshotDma = IOBufferMemoryDescriptor::inTaskWithOptions (kernel_task,
+    static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryMapperNone), snapshotBytes, 4096);
+  if (snapshotDma && snapshotDma->getBytesNoCopy ()) {
+    IOFree (bounce, kDataMax);
+    bounce = static_cast<uint8_t *> (snapshotDma->getBytesNoCopy ());
+    verifiedCacheStorage = bounce + kDataMax;
+    concurrentCache.count = kUfsVerifiedCacheRecords;
+  } else {
+    if (snapshotDma) { snapshotDma->release (); snapshotDma = nullptr; }
+    verifiedCacheStorage = static_cast<uint8_t *> (IOMalloc ((kUfsVerifiedCacheRecords - 1) * kDataMax));
+    concurrentCache.count = verifiedCacheStorage ? kUfsVerifiedCacheRecords : 1;
   }
-  // Allocation pressure falls back to the original authenticated single slot.
-  IOLog ("NATIVE_UFS_CACHE configured window=%s slots=%u extra_bytes=%llu\n", label,
-         verifiedCacheStorage ? kUfsVerifiedCacheRecords : 1,
-         static_cast<unsigned long long> (verifiedCache.extraBytes));
+  IOLog ("NATIVE_UFS_CACHE configured window=%s slots=%u owned_dma=%u\n", label,
+         concurrentCache.count, snapshotDma != nullptr);
   IOLog ("NATIVE_UFS_VERIFY embedded window=%s records=%llu record_bytes=%u table=%llu table_sha256=%02x%02x%02x%02x\n",
          label, blockCount, verifiedRecordBytes, blockCount * 32,
          tableDigest[0], tableDigest[1], tableDigest[2], tableDigest[3]);
@@ -2112,6 +2203,20 @@ bool NativeUfsBlock::start (IOService *provider)
     return false;
   }
   online = true;
+  OSDictionary *protocol = OSDictionary::withCapacity (2);
+  OSString *location = OSString::withCString (kIOPropertyInternalKey);
+  OSString *interconnect = OSString::withCString (kIOPropertyPhysicalInterconnectTypeVirtual);
+  OSDictionary *characteristics = OSDictionary::withCapacity (1);
+  OSString *medium = OSString::withCString (kIOPropertyMediumTypeSolidStateKey);
+  const bool properties = protocol && location && interconnect && characteristics && medium &&
+    protocol->setObject (kIOPropertyPhysicalInterconnectLocationKey, location) &&
+    protocol->setObject (kIOPropertyPhysicalInterconnectTypeKey, interconnect) &&
+    characteristics->setObject (kIOPropertyMediumTypeKey, medium) &&
+    setProperty (kIOPropertyProtocolCharacteristicsKey, protocol) &&
+    setProperty (kIOPropertyDeviceCharacteristicsKey, characteristics);
+  OSSafeReleaseNULL (protocol); OSSafeReleaseNULL (location); OSSafeReleaseNULL (interconnect);
+  OSSafeReleaseNULL (characteristics); OSSafeReleaseNULL (medium);
+  if (!properties) return false;
   registerService ();
   return true;
 }
@@ -2136,6 +2241,8 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     const vr_view *view;
     uint32_t recordBytes;
     UfsVerifiedReadStats *stats;
+    const VrootTable *table;
+    bool owned;
 #endif
     uint64_t lastLba = 0;
     uint32_t lastBlocks = 0;
@@ -2143,15 +2250,17 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     UfsRecordFailure failure = {};
     void lock () { IOLockLock (mutex); }
     void unlock () { IOLockUnlock (mutex); }
+    void sleep (void *event) { IOLockSleep (mutex, event, THREAD_UNINT); }
+    void wakeup (void *event) { IOLockWakeup (mutex, event, false); }
     IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
       phase = "transport";
       lastLba = lba;
       lastBlocks = blocks;
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
       uint64_t t0 = timerTicks ();
-      IOReturn r = hostRead4k (0, lba, blocks, out);
+      IOReturn r = runtimeRead4k (0, lba, blocks, out, owned);
       uint64_t elapsed = timerTicks () - t0;
-      stats->readTicks += elapsed;
+      lock (); stats->readTicks += elapsed; unlock ();
       __atomic_fetch_add (&native_ufs_read_ticks, elapsed, __ATOMIC_RELAXED);
 #else
       IOReturn r = hostRead4k (0, lba, blocks, out);
@@ -2162,11 +2271,15 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
       phase = "verification";
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
       uint64_t t0 = timerTicks ();
-      bool verifiedRecord = verifyEmbeddedRecord (
-        view, recordBytes, index, data, length, &failure
+      uint8_t wanted[32];
+      EmbeddedTableOps tableOps;
+      const bool tableOk = !table->where || vrootTableEntry (gTableCache, tableOps, *table, index, wanted);
+      bool verifiedRecord = tableOk && verifyEmbeddedRecord (
+        view, recordBytes, index, data, length, &failure, table->where ? wanted : nullptr
       );
+      if (!tableOk) ufsRejectRecord (&failure, "hash_table_page", index, length, 0);
       uint64_t elapsed = timerTicks () - t0;
-      stats->verifyTicks += elapsed;
+      lock (); stats->verifyTicks += elapsed; unlock ();
       __atomic_fetch_add (&native_ufs_verify_ticks, elapsed, __ATOMIC_RELAXED);
       if (!verifiedRecord) {
         gRootDiagnostic.stage = "read block integrity";
@@ -2189,13 +2302,13 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     }
   } operations = { windowLock, buffer
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
-    , &verified, verifiedRecordBytes, &verifiedCache.stats
+    , &verified, verifiedRecordBytes, &concurrentCache.stats, &verifiedTable, snapshotDma != nullptr
 #endif
   };
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
   UfsVerifiedReadStats report = {};
-  UfsWindowResult outcome = ufsReadVerifiedRecords (
-    operations, absolute, bytes, block, count, bounce, verifiedRecordBytes, verifiedCache, &report
+  UfsWindowResult outcome = ufsReadConcurrentRecords (
+    operations, absolute, bytes, block, count, bounce, verifiedCacheStorage, verifiedRecordBytes, concurrentCache, &report
   );
   if (report.requests) {
     IOLog ("NATIVE_UFS_CACHE window=%s requests=%llu requested_bytes=%llu hits=%llu misses=%llu read_bytes=%llu\n",
@@ -2235,19 +2348,25 @@ void NativeUfsBlock::free ()
 {
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
   verifiedCache = {};
-  if (verifiedCacheStorage) {
-    IOFree (verifiedCacheStorage, (kUfsVerifiedCacheRecords - 1) * kDataMax);
-    verifiedCacheStorage = nullptr;
+  if (verifiedTable.where) {
+    EmbeddedTableOps ops;
+    vrootTableDrop (gTableCache, ops, verifiedTable);
+    IOFree (tableWhere, verifiedTable.pages * sizeof (uint32_t)); tableWhere = nullptr; verifiedTable = {};
   }
-  if (verifiedStorage) {
-    kmem_free (kernel_map, verifiedStorage, verifiedStorageBytes);
-    verifiedStorage = 0;
+  if (verifiedStorage) { kmem_free (kernel_map, verifiedStorage, verifiedStorageBytes); verifiedStorage = 0; }
+  if (snapshotDma) {
+    // A timeout can leave the HC using a snapshot page. Retain the descriptor
+    // until reboot, just as the transport retains its own poisoned DMA region.
+    if (!__atomic_load_n (&gHost.poisoned, __ATOMIC_ACQUIRE)) snapshotDma->release ();
+    snapshotDma = nullptr; bounce = nullptr; verifiedCacheStorage = nullptr;
+  } else {
+    if (verifiedCacheStorage) IOFree (verifiedCacheStorage, (kUfsVerifiedCacheRecords - 1) * kDataMax);
+    if (bounce) IOFree (bounce, kDataMax);
+    bounce = nullptr; verifiedCacheStorage = nullptr;
   }
+#else
+  if (bounce) { IOFree (bounce, kDataMax); bounce = nullptr; }
 #endif
-  if (bounce) {
-    IOFree (bounce, kDataMax);
-    bounce = nullptr;
-  }
   if (windowLock) {
     IOLockFree (windowLock);
     windowLock = nullptr;

@@ -11,7 +11,7 @@ enum class Fault { None, Empty, Type, Tag, Lun, Query, Residual, Underflow,
   QueryDelayed, QueryDelayedMismatch, QueryDelayedFatal, QueryDelayedTimeout, QueryDelayedBusyTimeout,
   TurDelayed, TurDelayedFatal, TurDelayedCompleteFatal, TurDelayedTimeout, TurDelayedBusyTimeout };
 static Fault fault;
-static std::array<uint8_t,kDmaBytes> device;
+static std::array<uint8_t,kDmaBytesOneSlot> device;
 static std::array<uint32_t,64> registers;
 static std::array<uint32_t,64> smmuRegisters, cbRegisters;
 static unsigned mmioReads;
@@ -192,7 +192,7 @@ static void reset(Fault f=Fault::None)
 static void assertQuarantined()
 {
   assert(ufs_test_poisoned());
-  std::array<uint8_t,kDmaBytes> old; memcpy(old.data(),memory,sizeof(memory));
+  std::array<uint8_t,kDmaBytesOneSlot> old; memcpy(old.data(),memory,sizeof(memory));
   unsigned oldWrites=writes, oldReleases=releases;
   uint8_t cdb[6]={}; uint32_t scsi=0, value=0xabcdef;
   assert(ufs_test_nop()!=0);
@@ -227,7 +227,7 @@ static void checkDeadlineRead()
     assert(doorbellWrites==2 && releases==2 && runStopWrites==0);
     assert(lockDepth==0 && lockCalls==1 && unlockCalls==1);
     if (next==Fault::ClockComplete) {
-      assert(!ufs_test_poisoned() && acquires==priorAcquires+2);
+      assert(!ufs_test_poisoned() && acquires==priorAcquires+3);
       assert(failureLogs==0);
       assert(std::all_of(out.begin(),out.end(),[](uint8_t byte){return byte==0x7b;}));
       fault=Fault::None; assert(ufs_test_read(0,1,1,out.data())==kIOReturnSuccess);
@@ -326,7 +326,7 @@ int main(int argc, char **argv)
   for (unsigned blocked: {0x58U,0x20U}) {
     reset();
     assert(ufs_test_nop()==kIOReturnSuccess);
-    std::array<uint8_t,kDmaBytes> completedNop;
+    std::array<uint8_t,kDmaBytesOneSlot> completedNop;
     memcpy(completedNop.data(),memory,sizeof(memory));
     const unsigned nopWrites=writes, nopReleases=releases, nopAcquires=acquires;
     registers[blocked/4]=blocked==0x58 ? 1U : 0x20000U;

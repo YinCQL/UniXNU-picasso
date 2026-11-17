@@ -28,11 +28,11 @@ def main():
     fixture=r'''
 #include "RootCommandsBridge.cpp"
 #include <array>
-static std::array<uint8_t,kDmaBytes> sent;
+static std::array<uint8_t,kDmaBytesOneSlot> sent;
 static uint64_t ticks;
 static uint64_t io(unsigned op,uint64_t address,uint64_t,void *) {
   if (op==1 && address==0x58) {
-    memcpy(sent.data(),memory,kDmaBytes);
+    memcpy(sent.data(),memory,kDmaBytesOneSlot);
     *reinterpret_cast<uint32_t *>(memory+8)=0;
     uint8_t *c=memory+kUcdOffset,*r=c+kRspOffset;
     memcpy(r,c,32); r[0]=c[0]+0x20;
@@ -51,7 +51,7 @@ static void same(const uint8_t *old) {
   ++cases;
 }
 int main() {
-  alignas(4096) uint8_t old[kDmaBytes];
+  alignas(4096) uint8_t old[kDmaBytesOneSlot];
   uint8_t *virt=old;
   const uint32_t ucdOffset=4096,rspOffset=512,prdtOffset=1024,dataOffset=8192;
   for (uint64_t phys: {0x40010000ULL,0x8cb5e9000ULL}) {

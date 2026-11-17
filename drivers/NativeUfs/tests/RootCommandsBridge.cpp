@@ -40,7 +40,7 @@ static Host gHost;
 static unsigned testLock;
 static unsigned failureLogs;
 static char failureLog[2048];
-alignas(4096) static uint8_t memory[kDmaBytes];
+alignas(4096) static uint8_t memory[kDmaBytesOneSlot];
 using Callback = uint64_t (*)(unsigned operation, uint64_t address, uint64_t value, void *bytes);
 static Callback callback;
 // 0: MMIO read; 1: ordered MMIO write; 2: release DMA; 3: acquire DMA;
@@ -74,12 +74,19 @@ static void IOLog(const char *format, ...) {
   ++failureLogs;
 }
 #include "../RootTransportDiagnostics.h"
+static bool gRuntimeSlots = false;
+static uint64_t gUtrlPhys = 0;
+static IOReturn runtimeRead4k (uint8_t, uint64_t, uint32_t, void *) { assert(false); return kIOReturnNotReady; }
+static IOReturn runtimeWrite4k (uint8_t, uint64_t, uint32_t, const void *, bool) { assert(false); return kIOReturnNotReady; }
+static IOReturn runtimeSyncCache () { assert(false); return kIOReturnNotReady; }
+static int runtimeFirmwareGeometry (uint8_t, uint64_t *) { assert(false); return -1; }
 #include "../RootCommands.h"
 #include "../FirmwareCommands.h"
 #include "../RootQueue.h"
 extern "C" {
 void ufs_test_reset(Callback cb, uint64_t physical) {
   callback=cb; memset(memory,0,sizeof(memory));
+  gUtrlPhys=physical;
   gHost={memory,physical,true,false,1,&testLock}; gRootDiagnostic=UfsRootDiagnostics{};
   gRootDiagnosticEnabled=gRootTransportFailureReported=false;
   failureLogs=0; failureLog[0]=0;

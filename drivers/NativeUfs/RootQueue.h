@@ -56,11 +56,11 @@ static bool hostStopQueue (const char **why)
 
 static bool hostStartQueue (const char **why)
 {
-  NATIVE_UFS_TRACE ("NATIVE_UFS_QUEUE start list=%llx\n", gHost.phys);
-  hostWrite (0x50, static_cast<uint32_t> (gHost.phys));
-  hostWrite (0x54, static_cast<uint32_t> (gHost.phys >> 32));
-  if (read32 (gHost.hc, 0x50) != uint32_t (gHost.phys) ||
-      read32 (gHost.hc, 0x54) != uint32_t (gHost.phys >> 32)) {
+  NATIVE_UFS_TRACE ("NATIVE_UFS_QUEUE start list=%llx\n", gUtrlPhys);
+  hostWrite (0x50, static_cast<uint32_t> (gUtrlPhys));
+  hostWrite (0x54, static_cast<uint32_t> (gUtrlPhys >> 32));
+  if (read32 (gHost.hc, 0x50) != uint32_t (gUtrlPhys) ||
+      read32 (gHost.hc, 0x54) != uint32_t (gUtrlPhys >> 32)) {
     recordTransport (kIOReturnIOError, 15);
     *why = "request list address";
     return false;

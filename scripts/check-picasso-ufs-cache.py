@@ -29,15 +29,17 @@ def main():
         fault = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fault)
         vcvars = fault.find_vcvars()
+    if vcvars:
+        parser.error('Extended runtime/cache checks require clang++ with OpenSSL; run this checker in WSL')
     if not vcvars and not args.cxx:
         parser.error('Requires installed MSVC on Windows or --cxx; no tool is installed')
     report = {'scope': __doc__, 'pass': False, 'runs': [], 'sha256': {}}
     files = [source.parent / 'RootWindowRead.h', source.parent / 'NativeUfs.cpp',
-             source / 'RootWindowRead.cpp', source / 'RootVerifiedCache.cpp']
+             source / 'RootWindowRead.cpp', source / 'RootVerifiedCache.cpp', source.parent / 'ConcurrentRecords.h', source.parent / 'VerifiedTableCache.h', source / 'ConcurrentRecords.cpp', source / 'VerifiedTableCache.cpp', source.parent / 'RuntimeSlots.h', source.parent / 'RuntimeQueue.h', source.parent / 'RuntimePlatform.h', source.parent / 'RuntimeFirmware.h', source / 'RuntimeCommands.cpp']
     for p in files:
         report['sha256'][str(p.relative_to(root))] = hashlib.sha256(p.read_bytes()).hexdigest()
     try:
-        for fixture in ('RootWindowRead', 'RootVerifiedCache'):
+        for fixture in ('RootWindowRead', 'RootVerifiedCache', 'ConcurrentRecords', 'VerifiedTableCache', 'RuntimeCommands'):
             for asan in (False, True):
                 name = fixture + ('-asan' if asan else '')
                 binary = out / (name + ('.exe' if os.name == 'nt' else ''))
@@ -54,8 +56,10 @@ def main():
                     result = fault.batch_run(out, name + '-compile',
                         f'{command} > {name}-compile.log 2>&1\nexit /b %errorlevel%\n', vcvars)
                 else:
-                    command = [args.cxx, '-std=c++17', '-Wall', '-Wextra', '-Werror', '-O1', '-g',
+                    command = [args.cxx, '-std=c++17', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-O1', '-g', '-pthread',
                                str(source / (fixture + '.cpp')), '-o', str(binary)]
+                    if fixture == 'VerifiedTableCache':
+                        command += ['-lcrypto']
                     if asan:
                         command += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
                     entry['command'] = command

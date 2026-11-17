@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the actual record verifier with Python SHA256 and host I/O.
 
-Extracts the production verifier and compares its decisions against the build91
+Extracts the production verifier and compares its decisions against the accepted 120a616
 version. Uses the production window reader with file-backed transport stand-ins.
 No Apple SDK, native IOKit, APFS mounting or phone access. Preserves all outputs.
 """
@@ -37,11 +37,11 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     source = ROOT / 'drivers/NativeUfs/NativeUfs.cpp'
     current = source.read_text(encoding='utf-8')
-    old = subprocess.check_output(['git', 'show', '5090cf320e4856b99ba91f867af12e2d713e16e1:drivers/NativeUfs/NativeUfs.cpp'], cwd=ROOT, text=True)
+    old = subprocess.check_output(['git', 'show', '120a6168c2a52e679334d28d304ab9ac32149a61:drivers/NativeUfs/NativeUfs.cpp'], cwd=ROOT, text=True)
     helper = extract(current, 'equalDigest') + '\n' + extract(current, 'verifyEmbeddedRecord')
-    legacy = extract(old, 'verifyEmbeddedRecord').replace('verifyEmbeddedRecord', 'verifyBuild91Record')
+    legacy = extract(old, 'verifyEmbeddedRecord').replace('verifyEmbeddedRecord', 'verifyPriorRecord')
     (out / 'actual-verifier.inc').write_text(helper + '\n' + legacy, encoding='utf-8')
-    for name in ('RootReadDiagnostics.h', 'RootWindowRead.h', 'RootDiagnostics.h'):
+    for name in ('RootReadDiagnostics.h', 'RootWindowRead.h', 'RootDiagnostics.h', 'ConcurrentRecords.h', 'VerifiedTableCache.h'):
         shutil.copyfile(source.parent / name, out / name)
     bodies = re.findall(r'^IOReturn NativeUfsBlock::doAsyncReadWrite\s*\(.*?^}', current, re.M | re.S)
     if len(bodies) != 1:
@@ -69,7 +69,7 @@ using Read = int (*)(uint64_t, uint32_t, void *);
 API int verify(int prior, const uint8_t *hashes, uint64_t count, uint64_t bytes, uint32_t recordBytes,
                uint64_t index, const void *data, size_t length, Sha sha, char *text) {
   vr_view view{hashes,count,bytes}; vr_xnu_crypto.sha256=sha;
-  if(prior) return verifyBuild91Record(&view,recordBytes,index,data,length);
+  if(prior) return verifyPriorRecord(&view,recordBytes,index,data,length);
   UfsRecordFailure f{};
   bool ok=verifyEmbeddedRecord(&view,recordBytes,index,data,length,&f);
   if(!ok) {
