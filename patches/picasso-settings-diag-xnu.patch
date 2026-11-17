@@ -80,7 +80,7 @@
 +/* PICASSO_SETTINGS_DIAG_BSD_END */
 --- a/osfmk/kern/task.c
 +++ b/osfmk/kern/task.c
-@@ -10404,3 +10404,110 @@
+@@ -10404,3 +10404,171 @@
  	}
  }
  #endif
@@ -92,6 +92,66 @@
 +    uint64_t tid, pc, lr, fp;
 +    unsigned valid, state, hint, regs;
 +};
++
++
++/* Exact 20H392 configd scalar state, requested with the existing diagnostic.
++ * Validate the main image header and LC_UUID before applying fixed offsets.
++ * Read only initialization handles and timeout bits, never preferences or
++ * pointed-to CF objects. Nonfaulting copies are bounded to sixteen bytes.
++ * This best-effort view is not a coherent snapshot or a completion signal. */
++static int
++picasso_settings_read_words(vm_map_t map, uint64_t address, uint64_t *words, unsigned count)
++{
++    const uint64_t mask = 0x7fffffffffULL;
++    if ((address & 7) || address < 0x1000 || !count || (count & 1) ||
++        count > 8 || address > mask - count * sizeof(*words)) return EFAULT;
++    for (unsigned i = 0; i < count; i += 2) {
++        vm_map_t previous = vm_map_switch(map);
++        disable_preemption();
++        int error = copyin(address + i * sizeof(*words), words + i, 16);
++        enable_preemption();
++        vm_map_switch(previous);
++        if (error) return error;
++    }
++    return 0;
++}
++
++static void
++picasso_settings_configd_state(vm_map_t map, uint64_t header, unsigned sample, int pid)
++{
++    static const uint64_t expected_header[4] = {
++        0x0100000cfeedfacfULL, 0x0000000200000000ULL,
++        0x0000112800000024ULL, 0x0000000000200085ULL
++    };
++    static const uint64_t expected_uuid[4] = {
++        0x000000180000001bULL, 0x7f3473bf7fffcb93ULL,
++        0x976d708701d10995ULL, 0x0000002000000032ULL
++    };
++    uint64_t identity[4] = {0}, words[8] = {0}, timeouts[2] = {0}, plugins[2] = {0};
++    int error = EINVAL;
++    unsigned matched = 0;
++    if (!header || (header & 0xfff) || header > 0x7fffffffffULL - 0x71b80) goto done;
++    error = picasso_settings_read_words(map, header, identity, 4);
++    if (error) goto done;
++    if (memcmp(identity, expected_header, sizeof(identity))) { error = EINVAL; goto done; }
++    error = picasso_settings_read_words(map, header + 0xaa0, identity, 4);
++    if (error) goto done;
++    /* The fourth word is the following LC_BUILD_VERSION header. */
++    if (memcmp(identity, expected_uuid, sizeof(identity))) { error = EINVAL; goto done; }
++    matched = 1;
++    error = picasso_settings_read_words(map, header + 0x71b38, words, 8);
++    if (!error) error = picasso_settings_read_words(map, header + 0x71970, timeouts, 2);
++    if (!error) error = picasso_settings_read_words(map, header + 0x71ab0, plugins, 2);
++done:
++    printf("PICASSO_SETTINGS configd_state sample=%u pid=%d matched=%u error=%d coherent=0\n",
++        sample, pid, matched, error);
++    if (!error) {
++        printf("PICASSO_SETTINGS ifnamer sample=%u connect=%x db=%u iter=%x notify=%u quiet=%x stack=%x state=%u timer=%u prefs=%u plugins=%u stack_bits=%llx quiet_bits=%llx\n",
++            sample, (unsigned)words[0], words[1] != 0, (unsigned)words[2], words[3] != 0,
++            (unsigned)words[4], (unsigned)(words[4] >> 32), words[5] != 0, words[6] != 0,
++            words[7] != 0, plugins[0] != 0, timeouts[0], timeouts[1]);
++    }
++}
 +
 +/* Remote reads use a referenced map and never page in or wait on a VM fault.
 + * Only 16-byte frame records are read; addresses are checked before switching.
@@ -187,6 +247,7 @@
 +                (unsigned long long)frames[j+2], (unsigned long long)frames[j+3]);
 +        }
 +    }
++    if (map && !strcmp(name, "configd")) picasso_settings_configd_state(map, header, sample, pid);
 +    if (map) vm_map_deallocate(map);
 +}
 +#endif
