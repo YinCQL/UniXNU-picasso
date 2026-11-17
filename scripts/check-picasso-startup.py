@@ -48,8 +48,11 @@ def main():
     assert 'VATTR_WANTED(&va, va_data_size)' in reader and 'VATTR_IS_SUPPORTED(&va, va_data_size)' in reader
     assert 'O_NOFOLLOW' in reader and 'vnode_vtype(vp) != VREG' in reader
     (out / 'network-reader.inc').write_text(reader, newline='\n')
-    policy = literal + '\n' + '\n'.join(module.extract(source, name) for name in
-        ('static int\npicasso_ifnamer_directory(', 'static int\npicasso_ifnamer_metadata(', 'static void\npicasso_ifnamer_mount('))
+    signature_start = source.index('static const struct picasso_ifnamer_signature_file')
+    signature_end = source.index('\n\n', signature_start)
+    signature_literal = source[signature_start:signature_end]
+    policy = literal + '\n' + signature_literal + '\n' + '\n'.join(module.extract(source, name) for name in
+        ('static int\npicasso_ifnamer_directory(', 'static int\npicasso_ifnamer_metadata(', 'static int\npicasso_ifnamer_copy_signatures(', 'static int\npicasso_ifnamer_bind(', 'static void\npicasso_ifnamer_mount('))
     (out / 'network-config.inc').write_text(policy, newline='\n')
     data_prepare = module.extract(source, 'static int\nnative_owner_data_prepare(')
     assert data_prepare.count('picasso_ifnamer_mount(p, scratch);') == 1
@@ -108,6 +111,8 @@ def main():
                    '-O1', '-I', str(out), str(ROOT / 'scripts/tests' / fixture), '-o', str(exe)]
             if fixture == 'picasso-runtime-jobs-host.c':
                 cmd += ['-DJOBS_SHA_SCRIPT=' + '"' + str(out / 'jobs-sha.py') + '"']
+            if fixture == 'picasso-network-config-host.c':
+                cmd += ['-lcrypto', '-Wno-deprecated-declarations']
             if sanitized:
                 cmd += ['-fsanitize=address' if os.name == 'nt' else '-fsanitize=address,undefined']
             for stage, command in (('compile', cmd), ('run', [str(exe)])):

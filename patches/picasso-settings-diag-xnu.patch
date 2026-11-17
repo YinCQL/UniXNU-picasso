@@ -481,3 +481,341 @@
  
  	/* Retain the namei reference until the getattrlist completes. */
  	nameidone(&nd);
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -3660,6 +3660,8 @@
+ /*
+  * Get file system statistics in 64-bit mode
+  */
++static void picasso_configd_statfs_event(vfs_context_t, vnode_t, int, int);
++
+ int
+ fstatfs64(__unused struct proc *p, struct fstatfs64_args *uap, __unused int32_t *retval)
+ {
+@@ -3708,6 +3710,7 @@
+ 	error = copyout(&sfs, uap->buf, sizeof(sfs));
+ 
+ out:
++	picasso_configd_statfs_event(vfs_context_current(), vp, error, uap->fd);
+ 	file_drop(uap->fd);
+ 	vnode_put(vp);
+ 
+@@ -4707,6 +4710,110 @@
+ { (void)ctx; (void)path; (void)op; (void)error; (void)a; (void)b; }
+ #endif
+ /* PICASSO_CONFIGD_VFS_END */
++
++/* Fixed directory identities include the real addon backing tree. */
++#if DEVELOPMENT || DEBUG
++static unsigned
++picasso_configd_directory_name(const char *path)
++{
++    static const char *const directories[] = {
++        "/System/Library/SystemConfiguration",
++        "/System/Library/SystemConfiguration/InterfaceNamer.bundle",
++        "/private/var/picasso/ifnamer/InterfaceNamer.bundle"};
++    for (unsigned i = 0; i < sizeof(directories) / sizeof(directories[0]); ++i)
++        if (!strcmp(path, directories[i])) return 1;
++    return 0;
++}
++
++static unsigned
++picasso_configd_directory_vnode(vfs_context_t ctx, vnode_t vp, char path[256])
++{
++    proc_t p = vfs_context_proc(ctx);
++    if (!p || strcmp(p->p_name, "configd")) return 0;
++    int length = 256;
++    if (!vn_getpath(vp, path, &length) && picasso_configd_directory_name(path)) return 1;
++    /* A mount root can lack a cached parent/name; its mountpoint is exact. */
++    if (vnode_isvroot(vp) && vnode_mount(vp)) {
++        const char *mountpoint = vfs_statfs(vnode_mount(vp))->f_mntonname;
++        if (picasso_configd_directory_name(mountpoint)) {
++            strlcpy(path, mountpoint, 256);
++            return 1;
++        }
++    }
++    path[0] = 0;
++    return 0;
++}
++
++static unsigned
++picasso_configd_relative_path(vfs_context_t ctx, int fd, user_addr_t address, char path[256])
++{
++    proc_t p = vfs_context_proc(ctx);
++    if (!p || strcmp(p->p_name, "configd")) return 0;
++    char relative[32];
++    size_t length = 0;
++    if (copyinstr(address, relative, sizeof(relative), &length) || !length ||
++        (strcmp(relative, ".") && strcmp(relative, "Info.plist") &&
++         strcmp(relative, "Contents") && strcmp(relative, "Resources"))) return 0;
++    vnode_t vp = NULLVP;
++    if (file_vnode(fd, &vp)) return 0;
++    unsigned selected = 0;
++    if (!vnode_getwithref(vp)) {
++        selected = picasso_configd_directory_vnode(ctx, vp, path);
++        vnode_put(vp);
++    }
++    file_drop(fd);
++    if (selected) {
++        strlcat(path, "/", 256);
++        strlcat(path, relative, 256);
++    }
++    return selected;
++}
++
++static void
++picasso_configd_resolved_event(vfs_context_t ctx, const char *path, unsigned op, int error,
++    uint64_t a, uint64_t b)
++{
++    unsigned ticket = picasso_configd_vfs_ticket();
++    if (ticket) printf("PICASSO_CONFIGD_VFS sample=%u pid=%d op=%u error=%d a=%llx b=%llx path=%s\n",
++        ticket, proc_getpid(vfs_context_proc(ctx)), op, error,
++        (unsigned long long)a, (unsigned long long)b, path);
++}
++#endif
++
++
++static void
++picasso_configd_statfs_event(vfs_context_t ctx, vnode_t vp, int error, int fd)
++{
++#if DEVELOPMENT || DEBUG
++    char path[256] = {0};
++    if (picasso_configd_directory_vnode(ctx, vp, path)) {
++        mount_t mp = vnode_mount(vp);
++        picasso_configd_resolved_event(ctx, path, 6, error, (uint64_t)(unsigned)fd,
++            mp ? (uint64_t)vfs_flags(mp) : 0);
++    }
++#else
++    (void)ctx; (void)vp; (void)error; (void)fd;
++#endif
++}
++
++void picasso_configd_attr_event(vfs_context_t, user_addr_t, int, const struct attrlist *, uint64_t, size_t);
++void
++picasso_configd_attr_event(vfs_context_t ctx, user_addr_t path, int error,
++    const struct attrlist *attrs, uint64_t options, size_t size)
++{
++#if DEVELOPMENT || DEBUG
++    char buffer[256];
++    if (!picasso_configd_vfs_path(ctx, path, buffer)) return;
++    unsigned ticket = picasso_configd_vfs_ticket();
++    if (ticket) printf("PICASSO_CONFIGD_ATTR sample=%u pid=%d error=%d bitmap=%u common=%x vol=%x dir=%x file=%x fork=%x options=%llx size=%llu path=%s\n",
++        ticket, proc_getpid(vfs_context_proc(ctx)), error, attrs->bitmapcount,
++        attrs->commonattr, attrs->volattr, attrs->dirattr, attrs->fileattr, attrs->forkattr,
++        (unsigned long long)options, (unsigned long long)size, buffer);
++#else
++    (void)ctx; (void)path; (void)error; (void)attrs; (void)options; (void)size;
++#endif
++}
++
+ 
+ int
+ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
+@@ -5266,7 +5373,15 @@
+ 	NDINIT(ndp, LOOKUP, OP_OPEN, FOLLOW | AUDITVNPATH1,
+ 	    segflg, path, ctx);
+ 
++#if DEVELOPMENT || DEBUG
++	char configd_relative[256] = {0};
++	if (UIO_SEG_IS_USER_SPACE(segflg)) picasso_configd_relative_path(ctx, fd, path, configd_relative);
++#endif
+ 	error = open1at(ctx, ndp, flags, vap, NULL, NULL, retval, fd, AUTH_OPEN_NOAUTHFD);
++#if DEVELOPMENT || DEBUG
++	if (configd_relative[0]) picasso_configd_resolved_event(ctx, configd_relative, 5, error,
++	    (uint64_t)(unsigned)flags, error ? 0 : (uint64_t)*retval);
++#endif
+ 	picasso_configd_vfs_event(ctx, path, 1, error, (uint64_t)(unsigned)flags, error ? 0 : (uint64_t)*retval);
+ 
+ 	kfree_type(typeof(*__open_data), __open_data);
+@@ -10581,11 +10696,7 @@
+ 
+ #if DEVELOPMENT || DEBUG
+ 	char configd_directory[256] = {0};
+-	int configd_len = sizeof(configd_directory);
+-	unsigned configd_trace = !strcmp(vfs_context_proc(&context)->p_name, "configd") &&
+-	    !vn_getpath(vp, configd_directory, &configd_len) &&
+-	    (!strcmp(configd_directory, "/System/Library/SystemConfiguration") ||
+-	     !strcmp(configd_directory, "/System/Library/SystemConfiguration/InterfaceNamer.bundle"));
++	unsigned configd_trace = picasso_configd_directory_vnode(&context, vp, configd_directory);
+ #endif
+ 	loff = fp->fp_glob->fg_offset;
+ 	auio = uio_createwithbuffer(1, loff, spacetype, UIO_READ, &uio_buf[0], sizeof(uio_buf));
+--- a/bsd/vfs/vfs_attrlist.c
++++ b/bsd/vfs/vfs_attrlist.c
+@@ -3402,7 +3402,7 @@
+ 	return error;
+ }
+ 
+-extern void picasso_configd_vfs_event(vfs_context_t, user_addr_t, unsigned, int, uint64_t, uint64_t);
++extern void picasso_configd_attr_event(vfs_context_t, user_addr_t, int, const struct attrlist *, uint64_t, size_t);
+ 
+ static int
+ getattrlistat_internal(vfs_context_t ctx, user_addr_t path,
+@@ -3432,7 +3432,7 @@
+ 	error = nameiat(&nd, fd);
+ 
+ 	if (error) {
+-		if (UIO_SEG_IS_USER_SPACE(pathsegflg)) picasso_configd_vfs_event(ctx, path, 3, error, alp->commonattr, options);
++		if (UIO_SEG_IS_USER_SPACE(pathsegflg)) picasso_configd_attr_event(ctx, path, error, alp, options, bufferSize);
+ 		return error;
+ 	}
+ 
+@@ -3441,7 +3441,7 @@
+ 	error = getattrlist_internal(ctx, vp, alp, attributeBuffer,
+ 	    bufferSize, options, segflg, NULL, NOCRED);
+ 
+-	if (UIO_SEG_IS_USER_SPACE(pathsegflg)) picasso_configd_vfs_event(ctx, path, 3, error, alp->commonattr, options);
++	if (UIO_SEG_IS_USER_SPACE(pathsegflg)) picasso_configd_attr_event(ctx, path, error, alp, options, bufferSize);
+ 
+ 	/* Retain the namei reference until the getattrlist completes. */
+ 	nameidone(&nd);
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -3660,7 +3660,7 @@
+ /*
+  * Get file system statistics in 64-bit mode
+  */
+-static void picasso_configd_statfs_event(vfs_context_t, vnode_t, int, int);
++static void picasso_configd_statfs_event(vfs_context_t, vnode_t, int, int, const struct statfs64 *);
+ 
+ int
+ fstatfs64(__unused struct proc *p, struct fstatfs64_args *uap, __unused int32_t *retval)
+@@ -3710,7 +3710,7 @@
+ 	error = copyout(&sfs, uap->buf, sizeof(sfs));
+ 
+ out:
+-	picasso_configd_statfs_event(vfs_context_current(), vp, error, uap->fd);
++	picasso_configd_statfs_event(vfs_context_current(), vp, error, uap->fd, &sfs);
+ 	file_drop(uap->fd);
+ 	vnode_put(vp);
+ 
+@@ -4782,17 +4782,20 @@
+ 
+ 
+ static void
+-picasso_configd_statfs_event(vfs_context_t ctx, vnode_t vp, int error, int fd)
++picasso_configd_statfs_event(vfs_context_t ctx, vnode_t vp, int error, int fd, const struct statfs64 *sfs)
+ {
+ #if DEVELOPMENT || DEBUG
+     char path[256] = {0};
+     if (picasso_configd_directory_vnode(ctx, vp, path)) {
+         mount_t mp = vnode_mount(vp);
+-        picasso_configd_resolved_event(ctx, path, 6, error, (uint64_t)(unsigned)fd,
+-            mp ? (uint64_t)vfs_flags(mp) : 0);
++        unsigned ticket = picasso_configd_vfs_ticket();
++        if (ticket) printf("PICASSO_CONFIGD_STATFS sample=%u pid=%d fd=%d error=%d flags=%x type=%x kernel_flags=%llx path=%s\n",
++            ticket, proc_getpid(vfs_context_proc(ctx)), fd, error,
++            error ? 0 : sfs->f_flags, error ? 0 : sfs->f_type,
++            mp ? (unsigned long long)vfs_flags(mp) : 0, path);
+     }
+ #else
+-    (void)ctx; (void)vp; (void)error; (void)fd;
++    (void)ctx; (void)vp; (void)error; (void)fd; (void)sfs;
+ #endif
+ }
+ 
+@@ -5376,11 +5379,20 @@
+ #if DEVELOPMENT || DEBUG
+ 	char configd_relative[256] = {0};
+ 	if (UIO_SEG_IS_USER_SPACE(segflg)) picasso_configd_relative_path(ctx, fd, path, configd_relative);
++	char configd_component[2] = {0};
++	size_t configd_component_length = 0;
++	unsigned configd_dot = !strcmp(vfs_context_proc(ctx)->p_name, "configd") &&
++	    UIO_SEG_IS_USER_SPACE(segflg) && !copyinstr(path, configd_component, sizeof(configd_component), &configd_component_length) &&
++	    configd_component_length == 2 && configd_component[0] == '.';
++
+ #endif
+ 	error = open1at(ctx, ndp, flags, vap, NULL, NULL, retval, fd, AUTH_OPEN_NOAUTHFD);
+ #if DEVELOPMENT || DEBUG
+ 	if (configd_relative[0]) picasso_configd_resolved_event(ctx, configd_relative, 5, error,
+ 	    (uint64_t)(unsigned)flags, error ? 0 : (uint64_t)*retval);
++	else if (configd_dot) picasso_configd_resolved_event(ctx, "<dot-relative-parent-unresolved>", 5, error,
++	    (uint64_t)(unsigned)fd, (uint64_t)(unsigned)flags);
++
+ #endif
+ 	picasso_configd_vfs_event(ctx, path, 1, error, (uint64_t)(unsigned)flags, error ? 0 : (uint64_t)*retval);
+ 
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -96,6 +96,15 @@
+ 	int             error;
+ 	unsigned short  code, syscode;
+ 	pid_t           pid;
++#if DEVELOPMENT || DEBUG
++	/* Bounded observation of configd directory calls before VFS entry. This
++	 * reports dispatch/rejection outcomes only; no argument strings or file
++	 * data are read and no filter, credentials or result is changed. */
++	static unsigned picasso_configd_syscall_count;
++	unsigned picasso_configd_ticket = 0, picasso_configd_args_ok = 1;
++	unsigned picasso_configd_filtered = 0, picasso_configd_dispatched = 0;
++	uint64_t picasso_configd_pc = 0;
++#endif
+ 	struct uthread *uthread = get_bsdthread_info(thread_act);
+ 
+ 	uthread_reset_proc_refcount(uthread);
+@@ -111,6 +120,20 @@
+ 
+ 	syscode = (code < nsysent) ? code : SYS_invalid;
+ 	callp   = &sysent[syscode];
++#if DEVELOPMENT || DEBUG
++	if ((code == SYS_openat_nocancel || code == SYS_getdirentries64) &&
++	    !strcmp(proc->p_name, "configd")) {
++		unsigned value = os_atomic_load(&picasso_configd_syscall_count, relaxed);
++		while (value < 32) {
++			if (os_atomic_cmpxchg(&picasso_configd_syscall_count, value, value + 1, relaxed)) {
++				picasso_configd_ticket = value + 1;
++				break;
++			}
++			value = os_atomic_load(&picasso_configd_syscall_count, relaxed);
++		}
++		if (picasso_configd_ticket) picasso_configd_pc = get_saved_state_pc(state);
++	}
++#endif
+ 
+ 	/*
+ 	 * sy_narg is inaccurate on ARM if a 64 bit parameter is specified. Since user_addr_t
+@@ -121,6 +144,9 @@
+ 			/* Too many arguments, or something failed */
+ 			unix_syscall_kprintf("arm_get_syscall_args failed.\n");
+ 			callp = &sysent[SYS_invalid];
++#if DEVELOPMENT || DEBUG
++			picasso_configd_args_ok = 0;
++#endif
+ 		}
+ 	}
+ 
+@@ -159,6 +185,9 @@
+ 
+ #if CONFIG_MACF
+ 	if (__improbable(proc_syscall_filter_mask(proc) != NULL && !bitstr_test(proc_syscall_filter_mask(proc), syscode))) {
++#if DEVELOPMENT || DEBUG
++		picasso_configd_filtered = 1;
++#endif
+ 		error = mac_proc_check_syscall_unix(proc, syscode);
+ 		if (error) {
+ 			goto skip_syscall;
+@@ -177,6 +206,9 @@
+ 	}
+ #endif /* CONFIG_DEBUG_SYSCALL_REJECTION */
+ 
++#if DEVELOPMENT || DEBUG
++	picasso_configd_dispatched = 1;
++#endif
+ 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+ 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
+@@ -184,6 +216,14 @@
+ #if CONFIG_MACF
+ skip_syscall:
+ #endif /* CONFIG_MACF */
++#if DEVELOPMENT || DEBUG
++	if (picasso_configd_ticket) {
++		printf("PICASSO_CONFIGD_SYSCALL sample=%u pid=%d tid=%llu code=%u mapped=%u args_ok=%u filter=%u dispatched=%u error=%d result=%d pc=%llx\n",
++		    picasso_configd_ticket, pid, (unsigned long long)thread_tid(thread_act), code, syscode,
++		    picasso_configd_args_ok, picasso_configd_filtered, picasso_configd_dispatched,
++		    error, uthread->uu_rval[0], (unsigned long long)picasso_configd_pc);
++	}
++#endif
+ 
+ 	unix_syscall_kprintf("code %d, error %d, results %x, %x (pid %d - %s, tid %lld)\n", code, error,
+ 	    uthread->uu_rval[0], uthread->uu_rval[1],
