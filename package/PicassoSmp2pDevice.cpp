@@ -6,6 +6,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <libkern/c++/OSSharedPtr.h>
 #include <kern/cpu_data.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include "PicassoSmp2p.h"
 #include "PicassoSmemLock.h"
@@ -277,6 +278,9 @@ struct BootEvents {
     int qrtrError = 0;
     PicassoRpcTrace rpcTrace[2]={};
     PicassoRpcIdle rpcIdle[2]={};
+    struct RpcProgress { uint64_t first,last;uint32_t count,checkpoint;bool seen; };
+    RpcProgress rpcProgress[2]={};
+    uint32_t rpcFastReceived=0,rpcFastBudget=0,rpcFastCalls=0;
     uint32_t fastrpcReceived = 0, fastrpcLogs = 0, fastrpcEvents = 0;
     int fastrpcError = 0;
     uint32_t reuseLogs = 0, remoteReuse = 0, localReuse = 0;
@@ -357,13 +361,41 @@ int bootPoll(void *context, PicassoSmp2pEvent *event) {
     if(!error && event->kick)smpKick(b->device);
     return error;
 }
+void observeRpc(BootEvents *b) {
+    for(unsigned n=0;n<2;++n) {
+        auto &p=b->rpcProgress[n];uint32_t count=b->glink->fastrpc.domain[n].requests;
+        if(count==p.count)continue;
+        p.count=count;p.last=mach_absolute_time();
+        if(!p.seen) {p.first=p.last;p.seen=true;}
+    }
+}
+void logRpcProgress(BootEvents *b,unsigned n) {
+    const auto &p=b->rpcProgress[n];if(!p.seen)return;
+    uint64_t ns=0;absolutetime_to_nanoseconds(p.last-p.first,&ns);
+    IOLog("PICASSO_ADSP rpc-progress pd=%u count=%u elapsed_ms=%llu fast_calls=%u sensor_init=unknown\n",
+        b->glink->fastrpc.domain[n].pd,p.count,ns/1000000ULL,b->rpcFastCalls);
+    const auto &d=b->glink->fastrpc.domain[n];
+    IOLog("PICASSO_ADSP rpc-errors pd=%u count=%u errors=%u notfound=%u decode=%u first=%u scalar=%x\n",
+        d.pd,d.requests,d.reverseErrors,d.notFound,d.decodeErrors,d.firstFailure,d.firstFailureScalar);
+    if(d.firstFailure)IOLog("PICASSO_ADSP rpc-first-error pd=%u path=%.127s\n",d.pd,d.firstFailureName);
+}
 bool bootFast(void *context) {
     auto *b=static_cast<BootEvents *>(context);auto *g=b->glink;
     const auto &v=g->apr.capture;
-    if(g->failed || !v.streaming || !v.enabled || !v.attempted || v.done || v.firstError ||
-       v.phase<PicassoCapturePrime || v.phase>PicassoCaptureRead)return false;
+    if(g->failed)return false;
+    bool capture=v.streaming && v.enabled && v.attempted && !v.done && !v.firstError &&
+        v.phase>=PicassoCapturePrime && v.phase<=PicassoCaptureRead;
+    const auto &f=g->fastrpc;bool rpc=f.bound && !f.stopped;
+    bool up=false;for(const auto &c:g->channel)if(c.used && c.local==3 && c.up && !c.closing)up=true;
+    rpc=rpc && up;
+    if(f.received!=b->rpcFastReceived) {b->rpcFastReceived=f.received;b->rpcFastBudget=8;}
+    if(!rpc)b->rpcFastBudget=0;
+    if(!capture && !b->rpcFastBudget)return false;
+    if(b->rpcFastBudget)--b->rpcFastBudget;
     bool kick=false;(void)picasso_glink_service(b->io,g,&kick,false);
     if(kick)glinkKick(b->device);
+    ++b->rpcFastCalls;observeRpc(b);
+    if(f.received!=b->rpcFastReceived) {b->rpcFastReceived=f.received;b->rpcFastBudget=8;}
     return !g->failed;
 }
 void bootService(void *context) {
@@ -375,6 +407,7 @@ void bootService(void *context) {
         for(const auto &c:g->channel)if(c.used && c.local==3 && c.up && !g->fastrpc.bound && !g->fastrpc.stopped)
             picasso_rpc_device_prepare(&g->fastrpc);
         int transport=picasso_glink_service(b->io,g,&kick);
+        observeRpc(b);
         if(kick)glinkKick(b->device);
         if(g->sent && !b->sentLogged) {
             b->sentLogged=true;
@@ -430,6 +463,10 @@ void bootService(void *context) {
             bool trace=picasso_rpc_trace(b->rpcTrace[n],d);
             bool idle=picasso_rpc_idle(b->rpcIdle[n],d.requests);
             if(trace || idle)logRpcRequest(d,b->rpcTrace[n].repeated);
+            auto &progress=b->rpcProgress[n];
+            if(idle || (d.requests>>8)!=progress.checkpoint) {
+                progress.checkpoint=d.requests>>8;logRpcProgress(b,n);
+            }
             if(idle) {
                 if(n==1 && d.stage==5 && !d.error && !g->fastrpc.stopped)
                     picasso_qmi_registry_idle(&g->qrtr.qmi,d.requests);

@@ -246,11 +246,14 @@ int aprWork(const PicassoSmemIo *io,PicassoGlink *s,PicassoGlinkChannel &c,bool 
     return 0;
 }
 
-int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c, bool *kick) {
+int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c, bool *kick,bool elapsed=true) {
     if (!s->ready || !c.supported) return 0;
     if (c.closing) return 0;
+    // Continuations service only an already open, backed FastRPC channel.
+    // APR/QRTR and channel negotiation keep their regular deadline cadence.
+    if(!elapsed && (c.local!=3 || !c.up || !s->fastrpc.bound || s->fastrpc.stopped))return 0;
     int error;
-    if (!c.up && ++c.steps > 500) {
+    if (elapsed && !c.up && ++c.steps > 500) {
         if (c.local==1) s->apr.error = -60;
         else if(c.local==2) s->qrtr.error = -60;
         else s->fastrpc.error = -60;
@@ -374,7 +377,7 @@ int channelWork(const PicassoSmemIo *io, PicassoGlink *s, PicassoGlinkChannel &c
         ++q.events; return 0;
     }
     if(c.local==3) {
-        auto &f=s->fastrpc;picasso_rpc_tick(&f);
+        auto &f=s->fastrpc;picasso_rpc_tick(&f,elapsed);
         uint32_t words[14]={9U|(uint32_t(c.local)<<16),0,40,0};
         int call=picasso_rpc_packet(&f,words+4);if(call<0)return 0;
         PicassoGlinkRemoteIntent *slot=nullptr;
@@ -691,6 +694,19 @@ int picasso_glink_service(const PicassoSmemIo *io, PicassoGlink *s, bool *kick,b
         if (!intentBudget) break;
     }
     // The complete RX commands and their tail publication are now committed.
+    // Complete/queue one bounded FastRPC pass now, including RX_DONE reuse.
+    // This removes a second 20 ms sleep from each serial reverse request.
+    if(!s->intentProgress && s->fastrpc.bound && !s->fastrpc.stopped) {
+        bool work=false;
+        for(const auto &d:s->fastrpc.domain)if(!d.error)
+            for(const auto &call:d.call)work|=call.complete || call.queued;
+        for(const auto &i:s->fastrpcLocal)work|=i.done;
+        if(work)for(auto &c:s->channel)if(c.used && c.local==3 && c.up && !c.closing) {
+            error=channelWork(io,s,c,kick,false);
+            if(s->failed)return error;
+            break;
+        }
+    }
     // Advance one successful source control ACK without waiting another 20ms
     // tick. Do not age deadlines twice or accelerate WRITE/DMA completions.
     auto &a=s->apr;auto &v=a.play;

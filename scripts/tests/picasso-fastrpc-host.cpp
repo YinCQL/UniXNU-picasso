@@ -69,9 +69,11 @@ static void reverseCalls() {
     meta=output(n,1,2);rpcPut32(meta,0x124);rpcPut32(meta+4,0x100);rpcPut32(meta+8,0x1f020100);rpcPut32(meta+12,len);
     reply(n,1);picasso_rpc_tick(&f);
     assert(d.previousResult==2 && d.replyBytes==0 && !strcmp(d.name,path));
+    assert(d.reverseErrors==1 && d.notFound==1 && !d.decodeErrors && d.firstFailure==2 && !strcmp(d.firstFailureName,path));
     assert(rpc32(output(n,1,0))==0x124 && rpc32(output(n,1,0)+4)==2 && !rpc32(output(n,1,0)+8));
     sent(n,1);meta=output(n,1,2);rpcPut32(meta,0x125);rpcPut32(meta+12,PicassoRpcBlob+1);
     reply(n,1);picasso_rpc_tick(&f);assert(d.previousResult==77 && !d.replyBytes);
+    assert(d.reverseErrors==2 && d.notFound==1 && d.decodeErrors==1 && d.firstFailure==2);
 }
 static void fileListener() {
     picasso_rpc_fs_reset();initialization();auto &d=f.domain[1];d.stdOpen=true;d.opens=1;
@@ -112,6 +114,36 @@ static void errors() {
     uint32_t rng=0x12345678;uint8_t p[100],out[PicassoRpcBlob];PicassoRpcArg a[8];unsigned olen;
     for(unsigned i=0;i<10000;++i) { for(auto &x:p) { rng=rng*1664525+1013904223;x=uint8_t(rng>>24); }
         picasso_rpc_receive(&f,p,i%101);(void)rpcUnpack(p,i%101,rng,out,a,&olen); }
+}
+static void continuationClock() {
+    reset();picasso_rpc_tick(&f);sent(0,0);
+    unsigned queued=f.domain[1].call[0].ticks,control=f.domain[0].call[0].ticks;
+    for(unsigned i=0;i<1000;++i)picasso_rpc_tick(&f,false);
+    assert(f.domain[1].call[0].ticks==queued && f.domain[0].call[0].ticks==control);
+    assert(!f.domain[0].error && !f.domain[1].error);
+    reply(0,0);picasso_rpc_tick(&f,false);
+    assert(f.domain[0].stage==2 && f.domain[0].call[0].queued);
+    // Early wakeup cannot overwrite a remotely owned slot or complete a call.
+    sent(0,0);reply(0,0,0,2);picasso_rpc_tick(&f,false);
+    assert(f.domain[0].call[0].pending && !f.domain[0].call[0].queued);
+    for(unsigned i=0;i<251;++i)picasso_rpc_tick(&f);
+    assert(f.domain[0].error==-60 && f.domain[0].call[0].pending);
+    initialization();auto &d=f.domain[1];d.stdOpen=true;d.opens=1;
+    // 1283 serial requests run through the real decoder and stock file stat.
+    // Each result is submitted before that slot is reused for another request.
+    const char path[]="/vendor/etc/sensors/sns_reg_config";
+    for(unsigned i=0;i<1283;++i) {
+        auto *p=output(1,1,3);uint8_t prim[8];rpcPut32(prim,31);rpcPut32(prim+4,sizeof path);
+        unsigned len=input(p,0,prim,8);len=input(p,len,path,sizeof path);rpcPut32(p+len,96);len+=4;
+        auto *meta=output(1,1,2);rpcPut32(meta,i+1);rpcPut32(meta+4,0x100);
+        rpcPut32(meta+8,0x1f020100);rpcPut32(meta+12,len);
+        reply(1,1);picasso_rpc_tick(&f,false);
+        assert(d.requests==i+1 && !d.previousResult && !d.decodeResult && d.replyBytes==104);
+        assert(d.call[1].queued && !d.call[1].pending && rpc32(output(1,1,0))==i+1);
+        assert(rpc64(output(1,1,1)+8+40)==553);sent(1,1);
+    }
+    assert(!d.error && d.call[1].pending);
+    puts("PASS 1283 serial stock requests, early wakeup ownership, regular-only timeout clock");
 }
 static uint32_t regs[0x100000/4];
 static unsigned writes;static bool stuck,drop;
@@ -235,4 +267,4 @@ static void pcmDma() {
     inheritedImage();assert(picasso_rpc_dma_plan(rd,0x1401,2).error && picasso_rpc_dma_plan(rd,0x1403,1).error);
     puts("PASS dedicated PCM SID1401 bank/ASID isolation alongside live RPC1403/1404, conflicts and fault rejection");
 }
-int main() { initialization();reverseCalls();fileListener();errors();dma();inheritedDma();pcmDma();assert(published && acquired); }
+int main() { initialization();reverseCalls();fileListener();errors();continuationClock();dma();inheritedDma();pcmDma();assert(published && acquired); }

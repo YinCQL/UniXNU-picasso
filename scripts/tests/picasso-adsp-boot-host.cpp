@@ -47,6 +47,7 @@ public:
 static void IOLog(const char *fmt,...) {va_list a;va_start(a,fmt);vprintf(fmt,a);va_end(a);}
 static void IOSleep(unsigned ms){ticks+=ms;assert(ticks<45000);}
 static uint64_t mach_absolute_time(){return ticks;}
+static void absolutetime_to_nanoseconds(uint64_t t,uint64_t *n){*n=t*1000000;}
 static void clock_interval_to_deadline(unsigned n,unsigned scale,uint64_t *out){assert(scale==1||scale==1000);*out=ticks+n*scale;}
 #include "PicassoAdspBoot-body.inc"
 extern "C" int picasso_pas_acquire(){++leases;assert(!owned);if(is("lease") || (is("reacquire")&&leases>1))return -16;owned=true;return 0;}
@@ -109,7 +110,7 @@ static void service(void *) {
 static unsigned fastCalls;
 static bool fast(void *) {
     assert(services && latest.hasValue && (latest.value&2) && !(latest.value&1));
-    ++fastCalls;return is("fast");
+    ++fastCalls;return is("fast") || (is("fast-burst") && fastCalls<9);
 }
 static int snapshot(void *){++snapshots;return -2;}
 int main(int argc,char **argv){
@@ -134,6 +135,7 @@ int main(int argc,char **argv){
     if(is("memory-overlap")||is("memory-missing"))assert(!maps&&!on&&!writes&&!commandCount);
     if(is("initial-restart")||is("restart-no-entry")||is("lost-ready"))assert(polls<=4 && shutdowns==1);
     if(is("fast"))assert(services==2 && fastCalls==40 && ticks==40);
+    if(is("fast-burst"))assert(services==2 && fastCalls==10 && ticks==40);
     if(is("long-ready"))assert(snapshots==4 && ticks==31000 && shutdowns==1);
     puts("PASS production ADSP transaction ordering, failure cleanup, ownership and stale/ready/fatal handling");
 }

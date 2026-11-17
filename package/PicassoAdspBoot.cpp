@@ -147,7 +147,13 @@ int start(Boot &b) {
         uint64_t deadline;clock_interval_to_deadline(20,kMillisecondScale,&deadline);
         do {
             bool fast=e.hasValue && (e.value&2) && b.events->fast && b.events->fast(b.events->context);
-            IOSleep(fast?1:20);
+            uint64_t now=mach_absolute_time();if(now>=deadline)break;
+            // A burst ending partway through the interval sleeps only the
+            // remaining time, preserving the normal service/deadline cadence.
+            uint64_t ns=0;absolutetime_to_nanoseconds(deadline-now,&ns);
+            unsigned remaining=unsigned((ns+999999)/1000000);
+            if(remaining>20)remaining=20;
+            IOSleep(fast?1:(remaining?remaining:1));
         } while(mach_absolute_time()<deadline);
     }
 }

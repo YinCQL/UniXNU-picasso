@@ -180,7 +180,7 @@ static void tracing() {
     d.requests++;d.previousResult=0;assert(picasso_rpc_trace(trace,d) && trace.repeated==1);
     trace={};emitted=0;
     for(unsigned i=1;i<=6000;++i) { d.requests=i;d.lastScalar=i;emitted+=picasso_rpc_trace(trace,d); }
-    assert(emitted<540 && emitted>=512 && trace.requests==6000);
+    assert(emitted<90 && emitted>=64 && trace.requests==6000);
     d.requests++;d.previousResult=28;assert(picasso_rpc_trace(trace,d));
     d.requests++;strcpy(d.fs.target,"/persist/sensors/registry/new-group");assert(picasso_rpc_trace(trace,d));
     puts("PASS repeated request sampling and progress after transition log budget");

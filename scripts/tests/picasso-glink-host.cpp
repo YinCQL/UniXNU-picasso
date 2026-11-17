@@ -1287,16 +1287,24 @@ __attribute__((noinline)) static void fastrpcTests() {
     rx=connectFastrpc(s);bind();at=s.txHead;step(s);drain(s);
     assert(s.fastrpc.intentAsked && s.fastrpc.domain[0].call[0].queued && !s.fastrpc.sent);
     assert(r32(s.tx.offset+at)==0x30007 && r32(s.tx.offset+at+4)==40);
-    message(s,rx,8,9,1);frame(s,rx,offerFast,16);step(s);drain(s);
-    at=s.txHead;step(s);drain(s);
+    at=s.txHead;message(s,rx,8,9,1);frame(s,rx,offerFast,16);step(s);drain(s);
     assert(s.fastrpc.sent==1 && s.fastrpc.domain[0].call[0].pending && s.fastrpcRemote[0].busy);
     assert(r32(s.tx.offset+at)==0x30009 && !r32(s.tx.offset+at+4) && r32(s.tx.offset+at+8)==40);
     assert(r32(s.tx.offset+at+16)==0 && r32(s.tx.offset+at+32)==1 && r32(s.tx.offset+at+36)==0x10000);
     message(s,rx,14,9,0);step(s);drain(s);
-    assert(s.fastrpc.domain[0].call[0].pending && !s.fastrpcRemote[0].busy);
+    assert(s.fastrpc.domain[0].call[0].pending && s.fastrpc.domain[1].call[0].pending);
+    assert(s.fastrpcRemote[0].busy && s.fastrpc.sent==2);
     uint8_t response[16]={};rpcPut64(response,s.fastrpc.domain[0].call[0].ctx);
-    fastrpcPacket(s,rx,s.fastrpcLocal[0].id,response,16);step(s);drain(s);step(s);drain(s);
+    unsigned clock=s.apr.ticks;message(s,rx,14,9,0);
+    fastrpcPacket(s,rx,s.fastrpcLocal[0].id,response,16);
+    assert(!picasso_glink_service(&io,&s,&kick,false));drain(s);
     assert(s.fastrpc.completed==1 && s.fastrpc.domain[0].stage==2);
+    assert(s.fastrpc.domain[0].call[0].pending && s.fastrpc.sent==3);
+    assert(s.apr.ticks==clock && !s.fastrpc.domain[1].call[0].ticks);
+    unsigned rpcTicks=s.fastrpc.domain[0].call[0].ticks;
+    for(unsigned i=0;i<300;++i) {assert(!picasso_glink_service(&io,&s,&kick,false));drain(s);}
+    assert(s.apr.ticks==clock && s.fastrpc.domain[0].call[0].ticks==rpcTicks);
+    assert(!s.fastrpc.domain[0].error && !s.fastrpc.domain[1].error);
     // Full FIFO cannot publish a context or reuse its DMA slot.
     rx=connectFastrpc(s);frame(s,rx,offerFast,16);step(s);drain(s);bind();at=s.txHead;
     p32(s.desc.offset,(at+8)%s.tx.size);step(s);
