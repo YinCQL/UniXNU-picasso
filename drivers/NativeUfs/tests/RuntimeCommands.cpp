@@ -45,8 +45,21 @@ static uint64_t mach_absolute_time(){
 static void clock_interval_to_deadline(uint32_t n,unsigned,uint64_t*out){*out=mach_absolute_time()+n;}
 static void absolutetime_to_nanoseconds(uint64_t n,uint64_t*out){*out=n*1000;}
 static void hostCpuRelax(){tick.fetch_add(1);std::this_thread::yield();}
-static void cacheCivac(const void*s,size_t n){auto at=static_cast<const uint8_t*>(s)-memory;assert(at>=0&&size_t(at)+n<=device.size());memcpy(device.data()+at,s,n);}
-static void cacheInvalidate(const void*s,size_t n){auto at=static_cast<const uint8_t*>(s)-memory;assert(at>=0&&size_t(at)+n<=device.size());memcpy(const_cast<void*>(s),device.data()+at,n);if(n>=4096)++dataAcquires;}
+static const uint8_t *directFixture = nullptr;
+static uint64_t directFixtureBytes=8192;
+static bool directContiguous=false;
+static std::array<uint8_t,kDataMax> directDevice;
+static uint64_t directAcquireBytes=0;
+static void cacheCivac(const void*s,size_t n){
+  if(directFixture && uintptr_t(s)>=uintptr_t(directFixture) && uintptr_t(s)-uintptr_t(directFixture)<directFixtureBytes){
+    size_t at=uintptr_t(s)-uintptr_t(directFixture);assert(at+n<=directFixtureBytes);memcpy(directDevice.data()+at,s,n);return;
+  }
+  auto at=static_cast<const uint8_t*>(s)-memory;assert(at>=0&&size_t(at)+n<=device.size());memcpy(device.data()+at,s,n);}
+static void cacheInvalidate(const void*s,size_t n){
+  if(directFixture && uintptr_t(s)>=uintptr_t(directFixture) && uintptr_t(s)-uintptr_t(directFixture)<directFixtureBytes){
+    size_t at=uintptr_t(s)-uintptr_t(directFixture);assert(at+n<=directFixtureBytes);memcpy(const_cast<void*>(s),directDevice.data()+at,n);directAcquireBytes+=n;return;
+  }
+  auto at=static_cast<const uint8_t*>(s)-memory;assert(at>=0&&size_t(at)+n<=device.size());memcpy(const_cast<void*>(s),device.data()+at,n);if(n>=4096)++dataAcquires;}
 static IOReturn recordTransport(IOReturn r,uint32_t o){gRootDiagnostic.result=r;gRootDiagnostic.ocs=o;return r;}
 static void hostWrite(unsigned,uint32_t);
 static bool gStoreOpen=true,gLogOpen=false,gAuxOpen=false;
@@ -62,11 +75,10 @@ static void rtWaitCompletion(unsigned slot,uint32_t,uint64_t,uint64_t){
   else ufsPollPause(hostCpuRelax);
 }
 static void rtWaitDone(uint64_t){}
-static const uint8_t *directFixture = nullptr;
 static uint64_t rtDmaAddress(const void *p){
   auto at=static_cast<const uint8_t*>(p);
-  if (!directFixture || at < directFixture || at >= directFixture+8192) return 0;
-  return 0x900000000ULL + uint64_t(at-directFixture)*2;
+  if (!directFixture || at < directFixture || at >= directFixture+directFixtureBytes) return 0;
+  return 0x900000000ULL + uint64_t(at-directFixture)*(directContiguous?1:2);
 }
 static void complete(unsigned entry){
   unsigned slot=unsigned(gEntrySlot[entry]);const UfsSlot&s=gSlotGeom[slot];
@@ -75,6 +87,19 @@ static void complete(unsigned entry){
   if(c[0]==1){rtPutBe32(r+12,failResidual?4096:0);r[7]=busyLeft?8:0;if(busyLeft)--busyLeft;}
   else{r[11]=r[19]=0x23;uint8_t*d=r+32;memset(d,0,0x23);d[0]=0x23;d[1]=2;d[2]=4;d[3]=1;d[10]=12;rtPutBe32(d+15,1001);}
   auto data=s.data-memory;memset(device.data()+data,0x70+slot,kDataMax);
+  if(c[0]==1 && c[16]==0x28 && directFixture) {
+    const unsigned entries=*reinterpret_cast<uint32_t*>(device.data()+(s.utrd-memory)+28)&0xffff;
+    uint32_t *prdt=reinterpret_cast<uint32_t*>(c+kPrdtOffset);
+    for(unsigned i=0;i<entries;++i) {
+      const uint64_t pa=uint64_t(prdt[4*i])|(uint64_t(prdt[4*i+1])<<32);
+      const uint32_t bytes=prdt[4*i+3]+1;
+      if(pa<0x900000000ULL) continue; // staged path still uses its slot area.
+      const uint64_t at=(pa-0x900000000ULL)/(directContiguous?1:2);
+      assert(at+bytes<=directFixtureBytes);
+      for(unsigned j=0;j<bytes;++j)directDevice[at+j]=uint8_t((at+j)*17+slot);
+    }
+  }
+
   if(c[0]==1&&c[16]==0x25){rtPutBe32(device.data()+data,1000);rtPutBe32(device.data()+data+4,4096);}
   // A write-combined list is the same memory at both endpoints; cached
   // descriptors require the production invalidate before the CPU sees OCS.
@@ -94,6 +119,34 @@ static void reset(unsigned count=4){
   rings=dataAcquires=busyLeft=0;completeImmediately=true;failResidual=fatal=boundary=false;gOutstanding=0;tick=1;
 }
 int main(){
+
+  // Non-coherent DMA lands in the owned record pages and becomes visible only
+  // after completion's invalidate. Exercise scattered and coalesced PRDTs.
+  for(bool contiguous : {false,true}) {
+    reset(4); alignas(4096) uint8_t record[kDataMax]; memset(record,0xa5,sizeof(record));
+    directFixture=record; directFixtureBytes=sizeof(record);directContiguous=contiguous;
+    directDevice.fill(0);directAcquireBytes=0;gZeroCopy=true;
+    const uint64_t directBefore=gDirectCommands,stagedBefore=gStagedCommands;
+    assert(!runtimeRead4k(0,1,32,record,true));
+    assert(gDirectCommands==directBefore+1 && gStagedCommands==stagedBefore);
+    assert(directAcquireBytes==sizeof(record));
+    for(unsigned i=0;i<sizeof(record);++i)assert(record[i]==uint8_t(i*17));
+    assert(gSlotPrds[0][0].bytes==(contiguous?kDataMax:4096));
+    // The same DMA-capable address without ownership must use staged transport.
+    memset(record,0xa5,sizeof(record)); directAcquireBytes=0;
+    assert(!runtimeRead4k(0,1,32,record,false));
+    assert(gStagedCommands==stagedBefore+1 && !directAcquireBytes && record[0]==0x70);
+    directFixture=nullptr;directFixtureBytes=8192;directContiguous=false;gZeroCopy=false;
+  }
+  {reset(4);alignas(4096) uint8_t record[kDataMax];memset(record,0xa5,sizeof(record));
+    directFixture=record;directFixtureBytes=sizeof(record);directAcquireBytes=0;gZeroCopy=true;
+    completeImmediately=false;
+    assert(runtimeRead4k(0,1,32,record,true)==kIOReturnTimeout && gHost.poisoned && rings==1);
+    assert(!directAcquireBytes && record[0]==0xa5);
+    assert(runtimeRead4k(0,2,32,record,true)==kIOReturnNotReady && rings==1 && record[0]==0xa5);
+    directFixture=nullptr;directFixtureBytes=8192;gZeroCopy=false;
+  }
+
 
   // Four total / three leased descriptors, in both cached-line-isolated and
   // write-combined list geometry. Complete out of order without touching peers.

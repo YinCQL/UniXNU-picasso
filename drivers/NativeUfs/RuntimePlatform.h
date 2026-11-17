@@ -80,7 +80,7 @@ static void runtimeInterruptThread (void *, wait_result_t)
 }
 static void runtimeEnableInterrupt (void)
 {
-  uint32_t direct = 0;
+  uint32_t direct = 1;
   PE_parse_boot_argn ("native-ufs-direct", &direct, sizeof (direct));
   gZeroCopy = direct != 0;
   IOLog ("NATIVE_UFS_DMA direct=%u prdt_scratch=per_slot bytes=%u\n", gZeroCopy, static_cast<unsigned> (sizeof (gSlotPrds[0])));
