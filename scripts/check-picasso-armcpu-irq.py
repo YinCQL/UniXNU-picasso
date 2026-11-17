@@ -40,7 +40,9 @@ def main():
         with (out/(name+'-run.log')).open('w') as log: result=subprocess.run([str(exe)],env=env,stdout=log,stderr=subprocess.STDOUT)
         if result.returncode or 'PASS ArmCpu' not in (out/(name+'-run.log')).read_text(): raise RuntimeError('Fixture failed: '+str(out/(name+'-run.log')))
         runs.append(dict(name=name,passed=True))
-    result=dict(passed=True,inputs={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest(),str(fixture.relative_to(ROOT)):hashlib.sha256(fixture.read_bytes()).hexdigest(),'drivers/ArmCpu/ArmCpuTimer.h':hashlib.sha256((ROOT/'drivers/ArmCpu/ArmCpuTimer.h').read_bytes()).hexdigest()},runs=runs,concurrent_distinct_rounds=64,concurrent_duplicate_rounds=64,threads=16,hardware_tested=False,scope='actual registration code; host IOLock/MMIO stand-ins')
+    inputs={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest(),str(fixture.relative_to(ROOT)):hashlib.sha256(fixture.read_bytes()).hexdigest()}
+    for name in ['ArmCpuTimer.h','ArmCpuSpi.h']: inputs['drivers/ArmCpu/'+name]=hashlib.sha256((ROOT/'drivers/ArmCpu'/name).read_bytes()).hexdigest()
+    result=dict(passed=True,inputs=inputs,runs=runs,concurrent_distinct_rounds=64,concurrent_duplicate_rounds=64,threads=16,secure_group_view_checked=True,hardware_tested=False,scope='actual registration code; host IOLock/MMIO stand-ins')
     (out/'results.json').write_text(json.dumps(result,indent=2)+'\n')
     print('PASS ArmCpu: 64 distinct + 64 duplicate 16-thread rounds, boundary/timeout/publication/owned SGI; ordinary + ASan/UBSan')
 if __name__=='__main__': main()

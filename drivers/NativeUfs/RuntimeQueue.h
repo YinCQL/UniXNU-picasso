@@ -110,6 +110,17 @@ static IOReturn rtScsiRetry (const UfsSlot &slot, uint8_t lun, const uint8_t *cd
     while (mach_absolute_time () < pause && mach_absolute_time () < totalDeadline) ufsPollPause (hostCpuRelax);
   }
 }
+static void rtLogRuntimeStats (void)
+{
+  IOLockLock (gSlotLock);
+  const unsigned peak = gSlotsPeak;
+  const uint64_t waits = gSlotWaits;
+  IOLockUnlock (gSlotLock);
+  IOLog ("NATIVE_UFS_RUNTIME_STATS slots=%u peak=%u waits=%llu irq=%u irqs=%llu sleeps=%llu direct=%llu staged=%llu\n",
+    gSlotCount, peak, waits, rtInterruptMode (),
+    __atomic_load_n (&gIrqs, __ATOMIC_RELAXED), __atomic_load_n (&gIrqSleeps, __ATOMIC_RELAXED),
+    __atomic_load_n (&gDirectCommands, __ATOMIC_RELAXED), __atomic_load_n (&gStagedCommands, __ATOMIC_RELAXED));
+}
 static IOReturn runtimeRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst, bool owned)
 {
   if (!dst || !blocks || blocks > kDataMax / 4096 || lba > 0xffffffffULL - (blocks - 1)) return kIOReturnBadArgument;
@@ -127,7 +138,9 @@ static IOReturn runtimeRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void 
   IOReturn result = rtScsiRetry (slot, lun, cdb, 2, blocks * 4096U, 1000000, prds ? prd : nullptr, prds, prds ? dst : nullptr);
   if (trace < 8) IOLog ("NATIVE_UFS_RUNTIME_READ end sample=%u result=%08x scsi=%x polls=%u db=%x is=%x\n", trace + 1, static_cast<unsigned> (result), rtDiagnostic (slot).scsi, rtDiagnostic (slot).polls, rtDiagnostic (slot).dbLast, rtDiagnostic (slot).isLast);
   if (result == kIOReturnSuccess && !prds) memcpy (dst, slot.data, blocks * 4096U);
-  rtSlotGive (slot, pooled); return result;
+  rtSlotGive (slot, pooled);
+  if (trace >= 4095 && !((trace + 1) & trace)) rtLogRuntimeStats ();
+  return result;
 }
 static IOReturn runtimeWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua)
 {
@@ -173,7 +186,7 @@ extern "C" int native_ufs_stats_text (char *out, size_t bytes)
   const uint64_t waits = gSlotWaits;
   IOLockUnlock (gSlotLock);
   return snprintf (out, bytes, "UFS slots=%u peak=%u waits=%llu irq=%u irqs=%llu sleeps=%llu direct=%llu staged=%llu busy=%llu r/w/s=%llu/%llu/%llu ticks=%llu",
-    gSlotCount, peak, static_cast<unsigned long long> (waits), gIrqMode,
+    gSlotCount, peak, static_cast<unsigned long long> (waits), rtInterruptMode (),
     static_cast<unsigned long long> (__atomic_load_n (&gIrqs, __ATOMIC_RELAXED)),
     static_cast<unsigned long long> (__atomic_load_n (&gIrqSleeps, __ATOMIC_RELAXED)),
     static_cast<unsigned long long> (__atomic_load_n (&gDirectCommands, __ATOMIC_RELAXED)),

@@ -8,6 +8,7 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include "ArmCpuTimer.h"
+#include "ArmCpuSpi.h"
 
 // Exact private entry from Darwin 23 arm/rtclock.h. Its full data header is
 // not exported to IOKit; the IRQ path calls the real kernel implementation.
@@ -933,9 +934,10 @@ static IOReturn spiAttachUnlocked (uint32_t intid, bool edge, void (*handler) (v
   __asm__ volatile ("dsb sy" ::: "memory");
   write32 (gDist, 0x100 + word, bit); // ISENABLER
   if (readback != nullptr) {
-    *readback = ((read32 (gDist, 0x80 + word) & bit) ? 1U : 0U) | ((read32 (gDist, 0x100 + word) & bit) ? 2U : 0U) |
+    const uint32_t raw = ((read32 (gDist, 0x80 + word) & bit) ? 1U : 0U) | ((read32 (gDist, 0x100 + word) & bit) ? 2U : 0U) |
                 (((read32 (gDist, cfg) >> shift) & 1U) << 2) |
                 (static_cast<uint32_t> (*reinterpret_cast<volatile uint8_t *> (gDist + 0x400 + intid)) << 8);
+    *readback = ArmCpuSpiReadbackView (raw, read32 (gDist, 4));
   }
   if (router != nullptr) { *router = *reinterpret_cast<volatile uint64_t *> (gDist + gicdRouterOffset (intid)); }
   return kIOReturnSuccess;

@@ -1,22 +1,28 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
+#include "../ArmCpu/ArmCpuSpi.h"
 static uint32_t rtCompletionCount (unsigned slot) { return __atomic_load_n (&gSlotGen[slot], __ATOMIC_ACQUIRE); }
-static bool rtInterruptMode (void) { return gIrqMode; }
+static bool rtInterruptMode (void) { return __atomic_load_n (&gIrqMode, __ATOMIC_ACQUIRE); }
+#include "RuntimeCompletionWait.h"
+struct RuntimeCompletionPort {
+  unsigned slot;
+  uint64_t now () { return mach_absolute_time (); }
+  bool interruptMode () { return __atomic_load_n (&gIrqMode, __ATOMIC_ACQUIRE); }
+  bool canBlock () { return preemption_enabled (); } // XNU also checks CPU interrupts.
+  uint64_t spinTicks () { return gSpinTicks; }
+  uint64_t nanoseconds (uint64_t ticks) { uint64_t ns = 0; absolutetime_to_nanoseconds (ticks, &ns); return ns; }
+  void pause () { ufsPollPause (hostCpuRelax); }
+  void relax () { hostCpuRelax (); }
+  bool arm (uint32_t us) {
+    return assert_wait_timeout ((event_t) (uintptr_t) &gSlotGen[slot], THREAD_UNINT, us, NSEC_PER_USEC) == THREAD_WAITING;
+  }
+  uint32_t generation () { return rtCompletionCount (slot); }
+  void cancel () { clear_wait (current_thread (), THREAD_AWAKENED); }
+  void block () { __atomic_fetch_add (&gIrqSleeps, 1, __ATOMIC_RELAXED); thread_block (THREAD_CONTINUE_NULL); }
+};
 static void rtWaitCompletion (unsigned slot, uint32_t seen, uint64_t started, uint64_t deadline)
 {
-  const uint64_t now = mach_absolute_time ();
-  // Keep the board's qualified yield polling in bootstrap and when blocking
-  // is unavailable. WFE would require a qualified periodic event source.
-  if (!gIrqMode || !preemption_enabled () || now - started < gSpinTicks || now >= deadline) {
-    ufsPollPause (hostCpuRelax); return;
-  }
-  uint64_t ns = 0;
-  absolutetime_to_nanoseconds (deadline - now, &ns);
-  uint32_t us = ns / 1000 > 1000 ? 1000 : static_cast<uint32_t> (ns / 1000);
-  if (!us) { hostCpuRelax (); return; }
-  assert_wait_timeout ((event_t) (uintptr_t) &gSlotGen[slot], THREAD_UNINT, us, NSEC_PER_USEC);
-  if (rtCompletionCount (slot) != seen) { clear_wait (current_thread (), THREAD_AWAKENED); return; }
-  __atomic_fetch_add (&gIrqSleeps, 1, __ATOMIC_RELAXED);
-  thread_block (THREAD_CONTINUE_NULL);
+  RuntimeCompletionPort port = { slot };
+  ufsRuntimeWaitCompletion (port, seen, started, deadline);
 }
 static void rtWaitDone (uint64_t started) { __atomic_fetch_add (&gRuntimeTicks, mach_absolute_time () - started, __ATOMIC_RELAXED); }
 static void runtimeInterrupt (void *)
@@ -33,24 +39,68 @@ static void runtimeInterrupt (void *)
 }
 extern "C" IOReturn armcpu_spi_attach (uint32_t, bool, void (*) (void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
 extern "C" IOReturn armcpu_spi_mask (uint32_t, bool) __attribute__((weak_import));
+// A bring-up caller may run before ArmCpu publishes GIC readiness. Retry
+// on a separate stack; never hold up root publication or an I/O caller.
+static bool gIrqAttached = false;
+static IOReturn runtimeTryInterrupt (void)
+{
+  RuntimeSubmitGuard guard;
+  if (__atomic_load_n (&gHost.poisoned, __ATOMIC_ACQUIRE)) return kIOReturnIOError;
+  if (__atomic_load_n (&gOutstanding, __ATOMIC_ACQUIRE) || read32 (gHost.hc, 0x58)) return kIOReturnBusy;
+  if (!gIrqAttached) {
+    uint32_t readback = 0; uint64_t router = 0;
+    IOReturn result = armcpu_spi_attach (297, false, runtimeInterrupt, nullptr, &readback, &router);
+    IOLog ("NATIVE_UFS_IRQ attach result=%08x readback=%x router=%llx\n", static_cast<unsigned> (result), readback, router);
+    if (result != kIOReturnSuccess) return result;
+    gIrqAttached = true;
+    result = armcpu_spi_mask (297, true);
+    if (result != kIOReturnSuccess) return result;
+    if (!ArmCpuSpiLevelConfigured (readback)) return kIOReturnIOError;
+  }
+  hostWrite (0x20, 1); // no in-flight command; discard only stale completion
+  __atomic_store_n (&gIrqMode, true, __ATOMIC_RELEASE);
+  hostWrite (0x24, 1);
+  IOReturn result = armcpu_spi_mask (297, false);
+  if (result != kIOReturnSuccess) {
+    hostWrite (0x24, 0); __atomic_store_n (&gIrqMode, false, __ATOMIC_RELEASE); return result;
+  }
+  IOLog ("NATIVE_UFS_IRQ enabled intid=297 spin_us=%u\n", gSpinUs);
+  return kIOReturnSuccess;
+}
+static void runtimeInterruptThread (void *, wait_result_t)
+{
+  IOReturn result = kIOReturnNotReady;
+  for (unsigned attempt = 0; attempt < 200; ++attempt) {
+    result = runtimeTryInterrupt ();
+    if (result == kIOReturnSuccess || (result != kIOReturnNotReady && result != kIOReturnBusy)) break;
+    IOSleep (10);
+  }
+  if (result != kIOReturnSuccess) IOLog ("NATIVE_UFS_IRQ fallback result=%08x mode=polling\n", static_cast<unsigned> (result));
+  thread_terminate (current_thread ());
+}
 static void runtimeEnableInterrupt (void)
 {
-  // Qualify the runtime transport in polling mode before enabling the IRQ.
   uint32_t direct = 0;
   PE_parse_boot_argn ("native-ufs-direct", &direct, sizeof (direct));
   gZeroCopy = direct != 0;
   IOLog ("NATIVE_UFS_DMA direct=%u prdt_scratch=per_slot bytes=%u\n", gZeroCopy, static_cast<unsigned> (sizeof (gSlotPrds[0])));
-  uint32_t enabled = 0;
+  uint32_t enabled = 1;
   PE_parse_boot_argn ("native-ufs-irq", &enabled, sizeof (enabled));
   PE_parse_boot_argn ("native-ufs-spin-us", &gSpinUs, sizeof (gSpinUs));
   if (gSpinUs > 10000) gSpinUs = 10000;
   nanoseconds_to_absolutetime (uint64_t (gSpinUs) * 1000, &gSpinTicks);
-  if (!enabled || !&armcpu_spi_attach || !&armcpu_spi_mask) return;
-  if (armcpu_spi_attach (297, false, runtimeInterrupt, nullptr, nullptr, nullptr) != kIOReturnSuccess) return;
-  hostWrite (0x24, 1);
-  if (armcpu_spi_mask (297, false) != kIOReturnSuccess) { hostWrite (0x24, 0); return; }
-  gIrqMode = true;
-  IOLog ("NATIVE_UFS_IRQ enabled intid=297 spin_us=%u\n", gSpinUs);
+  if (!enabled || !&armcpu_spi_attach || !&armcpu_spi_mask) {
+    IOLog ("NATIVE_UFS_IRQ disabled requested=%u api=%u/%u\n", enabled, &armcpu_spi_attach != nullptr, &armcpu_spi_mask != nullptr); return;
+  }
+  IOReturn result = runtimeTryInterrupt ();
+  if (result == kIOReturnSuccess) return;
+  if (result != kIOReturnNotReady && result != kIOReturnBusy) {
+    IOLog ("NATIVE_UFS_IRQ fallback result=%08x mode=polling\n", static_cast<unsigned> (result)); return;
+  }
+  thread_t thread = nullptr;
+  kern_return_t dispatched = kernel_thread_start (runtimeInterruptThread, nullptr, &thread);
+  if (dispatched == KERN_SUCCESS) thread_deallocate (thread);
+  IOLog ("NATIVE_UFS_IRQ deferred result=%08x thread=%d max_attempts=200 interval_ms=10\n", static_cast<unsigned> (result), dispatched);
 }
 
 static bool rtReachable (uint64_t phys, uint64_t bytes, bool wide)

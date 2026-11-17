@@ -7,13 +7,14 @@
 #include <thread>
 #include <vector>
 #include "ArmCpuTimer.h"
+#include "ArmCpuSpi.h"
 using IOReturn=int;
 enum { kIOReturnSuccess=0, kIOReturnNotReady=1, kIOReturnBadArgument=2,
        kIOReturnExclusiveAccess=3, kIOReturnNoResources=4, kIOReturnTimeout=5 };
 struct IOLock { std::mutex mutex; };
 static std::atomic<unsigned> allocs{0}, frees{0}, arrivals{0};
 static unsigned allocationRace=0;
-static bool allocationFail=false, timeout=false;
+static bool allocationFail=false, timeout=false, secureView=false;
 static IOLock *IOLockAlloc() {
     if(allocationFail) return nullptr;
     IOLock *p=new IOLock; ++allocs;
@@ -27,6 +28,7 @@ alignas(8) static uint8_t mmio[0x10000];
 static uintptr_t gDist=reinterpret_cast<uintptr_t>(mmio);
 static volatile uint32_t armcpu_gic_ready=1;
 static unsigned read32(uintptr_t base,unsigned offset) {
+    if(secureView && offset>=0x80 && offset<0x100) return 0;
     uint32_t value; std::memcpy(&value,reinterpret_cast<void *>(base+offset),4); return value;
 }
 static void write32(uintptr_t base,unsigned offset,uint32_t value) {
@@ -46,7 +48,7 @@ static void reset() {
     const uint32_t typer=29; std::memcpy(mmio+4,&typer,4); // INTIDs 0..959.
     gDist=reinterpret_cast<uintptr_t>(mmio); armcpu_gic_ready=1;
     gBootAffinity=0x0300020104ULL;
-    allocationFail=false; allocationRace=0; arrivals=0; timeout=false;
+    allocationFail=false; allocationRace=0; arrivals=0; timeout=false; secureView=false;
 }
 static void concurrency(bool duplicate) {
     reset(); allocationRace=16;
@@ -108,6 +110,21 @@ int main() {
     uint32_t v=0; uint8_t bad[4]={32,0,0,0};
     assert(!ArmCpuTimerIntid(bad,4,&v)); assert(!ArmCpuTimerIntid(bad,3,&v));
     assert(ArmCpuTimerIntid(nullptr,0,&v) && v==27);
+    reset(); secureView=true;
+    const uint32_t securityTyper=0x7b041d; std::memcpy(mmio+4,&securityTyper,4);
+    uint32_t rb=0;
+    assert(armcpu_spi_attach(297,false,handler,nullptr,&rb,nullptr)==0);
+    assert(rb==0x1a002 && !(rb&1U) && ArmCpuSpiLevelConfigured(rb));
+    // No security flag on a single-state GIC; a missing group bit must fail.
+    assert(ArmCpuSpiReadbackView(0xa002,29)==0xa002);
+    assert(!ArmCpuSpiLevelConfigured(0xa002));
+    assert(ArmCpuSpiLevelConfigured(0xa003));
+    for(uint32_t bits: {0U,1U,4U,5U,6U,7U}) {
+        assert(!ArmCpuSpiLevelConfigured(0x1a000|bits));
+        assert(!ArmCpuSpiLevelConfigured(0xa000|bits));
+    }
+    for(uint32_t priority: {0U,0x80U,0x9fU,0xa1U,0xffU})
+        assert(!ArmCpuSpiLevelConfigured((1U<<16)|(priority<<8)|2U));
     reset();
     assert(allocs==frees);
     puts("PASS ArmCpu registration concurrency, publication, timeout, boundaries, ownership");

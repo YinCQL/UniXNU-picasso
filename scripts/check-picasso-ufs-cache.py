@@ -35,11 +35,11 @@ def main():
         parser.error('Requires installed MSVC on Windows or --cxx; no tool is installed')
     report = {'scope': __doc__, 'pass': False, 'runs': [], 'sha256': {}}
     files = [source.parent / 'RootWindowRead.h', source.parent / 'NativeUfs.cpp',
-             source / 'RootWindowRead.cpp', source / 'RootVerifiedCache.cpp', source.parent / 'ConcurrentRecords.h', source.parent / 'VerifiedTableCache.h', source / 'ConcurrentRecords.cpp', source / 'VerifiedTableCache.cpp', source.parent / 'RuntimeSlots.h', source.parent / 'RuntimeQueue.h', source.parent / 'RuntimePlatform.h', source.parent / 'RuntimeFirmware.h', source / 'RuntimeCommands.cpp']
+             source / 'RootWindowRead.cpp', source / 'RootVerifiedCache.cpp', source.parent / 'ConcurrentRecords.h', source.parent / 'VerifiedTableCache.h', source / 'ConcurrentRecords.cpp', source / 'VerifiedTableCache.cpp', source.parent / 'RuntimeSlots.h', source.parent / 'RuntimeQueue.h', source.parent / 'RuntimePlatform.h', source.parent / 'RuntimeFirmware.h', source / 'RuntimeCommands.cpp', source.parent / 'RuntimeCompletionWait.h', source / 'RuntimeCompletionWait.cpp']
     for p in files:
         report['sha256'][str(p.relative_to(root))] = hashlib.sha256(p.read_bytes()).hexdigest()
     try:
-        for fixture in ('RootWindowRead', 'RootVerifiedCache', 'ConcurrentRecords', 'VerifiedTableCache', 'RuntimeCommands'):
+        for fixture in ('RootWindowRead', 'RootVerifiedCache', 'ConcurrentRecords', 'VerifiedTableCache', 'RuntimeCommands', 'RuntimeCompletionWait'):
             for asan in (False, True):
                 name = fixture + ('-asan' if asan else '')
                 binary = out / (name + ('.exe' if os.name == 'nt' else ''))
