@@ -76,7 +76,10 @@ static void complete(unsigned entry){
   else{r[11]=r[19]=0x23;uint8_t*d=r+32;memset(d,0,0x23);d[0]=0x23;d[1]=2;d[2]=4;d[3]=1;d[10]=12;rtPutBe32(d+15,1001);}
   auto data=s.data-memory;memset(device.data()+data,0x70+slot,kDataMax);
   if(c[0]==1&&c[16]==0x25){rtPutBe32(device.data()+data,1000);rtPutBe32(device.data()+data+4,4096);}
-  *reinterpret_cast<uint32_t*>(device.data()+(s.utrd-memory)+8)=0;
+  // A write-combined list is the same memory at both endpoints; cached
+  // descriptors require the production invalidate before the CPU sees OCS.
+  uint8_t *list=gListUncached?memory:device.data();
+  *reinterpret_cast<uint32_t*>(list+(s.utrd-memory)+8)=0;
   registers[0x58/4]&=~s.bit;
 }
 static void hostWrite(unsigned at,uint32_t value){
@@ -91,6 +94,37 @@ static void reset(unsigned count=4){
   rings=dataAcquires=busyLeft=0;completeImmediately=true;failResidual=fatal=boundary=false;gOutstanding=0;tick=1;
 }
 int main(){
+
+  // Four total / three leased descriptors, in both cached-line-isolated and
+  // write-combined list geometry. Complete out of order without touching peers.
+  for (bool wc : {false,true}) {
+    reset(4); gListUncached=wc;
+    if(wc) {
+      for(unsigned i=0;i<32;++i) gEntrySlot[i]=-1;
+      for(unsigned i=0;i<4;++i) rtSlotGeometry(i,memory+32*i,i,
+        memory+ufsSlotUcdOffset(i),gHost.phys+ufsSlotUcdOffset(i),
+        memory+ufsSlotDataOffset(i),gHost.phys+ufsSlotDataOffset(i));
+    }
+    completeImmediately=false;
+    UfsSlot leased[3]; bool pooled[3]; uint64_t deadlines[3]; uint32_t scsi=0;
+    uint8_t cdb[10]={0x28}; uint32_t bits=0;
+    for(unsigned i=0;i<3;++i) {
+      leased[i]=rtSlotTake(&pooled[i]); assert(pooled[i]);
+      assert(leased[i].entry==(wc?i:2*i));
+      assert(!rtScsiIssue(leased[i],0,cdb,10,2,4096,1000,&deadlines[i],&scsi));
+      bits|=leased[i].bit;
+    }
+    assert(gSlotsPeak==3 && !gSlotFree && registers[0x58/4]==bits);
+    for(unsigned i : {1U,2U,0U}) {
+      complete(leased[i].entry); bits&=~leased[i].bit;
+      assert(registers[0x58/4]==bits);
+      assert(!rtScsiAwait(leased[i],0,4096,deadlines[i],&scsi));
+      rtSlotGive(leased[i],pooled[i]);
+    }
+    assert(gSlotFree==7 && !gSlotsBusy && !gOutstanding);
+    gListUncached=false;
+  }
+
   // Two leased slots build discontiguous PRDTs without sharing CPU scratch.
   {reset(); alignas(4096) uint8_t pages[8192]{}; directFixture=pages; gZeroCopy=true;
     bool a,b; auto x=rtSlotTake(&a),y=rtSlotTake(&b); assert(a&&b);

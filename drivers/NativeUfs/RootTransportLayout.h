@@ -21,6 +21,7 @@ enum : uint32_t {
   kDmaBytes = kExtraDataOffset + (kRegionSlots - 1) * kDataMax,
   kDmaBytesOneSlot = kDataOffset + kDataMax,
   kDmaBytesEightSlots = kExtraDataOffset + 7 * kDataMax,
+  kDmaBytesFourSlots = kExtraDataOffset + 3 * kDataMax,
   kRegionBDataOffset = kRegionSlots * kUcdStride,
   kRegionBBytes = kRegionBDataOffset + kRegionSlots * kDataMax,
 };
@@ -32,3 +33,6 @@ static constexpr uint32_t ufsSlotEntry (unsigned slot) { return 2 * slot; }
 static constexpr uint32_t ufsSlotUtrdOffset (unsigned slot) { return 32 * ufsSlotEntry (slot); }
 static_assert (ufsSlotUcdOffset (kRegionSlots - 1) + kPrdtOffset + 16 <= kExtraDataOffset, "slot descriptors overlap data");
 static_assert (ufsSlotUtrdOffset (kRegionSlots - 1) + 32 <= kUcdOffset, "request list overlaps slot 0's descriptor");
+
+static_assert (ufsSlotDataOffset (3) + kDataMax <= kDmaBytesFourSlots, "four-slot data exceeds allocation");
+static_assert (ufsSlotUcdOffset (3) + kUcdStride <= kDmaBytesFourSlots, "four-slot UCD exceeds allocation");

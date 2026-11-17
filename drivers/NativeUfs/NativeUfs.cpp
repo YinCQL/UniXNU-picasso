@@ -1013,16 +1013,16 @@ static bool hostBringUp (const char **why)
   }
   const bool wide = (read32 (gHost.hc, 0) & 0x01000000) != 0;
   const unsigned entries = (read32 (gHost.hc, 0) & 31) + 1;
-  const unsigned sizes[] = { kDmaBytes, kDmaBytesEightSlots, kDmaBytesOneSlot };
-  const unsigned counts[] = { 16, 8, 1 };
-  uint32_t requestedSlots = 1;
+  const unsigned sizes[] = { kDmaBytes, kDmaBytesEightSlots, kDmaBytesFourSlots, kDmaBytesOneSlot };
+  const unsigned counts[] = { 16, 8, 4, 1 };
+  uint32_t requestedSlots = 4;
   PE_parse_boot_argn ("native-ufs-slots", &requestedSlots, sizeof (requestedSlots));
   if (!requestedSlots) requestedSlots = 1;
   if (requestedSlots > kSlots) requestedSlots = kSlots;
   unsigned regionSlots = 1;
   gHost.lock = IOLockAlloc ();
   gDiagnosticLock = IOLockAlloc ();
-  for (unsigned attempt = 0; attempt < 3 && !gHost.dma; ++attempt) {
+  for (unsigned attempt = 0; attempt < sizeof (counts) / sizeof (counts[0]) && !gHost.dma; ++attempt) {
     if (counts[attempt] > requestedSlots) continue;
     if (counts[attempt] > (entries + 1) / 2 && counts[attempt] > 1) continue;
     auto *dma = IOBufferMemoryDescriptor::inTaskWithOptions (
