@@ -44,6 +44,7 @@ jobs:
         shell: bash --noprofile --norc -e -o pipefail {0}
         working-directory: device
     env:
+      PICASSO_CI_PAYLOAD_MIB: "96"
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:
       - name: Check out the picasso device repo
@@ -224,7 +225,7 @@ jobs:
 
       - name: Verify media, Data seed, compiled UUID and payload handoff
         run: |
-          sudo env PATH="$PATH" PICASSO_LINUX_INPUTS="${PICASSO_LINUX_INPUTS:-}" \
+          sudo env PATH="$PATH" PICASSO_CI_PAYLOAD_MIB="$PICASSO_CI_PAYLOAD_MIB" PICASSO_LINUX_INPUTS="${PICASSO_LINUX_INPUTS:-}" \
             "$(command -v python3)" -B scripts/picasso_media_payload.py check \
             --tree out/picasso/tree --work out/picasso --output out/picasso/logs/data-artifacts.json
 
@@ -312,7 +313,7 @@ jobs:
 
       - name: Export audited iOS16 inputs for Linux builds
         run: |
-          sudo env PATH="$PATH" PICASSO_LINUX_INPUTS="${PICASSO_LINUX_INPUTS:-}" GITHUB_SHA="$GITHUB_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+          sudo env PATH="$PATH" PICASSO_CI_PAYLOAD_MIB="$PICASSO_CI_PAYLOAD_MIB" PICASSO_LINUX_INPUTS="${PICASSO_LINUX_INPUTS:-}" GITHUB_SHA="$GITHUB_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \
             "$(command -v python3)" -B scripts/export-picasso-media-inputs.py --tree out/picasso/tree \
             --work out/picasso --output out/picasso/linux-inputs
 
@@ -335,7 +336,7 @@ jobs:
           assert page >= 2048 and page & (page - 1) == 0
           offset = page + (kernel_size + page - 1) // page * page
           payload = Path('out/picasso/payload/payload.img').read_bytes()
-          assert ramdisk_size == len(payload) == 80 * 1024**2
+          assert ramdisk_size == len(payload) == 96 * 1024**2
           assert blob[offset:offset + ramdisk_size] == payload
           files = [boot, Path('out/picasso/payload/payload.img')]
           (boot.parent / 'SHA256SUMS').write_text(''.join(

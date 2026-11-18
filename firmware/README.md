@@ -95,4 +95,6 @@ Compose retains the original 20 GiB Data seed through the hash-pinned Release in
 `configs/retained-data-seed.json`; it does not regenerate Data when Actions
 artifacts expire. Linux requires `compose_run_id` for a successful Compose of
 the same branch and commit, then imports its signed audio/GL/UI/Bluetooth media
-and unchanged Data inputs. Both workflows build an 80 MiB combined payload.
+and unchanged Data inputs. Both workflows build a 96 MiB combined payload to fit the larger Apple-clang
+kernel and FAT reserve. Local builds retain their qualified 80 MiB payload;
+the source board and Data recipe remain unchanged.

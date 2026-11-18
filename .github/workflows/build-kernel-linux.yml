@@ -20,6 +20,8 @@ jobs:
   kernel_linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    env:
+      PICASSO_CI_PAYLOAD_MIB: "96"
     defaults:
       run:
         shell: bash
@@ -203,7 +205,7 @@ jobs:
           assert page >= 2048 and page & (page - 1) == 0
           offset = page + (kernel_size + page - 1) // page * page
           payload = Path('out/picasso/payload/payload.img').read_bytes()
-          assert ramdisk_size == len(payload) == 80 * 1024**2
+          assert ramdisk_size == len(payload) == 96 * 1024**2
           assert blob[offset:offset + ramdisk_size] == payload
           (boot.parent / 'build-identity.json').write_text(json.dumps(dict(
               revision=os.environ['GITHUB_SHA'], payload_bytes=len(payload), boot_bytes=len(blob),
