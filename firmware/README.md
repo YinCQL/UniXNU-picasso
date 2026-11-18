@@ -80,3 +80,19 @@ and speaker playback, with no grey screen or automatic restart during the
 check. Long-term stability and controlled performance comparisons remain
 unmeasured. The historical Bluetooth firmware-handshake timeout (`-60`) can
 still occur; this layout does not claim to resolve it.
+
+## Retained factory images and CI
+
+Complete `NON-HLOS.bin`, `dspso.bin` and `BTFM.bin` from the same factory package
+are retained in [picasso-factory-firmware-v13.0.5.0](https://github.com/YinCQL/UniXNU-picasso/releases/tag/picasso-factory-firmware-v13.0.5.0).
+The attached `factory-firmware-manifest.json` fixes their sizes and SHA256 hashes.
+Existing firmware and toolchain Releases remain available to other consumers.
+Both build workflows stage small board firmware directly from this directory;
+they do not fetch the old touch/GPU firmware Releases. ADSP runtime still uses
+the existing UFS LUN4/PAS path.
+
+Compose retains the original 20 GiB Data seed through the hash-pinned Release in
+`configs/retained-data-seed.json`; it does not regenerate Data when Actions
+artifacts expire. Linux requires `compose_run_id` for a successful Compose of
+the same branch and commit, then imports its signed audio/GL/UI/Bluetooth media
+and unchanged Data inputs. Both workflows build an 80 MiB combined payload.

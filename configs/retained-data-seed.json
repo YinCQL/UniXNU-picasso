@@ -1,0 +1,21 @@
+{
+  "schema": "picasso-retained-seed-v1",
+  "repository": "YinCQL/UniXNU-picasso",
+  "tag": "picasso-data-seed-72443f51",
+  "asset": "picasso-data-seed-72443f51.zip",
+  "bytes": 1177534,
+  "sha256": "f61e92ba762e481d84abdcf4d8f391b08d2e4b03f8bbeab40eb92df923b99eec",
+  "recipe_sha256": "b5fc7d559c3ab0dd1c7fee9fe46674b50457772c63321f01ace72498de5a2832",
+  "volume_uuid": "72443F51-21DE-49BF-AA5A-BDBFEEA830ED",
+  "original_producer": {
+    "schema": "picasso-ios16-linux-inputs-v1",
+    "repository": "YinCQL/UniXNU-picasso",
+    "recipe_sha256": "b5fc7d559c3ab0dd1c7fee9fe46674b50457772c63321f01ace72498de5a2832",
+    "producer_run_id": 42221066036,
+    "producer_revision": "444092ed195eee428bb34458df87cf75259ff50b",
+    "producer_branch": "feat/ios16-audio",
+    "producer_workflow": ".github/workflows/compose-bootimg.yml",
+    "artifact_id": 13504141932,
+    "artifact_sha256": "943e12aa15de668f0ed87d0261eab36729c03e2ac87c5fb5b5d17336573092e1"
+  }
+}

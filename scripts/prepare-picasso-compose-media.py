@@ -75,6 +75,21 @@ def main():
             output.mkdir(parents=True, exist_ok=False)
             (output / 'VirtualAudio').write_bytes(binary)
             (output / 'Info.plist').write_bytes(info)
+            from picasso_bluetooth_payload import STOCK
+            pins = {
+                'usr/sbin/bluetoothd': STOCK,
+                'Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/BTAudioHALPlugin': '58d65dbdc009dc8cea4e1acb23e86c7d93aff3e0451dc2cc4e0c5969745db88d',
+                'Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/Info.plist': '58d261506fbd9add9fe0850d0ed363890120222d6a7203dab4547ef38096b6de',
+                'Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/_CodeSignature/CodeResources': '3c727b0f043e463c0227db49cef54c5567715986d08a46c98923c9bb73585e5a',
+            }
+            for name, expected in pins.items():
+                original = mount / name
+                if digest(original) != expected:
+                    raise ValueError('Stock Bluetooth input differs: ' + name)
+                relative = name.split('/HAL/')[-1] if '/HAL/' in name else 'bluetoothd'
+                target = work / 'bluetooth-input' / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(original.read_bytes())
         (output.parent / 'input-report.json').write_text(json.dumps(dict(
             os_sha256=OS_SHA256, binary_sha256=STOCK_SHA256, info_sha256=INFO_SHA256,
             source_readonly=True), indent=2) + '\n')
@@ -91,6 +106,10 @@ def main():
     for path in (sdk / 'SDKSettings.json', Path(cc), ld, nm):
         if not path.is_file():
             raise ValueError('Missing native SDK/tool input: ' + str(path))
+    from picasso_ci_tools import prepare_tools
+    signer, xnu = prepare_tools(work, ROOT)
+    os.environ.update(PICASSO_BT_SDK=str(sdk), PICASSO_BT_CC=cc, PICASSO_BT_LD=str(ld),
+                      PICASSO_BT_LDID=str(signer), PICASSO_BT_XNU=str(xnu))
     staged_headers = work / 'audio-headers/CoreAudio'
     staged_headers.mkdir(parents=True, exist_ok=True)
     # Retain the exact HAL interface used by the qualified iOS16 build.

@@ -86,7 +86,7 @@ jobs:
           test -d "$DEVELOPER_DIR"
           # lld is a separate Homebrew formula now; the llvm bottle no longer
           # ships ld.lld, which the entry-probe patcher needs.
-          brew install cmake ninja unifdef llvm lld mtools dtc ccache
+          brew install cmake ninja unifdef llvm lld mtools dtc ccache pkg-config openssl@3 libplist
           # Kernel compiles go through ccache with the SDK's own clang (not the Homebrew llvm
           # added to PATH below); MakeInc.cmd keeps CC/CXX that come from the environment.
           mkdir -p "$RUNNER_TEMP/ccache-bin"
@@ -170,8 +170,8 @@ jobs:
             python3 scripts/prepare-picasso-compose-seed.py --tree "$UNIXNU_TREE" \
               --work out/picasso --output out/picasso/persistent-inputs
           else
-            python3 scripts/picasso_linux_inputs.py reuse-optional --tree "$UNIXNU_TREE" \
-              --output out/picasso/persistent-inputs "${SEED_ARGS[@]}"
+            python3 -B scripts/prepare-picasso-retained-seed.py --tree "$UNIXNU_TREE" \
+              --work out/picasso --output out/picasso/persistent-inputs
           fi
           if [ -s out/picasso/persistent-inputs/manifest.json ]; then
             echo "PICASSO_LINUX_INPUTS=$PWD/out/picasso/persistent-inputs" >> "$GITHUB_ENV"
@@ -187,13 +187,15 @@ jobs:
               2>&1 | tee out/picasso/logs/actions-ram-data.log
           fi
 
-      - name: Extract the exact stock audio route read-only
+      - name: Extract exact stock audio and Bluetooth inputs read-only
         run: |
           sudo "$(command -v python3)" -B scripts/prepare-picasso-compose-media.py stock-audio \
             --work out/picasso --source "out/ipsw/$PICASSO_IPSW_BUILD/$PICASSO_OS_MEMBER" \
             2>&1 | tee out/picasso/logs/actions-stock-audio.log
 
-      - name: Build signed audio, NativeGL and runtime UI inputs
+      - name: Build signed audio, NativeGL, runtime UI and Bluetooth inputs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 -B scripts/prepare-picasso-compose-media.py build --work out/picasso \
             2>&1 | tee out/picasso/logs/actions-media.log
@@ -310,7 +312,7 @@ jobs:
 
       - name: Export audited iOS16 inputs for Linux builds
         run: |
-          sudo env PATH="$PATH" PICASSO_LINUX_INPUTS="${PICASSO_LINUX_INPUTS:-}" \
+          sudo env PATH="$PATH" PICASSO_LINUX_INPUTS="${PICASSO_LINUX_INPUTS:-}" GITHUB_SHA="$GITHUB_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \
             "$(command -v python3)" -B scripts/export-picasso-media-inputs.py --tree out/picasso/tree \
             --work out/picasso --output out/picasso/linux-inputs
 
@@ -354,6 +356,14 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+      - name: Retain signed media for this exact revision
+        uses: actions/upload-artifact@v4
+        with:
+          name: picasso-signed-media-${{ github.run_number }}
+          path: device/out/picasso/signed-media-inputs/**
+          if-no-files-found: error
+          retention-days: 90
+
       - name: Upload boot image, diagnostic kernel, reports and reusable inputs
         if: always()
         uses: actions/upload-artifact@v4
@@ -385,6 +395,9 @@ jobs:
             device/out/picasso/runtime-ui/*.json
             device/out/picasso/runtime-ui/*.log
             device/out/picasso/media/*.json
+            device/out/picasso/bluetooth-userland/**/*.json
+            device/out/picasso/bluetooth-userland/**/*.log
+            device/out/picasso/firmware-inputs.json
             device/out/picasso/persistent-inputs/imported-seed.json
             device/out/picasso/linux-inputs/**
             device/out/picasso/.config
