@@ -127,7 +127,7 @@ def skywalk_objects(work,src,out,sdk,cc,run):
     rename+=['-D__channel_'+name+'=picasso_sw___channel_'+name for name in ['open','get_info','sync','get_opt','set_opt']]
     entries=json.loads((src/'skywalk-imports.json').read_text())
     (private/'skywalk-slots.inc').write_text(''.join('    *(void **)((uintptr_t)'+entry['slot']+'ULL + slide) = (void *)picasso_sw_'+entry['name']+';\n' for entry in entries))
-    flags=['-target','arm64-apple-ios16.0','-isysroot',sdk,'-O2','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unused-but-set-variable','-Wno-sign-compare','-DPRIVATE=1','-DLIBSYSCALL_INTERFACE=1','-include',src/'PicassoBTSkywalk.h','-I'+str(include),'-I'+str(private),'-I'+str(xnu/'libkern'),'-idirafter',xnu/'bsd']+rename
+    flags=['-target','arm64-apple-ios16.0','-isysroot',sdk,'-O2','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unused-but-set-variable','-Wno-sign-compare','-Wno-enum-compare','-DPRIVATE=1','-DLIBSYSCALL_INTERFACE=1','-include',src/'PicassoBTSkywalk.h','-I'+str(include),'-I'+str(private),'-I'+str(xnu/'libkern'),'-idirafter',xnu/'bsd']+rename
     objects=[]
     for source in [*wrappers,src/'PicassoBTSkywalk.c']:
         obj=private/(source.stem+'.o');run([cc,*flags,'-c',source,'-o',obj]);objects.append(obj)
