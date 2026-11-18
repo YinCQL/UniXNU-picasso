@@ -11,6 +11,15 @@ def build(root, platform, record, out):
     driver=root/'drivers/PicassoBluetooth'
     subprocess.run([sys.executable,'-B',driver/'tools/prepare-linux.py'],check=True)
     c_record=json.loads((root/'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o.json').read_text().strip().rstrip(','))
+    # Apple clang records the implicit <source-stem>.o separately in output.
+    # Materialize that exact default before the strict source/output adapter.
+    if '-o' not in c_record['arguments']:
+        if (c_record.get('output') != 'kern_exec.o' or
+                Path(c_record['file']).name != 'kern_exec.c' or
+                c_record['arguments'].count('-c') != 1 or
+                any(a.startswith('-o') for a in c_record['arguments'])):
+            raise ValueError('Unexpected implicit C compile output')
+        c_record['arguments'] += ['-o', c_record['output']]
     inputs=[root/'kits/picasso/PicassoBluetooth.cpp',root/'kits/picasso/PicassoBluetoothPower.cpp']
     inputs += [driver/name for name in ['src/qbt_core.c','src/qbt_linux.c','src/qbt_geni.c','src/qbt_transport.c','src/PicassoBtFirmware.c','linux/btqca.c']]
     objects=[]
