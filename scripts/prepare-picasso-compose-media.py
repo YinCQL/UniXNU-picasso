@@ -78,9 +78,9 @@ def main():
             from picasso_bluetooth_payload import STOCK
             pins = {
                 'usr/sbin/bluetoothd': STOCK,
-                'Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/BTAudioHALPlugin': '58d65dbdc009dc8cea4e1acb23e86c7d93aff3e0451dc2cc4e0c5969745db88d',
-                'Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/Info.plist': '58d261506fbd9add9fe0850d0ed363890120222d6a7203dab4547ef38096b6de',
-                'Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/_CodeSignature/CodeResources': '3c727b0f043e463c0227db49cef54c5567715986d08a46c98923c9bb73585e5a',
+                'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/BTAudioHALPlugin': '58d65dbdc009dc8cea4e1acb23e86c7d93aff3e0451dc2cc4e0c5969745db88d',
+                'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/Info.plist': '58d261506fbd9add9fe0850d0ed363890120222d6a7203dab4547ef38096b6de',
+                'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/_CodeSignature/CodeResources': '3c727b0f043e463c0227db49cef54c5567715986d08a46c98923c9bb73585e5a',
             }
             for name, expected in pins.items():
                 original = mount / name
