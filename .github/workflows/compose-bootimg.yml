@@ -105,14 +105,10 @@ jobs:
           python3 scripts/build-picasso-sb-inject.py \
             package/picasso-springboard/picasso-springboard-probe.m out/picasso/libpicasso-sb.dylib
 
-      - name: Prepare authenticated stock touch firmware
+      - name: Prepare bundled factory touch, GPU and Bluetooth firmware
         run: |
-          python3 scripts/fetch-picasso-touch-firmware.py --output out/picasso/novatek/firmware.bin
+          python3 -B scripts/prepare-picasso-firmware.py --work out/picasso
           echo "NOVATEK_TOUCH_FW=$PWD/out/picasso/novatek/firmware.bin" >> "$GITHUB_ENV"
-
-      - name: Prepare exact stock Adreno 620 firmware
-        run: |
-          python3 scripts/fetch-picasso-gpu-firmware.py --output out/picasso/gpu-firmware
           echo "ADRENO620_FW_DIR=$PWD/out/picasso/gpu-firmware" >> "$GITHUB_ENV"
           cp out/picasso/gpu-firmware/firmware.json out/picasso/logs/gpu-firmware.json
 

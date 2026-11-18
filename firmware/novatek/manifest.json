@@ -1,0 +1,25 @@
+{
+  "schema": "picasso-firmware-input-v1",
+  "board": "picasso",
+  "soc": "SM7250",
+  "source": "Picasso V13.0.5.0.SGICNXM",
+  "panel": "g7a_37_02_0a",
+  "version": 20,
+  "files": {
+    "novatek_nt36672c_g7a_fw01.bin": {
+      "bytes": 131072,
+      "sha256": "f62db7d12c372834e3d0d1ea95665a338a1c64ec955d45e4b91f921ba0690ce2"
+    }
+  },
+  "stock_version": "V13.0.5.0.SGICNXM",
+  "authority": "picasso_images_V13.0.5.0.SGICNXM",
+  "container": {
+    "name": "boot.img",
+    "bytes": 134217728,
+    "sha256": "af0cf6685fe65e336b78b037174e4524fcd4afad3eb45f766febf4b465333eb8",
+    "md5": "0e67155099280a452b1311ba056b7f0a",
+    "kernel_offset": 4096,
+    "firmware_kernel_offset": 32179216
+  },
+  "storage": "Tracked firmware bytes."
+}

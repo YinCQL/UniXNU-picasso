@@ -6,3 +6,8 @@
 policy/verified-root-picasso/** text eol=lf
 policy/verified-root-picasso/**/*.bin binary
 policy/verified-root-picasso/*.bin binary
+
+# Factory firmware identities must survive Windows checkouts byte for byte.
+firmware/** -text
+firmware/**/*.json text eol=lf
+firmware/**/*.md text eol=lf

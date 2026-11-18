@@ -69,7 +69,11 @@ USB logs: run `capture-logs.cmd` on Windows, or
 
 ## Build
 
-- Firmware: [UEFI for picasso](https://github.com/YinCQL/uefi_picasso).
+- Boot firmware: [UEFI for picasso](https://github.com/YinCQL/uefi_picasso).
+- Board firmware: [firmware/README.md](firmware/README.md). Small touch, GPU
+  and Bluetooth inputs are bundled by category and pinned to the supplied
+  `picasso_images_V13.0.5.0.SGICNXM` factory images. Preparation verifies every
+  file without a firmware download. ADSP retains its UFS/PAS runtime path.
 - Kernel, 80 MiB media payload and boot image: run
   [Compose Boot Image (FD + kernel + payload)](.github/workflows/compose-bootimg.yml)
   manually on the selected branch. It builds the audio HAL, NativeGL and runtime

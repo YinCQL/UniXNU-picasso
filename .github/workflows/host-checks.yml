@@ -5,11 +5,11 @@ on:
   pull_request:
     branches: [main-ios16]
   push:
-    branches: [main-ios16, feat/ios16, feat/ios16-gpu, feat/ios16-dsp, feat/fix-v1, feat/fix-v2]
     paths:
       - '.github/workflows/host-checks.yml'
       - 'scripts/**'
       - 'drivers/**'
+      - 'firmware/**'
       - 'hal/**'
       - 'package/**'
       - 'board.toml'
@@ -86,6 +86,11 @@ jobs:
         run: |
           python3 scripts/check-picasso-ui-trust.py --output out/picasso/host-checks/ui-trust
           cp out/picasso/host-checks/ui-trust/results.json out/picasso/logs/ui-trust-host.json
+
+      - name: Check board firmware manifests and local staging
+        run: |
+          python3 -B scripts/check-picasso-firmware-layout.py --output out/picasso/host-checks/firmware-layout
+          cp out/picasso/host-checks/firmware-layout/results.json out/picasso/logs/firmware-layout-host.json
 
       - name: Check PR13 GPU firmware and staged probe
         run: |

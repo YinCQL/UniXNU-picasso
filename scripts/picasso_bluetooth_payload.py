@@ -10,6 +10,7 @@ import shutil
 import struct
 import subprocess
 import uuid
+from picasso_firmware import manifest, bluetooth_files, stage, read_file
 
 ROOT=Path(__file__).resolve().parents[1]
 FILES={
@@ -138,6 +139,9 @@ def skywalk_objects(work,src,out,sdk,cc,run):
 
 def build(work):
     work=Path(work);out,stock=paths(work);out.mkdir(parents=True,exist_ok=True)
+    firmware_output=work/'bluetooth-firmware'
+    pins=manifest('bluetooth')
+    stage(firmware_output, bluetooth_files(firmware_output if firmware_output.is_dir() else None), pins)
     original=stock.read_bytes()
     if sha(original)!=STOCK:raise ValueError('Require original 20H392 bluetoothd')
     src=ROOT/'drivers/PicassoBluetooth/userland'
@@ -204,13 +208,13 @@ def make(work):
     for name,digest in report['skywalk']['source_sha256'].items():
         if sha((Path(report['skywalk']['root'])/name).read_bytes())!=digest:raise ValueError('Stale Skywalk source '+name)
     entries=[];ids={}
-    fw=json.loads((ROOT/'drivers/PicassoBluetooth/firmware.json').read_text())['files']
+    pins=manifest('bluetooth');fw=pins['files']
     for name,mode in FILES.items():
         base=name.split('/')[-1]
         path=out/'BTAudioHALPlugin.driver'/base if 'BTAudioHALPlugin.driver/' in name else out/base
-        data=(work/'bluetooth-firmware'/base if base in fw else path).read_bytes()
+        data=read_file(work/'bluetooth-firmware'/base, fw[base]) if base in fw else path.read_bytes()
         if base in fw:
-            if len(data)!=fw[base]['size'] or sha(data)!=fw[base]['sha256']:raise ValueError('Wrong firmware '+base)
+            if len(data)!=fw[base]['bytes'] or sha(data)!=fw[base]['sha256']:raise ValueError('Wrong firmware '+base)
         elif base=='Info.plist':
             if sha(data)!=report['audio']['info_sha256']:raise ValueError('Stale BTAudio Info.plist')
         else:

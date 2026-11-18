@@ -2,10 +2,12 @@
 import hashlib
 import struct
 
-NAME = 'novatek_nt36672c_g7a_fw01.bin'
-URL = 'https://github.com/YinCQL/UniXNU-picasso/releases/download/picasso-touch-firmware-v13.0.5.0/' + NAME
-SHA256 = 'f62db7d12c372834e3d0d1ea95665a338a1c64ec955d45e4b91f921ba0690ce2'
-SIZE = 131072
+from picasso_firmware import manifest
+
+PINS = manifest('novatek')
+NAME, = PINS['files']
+SHA256 = PINS['files'][NAME]['sha256']
+SIZE = PINS['files'][NAME]['bytes']
 
 
 def verify(data):

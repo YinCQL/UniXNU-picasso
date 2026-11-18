@@ -1,4 +1,4 @@
-"""Exact stock V13.0.5.0 Adreno 620 inputs; no firmware bytes live in Git."""
+"""Exact factory V13.0.5.0 Adreno 620 inputs, bundled in firmware/adreno620."""
 import hashlib
 import io
 import json
@@ -7,20 +7,14 @@ import stat
 import zipfile
 import zlib
 
-VERSION = 'V13.0.5.0.SGICNXM'
-ARCHIVE_BYTES = 72163
-ARCHIVE_SHA256 = 'bc8b240a1d1220371ded8f3d103f75682d68f97f2506f3d731b242bb853665e9'
-URL = 'https://github.com/YinCQL/UniXNU-picasso/releases/download/picasso-gpu-firmware-v13.0.5.0/picasso-adreno620-v13.0.5.0.zip'
-FILES = {
-    'a650_gmu.bin': (41548, 'df79fa8482fcc7587bb239b9c9e2b24bce4729893b990fe3f82b30da8175b01c', 0x5c66275c),
-    'a650_sqe.fw': (31632, 'b4c27420fd6a5c6b511b254cc0fad8cdd40eea38ceb3418f895a1084f4460487', 0x1f3285db),
-    'a630_sqe.fw': (32264, '57eece0d8032b0ab2467d856c304ce22f502ae8d4b2f8169b9d1ca890ceb463c', 0xf9a2972e),
-    'a620_zap.mdt': (6860, '5f9b1c2804a4c680d03ebc7f1e1d87995d2f1c96fa1acfe87aaba1003711eba2', 0x7de1dd05),
-    'a620_zap.b00': (148, 'ec9b9d5a67456384809624b14a00d15d36297e5f2e75728504cd872bc95e0947', 0x4629d3f3),
-    'a620_zap.b01': (6712, '580bf91b7e582b3c513ee09292da74d1d93d5513daa8dc28bea7f092dd43670a', 0x41ba9c58),
-    'a620_zap.b02': (1676, '5a4de8ad881b57d64c3697b1078ce012fb47300d914a32c50522da762e2f2bd8', 0xb439bc29),
-    'a620_zap.elf': (13964, 'd7d7c4a019945850e37ed4370c6f6fc5b763b3933179379a366090c87f5e39b6', 0xc2f2ba0c),
-}
+from picasso_firmware import manifest
+
+PINS = manifest('adreno620')
+VERSION = PINS['stock_version']
+ARCHIVE_BYTES = PINS['archive']['bytes']
+ARCHIVE_SHA256 = PINS['archive']['sha256']
+FILES = {name: (row['bytes'], row['sha256'], row['crc32'])
+         for name, row in PINS['files'].items()}
 
 
 def verify(name, data):
@@ -46,7 +40,7 @@ def verify_directory(directory):
 
 def unpack(data):
     if len(data) != ARCHIVE_BYTES or hashlib.sha256(data).hexdigest() != ARCHIVE_SHA256:
-        raise ValueError('GPU firmware archive differs from fixed Release')
+        raise ValueError('GPU firmware archive differs from pinned local archive')
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         entries = archive.infolist()
         if len(entries) != len(FILES) + 1 or {e.filename for e in entries} != set(FILES) | {'manifest.json'}:

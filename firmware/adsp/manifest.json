@@ -1,0 +1,19 @@
+{
+  "schema": "picasso-firmware-input-v1",
+  "board": "picasso",
+  "soc": "SM7250",
+  "source": "Picasso V13.0.5.0.SGICNXM NON-HLOS.bin",
+  "files": {
+    "NON-HLOS.bin": {
+      "bytes": 178958336,
+      "sha256": "a77ac6adc2f89300ce953d2b5e0e52d6f9263e41bb23c424aaaf9a26bf20a8be"
+    },
+    "dspso.bin": {
+      "bytes": 67108864,
+      "sha256": "4548f73fec3e1aff69403503463824dcb135ff0ea01774dd870874fd11fb3d43"
+    }
+  },
+  "loader": "Existing UFS LUN4 firmware reader and PAS path; no runtime loading change.",
+  "stock_version": "V13.0.5.0.SGICNXM",
+  "authority": "picasso_images_V13.0.5.0.SGICNXM"
+}

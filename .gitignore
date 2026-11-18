@@ -7,3 +7,12 @@ build/
 __pycache__/
 *.py[cod]
 /picasso-diagnostics/
+
+# Large factory ADSP images remain local; small build inputs are tracked.
+/firmware/adsp/*.bin
+/firmware/adsp/*.mbn
+/firmware/adsp/*.mdt
+/firmware/adsp/*.b[0-9][0-9]
+/firmware/**/*.zip
+/firmware/**/*.tgz
+/firmware/**/*.part
