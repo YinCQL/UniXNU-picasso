@@ -25,7 +25,7 @@ addon = media.addon
 
 
 def source_files():
-    names = subprocess.check_output(['git', '-C', str(ROOT), 'ls-files'], text=True).splitlines()
+    names = subprocess.check_output(['git', '-c', 'safe.directory=' + str(ROOT), '-C', str(ROOT), 'ls-files'], text=True).splitlines()
     return {n: inputs.digest(ROOT / n) for n in names if (ROOT / n).is_file()}
 
 

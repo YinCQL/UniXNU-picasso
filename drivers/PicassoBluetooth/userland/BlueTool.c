@@ -21,20 +21,22 @@
 typedef void *xpc_object_t;
 typedef const struct _xpc_type_s *xpc_type_t;
 extern const struct _xpc_type_s _xpc_type_connection,_xpc_type_dictionary;
+#ifndef XPC_CONNECTION_MACH_SERVICE_LISTENER
 #define XPC_CONNECTION_MACH_SERVICE_LISTENER (1ULL<<0)
-xpc_object_t xpc_connection_create_mach_service(const char *,dispatch_queue_t,uint64_t);
-void xpc_connection_set_event_handler(xpc_object_t,void (^)(xpc_object_t));
-void xpc_connection_resume(xpc_object_t);
-void xpc_connection_send_message(xpc_object_t,xpc_object_t);
+#endif
+xpc_object_t picasso_xpc_connection_create_mach_service(const char *,dispatch_queue_t,uint64_t) __asm("_xpc_connection_create_mach_service");
+void picasso_xpc_connection_set_event_handler(xpc_object_t,void (^)(xpc_object_t)) __asm("_xpc_connection_set_event_handler");
+void picasso_xpc_connection_resume(xpc_object_t) __asm("_xpc_connection_resume");
+void picasso_xpc_connection_send_message(xpc_object_t,xpc_object_t) __asm("_xpc_connection_send_message");
 xpc_type_t xpc_get_type(xpc_object_t);
 xpc_object_t xpc_dictionary_get_value(xpc_object_t,const char *);
 const char *xpc_dictionary_get_string(xpc_object_t,const char *);
 xpc_object_t xpc_dictionary_create_reply(xpc_object_t);
-xpc_object_t xpc_dictionary_get_remote_connection(xpc_object_t);
+xpc_object_t picasso_xpc_dictionary_get_remote_connection(xpc_object_t) __asm("_xpc_dictionary_get_remote_connection");
 void xpc_dictionary_set_int64(xpc_object_t,const char *,int64_t);
 void xpc_dictionary_set_string(xpc_object_t,const char *,const char *);
 void xpc_release(xpc_object_t);
-void xpc_transaction_begin(void);
+void picasso_xpc_transaction_begin(void) __asm("_xpc_transaction_begin");
 
 /* Bluetooth SIG company identifier of Qualcomm (HCI manufacturer name). */
 #define MANUFACTURER_QUALCOMM 29
@@ -80,21 +82,21 @@ static void handle(xpc_object_t message)
         xpc_dictionary_set_int64(reply,"result",1);
         if(id && !strcmp(id,"RunCommand")) xpc_dictionary_set_string(reply,"output","not supported on WCN399x");
     }
-    xpc_connection_send_message(xpc_dictionary_get_remote_connection(message),reply);
+    picasso_xpc_connection_send_message(picasso_xpc_dictionary_get_remote_connection(message),reply);
     xpc_release(reply);
 }
 
 int main(int argc,char **argv)
 {
     if(argc!=2 || strcmp(argv[1],"-R")) {fprintf(stderr,"usage: %s -R\n",argv[0]);return 64;}
-    xpc_transaction_begin(); /* Keep the launchd pressured-exit service alive. */
+    picasso_xpc_transaction_begin(); /* Keep the launchd pressured-exit service alive. */
     logger=os_log_create("com.apple.bluetooth","BlueTool");
-    xpc_object_t listener=xpc_connection_create_mach_service("com.apple.BlueTool",dispatch_get_main_queue(),XPC_CONNECTION_MACH_SERVICE_LISTENER);
-    xpc_connection_set_event_handler(listener,^(xpc_object_t peer) {
+    xpc_object_t listener=picasso_xpc_connection_create_mach_service("com.apple.BlueTool",dispatch_get_main_queue(),XPC_CONNECTION_MACH_SERVICE_LISTENER);
+    picasso_xpc_connection_set_event_handler(listener,^(xpc_object_t peer) {
         if(xpc_get_type(peer)!=&_xpc_type_connection) return;
-        xpc_connection_set_event_handler(peer,^(xpc_object_t message) {handle(message);});
-        xpc_connection_resume(peer);
+        picasso_xpc_connection_set_event_handler(peer,^(xpc_object_t message) {handle(message);});
+        picasso_xpc_connection_resume(peer);
     });
-    xpc_connection_resume(listener);
+    picasso_xpc_connection_resume(listener);
     dispatch_main();
 }
