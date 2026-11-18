@@ -51,9 +51,6 @@ def main():
             board_text, count = re.subn(rf'{key} = "[^"]*"', f'{key} = "{value}"', board_text, count=1)
             if count != 1:
                 raise ValueError(f'Board field missing: {key}')
-    board_text, count = re.subn(r'size_mib = 60\b', 'size_mib = 80', board_text, count=1)
-    if count != 1:
-        raise ValueError('Expected current 60 MiB payload layout')
     # The experiment uses physical touch; omit repeated synthetic swipe trials
     # to leave room in DarwinBoot's 1000-byte argument buffer, as in PR13.
     for argument in ('offline-hid-swipe-delay=8', 'offline-hid-auto-home-count=8', 'offline-hid-swipe=8',

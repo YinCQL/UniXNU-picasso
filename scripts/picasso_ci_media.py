@@ -19,7 +19,6 @@ ROOT = inputs.ROOT
 SCHEMA = 'picasso-signed-media-inputs-v1'
 FILES = ('media.addon', 'media-trust.bundle', 'build-report.json', 'audio-report.json',
          'bluetoothd-stock', 'btaudio-stock', 'manifest.json')
-PAYLOAD_MIB = media.PAYLOAD_MIB
 GPU_ARGS = media.GPU_ARGS
 kernel_args = media.kernel_args
 addon = media.addon

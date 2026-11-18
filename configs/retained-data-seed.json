@@ -17,5 +17,11 @@
     "producer_workflow": ".github/workflows/compose-bootimg.yml",
     "artifact_id": 13504141932,
     "artifact_sha256": "943e12aa15de668f0ed87d0261eab36729c03e2ac87c5fb5b5d17336573092e1"
+  },
+  "recipe_compatibility": {
+    "schema": "picasso-seed-recipe-compatibility-v1",
+    "original_recipe_sha256": "b5fc7d559c3ab0dd1c7fee9fe46674b50457772c63321f01ace72498de5a2832",
+    "compatible_recipe_sha256": "b4111613aac677805150feb2f00cc7e3eecaa5237c90e1e05ad6029d3bfe0d8f",
+    "reason": "Payload capacity is independent of the unchanged packed Data and Setup seed."
   }
 }

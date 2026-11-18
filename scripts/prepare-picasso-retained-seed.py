@@ -17,7 +17,7 @@ def main():
     a = p.parse_args()
     tree, work, output = a.tree.resolve(), a.work.resolve(), a.output.resolve()
     pin = json.loads((inputs.ROOT / 'configs/retained-data-seed.json').read_text())
-    if pin['schema'] != 'picasso-retained-seed-v1' or pin['recipe_sha256'] != inputs.recipe(tree):
+    if pin['schema'] != 'picasso-retained-seed-v1' or not inputs.recipe_matches(pin['recipe_sha256'], tree):
         raise ValueError('Retained seed recipe differs; never create a replacement implicitly')
     url = 'https://github.com/' + pin['repository'] + '/releases/download/' + pin['tag'] + '/' + pin['asset']
     output.parent.mkdir(parents=True, exist_ok=True)

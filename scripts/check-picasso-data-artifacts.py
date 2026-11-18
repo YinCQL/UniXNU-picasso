@@ -139,7 +139,8 @@ def verify_payload_policy(path, packed, preparation, identity, spec, jobs, polic
 def check(work, tree, output):
     board = tomllib.loads((ROOT / 'board.toml').read_text(encoding='utf-8'))
     spec = board['payload']
-    require(spec['size_mib'] == 60, 'Picasso payload must be 60 MiB')
+    require(type(spec['size_mib']) is int and spec['size_mib'] > 0,
+            'payload.size_mib must be a positive integer')
     require(spec['adt'].get('packed_data_ramdisk') is True, 'Packed Data ADT mode required')
     require(spec['adt'].get('persistent_data') is True and spec['adt'].get('unprotected_developer_data') is True,
             'Require explicit unprotected developer Data')
@@ -229,7 +230,8 @@ def check(work, tree, output):
                 f'Storage target outside original component: {name}')
 
     payload = work / 'payload/payload.img'
-    require(payload.stat().st_size == 60 * 1024**2, 'Incorrect FAT payload size')
+    require(payload.stat().st_size == spec['size_mib'] * 1024**2,
+            'FAT payload size differs from board.toml payload.size_mib')
     payload_report = json.loads(payload.with_suffix('.json').read_text())
     require(payload_report['payload_sha256'] == digest(payload), 'Stale payload report')
     data_path, payload_packed, transformation = payload_seed(work, spec, payload_report, packed, inspect)

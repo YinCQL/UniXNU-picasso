@@ -231,8 +231,8 @@ offline_disabled_jobs = [
 skip_setup_tool = "scripts/picasso-seed-skip-setup.py"
 # Native rectangular status bar: time at left, no carrier label or date.
 skip_setup_args = ["--no-auto-dim", "--inject-lib", "out/picasso/libpicasso-sb.dylib", "--statusbar-provider", "_UIStatusBarVisualProvider_Pad_ForcedNoCell"]
-# Fits the kernel, trust caches and packed Data seed within the 95% content limit.
-size_mib = 60
+# Actual FAT payload capacity for local and CI builds; contents must fit its 95% limit.
+size_mib = 96
 loader = "firmware"
 title = "Boot"
 dram_size = "0x180000000"

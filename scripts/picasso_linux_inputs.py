@@ -36,7 +36,8 @@ def board():
 
 
 def recipe(tree):
-    sha = hashlib.sha256(SCHEMA.encode() + b'\0')
+    # FAT capacity does not change the packed APFS seed or its Setup contents.
+    sha = hashlib.sha256(SCHEMA.encode() + b'\0seed-recipe-v2\0')
     for name in ('picasso_linux_inputs.py', 'picasso_target.py', 'prepare-picasso-ram-data.py',
                  'picasso-seed-skip-setup.py', 'picasso_ui_trust.py', 'build-picasso-sb-inject.py',
                  'check-picasso-data-artifacts.py'):
@@ -50,9 +51,22 @@ def recipe(tree):
         sha.update(path.name.encode() + b'\0' + path.read_bytes() + b'\0')
     spec = board()['payload']
     settings = {key: spec.get(key) for key in ('skip_setup_tool', 'skip_setup_args',
-                'offline_disabled_jobs', 'owned_trust_library', 'size_mib', 'adt', 'kernel_args')}
+                'offline_disabled_jobs', 'owned_trust_library', 'adt', 'kernel_args')}
     sha.update(json.dumps(settings, sort_keys=True).encode())
     return sha.hexdigest()
+
+
+def recipe_matches(value, tree):
+    current = recipe(tree)
+    if value == current:
+        return True
+    pin = json.loads((ROOT / 'configs/retained-data-seed.json').read_text(encoding='utf-8'))
+    compatibility = pin.get('recipe_compatibility', {})
+    # Only the audited capacity migration accepts the original recipe. Any
+    # later source/policy change invalidates this exact compatibility key.
+    return (compatibility.get('schema') == 'picasso-seed-recipe-compatibility-v1' and
+            value == pin['recipe_sha256'] == compatibility.get('original_recipe_sha256') and
+            current == compatibility.get('compatible_recipe_sha256'))
 
 
 def require(value, message):
@@ -65,7 +79,7 @@ def validate(directory, tree):
     require(path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= 16 * 1024**2,
             'Invalid Compose input manifest')
     manifest = json.loads(path.read_text(encoding='utf-8'))
-    require(manifest['schema'] == SCHEMA and manifest['recipe_sha256'] == recipe(tree),
+    require(manifest['schema'] == SCHEMA and recipe_matches(manifest['recipe_sha256'], tree),
             'iOS16 Compose input recipe differs; refresh Compose on this branch')
     require(set(manifest['files']) == set(FILES), 'Incomplete iOS16 Compose inputs')
     for name in FILES:
@@ -221,7 +235,7 @@ def acquire(repository, branch, tree, output):
                     staged = Path(temporary) / 'inputs'
                     extract(archive, staged)
                     candidate = json.loads((staged / 'manifest.json').read_text(encoding='utf-8'))
-                    if candidate.get('recipe_sha256') != recipe(tree):
+                    if not recipe_matches(candidate.get('recipe_sha256'), tree):
                         continue  # A matching exporter can serve another iOS16 seed recipe.
                     # A compatible but damaged bundle is an error, not permission
                     # to format a new seed and strand an existing Data overlay.
@@ -240,7 +254,7 @@ def reuse(tree, output, work, repository, branch):
         acquire(repository, branch, tree, output)
     proof = json.loads((output / 'reuse.json').read_text())
     require(proof['schema'] == SCHEMA and proof['repository'] == repository and
-            proof['recipe_sha256'] == recipe(tree) and proof['producer_workflow'] == '.github/workflows/compose-bootimg.yml',
+            recipe_matches(proof['recipe_sha256'], tree) and proof['producer_workflow'] == '.github/workflows/compose-bootimg.yml',
             'Cached Compose input provenance differs')
     require(all(type(proof[key]) is int and proof[key] > 0 for key in ('producer_run_id', 'artifact_id')) and
             re.fullmatch('[0-9a-f]{40}', proof['producer_revision']) and

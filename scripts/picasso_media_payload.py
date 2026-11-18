@@ -27,9 +27,6 @@ GPU_FILES = {
 GPU_ARGS = ['sheng-gpu=4', 'sheng-gpu-metal=1', 'sheng-gpu-addon=1',
             'sheng-dpu-scanout=0', 'sheng-gpu-perf-index=4', 'sheng-gpu-gl=1',
             'glwait=1', 'glhooks=1']
-PAYLOAD_MIB = int(os.environ.get('PICASSO_CI_PAYLOAD_MIB', '80'))
-if PAYLOAD_MIB not in (80, 96):
-    raise ValueError('Unsupported media payload capacity')
 # Physical touch remains enabled. Only synthetic swipe repetition, the redundant
 # touch-HID default and the boot-logo hold are omitted from this playback image.
 DROP_ARGS = ['offline-hid-swipe-delay=8', 'offline-hid-auto-home-count=8',

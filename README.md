@@ -74,7 +74,10 @@ USB logs: run `capture-logs.cmd` on Windows, or
   and Bluetooth inputs are bundled by category and pinned to the supplied
   `picasso_images_V13.0.5.0.SGICNXM` factory images. Preparation verifies every
   file without a firmware download. ADSP retains its UFS/PAS runtime path.
-- Kernel, 80 MiB media payload and boot image: run
+- Kernel, media payload and boot image: `board.toml` `[payload].size_mib`
+  sets the actual FAT capacity for local and CI builds (currently 96 MiB).
+  Contents must fit its 95% budget and the resulting boot image must fit the
+  128 MiB boot partition. To build, run
   [Compose Boot Image (FD + kernel + payload)](.github/workflows/compose-bootimg.yml)
   manually on the selected branch. It builds the audio HAL, NativeGL and runtime
   UI with real Apple SDK inputs, then verifies signatures, Data identity and the
@@ -82,6 +85,9 @@ USB logs: run `capture-logs.cmd` on Windows, or
   payload verification, followed by boot-image checks and boot-only flashing.
 - Existing persistent Data requires its exact saved seed. Compose reuses a
   compatible retained artifact, or accepts an explicit `seed_artifact_id`.
+  Changing payload capacity preserves seed compatibility; the retained original
+  recipe is accepted only for the audited capacity migration, with all seed
+  hashes, signed-library checks and Data UUID verification retained.
   If no seed is available, it stops unless `create_data_seed` is explicitly
   enabled for a new installation. A new seed cannot restore an existing Data overlay.
 - Build success does not establish device stability or complete hardware support.
