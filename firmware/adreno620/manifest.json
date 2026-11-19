@@ -1,0 +1,66 @@
+{
+  "schema": "picasso-firmware-input-v1",
+  "board": "picasso",
+  "soc": "SM7250",
+  "source": "Picasso V13.0.5.0.SGICNXM",
+  "stock_version": "V13.0.5.0.SGICNXM",
+  "files": {
+    "a650_gmu.bin": {
+      "bytes": 41548,
+      "sha256": "df79fa8482fcc7587bb239b9c9e2b24bce4729893b990fe3f82b30da8175b01c",
+      "crc32": 1550198620
+    },
+    "a650_sqe.fw": {
+      "bytes": 31632,
+      "sha256": "b4c27420fd6a5c6b511b254cc0fad8cdd40eea38ceb3418f895a1084f4460487",
+      "crc32": 523404763
+    },
+    "a630_sqe.fw": {
+      "bytes": 32264,
+      "sha256": "57eece0d8032b0ab2467d856c304ce22f502ae8d4b2f8169b9d1ca890ceb463c",
+      "crc32": 4188182318
+    },
+    "a620_zap.mdt": {
+      "bytes": 6860,
+      "sha256": "0fbefcb9b7c7141bbbd619744d72ff0ccdfd901cd48acf74401d0dd164283045",
+      "crc32": 30599035
+    },
+    "a620_zap.b00": {
+      "bytes": 148,
+      "sha256": "ec9b9d5a67456384809624b14a00d15d36297e5f2e75728504cd872bc95e0947",
+      "crc32": 1177146355
+    },
+    "a620_zap.b01": {
+      "bytes": 6712,
+      "sha256": "567db69308a867d37830a401f86d6e00fd1ae17243516dce40bae5f499de6664",
+      "crc32": 1032431142
+    },
+    "a620_zap.b02": {
+      "bytes": 1676,
+      "sha256": "5a4de8ad881b57d64c3697b1078ce012fb47300d914a32c50522da762e2f2bd8",
+      "crc32": 3023682601
+    },
+    "a620_zap.elf": {
+      "bytes": 13964,
+      "sha256": "3f66fb69f504995464fff9240c5c16d1f18467cc7d656969f8e087902fee8838",
+      "crc32": 3093642607
+    }
+  },
+  "authority": "picasso_images_V13.0.5.0.SGICNXM",
+  "container": {
+    "name": "super.img",
+    "bytes": 7872849416,
+    "sha256": "887d5aee8d236eef58733ab9d67493b9cfc3c757bdd7e42d82bafc7cb2cc4715",
+    "md5": "ed1b64aaccf82a37419ab8084e02f473",
+    "partition": "vendor",
+    "partition_sha256": "c5079156e403d47987e3b9c552d34460ba3b833ca6fc35d4ef3d29e4ca23caed",
+    "first_sector": 12425216,
+    "sectors": 3013296,
+    "directory": "firmware"
+  },
+  "archive": {
+    "bytes": 70748,
+    "sha256": "6598cf00be90bdbb22501a35eca35f4be73fdde881cb064dfae92f608bd682a1"
+  },
+  "storage": "Tracked firmware bytes; archive is an optional local input."
+}

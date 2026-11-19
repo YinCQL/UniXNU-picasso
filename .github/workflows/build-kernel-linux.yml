@@ -2,6 +2,11 @@ name: Build Picasso Kernel (Linux)
 
 on:
   workflow_dispatch:
+    inputs:
+      compose_run_id:
+        description: Successful Compose run for this exact branch revision
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -45,32 +50,14 @@ jobs:
           echo "PICASSO_LINUX_INPUTS=$PWD/out/picasso/linux-inputs" >> "$GITHUB_ENV"
           python3 ./unixnu defconfig picasso_defconfig
 
-      - name: Identify the compatible iOS16 Compose inputs
-        id: inputs_key
-        run: |
-          KEY=$(python3 scripts/picasso_linux_inputs.py key --tree "$UNIXNU_TREE")
-          echo "digest=$KEY" >> "$GITHUB_OUTPUT"
-
-      - name: Restore the audited iOS16 Data seeds and signed UI library
-        id: inputs_cache
-        uses: actions/cache/restore@v4
-        with:
-          path: device/out/picasso/linux-inputs
-          key: picasso-ios16-linux-inputs-v1-${{ steps.inputs_key.outputs.digest }}
-
-      - name: Validate or import matching macOS Compose inputs
+      - name: Import Data and signed media from the exact successful Compose
         env:
           GH_TOKEN: ${{ github.token }}
+          PICASSO_COMPOSE_RUN_ID: ${{ inputs.compose_run_id }}
         run: |
-          python3 scripts/picasso_linux_inputs.py reuse --tree "$UNIXNU_TREE" \
-            2>&1 | tee out/picasso/logs/linux-compose-inputs.log
-
-      - name: Cache the verified inputs before compiling
-        if: steps.inputs_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: device/out/picasso/linux-inputs
-          key: ${{ steps.inputs_cache.outputs.cache-primary-key }}
+          python3 -B scripts/picasso_ci_media.py import --tree "$UNIXNU_TREE" --work out/picasso \
+            --run-id "$PICASSO_COMPOSE_RUN_ID" 2>&1 | tee out/picasso/logs/linux-compose-inputs.log
+          echo "PICASSO_SIGNED_MEDIA_INPUTS=$PWD/out/picasso/signed-media-inputs" >> "$GITHUB_ENV"
 
       - name: Identify the runner dependency cache
         id: host_key
@@ -114,14 +101,10 @@ jobs:
           echo "$UNIXNU_LLVM_BIN" >> "$GITHUB_PATH"
           test -x "$UNIXNU_LLVM_BIN/llvm-objcopy"
 
-      - name: Prepare authenticated stock touch firmware
+      - name: Prepare bundled factory touch, GPU and Bluetooth firmware
         run: |
-          python3 scripts/fetch-picasso-touch-firmware.py --output out/picasso/novatek/firmware.bin
+          python3 -B scripts/prepare-picasso-firmware.py --work out/picasso
           echo "NOVATEK_TOUCH_FW=$PWD/out/picasso/novatek/firmware.bin" >> "$GITHUB_ENV"
-
-      - name: Prepare exact stock Adreno 620 firmware
-        run: |
-          python3 scripts/fetch-picasso-gpu-firmware.py --output out/picasso/gpu-firmware
           echo "ADRENO620_FW_DIR=$PWD/out/picasso/gpu-firmware" >> "$GITHUB_ENV"
           cp out/picasso/gpu-firmware/firmware.json out/picasso/logs/gpu-firmware.json
 
@@ -147,14 +130,14 @@ jobs:
           cp "out/ipsw/$PICASSO_BACKEND_BUILD/report.json" out/picasso/logs/kernel-donor.json
           echo "UNIXNU_KERNELCACHE=$PWD/out/ipsw/$PICASSO_BACKEND_BUILD/kernelcache.decompressed" >> "$GITHUB_ENV"
 
-      - name: Build and prelink the iOS16 kernel and FAT payload
+      - name: Build and prelink the current kernel and combined media payload
         env:
           GITHUB_TOKEN: ${{ github.token }}
           UNIXNU_UNIQUE_CHIP_ID: "41a551c0dec0de01"
         run: |
           python3 ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread corecrypto-2023 IOStorageFamily
-          python3 ./unixnu build kernel payload -j "$(nproc)" --skip-setup \
-            --trust-cache out/picasso/ui-trust.bundle --data-ramdisk out/picasso/ram-data/data.dbrdisk \
+          python3 -B scripts/build-picasso-media.py build kernel payload -j "$(nproc)" --skip-setup \
+            --data-ramdisk out/picasso/ram-data/data.dbrdisk \
             2>&1 | tee out/picasso/logs/linux-build.log
           test -s out/picasso/kernel/kernel.macho
           test -s out/picasso/payload/payload.img
@@ -163,7 +146,7 @@ jobs:
       - name: Verify compiled Data UUID, seed and FAT handoff
         run: |
           export PATH="$PICASSO_HOST_PATH"
-          python3 scripts/check-picasso-data-artifacts.py --tree out/picasso/tree --work out/picasso \
+          python3 -B scripts/picasso_ci_media.py check --tree out/picasso/tree --work out/picasso \
             --output out/picasso/logs/data-artifacts.json
           python3 scripts/check-picasso-display-policy.py \
             --adt out/picasso/logs/data-artifacts.files/EFI/UniXNU/Payloads/kernel.macho.adt \
@@ -210,7 +193,24 @@ jobs:
             --dtb "$PWD/uefi/mu-silicium/Resources/DTBs/picasso-topology.dtb" \
             --ramdisk "$PWD/out/picasso/payload/payload.img" -o "$PWD/out/picasso/boot/boot.img" \
             2>&1 | tee out/picasso/logs/linux-bootimg.log
-          test -s out/picasso/boot/boot.img
+          python3 - <<'PY'
+          import hashlib, json, os, struct, tomllib
+          from pathlib import Path
+          boot = Path('out/picasso/boot/boot.img')
+          blob = boot.read_bytes()
+          assert blob[:8] == b'ANDROID!' and 0 < len(blob) <= 128 * 1024**2
+          kernel_size, _, ramdisk_size, _, _, _, _, page = struct.unpack_from('<8I', blob, 8)
+          assert page >= 2048 and page & (page - 1) == 0
+          offset = page + (kernel_size + page - 1) // page * page
+          payload = Path('out/picasso/payload/payload.img').read_bytes()
+          capacity = tomllib.loads(Path('board.toml').read_text())['payload']['size_mib']
+          assert type(capacity) is int and capacity > 0
+          assert ramdisk_size == len(payload) == capacity * 1024**2
+          assert blob[offset:offset + ramdisk_size] == payload
+          (boot.parent / 'build-identity.json').write_text(json.dumps(dict(
+              revision=os.environ['GITHUB_SHA'], payload_bytes=len(payload), boot_bytes=len(blob),
+              embedded_payload_verified=True), indent=2) + '\n')
+          PY
           sha256sum out/picasso/boot/boot.img out/picasso/payload/payload.img > out/picasso/boot/SHA256SUMS
 
       - name: Upload boot image, diagnostic kernel, reports and reusable inputs
@@ -237,6 +237,10 @@ jobs:
             device/out/picasso/novatek/*.json
             device/out/picasso/ram-data/*.json
             device/out/picasso/linux-inputs/**
+            device/out/picasso/signed-media-inputs/manifest.json
+            device/out/picasso/media/*.json
+            device/out/picasso/audio-hal/*.json
+            device/out/picasso/firmware-inputs.json
             device/out/picasso/.config
             !device/out/picasso/logs/**/*.files/**
             !device/out/picasso/logs/**/*.cdr

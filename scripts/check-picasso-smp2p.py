@@ -47,7 +47,8 @@ def main():
     arm = out/'smp2p-device-arm.cpp'
     arm.write_text('#include "picasso-wlan-kernel-api.h"\nextern "C" {\n'
         'void IOLog(const char *,...) __attribute__((format(printf,1,2)));\n'
-        'void IODelay(unsigned); void IOSleep(unsigned); void _disable_preemption(); void _enable_preemption(); }\n'
+        'void IODelay(unsigned); void IOSleep(unsigned); void _disable_preemption(); void _enable_preemption();\n'
+        'uint64_t mach_absolute_time();void absolutetime_to_nanoseconds(uint64_t,uint64_t *); }\n'
         '#define disable_preemption() _disable_preemption()\n#define enable_preemption() _enable_preemption()\n'+body,encoding='utf8',newline='\n')
     dma_body = re.sub(r'^#include <[^>]+>[^\n]*\n', '', (ROOT/'package/PicassoRpcDma.cpp').read_text(), flags=re.M)
     dma = out/'rpc-dma-arm.cpp'

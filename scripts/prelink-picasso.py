@@ -170,7 +170,11 @@ def build(native, emitter, args):
         require(separator and identifier and identifier not in initializers,
                 'Use one BUNDLE=ORIGINAL_VA initializer per module')
         initializers[identifier] = int(address, 0)
-    candidate, plan = emitter.emit(args.kernel.read_bytes(), original, args.root, args.slide, initializers)
+    if 'com.apple.driver.FairPlayIOKit' in args.root:
+        import picasso_fairplay_prelink
+        candidate, plan = picasso_fairplay_prelink.emit(native, emitter, args.kernel.read_bytes(), original, args.root, args.slide, initializers)
+    else:
+        candidate, plan = emitter.emit(args.kernel.read_bytes(), original, args.root, args.slide, initializers)
     qualify_native(native, candidate, native.macho(candidate))
     candidate, plan = adapt_policy(native, original, candidate, plan)
     verify_candidate(native, original, candidate, plan)

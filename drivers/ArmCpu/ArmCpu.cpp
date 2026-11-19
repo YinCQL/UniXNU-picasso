@@ -2,11 +2,13 @@
 #include <IOKit/IOCPU.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOLocks.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSSymbol.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include "ArmCpuTimer.h"
+#include "ArmCpuSpi.h"
 
 // Exact private entry from Darwin 23 arm/rtclock.h. Its full data header is
 // not exported to IOKit; the IRQ path calls the real kernel implementation.
@@ -160,7 +162,7 @@ static void spiIpiSend (uintptr_t dist, uint32_t core)
 static uint64_t counter (void)
 {
   uint64_t value;
-  __asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (value));
+  __asm__ volatile ("isb\n\tmrs %0, cntvct_el0" : "=r" (value));
   return value;
 }
 
@@ -202,6 +204,22 @@ struct ArmCpuSpi {uint32_t id; void (*handler) (void *); void *context; volatile
 static ArmCpuSpi gSpi[ARMCPU_SPI_SLOTS];
 static volatile uint32_t gSpiUsed = 0;
 static uint64_t gBootAffinity = 0;
+
+// Registration is a thread-context operation; IRQ dispatch only reads the
+// immutable entries published by gSpiUsed and never takes this lock.
+static IOLock *gSpiRegistrationLock;
+static IOLock *spiRegistrationLock (void)
+{
+  IOLock *lock = __atomic_load_n (&gSpiRegistrationLock, __ATOMIC_ACQUIRE);
+  if (lock != nullptr) { return lock; }
+  IOLock *candidate = IOLockAlloc ();
+  if (candidate == nullptr) { return nullptr; }
+  if (!__atomic_compare_exchange_n (&gSpiRegistrationLock, &lock, candidate, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    IOLockFree (candidate); return lock;
+  }
+  return candidate;
+}
+
 extern "C" {
 volatile uint64_t armcpu_spi_unhandled = 0;
 volatile uint32_t armcpu_spi_unhandled_id = 0;
@@ -369,7 +387,7 @@ void ArmCpu::enableGic (void)
   uint64_t value;
   __asm__ volatile ("mrs %0, icc_sre_el1" : "=r" (value));
   value |= 1;
-  __asm__ volatile ("msr icc_sre_el1, %0; isb" :: "r" (value) : "memory");
+  __asm__ volatile ("msr icc_sre_el1, %0\n\tisb" :: "r" (value) : "memory");
   __asm__ volatile ("mrs %0, icc_sre_el1" : "=r" (value));
   if ((value & 1) == 0) { panic ("ArmCpu: GICv3 system register interface unavailable"); }
   __asm__ volatile ("mrs %0, icc_ctlr_el1" : "=r" (value));
@@ -385,7 +403,7 @@ void ArmCpu::enableGic (void)
     write32 (dist, 0, read32 (dist, 0) | 0x12U);
   }
   value = 1;
-  __asm__ volatile ("msr icc_igrpen1_el1, %0; dsb sy; isb" :: "r" (value) : "memory");
+  __asm__ volatile ("msr icc_igrpen1_el1, %0\n\tdsb sy\n\tisb" :: "r" (value) : "memory");
   if (!secondary) {
     uint64_t pmr, ig, sre;
     __asm__ volatile ("mrs %0, icc_pmr_el1" : "=r" (pmr));
@@ -400,7 +418,7 @@ void ArmCpu::enableGic (void)
     armcpu_gic_boot[6] = static_cast<uint32_t> (ig);
     armcpu_gic_boot[7] = static_cast<uint32_t> (sre);
   }
-  armcpu_gic_ready = 1;
+  __atomic_store_n (&armcpu_gic_ready, 1U, __ATOMIC_RELEASE);
 }
 
 
@@ -715,7 +733,7 @@ void ArmCpu::interrupt (void)
       }
     }
     armcpu_irq_phase=6;
-    __asm__ volatile ("msr icc_eoir1_el1, %0; isb" :: "r" (id) : "memory");
+    __asm__ volatile ("msr icc_eoir1_el1, %0\n\tisb" :: "r" (id) : "memory");
   }
 }
 
@@ -730,7 +748,7 @@ void ArmCpu::signalCPU (IOCPU *target)
                  ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
   armcpu_ipi_sent = armcpu_ipi_sent + 1;
   if (gSpiIpi) { spiIpiSend (gDist, peer->logicalId & 7); return; }
-  __asm__ volatile ("dsb ishst; msr icc_sgi1r_el1, %0; isb" :: "r" (sgi) : "memory");
+  __asm__ volatile ("dsb ishst\n\tmsr icc_sgi1r_el1, %0\n\tisb" :: "r" (sgi) : "memory");
 }
 
 // Diagnostic: sends SGI 0 to the core whose MPIDR affinity is aff (the DT "reg" value, e.g. 0x100 for core 1) exactly as signalCPU
@@ -768,15 +786,14 @@ extern "C" void armcpu_gic_diag (uint64_t aff, uint32_t *out)
   armcpu_gic_diag_stage = 0xe;
 }
 
-// Does an SGI sent to the calling core itself become pending at its own CPU interface, and which INTIDs? Only system registers are used (no GIC
-// MMIO). With IRQs masked, SGIs 0..15 are sent one at a time to this core's own MPIDR affinity through ICC_SGI1R_EL1 (Group 1) and, when that
-// shows nothing, through ICC_SGI0R_EL1 (Group 0); ICC_HPPIR1_EL1 / ICC_HPPIR0_EL1 is polled and a pending SGI is acknowledged and ended here so the
-// kernel never sees it. out[8], out[9]: CNTVCT ticks of one ICC_SGI1R_EL1 write and of one ICC_PMR_EL1 read (a trapped write costs far more). out: 0 MPIDR, 1 INTIDs pending as Group 1, 2 INTIDs pending as Group 0, 3 ICC_PMR, 4 ICC_IGRPEN1, 5 ICC_SRE, 6 ICC_CTLR, 7 ICC_RPR.
+// Probe only registered SGI 0, with IRQs masked. A late delivery is handled
+// by the kernel's IPI callback. out[8]/[9] measure the SGI write/PMR read;
+// out[0..7] retain the existing MPIDR, pending and CPU-interface snapshot ABI.
 extern "C" void armcpu_sgi_selfprobe (uint64_t *out)
 {
   uint64_t mpidr, daif, v;
   __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
-  __asm__ volatile ("mrs %0, daif; msr daifset, #2; isb" : "=r" (daif) :: "memory");
+  __asm__ volatile ("mrs %0, daif\n\tmsr daifset, #2\n\tisb" : "=r" (daif) :: "memory");
   for (unsigned i = 0; i < 10; i++) { out[i] = 0; }
   out[0] = mpidr;
   __asm__ volatile ("mrs %0, icc_pmr_el1" : "=r" (v)); out[3] = v;
@@ -786,11 +803,11 @@ extern "C" void armcpu_sgi_selfprobe (uint64_t *out)
   __asm__ volatile ("mrs %0, icc_rpr_el1" : "=r" (v)); out[7] = v;
   if ((mpidr & 0xff) < 16) {
     const uint64_t base = ((mpidr & 0xff00000000ULL) << 16) | ((mpidr & 0xff0000) << 16) | ((mpidr & 0xff00) << 8) | (1ULL << (mpidr & 0xff));
-    for (uint64_t intid = 0; intid < 16; intid++) {
+    for (uint64_t intid = 0; intid < 1; intid++) {
       const uint64_t sgi = base | (intid << 24);
       uint64_t h = 1023, ta, tb;
-      __asm__ volatile ("dsb ishst; isb; mrs %0, cntvct_el0; isb" : "=r" (ta) :: "memory");
-      __asm__ volatile ("msr icc_sgi1r_el1, %0; isb; mrs %1, cntvct_el0" : "=r" (tb) : "r" (sgi) : "memory");
+      __asm__ volatile ("dsb ishst\n\tisb\n\tmrs %0, cntvct_el0\n\tisb" : "=r" (ta) :: "memory");
+      __asm__ volatile ("msr icc_sgi1r_el1, %1\n\tisb\n\tmrs %0, cntvct_el0" : "=r" (tb) : "r" (sgi) : "memory");
       if (intid == 0) { out[8] = tb - ta; }
       for (unsigned polls = 0; polls < 400; polls++) {
         __asm__ volatile ("mrs %0, icc_hppir1_el1" : "=r" (h));
@@ -800,10 +817,10 @@ extern "C" void armcpu_sgi_selfprobe (uint64_t *out)
       if ((h & 0xffffff) == intid) {
         out[1] |= 1ULL << intid;
         __asm__ volatile ("mrs %0, icc_iar1_el1" : "=r" (v));
-        __asm__ volatile ("msr icc_eoir1_el1, %0; isb" :: "r" (v) : "memory");
+        __asm__ volatile ("msr icc_eoir1_el1, %0\n\tisb" :: "r" (v) : "memory");
         continue;
       }
-      __asm__ volatile ("dsb ishst; msr icc_sgi0r_el1, %0; isb" :: "r" (sgi) : "memory");
+      __asm__ volatile ("dsb ishst\n\tmsr icc_sgi0r_el1, %0\n\tisb" :: "r" (sgi) : "memory");
       for (unsigned polls = 0; polls < 400; polls++) {
         __asm__ volatile ("mrs %0, icc_hppir0_el1" : "=r" (h));
         if ((h & 0xffffff) == intid) { break; }
@@ -812,16 +829,16 @@ extern "C" void armcpu_sgi_selfprobe (uint64_t *out)
       if ((h & 0xffffff) == intid) {
         out[2] |= 1ULL << intid;
         __asm__ volatile ("mrs %0, icc_iar0_el1" : "=r" (v));
-        __asm__ volatile ("msr icc_eoir0_el1, %0; isb" :: "r" (v) : "memory");
+        __asm__ volatile ("msr icc_eoir0_el1, %0\n\tisb" :: "r" (v) : "memory");
       }
     }
   }
   {
     uint64_t ta, tb;
-    __asm__ volatile ("isb; mrs %0, cntvct_el0; isb; mrs %2, icc_pmr_el1; isb; mrs %1, cntvct_el0" : "=r" (ta), "=r" (tb), "=r" (v) :: "memory");
+    __asm__ volatile ("isb\n\tmrs %0, cntvct_el0\n\tisb\n\tmrs %2, icc_pmr_el1\n\tisb\n\tmrs %1, cntvct_el0" : "=r" (ta), "=r" (tb), "=r" (v) :: "memory");
     out[9] = tb - ta;
   }
-  __asm__ volatile ("msr daif, %0; isb" :: "r" (daif) : "memory");
+  __asm__ volatile ("msr daif, %0\n\tisb" :: "r" (daif) : "memory");
 }
 
 extern "C" void armcpu_ipi_selftest (uint64_t aff)
@@ -829,13 +846,13 @@ extern "C" void armcpu_ipi_selftest (uint64_t aff)
   uint64_t sgi = ((aff & 0xff00000000ULL) << 16) | ((aff & 0xff0000) << 16) | ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
   armcpu_ipi_selftest_sent = armcpu_ipi_selftest_sent + 1;
   if (gSpiIpi) { spiIpiSend (gDist, static_cast<uint32_t> ((aff >> 8) & 7)); return; }
-  __asm__ volatile ("dsb ishst; msr icc_sgi1r_el1, %0; isb" :: "r" (sgi) : "memory");
+  __asm__ volatile ("dsb ishst\n\tmsr icc_sgi1r_el1, %0\n\tisb" :: "r" (sgi) : "memory");
 }
 
 void ArmCpu::enableCPUTimeBase (bool enabled)
 {
   uint64_t value = enabled ? 1 : 2;
-  __asm__ volatile ("msr cntv_ctl_el0, %0; isb" :: "r" (value) : "memory");
+  __asm__ volatile ("msr cntv_ctl_el0, %0\n\tisb" :: "r" (value) : "memory");
 }
 
 void ArmCpu::quiesceCPU (void)
@@ -844,7 +861,7 @@ void ArmCpu::quiesceCPU (void)
   if(diagnosePower)panic("ArmCpu: unsupported quiesce requested before timer/GIC disable caller=%p halt=%u timer=%llu phase=%u",__builtin_return_address(0),armcpu_halt_calls,armcpu_timer_interrupts,armcpu_irq_phase);
   enableCPUTimeBase (false);
   uint64_t value = 0;
-  __asm__ volatile ("msr icc_igrpen1_el1, %0; dsb sy; isb" :: "r" (value) : "memory");
+  __asm__ volatile ("msr icc_igrpen1_el1, %0\n\tdsb sy\n\tisb" :: "r" (value) : "memory");
 }
 
 void ArmCpu::haltCPU (void)
@@ -866,7 +883,7 @@ static void cleanToMemory (const void *start, size_t length)
   uintptr_t line = static_cast<uintptr_t> (4) << ((ctr >> 16) & 15);
   uintptr_t address = reinterpret_cast<uintptr_t> (start) & ~(line - 1), end = reinterpret_cast<uintptr_t> (start) + length;
   for (; address < end; address += line) { __asm__ volatile ("dc civac, %0" :: "r" (address) : "memory"); }
-  __asm__ volatile ("dsb sy; isb" ::: "memory");
+  __asm__ volatile ("dsb sy\n\tisb" ::: "memory");
 }
 
 kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
@@ -893,10 +910,10 @@ const OSSymbol *ArmCpu::getCPUName (void)
 }
 
 // Readback after configuration: bit 0 group 1, bit 1 enabled, bit 2 edge, bits 8..15 priority; IROUTER separately.
-extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler) (void *), void *context,
+static IOReturn spiAttachUnlocked (uint32_t intid, bool edge, void (*handler) (void *), void *context,
                                        uint32_t *readback, uint64_t *router)
 {
-  if (gDist == 0 || armcpu_gic_ready == 0 || handler == nullptr) { return kIOReturnNotReady; }
+  if (__atomic_load_n (&armcpu_gic_ready, __ATOMIC_ACQUIRE) == 0 || gDist == 0 || handler == nullptr) { return kIOReturnNotReady; }
   const unsigned interrupts = ((read32 (gDist, 4) & 31) + 1) * 32;
   if (intid < 32 || intid >= 1020 || intid >= interrupts) { return kIOReturnBadArgument; }
   const uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
@@ -917,11 +934,38 @@ extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler
   __asm__ volatile ("dsb sy" ::: "memory");
   write32 (gDist, 0x100 + word, bit); // ISENABLER
   if (readback != nullptr) {
-    *readback = ((read32 (gDist, 0x80 + word) & bit) ? 1U : 0U) | ((read32 (gDist, 0x100 + word) & bit) ? 2U : 0U) |
+    const uint32_t raw = ((read32 (gDist, 0x80 + word) & bit) ? 1U : 0U) | ((read32 (gDist, 0x100 + word) & bit) ? 2U : 0U) |
                 (((read32 (gDist, cfg) >> shift) & 1U) << 2) |
                 (static_cast<uint32_t> (*reinterpret_cast<volatile uint8_t *> (gDist + 0x400 + intid)) << 8);
+    *readback = ArmCpuSpiReadbackView (raw, read32 (gDist, 4));
   }
   if (router != nullptr) { *router = *reinterpret_cast<volatile uint64_t *> (gDist + gicdRouterOffset (intid)); }
+  return kIOReturnSuccess;
+}
+
+// Serialize both slot publication and GIC register read-modify-write updates.
+extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler) (void *), void *context,
+                                       uint32_t *readback, uint64_t *router)
+{
+  IOLock *lock = spiRegistrationLock ();
+  if (lock == nullptr) { return kIOReturnNoResources; }
+  IOLockLock (lock);
+  IOReturn result = spiAttachUnlocked (intid, edge, handler, context, readback, router);
+  IOLockUnlock (lock); return result;
+}
+
+// Mask only an attached SPI. W1S/W1C avoids read-modify-write races with
+// other interrupt owners; usable by a hard IRQ and its deferred executor.
+extern "C" IOReturn armcpu_spi_mask (uint32_t intid, bool masked)
+{
+  if (!__atomic_load_n (&armcpu_gic_ready, __ATOMIC_ACQUIRE) || !gDist) return kIOReturnNotReady;
+  const uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
+  bool attached = false;
+  for (uint32_t slot = 0; slot < used; ++slot)
+    if (gSpi[slot].id == intid) { attached = true; break; }
+  if (!attached || intid < 32 || intid >= 1020) return kIOReturnBadArgument;
+  write32 (gDist, (masked ? 0x180 : 0x100) + (intid / 32) * 4, 1U << (intid % 32));
+  __asm__ volatile ("dsb sy" ::: "memory");
   return kIOReturnSuccess;
 }
 

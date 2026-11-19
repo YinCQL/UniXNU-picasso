@@ -41,7 +41,7 @@ def main():
     (out / 'PersistentBoard.inc').write_text(actual, encoding='utf-8', newline='\n')
     files = [source.parent / 'NativeUfs.cpp', source.parent / 'RootCommands.h',
              source / 'RootCommandsBridge.cpp', source / 'RootCommands.cpp',
-             source / 'PersistentWindows.cpp', Path(__file__).resolve()]
+             source / 'PersistentWindows.cpp', source.parent / 'RuntimeMetrics.h', Path(__file__).resolve()]
     report = {'scope': __doc__, 'pass': False, 'runs': [],
               'sha256': {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
               'extracted_sha256': hashlib.sha256(actual.encode()).hexdigest()}

@@ -1,3 +1,4 @@
+#include "PicassoBluetoothBoard.h"
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Firmware-backed CPU display. No Qualcomm display registers are changed.
 #include <IOKit/IOPlatformExpert.h>
@@ -359,6 +360,7 @@ extern "C" void native_legacy_display_late_probe(void) {
     picasso_power_start();
     picasso_network_stack_start();
     picasso_keystore_probe();
+    picasso_bluetooth_probe();
     IOService *display = pendingDisplay;
     if (!display) return;
     pendingDisplay = nullptr;

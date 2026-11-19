@@ -16,6 +16,12 @@ IOService *native_keyevents_allocate(void);
 }
 static bool enabled;
 static IOService *stateService;
+static uint8_t deviceIdentity[12];
+static bool identityReady;
+extern "C" bool picasso_aks_device_id(uint8_t out[12]) {
+    if(!enabled || !identityReady || !out)return false;
+    memcpy(out,deviceIdentity,sizeof(deviceIdentity));return true;
+}
 extern "C" bool picasso_aks_state_enabled(void) {return enabled;}
 
 extern "C" void picasso_aks_observed(unsigned selector,IOReturn result,
@@ -65,12 +71,18 @@ extern "C" void picasso_keystore_probe(void) {
     if(persistentData && persistentData->getLength()==sizeof(unprotected))memcpy(&unprotected,persistentData->getBytesNoCopy(),sizeof(unprotected));
     PE_parse_boot_argn("sheng-data-persist",&mode,sizeof(mode));
     const bool policy=(ephemeral==1 && unprotected==0 && mode==0) || (ephemeral==0 && unprotected==1 && mode==2);
+    OSData *uid=chosen?OSDynamicCast(OSData,chosen->getProperty("unique-chip-id")):nullptr;
+    OSData *chip=chosen?OSDynamicCast(OSData,chosen->getProperty("chip-id")):nullptr;
+    if(policy && uid && uid->getLength()==8 && chip && chip->getLength()==4) {
+        memcpy(deviceIdentity,uid->getBytesNoCopy(),8);memcpy(deviceIdentity+8,chip->getBytesNoCopy(),4);
+        uint8_t nonzero=0;for(uint8_t b:deviceIdentity)nonzero|=b;identityReady=nonzero!=0;
+    }
     OSSafeReleaseNULL(chosen);
     const OSSymbol *name=OSSymbol::withCString("AppleKeyStore");
     bool absent=name && !OSMetaClass::getMetaClassWithName(name);
     OSSafeReleaseNULL(name);
     IOService *provider=IOService::getResourceService();
-    if(!policy || !absent || !provider) {
+    if(!policy || !identityReady || !absent || !provider) {
         IOLog("PICASSO_AKS publish refused ephemeral=%u class_absent=%u provider=%u\n",ephemeral,absent,provider!=nullptr);return;
     }
     void *handle=OSMetaClass::preModLoad(g_kernel_kmod_info.name);
@@ -89,5 +101,5 @@ extern "C" void picasso_keystore_probe(void) {
         if(attached)service->detach(provider);
         OSSafeReleaseNULL(service);
     } else stateService=service;
-    IOLog("PICASSO_AKS started=%u ephemeral=%u unprotected_persistent=%u compatibility_stubs=1 key_operations=0\n",started,ephemeral,unprotected);
+    IOLog("PICASSO_AKS started=%u ephemeral=%u unprotected_persistent=%u compatibility_stubs=1 software_wrap=1 hardware_protection=0\n",started,ephemeral,unprotected);
 }

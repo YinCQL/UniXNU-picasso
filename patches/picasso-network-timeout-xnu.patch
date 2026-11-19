@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -9318,6 +9318,223 @@
+@@ -9318,6 +9318,304 @@
      return 0;
  }
  
@@ -75,12 +75,16 @@
 +    "</plist>\n";
 +
 +static int
-+picasso_ifnamer_directory(vnode_t vp, vfs_context_t ctx)
++picasso_ifnamer_directory(vnode_t vp, int signature, vfs_context_t ctx)
 +{
 +    char *buffer = kalloc_data(4096, Z_WAITOK);
 +    uio_t uio = buffer ? uio_create(1, 0, UIO_SYSSPACE, UIO_READ) : NULL;
 +    int error = uio ? 0 : ENOMEM, eof = 0;
-+    unsigned found = 0;
++    static const char *const root_names[] = {"Info.plist", "_CodeSignature"};
++    static const char *const signature_names[] = {"CodeDirectory", "CodeRequirements",
++        "CodeRequirements-1", "CodeResources", "CodeSignature"};
++    const char *const *names = signature ? signature_names : root_names;
++    unsigned count = signature ? 5 : 2, found = 0;
 +    for (unsigned batch = 0; !error && !eof && batch < 4; ++batch) {
 +        uio_reset(uio, uio_offset(uio), UIO_SYSSPACE, UIO_READ);
 +        error = uio_addiov(uio, CAST_USER_ADDR_T(buffer), 4096);
@@ -99,16 +103,22 @@
 +            int dot = entry->d_namlen == 1 && entry->d_name[0] == '.';
 +            int dotdot = entry->d_namlen == 2 && !memcmp(entry->d_name, "..", 2);
 +            if (!dot && !dotdot) {
-+                if (entry->d_namlen != sizeof("Info.plist") - 1 ||
-+                    memcmp(entry->d_name, "Info.plist", sizeof("Info.plist") - 1) || ++found != 1) {
++                unsigned index = 0;
++                for (; index < count; ++index) {
++                    size_t length = strlen(names[index]);
++                    if (entry->d_namlen == length && !memcmp(entry->d_name, names[index], length)) break;
++                }
++                if (index == count || (found & (1U << index)) ||
++                    entry->d_type != (!signature && index == 1 ? DT_DIR : DT_REG)) {
 +                    error = EINVAL; break;
 +                }
++                found |= 1U << index;
 +            }
 +            at += entry->d_reclen;
 +        }
 +        if (!used && !eof) error = EIO;
 +    }
-+    if (!error && (!eof || found != 1)) error = EINVAL;
++    if (!error && (!eof || found != (1U << count) - 1)) error = EINVAL;
 +    if (uio) uio_free(uio);
 +    if (buffer) kfree_data(buffer, 4096);
 +    return error;
@@ -138,7 +148,7 @@
 +            !VATTR_IS_SUPPORTED(&va, va_mode) || va.va_uid || va.va_gid ||
 +            (va.va_mode & 07777) != (directory ? 0755 : 0644))) error = EPERM;
 +    }
-+    if (!error && directory == 2) error = picasso_ifnamer_directory(vp, ctx);
++    if (!error && directory >= 2) error = picasso_ifnamer_directory(vp, directory == 3, ctx);
 +    vnode_put(vp);
 +    return error;
 +}
@@ -165,6 +175,76 @@
 +    return error ? error : closed;
 +}
 +
++/* A complete read-only bundle view avoids libc's union-directory reopen,
++ * which stock configd's syscall filter rejects. Preserve every pinned original
++ * signature file byte-for-byte; only the supported timeout metadata differs.
++ * The immutable original is verified before copying, with no symlink following.
++ */
++static const struct picasso_ifnamer_signature_file {
++    const char *name;
++    size_t size;
++    uint8_t digest[32];
++} picasso_ifnamer_signature_files[] = {
++    {"CodeDirectory", 173, {0xc9,0x68,0x7c,0x4d,0xf7,0xae,0x44,0xfc,0x95,0x60,0x11,0x7a,0xe4,0x25,0x83,0x2a,0x0a,0x44,0xf6,0xbb,0xa4,0x1b,0xc9,0x91,0xae,0x99,0x23,0x90,0xba,0x71,0x7f,0xd7}},
++    {"CodeRequirements", 12, {0x98,0x79,0x20,0x90,0x4e,0xab,0x65,0x0e,0x75,0x78,0x8c,0x05,0x4a,0xa0,0xb0,0x52,0x4e,0x6a,0x80,0xbf,0xc7,0x1a,0xa3,0x2d,0xf8,0xd2,0x37,0xa6,0x17,0x43,0xf9,0x86}},
++    {"CodeRequirements-1", 221, {0xc3,0xa8,0x63,0x64,0x8c,0x98,0x41,0xf9,0x2f,0x34,0x49,0xac,0x5a,0xa4,0x54,0x25,0xdf,0xce,0xff,0xc8,0x9e,0x2d,0xb9,0x88,0x9f,0xac,0x56,0x22,0xe6,0xe8,0x48,0x7f}},
++    {"CodeResources", 1716, {0x3d,0xe9,0xed,0x42,0xab,0x92,0xf6,0x6b,0x2c,0x60,0x33,0xb5,0x9c,0xcf,0xa4,0x41,0xb1,0xd0,0x50,0xc3,0x19,0xda,0xee,0xb5,0x57,0x55,0x1b,0x4d,0xa5,0x13,0x14,0x7e}},
++    {"CodeSignature", 0, {0xe3,0xb0,0xc4,0x42,0x98,0xfc,0x1c,0x14,0x9a,0xfb,0xf4,0xc8,0x99,0x6f,0xb9,0x24,0x27,0xae,0x41,0xe4,0x64,0x9b,0x93,0x4c,0xa4,0x95,0x99,0x1b,0x78,0x52,0xb8,0x55}},
++};
++
++static int
++picasso_ifnamer_copy_signatures(vfs_context_t ctx)
++{
++    uint8_t buffer[2048], digest[32];
++    char original[192], backing[192];
++    for (unsigned i = 0; i < sizeof(picasso_ifnamer_signature_files) / sizeof(picasso_ifnamer_signature_files[0]); ++i) {
++        const struct picasso_ifnamer_signature_file *file = &picasso_ifnamer_signature_files[i];
++        snprintf(original, sizeof(original), "/System/Library/SystemConfiguration/InterfaceNamer.bundle/_CodeSignature/%s", file->name);
++        snprintf(backing, sizeof(backing), "/private/var/picasso/ifnamer/InterfaceNamer.bundle/_CodeSignature/%s", file->name);
++        uint64_t size = 0;
++        int error = picasso_ifnamer_read(original, buffer, sizeof(buffer), &size, ctx);
++        if (error) return error;
++        SHA256_CTX sha;
++        SHA256_Init(&sha); SHA256_Update(&sha, buffer, (size_t)size); SHA256_Final(digest, &sha);
++        if (size != file->size || memcmp(digest, file->digest, sizeof(digest))) return EAUTH;
++        error = picasso_ifnamer_metadata(backing, 0);
++        if (error && error != ENOENT) return error;
++        error = native_gpu_addon_write(backing, buffer, size, 0644, ctx);
++        if (error && error != -1) return error;
++        error = picasso_ifnamer_metadata(backing, 0);
++        if (!error) error = picasso_ifnamer_read(backing, buffer, sizeof(buffer), &size, ctx);
++        if (error) return error;
++        SHA256_Init(&sha); SHA256_Update(&sha, buffer, (size_t)size); SHA256_Final(digest, &sha);
++        if (size != file->size || memcmp(digest, file->digest, sizeof(digest))) return EIO;
++    }
++    return picasso_ifnamer_metadata("/private/var/picasso/ifnamer/InterfaceNamer.bundle/_CodeSignature", 3);
++}
++
++static int
++picasso_ifnamer_bind(proc_t p, user_addr_t scratch, const char *source, const char *point)
++{
++    struct mount_args request = {.type = scratch + 0xc00, .path = scratch + 0xc20,
++        .flags = MNT_RDONLY, .data = scratch + 0xd00};
++    int32_t result = 0;
++    int error = copyout("bindfs", request.type, 7);
++    if (!error) error = copyout(point, request.path, strlen(point) + 1);
++    if (!error) error = copyout(source, request.data, strlen(source) + 1);
++    if (error) return error;
++    native_bindfs_boot_mount = 1;
++    error = mount(p, &request, &result);
++    native_bindfs_boot_mount = 0;
++    if (error) return error;
++    vnode_t vp = NULLVP;
++    error = vnode_lookup(point, VNODE_LOOKUP_NOFOLLOW, &vp, vfs_context_current());
++    if (!error) {
++        mount_t mp = vnode_mount(vp);
++        if (vnode_vtype(vp) != VDIR || !mp || !(vfs_flags(mp) & MNT_RDONLY) ||
++            (vfs_flags(mp) & MNT_UNION)) error = EIO;
++        vnode_put(vp);
++    }
++    return error;
++}
++
 +static void
 +picasso_ifnamer_mount(proc_t p, user_addr_t scratch)
 +{
@@ -185,8 +265,9 @@
 +        SHA256_Init(&sha); SHA256_Update(&sha, buffer, (size_t)size); SHA256_Final(digest, &sha);
 +        if (size != 843 || memcmp(digest, expected, sizeof(expected))) error = EINVAL;
 +    }
-+    const char *dirs[] = {"/private/var/picasso", "/private/var/picasso/ifnamer", source};
-+    for (unsigned i = 0; !error && i < 3; ++i) {
++    const char *dirs[] = {"/private/var/picasso", "/private/var/picasso/ifnamer", source,
++        "/private/var/picasso/ifnamer/InterfaceNamer.bundle/_CodeSignature"};
++    for (unsigned i = 0; !error && i < 4; ++i) {
 +        error = picasso_ifnamer_metadata(dirs[i], 1);
 +        if (error == ENOENT) {
 +            struct mkdir_args args = {.path = scratch, .mode = 0755};
@@ -206,25 +287,25 @@
 +        if (error == -1) error = 0; /* already identical */
 +    }
 +    if (!error) error = picasso_ifnamer_metadata(file, 0);
++    if (!error) error = picasso_ifnamer_copy_signatures(ctx);
 +    if (!error) error = picasso_ifnamer_metadata(source, 2);
 +    if (error) { printf("PICASSO_NETWORK config prepare error=%d\n", error); return; }
-+    volatile int stage = 0, status = -1;
-+    native_gpu_addon_mount(p, scratch, 0xc00, source, sizeof(source), point, sizeof(point),
-+        "/System/Library/SystemConfiguration/InterfaceNamer.bundle/_CodeSignature/CodeResources",
-+        original, &stage, &status);
++    error = picasso_ifnamer_bind(p, scratch, source, point);
++    int stage = error ? 2 : 5;
 +    size = 0;
-+    if (stage == 5 && !status) {
++    if (!error) {
 +        error = picasso_ifnamer_read(original, buffer, sizeof(buffer), &size, ctx);
 +        if (!error && (size != sizeof(picasso_ifnamer_plist) - 1 ||
 +            memcmp(buffer, picasso_ifnamer_plist, (size_t)size))) error = EIO;
-+    } else error = status ? status : EIO;
++    }
++    printf("PICASSO_NETWORK complete_view=1 readonly=1 union=0 error=%d\n", error);
 +    printf("PICASSO_NETWORK config stage=%d error=%d stack_s=5 quiet_s=5\n", stage, error);
 +}
 +
  /* One read-only library union; signature/MAC/VM checks run normally on load. */
  static void
  picasso_ui_library_mount(proc_t p, user_addr_t scratch)
-@@ -9417,6 +9634,7 @@
+@@ -9417,6 +9715,7 @@
  #if DEVELOPMENT || DEBUG
  	if (!error) native_picasso_apps_mount(p, scratch);
  	if (!error) picasso_ui_library_mount(p, scratch);
@@ -234,7 +315,7 @@
  	if (data_root) vnode_put(data_root);
 --- a/iokit/Kernel/IOUserClient.cpp
 +++ b/iokit/Kernel/IOUserClient.cpp
-@@ -4447,6 +4447,29 @@
+@@ -4462,6 +4462,29 @@
  	return kIOReturnSuccess;
  }
  
@@ -264,7 +345,7 @@
  /* Routine io_service_get_busy_state */
  kern_return_t
  is_io_service_get_busy_state(
-@@ -4456,6 +4479,7 @@
+@@ -4471,6 +4494,7 @@
  	CHECK( IOService, _service, service );
  
  	*busyState = service->getBusyState();
@@ -272,7 +353,7 @@
  
  	return kIOReturnSuccess;
  }
-@@ -4644,6 +4668,8 @@
+@@ -4659,6 +4683,8 @@
  		picasso_service_end(trace, kIOReturnNotPermitted, kIOReturnNotPermitted, false);
  #endif
  /* PICASSO_SERVICE_TRACE_END */
@@ -281,7 +362,7 @@
  		return kIOReturnNotPermitted;
  	}
  #endif
-@@ -4854,6 +4880,9 @@
+@@ -4869,6 +4895,9 @@
  
  	*connection = client;
  	*result = res;

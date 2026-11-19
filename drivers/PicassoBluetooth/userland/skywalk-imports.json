@@ -1,0 +1,142 @@
+[
+  {
+    "name": "os_buflet_get_data_length",
+    "stub": "0x100660960",
+    "slot": "0x100867e00"
+  },
+  {
+    "name": "os_buflet_get_data_limit",
+    "stub": "0x10066096c",
+    "slot": "0x100867e08"
+  },
+  {
+    "name": "os_buflet_get_data_offset",
+    "stub": "0x100660978",
+    "slot": "0x100867e10"
+  },
+  {
+    "name": "os_buflet_get_object_address",
+    "stub": "0x100660984",
+    "slot": "0x100867e18"
+  },
+  {
+    "name": "os_buflet_set_data_length",
+    "stub": "0x100660990",
+    "slot": "0x100867e20"
+  },
+  {
+    "name": "os_channel_advance_slot",
+    "stub": "0x10066099c",
+    "slot": "0x100867e28"
+  },
+  {
+    "name": "os_channel_attr_create",
+    "stub": "0x1006609a8",
+    "slot": "0x100867e30"
+  },
+  {
+    "name": "os_channel_attr_destroy",
+    "stub": "0x1006609b4",
+    "slot": "0x100867e38"
+  },
+  {
+    "name": "os_channel_attr_get",
+    "stub": "0x1006609c0",
+    "slot": "0x100867e40"
+  },
+  {
+    "name": "os_channel_attr_set",
+    "stub": "0x1006609cc",
+    "slot": "0x100867e48"
+  },
+  {
+    "name": "os_channel_attr_set_key",
+    "stub": "0x1006609d8",
+    "slot": "0x100867e50"
+  },
+  {
+    "name": "os_channel_available_slot_count",
+    "stub": "0x1006609e4",
+    "slot": "0x100867e58"
+  },
+  {
+    "name": "os_channel_create",
+    "stub": "0x1006609f0",
+    "slot": "0x100867e60"
+  },
+  {
+    "name": "os_channel_create_extended",
+    "stub": "0x1006609fc",
+    "slot": "0x100867e68"
+  },
+  {
+    "name": "os_channel_destroy",
+    "stub": "0x100660a08",
+    "slot": "0x100867e70"
+  },
+  {
+    "name": "os_channel_get_fd",
+    "stub": "0x100660a14",
+    "slot": "0x100867e78"
+  },
+  {
+    "name": "os_channel_get_next_slot",
+    "stub": "0x100660a20",
+    "slot": "0x100867e80"
+  },
+  {
+    "name": "os_channel_read_attr",
+    "stub": "0x100660a2c",
+    "slot": "0x100867e88"
+  },
+  {
+    "name": "os_channel_ring_id",
+    "stub": "0x100660a38",
+    "slot": "0x100867e90"
+  },
+  {
+    "name": "os_channel_rx_ring",
+    "stub": "0x100660a44",
+    "slot": "0x100867e98"
+  },
+  {
+    "name": "os_channel_set_slot_properties",
+    "stub": "0x100660a50",
+    "slot": "0x100867ea0"
+  },
+  {
+    "name": "os_channel_slot_get_packet",
+    "stub": "0x100660a5c",
+    "slot": "0x100867ea8"
+  },
+  {
+    "name": "os_channel_sync",
+    "stub": "0x100660a68",
+    "slot": "0x100867eb0"
+  },
+  {
+    "name": "os_channel_tx_ring",
+    "stub": "0x100660a74",
+    "slot": "0x100867eb8"
+  },
+  {
+    "name": "os_packet_finalize",
+    "stub": "0x100660b28",
+    "slot": "0x100867ec0"
+  },
+  {
+    "name": "os_packet_get_flow_uuid",
+    "stub": "0x100660b34",
+    "slot": "0x100867ec8"
+  },
+  {
+    "name": "os_packet_get_next_buflet",
+    "stub": "0x100660b40",
+    "slot": "0x100867ed0"
+  },
+  {
+    "name": "os_packet_set_flow_uuid",
+    "stub": "0x100660b4c",
+    "slot": "0x100867ed8"
+  }
+]

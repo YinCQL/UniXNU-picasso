@@ -9,6 +9,9 @@ import picasso_media_payload as media
 
 ROOT = Path(__file__).resolve().parents[1]
 def main():
+    global media
+    if os.environ.get('PICASSO_SIGNED_MEDIA_INPUTS'):
+        import picasso_ci_media as media
     runpy.run_path(str(ROOT / 'scripts/check-picasso-target.py'))['check_board'](ROOT)
     work = ROOT / 'out/picasso'
     media.verify((work / 'media/media-trust.bundle').read_bytes(), work)
@@ -30,17 +33,6 @@ def main():
         arguments[:] = selected
         return original(arguments)
     payload.check_args = compact
-    original_build = payload.build
-    def build(ctx, kernel=None):
-        spec = ctx.board['payload']
-        if spec['size_mib'] != 60:
-            raise ValueError('Changed base payload capacity')
-        spec['size_mib'] = media.PAYLOAD_MIB
-        try:
-            return original_build(ctx, kernel)
-        finally:
-            spec['size_mib'] = 60
-    payload.build = build
     extra = ['--owner-trust-cache', str(work/'media/media-trust.bundle'), '--gpu-addon', str(media.addon(work))]
     for arg in ['picasso-audio-addon=1', *media.GPU_ARGS]:
         extra += ['--kernel-arg', arg]

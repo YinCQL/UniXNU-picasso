@@ -1,8 +1,9 @@
 /* Actual pre-launchd migration with injected I/O failures and crash remnants.
- * SHA API is an exact fixture preimage map; Python verifies production SHA constants.
+ * SHA uses the Python standard library oracle, including reordered policy bytes.
  */
 #include <assert.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,22 +64,64 @@ static void SHA256_Final(uint8_t out[32],SHA256_CTX *s);
 #include "network-reader.inc"
 #include "runtime-jobs.inc"
 static void SHA256_Final(uint8_t out[32],SHA256_CTX *s){
-    memset(out,0,32);
-    if(s->size==sizeof jobs_before && !memcmp(s->data,jobs_before,s->size))memcpy(out,picasso_jobs_before_sha,32);
-    if(s->size==sizeof jobs_after && !memcmp(s->data,jobs_after,s->size))memcpy(out,picasso_jobs_after_sha,32);
+    char path[1024], command[2300];
+    int n=snprintf(path,sizeof path,"%s.input",JOBS_SHA_SCRIPT);assert(n>0 && (size_t)n<sizeof path);
+    FILE *f=fopen(path,"wb");assert(f && fwrite(s->data,1,s->size,f)==s->size);assert(!fclose(f));
+    n=snprintf(command,sizeof command,"python3 \"%s\" \"%s\"",JOBS_SHA_SCRIPT,path);assert(n>0 && (size_t)n<sizeof command);
+    assert(!system(command));strcat(path,".sha");f=fopen(path,"rb");assert(f && fread(out,1,32,f)==32 && fgetc(f)==EOF);assert(!fclose(f));
 }
+
 static void setup(void){assert(!refs && !allocs);memset(nodes,0,sizeof nodes);for(unsigned i=0;i<4;++i){nodes[i].exists=1;nodes[i].type=i==3?VREG:VDIR;nodes[i].attr.va_mode=i==3?0644:0755;nodes[i].attr.va_nlink=1;}nodes[3].attr.va_data_size=sizeof jobs_before;memcpy(nodes[3].data,jobs_before,sizeof jobs_before);ops=renames=writes=failAt=0;shortWrite=corruptRead=0;}
 static int is_after(void){return nodes[3].attr.va_data_size==sizeof jobs_after && !memcmp(nodes[3].data,jobs_after,sizeof jobs_after);}
-static int is_before(void){return nodes[3].attr.va_data_size==sizeof jobs_before && !memcmp(nodes[3].data,jobs_before,sizeof jobs_before);}
+static int is_before(void){if(nodes[3].attr.va_data_size==sizeof jobs_bluetooth && !memcmp(nodes[3].data,jobs_bluetooth,sizeof jobs_bluetooth))return 1;if(nodes[3].attr.va_data_size==sizeof jobs_legacy && !memcmp(nodes[3].data,jobs_legacy,sizeof jobs_legacy))return 1;return nodes[3].attr.va_data_size==sizeof jobs_before && !memcmp(nodes[3].data,jobs_before,sizeof jobs_before);}
 static int run(void){int e=picasso_jobs_enable((void *)2,0x1000);assert(!refs && !allocs);return e;}
+static void parser_tests(void){
+    uint8_t data[8192],original[8192];size_t size;unsigned removed;
+    /* Reorder two entries, add an unrelated false override, then preserve it. */
+    const char *head="<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>";
+    const char *tail="\n</dict>\n</plist>\n";
+    const char *keep="\n <key>com.example.retained</key>\r\n <false/>";
+    const char *drop="\n <key>com.apple.bluetoothd</key>\r\n <true/>";
+    int n=snprintf((char *)data,sizeof data,"%s%s%s%s",head,drop,keep,tail);assert(n>0);size=(size_t)n;
+    assert(!picasso_jobs_transform(data,&size,&removed) && removed==1);
+    n=snprintf((char *)original,sizeof original,"%s%s%s",head,keep,tail);assert(size==(size_t)n && !memcmp(data,original,size));
+    assert(!picasso_jobs_transform(data,&size,&removed) && !removed);
+    const char *near="\n <key>com.apple.mobile.lockdown.extra</key>\r\n <true/>";
+    const char *owner="\n <key>com.apple.mobile.lockdown</key>\r\n <false/>";
+    n=snprintf((char *)data,sizeof data,"%s%s%s%s%s",head,keep,owner,near,tail);size=(size_t)n;
+    assert(!picasso_jobs_transform(data,&size,&removed) && removed==1);
+    n=snprintf((char *)original,sizeof original,"%s%s%s%s",head,keep,near,tail);assert(size==(size_t)n && !memcmp(data,original,size));
+    const char *bad[]={"<key>x</key><true/><key>x</key><false/>","<key>x</key><integer>1</integer>","<key></key><true/>","<key>x&amp;y</key><true/>","<key>x</key>","<key>com.apple.bluetoothd</key><true/><key>x</key><dict/>"};
+    for(unsigned i=0;i<sizeof bad/sizeof bad[0];++i){n=snprintf((char *)data,sizeof data,"%s%s%s",head,bad[i],tail);size=(size_t)n;memcpy(original,data,size);assert(picasso_jobs_transform(data,&size,&removed)==EINVAL && size==(size_t)n && !memcmp(data,original,size));}
+    memcpy(data,jobs_before,sizeof jobs_before);
+    for(size_t cut=0;cut<sizeof jobs_before-1;++cut){size=cut;memcpy(original,data,size);assert(picasso_jobs_transform(data,&size,&removed)==EINVAL && size==cut && !memcmp(data,original,size));}
+}
 int main(void){
+    parser_tests();
     setup();assert(!run() && is_after() && renames==1);unsigned max=ops;ops=0;assert(!run() && renames==1);
     for(unsigned at=1;at<=max;++at){setup();failAt=at;assert(run()!=0);assert(is_before() || is_after());failAt=0;assert(!run() && is_after());}
+    setup();nodes[3].attr.va_data_size=sizeof jobs_legacy;memcpy(nodes[3].data,jobs_legacy,sizeof jobs_legacy);assert(!run() && is_after());
+    setup();nodes[3].attr.va_data_size=sizeof jobs_bluetooth;memcpy(nodes[3].data,jobs_bluetooth,sizeof jobs_bluetooth);assert(!run() && is_after());
+    unsigned bluetoothMax=ops;
+    for(unsigned at=1;at<=bluetoothMax;++at){setup();nodes[3].attr.va_data_size=sizeof jobs_bluetooth;memcpy(nodes[3].data,jobs_bluetooth,sizeof jobs_bluetooth);failAt=at;assert(run()!=0 && (is_before() || is_after()));failAt=0;assert(!run() && is_after());}
+    setup();nodes[3].attr.va_data_size=sizeof jobs_legacy;memcpy(nodes[3].data,jobs_legacy,sizeof jobs_legacy);assert(!run() && is_after());
+    unsigned legacyMax=ops;
+    for(unsigned at=1;at<=legacyMax;++at){setup();nodes[3].attr.va_data_size=sizeof jobs_legacy;memcpy(nodes[3].data,jobs_legacy,sizeof jobs_legacy);failAt=at;assert(run()!=0 && (is_before() || is_after()));failAt=0;assert(!run() && is_after());}
     setup();shortWrite=1;assert(run()==EIO && is_before());shortWrite=0;assert(!run() && is_after());
     setup();corruptRead=1;assert(run()==EIO && is_before());corruptRead=0;assert(!run() && is_after());
     for(unsigned n=0;n<5;++n){for(unsigned bad=0;bad<4;++bad){setup();if(n==4){nodes[4]=nodes[3];nodes[4].attr.va_data_size=1;}if(bad==0)nodes[n].type=9;if(bad==1)nodes[n].attr.va_uid=501;if(bad==2)nodes[n].attr.va_gid=501;if(bad==3)nodes[n].attr.va_mode|=2;assert(run()!=0 && is_before() && !renames);}}
     setup();nodes[3].attr.va_nlink=2;assert(run()==EPERM && is_before());
     setup();nodes[3].data[0]^=1;assert(run()==EINVAL && !writes && !renames);
     setup();nodes[4]=nodes[3];nodes[4].attr.va_data_size=1;assert(!run() && is_after());
+    setup();nodes[3].attr.va_data_size=sizeof jobs_device;memcpy(nodes[3].data,jobs_device,sizeof jobs_device);
+    assert(!run() && nodes[3].attr.va_data_size==sizeof jobs_device_after && !memcmp(nodes[3].data,jobs_device_after,sizeof jobs_device_after));
+    unsigned deviceMax=ops;assert(!run() && renames==1);
+    for(unsigned at=1;at<=deviceMax;++at){
+        setup();nodes[3].attr.va_data_size=sizeof jobs_device;memcpy(nodes[3].data,jobs_device,sizeof jobs_device);failAt=at;
+        assert(run()!=0);
+        assert((nodes[3].attr.va_data_size==sizeof jobs_device && !memcmp(nodes[3].data,jobs_device,sizeof jobs_device)) ||
+            (nodes[3].attr.va_data_size==sizeof jobs_device_after && !memcmp(nodes[3].data,jobs_device_after,sizeof jobs_device_after)));
+        failAt=0;assert(!run() && nodes[3].attr.va_data_size==sizeof jobs_device_after && !memcmp(nodes[3].data,jobs_device_after,sizeof jobs_device_after));
+    }
     printf("PASS runtime jobs: %u injected operation failures/recovery, partial temp, short writes, readback, ownership/types, unknown policy and idempotence\n",max);
 }

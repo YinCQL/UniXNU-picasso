@@ -104,3 +104,26 @@ diff --git a/bsd/miscfs/bindfs/bind_vfsops.c b/bsd/miscfs/bindfs/bind_vfsops.c
  	.vfs_init               = bindfs_init,
  	.vfs_sysctl             = NULL,
  	.vfs_setattr            = NULL,
+--- a/bsd/miscfs/bindfs/bind_vfsops.c
++++ b/bsd/miscfs/bindfs/bind_vfsops.c
+@@ -99,6 +99,7 @@
+ 	VFSATTR_WANTED(vfap, f_files);
+ 	VFSATTR_WANTED(vfap, f_ffree);
+ 	VFSATTR_WANTED(vfap, f_capabilities);
++	VFSATTR_WANTED(vfap, f_uuid);
+ 
+ 	return vfs_getattr(mp, vfap, ctx);
+ }
+@@ -432,6 +433,12 @@
+ 			    ~(VOL_CAP_INT_SEARCHFS | VOL_CAP_INT_ATTRLIST | VOL_CAP_INT_READDIRATTR | VOL_CAP_INT_EXCHANGEDATA |
+ 			    VOL_CAP_INT_COPYFILE | VOL_CAP_INT_ALLOCATE | VOL_CAP_INT_VOL_RENAME | VOL_CAP_INT_ADVLOCK | VOL_CAP_INT_FLOCK);
+ 		}
++		/* A bind view keeps the backing volume's persistent identity. Only
++		 * return a UUID supplied by that filesystem; unsupported stays absent. */
++		if (VFSATTR_IS_ACTIVE(vfap, f_uuid) && VFSATTR_IS_SUPPORTED(&vfa, f_uuid)) {
++			memcpy(vfap->f_uuid, vfa.f_uuid, sizeof(vfap->f_uuid));
++			VFSATTR_SET_SUPPORTED(vfap, f_uuid);
++		}
+ 	}
+ 
+ 	if (VFSATTR_IS_ACTIVE(vfap, f_create_time)) {

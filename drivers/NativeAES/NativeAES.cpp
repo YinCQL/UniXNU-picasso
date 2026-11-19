@@ -9,6 +9,8 @@
 #pragma clang diagnostic pop
 #include <corecrypto/cc.h>
 #include <kern/task.h>
+/* PICASSO_FAIRPLAY_AES_HEADER */
+#include <sys/proc.h>
 
 extern "C" {
 volatile uint32_t native_aes_kat_status = 0;
@@ -148,30 +150,101 @@ bool NativeAES::start(IOService *provider)
   return true;
 }
 
+/* PICASSO_FAIRPLAY_AES_HELPER_BEGIN */
+#if DEVELOPMENT || DEBUG
+extern "C" int picasso_settings_service_match(proc_t);
+static unsigned picasso_fairplay_aes_ticket()
+{
+  if (!picasso_settings_service_match(current_proc())) return 0;
+  static unsigned counter;
+  unsigned value = __atomic_load_n(&counter, __ATOMIC_RELAXED);
+  while (value < 12) {
+    if (__atomic_compare_exchange_n(&counter, &value, value + 1, false,
+        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return value + 1;
+  }
+  return 0;
+}
+static void picasso_fairplay_aes_log(unsigned ticket, unsigned stage, unsigned bits,
+                                   unsigned selector, unsigned operation, IOReturn result)
+{
+  if (!ticket) return;
+  IOLog("PICASSO_FAIRPLAY_AES sample=%u stage=%u bits=%u selector=%u operation=%u result=%x\n",
+        ticket, stage, bits, selector, operation, static_cast<unsigned>(result));
+}
+#endif
+/* PICASSO_FAIRPLAY_AES_HELPER_END */
+
 IOReturn NativeAES::performAES(IOMemoryDescriptor *input, IOMemoryDescriptor *output,
                               unsigned long long bytes, IOAESIV *iv, IOAESOperation operation,
                               IOAESKeyData *key, unsigned long long inputOffset,
                               unsigned long long outputOffset, IOAESCompletion callback, void *refcon)
 {
+/* PICASSO_FAIRPLAY_AES_OBSERVE_BEGIN */
+#if DEVELOPMENT || DEBUG
+  const unsigned aes_ticket = picasso_fairplay_aes_ticket();
+  const unsigned observed_bits = aes_ticket && key ? key->bits : 0;
+  const unsigned observed_selector = aes_ticket && key ? key->selector : 0;
+  picasso_fairplay_aes_log(aes_ticket, 0, observed_bits, observed_selector, operation, 0);
+#endif
+/* PICASSO_FAIRPLAY_AES_OBSERVE_END */
   if (!input || !output || !key || !iv || !bytes || (bytes & 15) ||
-      (key->bits != 128 && key->bits != 192 && key->bits != 256)) return kIOReturnBadArgument;
+      (key->bits != 128 && key->bits != 192 && key->bits != 256)) {
+/* PICASSO_FAIRPLAY_AES_OBSERVE_BEGIN */
+#if DEVELOPMENT || DEBUG
+    picasso_fairplay_aes_log(aes_ticket, 1, observed_bits, observed_selector, operation, kIOReturnBadArgument);
+#endif
+/* PICASSO_FAIRPLAY_AES_OBSERVE_END */
+    return kIOReturnBadArgument;
+  }
   if (key->selector || (operation != IOAESEncrypt && operation != IOAESDecrypt)) {
     __atomic_fetch_add(&native_aes_unsupported_key, 1, __ATOMIC_RELAXED);
+
+/* PICASSO_FAIRPLAY_AES_OBSERVE_BEGIN */
+#if DEVELOPMENT || DEBUG
+    picasso_fairplay_aes_log(aes_ticket, 2, observed_bits, observed_selector, operation, kIOReturnUnsupported);
+#endif
+/* PICASSO_FAIRPLAY_AES_OBSERVE_END */
     return kIOReturnUnsupported;
   }
   if (inputOffset > input->getLength() || bytes > input->getLength() - inputOffset ||
-      outputOffset > output->getLength() || bytes > output->getLength() - outputOffset) return kIOReturnBadArgument;
+      outputOffset > output->getLength() || bytes > output->getLength() - outputOffset) {
+/* PICASSO_FAIRPLAY_AES_OBSERVE_BEGIN */
+#if DEVELOPMENT || DEBUG
+    picasso_fairplay_aes_log(aes_ticket, 3, observed_bits, observed_selector, operation, kIOReturnBadArgument);
+#endif
+/* PICASSO_FAIRPLAY_AES_OBSERVE_END */
+    return kIOReturnBadArgument;
+  }
   unsigned char *buffer = static_cast<unsigned char *>(IOMalloc(4096));
-  if (!buffer) return kIOReturnNoMemory;
+  if (!buffer) {
+/* PICASSO_FAIRPLAY_AES_OBSERVE_BEGIN */
+#if DEVELOPMENT || DEBUG
+    picasso_fairplay_aes_log(aes_ticket, 4, observed_bits, observed_selector, operation, kIOReturnNoMemory);
+#endif
+/* PICASSO_FAIRPLAY_AES_OBSERVE_END */
+    return kIOReturnNoMemory;
+  }
   IOReturn result = input->prepare();
   if (result) {
     IOFree(buffer, 4096);
+
+/* PICASSO_FAIRPLAY_AES_OBSERVE_BEGIN */
+#if DEVELOPMENT || DEBUG
+    picasso_fairplay_aes_log(aes_ticket, 5, observed_bits, observed_selector, operation, result);
+#endif
+/* PICASSO_FAIRPLAY_AES_OBSERVE_END */
     return result;
   }
   result = output->prepare();
   if (result) {
     input->complete();
     IOFree(buffer, 4096);
+
+/* PICASSO_FAIRPLAY_AES_OBSERVE_BEGIN */
+#if DEVELOPMENT || DEBUG
+    picasso_fairplay_aes_log(aes_ticket, 6, observed_bits, observed_selector, operation, result);
+#endif
+/* PICASSO_FAIRPLAY_AES_OBSERVE_END */
     return result;
   }
   unsigned char chaining[16];
@@ -195,6 +268,12 @@ IOReturn NativeAES::performAES(IOMemoryDescriptor *input, IOMemoryDescriptor *ou
   cc_clear(sizeof(chaining), chaining);
   output->complete();
   input->complete();
+
+/* PICASSO_FAIRPLAY_AES_OBSERVE_BEGIN */
+#if DEVELOPMENT || DEBUG
+  picasso_fairplay_aes_log(aes_ticket, 7, observed_bits, observed_selector, operation, result);
+#endif
+/* PICASSO_FAIRPLAY_AES_OBSERVE_END */
   if (callback) {
     callback(refcon, result);
     return kIOReturnSuccess;

@@ -47,9 +47,6 @@ def check(work,tree,output,profile=None):
         base=tomllib.loads((ROOT/"board.toml").read_text())["payload"]["kernel_args"]
         expected=" ".join(profile.kernel_args(base))
         new="require(payload_report['kernel_args'] == "+repr(expected)+", 'Unexpected media boot arguments')"
-        size_check="require(payload.stat().st_size == 60 * 1024**2, 'Incorrect FAT payload size')"
-        if source.count(size_check)!=1:raise ValueError('Data checker size contract changed')
-        source=source.replace(size_check,"require(payload.stat().st_size == "+str(profile.PAYLOAD_MIB)+" * 1024**2, 'Incorrect media FAT payload size')")
     if source.count(old)!=1:raise ValueError('Data checker contract changed')
     ns={'__name__':'picasso_audio_data_check','__file__':str(ROOT/'scripts/check-picasso-data-artifacts.py')}
     try:

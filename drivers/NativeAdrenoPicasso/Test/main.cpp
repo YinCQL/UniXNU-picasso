@@ -191,7 +191,7 @@ static void testBoard()
 
     CHECK(zapSegmentCount() == 3);
     CHECK(std::strcmp(zapSegment(0).name, "a620_zap.b00") == 0);
-    CHECK(zapMdt().bytes == 6860u && zapMdt().crc32 == 0x7de1dd05u);
+    CHECK(zapMdt().bytes == 6860u && zapMdt().crc32 == 0x01d2e77bu);
     CHECK(sqe().bytes == 32264u && sqe().crc32 == 0xf9a2972eu);
     CHECK(sqeAlternate() && sqeAlternate()->bytes == 31632u);
     CHECK(gmu().bytes == 41548u && gmu().crc32 == 0x5c66275cu);

@@ -27,7 +27,6 @@ GPU_FILES = {
 GPU_ARGS = ['sheng-gpu=4', 'sheng-gpu-metal=1', 'sheng-gpu-addon=1',
             'sheng-dpu-scanout=0', 'sheng-gpu-perf-index=4', 'sheng-gpu-gl=1',
             'glwait=1', 'glhooks=1']
-PAYLOAD_MIB = 80
 # Physical touch remains enabled. Only synthetic swipe repetition, the redundant
 # touch-HID default and the boot-logo hold are omitted from this playback image.
 DROP_ARGS = ['offline-hid-swipe-delay=8', 'offline-hid-auto-home-count=8',
@@ -105,7 +104,8 @@ def pack(files):
     from picasso_audio_payload import load
     hal = load(ROOT / 'scripts/build-picasso-audio-hal.py')
     from picasso_runtime_ui import FILE
-    expected = list(hal.AUDIO_FILES.items()) + list(GPU_FILES.items()) + [(FILE, 0o644)]
+    from picasso_bluetooth_payload import FILES
+    expected = list(hal.AUDIO_FILES.items()) + list(GPU_FILES.items()) + [(FILE, 0o644)] + list(FILES.items())
     if [(name, mode) for name, mode, _ in files] != expected:
         raise ValueError('Require exact ordered audio and GL files')
     body = bytearray()
@@ -178,10 +178,13 @@ def make(work):
     import picasso_runtime_ui
     audio_modules, runtime_library, runtime_report = picasso_runtime_ui.replace_module(work, audio_modules)
     files = audio_files + gpu_files + [(picasso_runtime_ui.FILE, 0o644, runtime_library)]
-    addon, trust = pack(files), bundle(audio_modules + [gpu_module])
+    import picasso_bluetooth_payload as bluetooth
+    bt_files, bt_module, bt_report = bluetooth.make(work)
+    files += bt_files
+    addon, trust = pack(files), bundle(audio_modules + [gpu_module, bt_module])
     report = dict(passed=True, runtime_qualified=False, addon_sha256=digest(addon), trust_sha256=digest(trust),
         gpu_release_sha256=GPU_SHA, gpu_release_trust_sha256=GPU_TRUST_SHA, gpu_identities=identities, nativegl=gl_report,
-        original_modules_unchanged=True, audio_module_unchanged=True, exact_owned_entries=7, runtime_ui=runtime_report,
+        original_modules_unchanged=True, audio_module_unchanged=True, exact_owned_entries=12, runtime_ui=runtime_report, bluetooth=bt_report,
         excluded_release_files=[n for n, _, _ in all_gpu if n not in GPU_FILES],
         files={n:dict(mode=m, bytes=len(data), sha256=digest(data)) for n, m, data in files})
     return addon, trust, report, ui, audio_identity
@@ -215,6 +218,8 @@ def main():
     if a.mode == 'prepare':
         import picasso_runtime_ui
         picasso_runtime_ui.build(work)
+        import picasso_bluetooth_payload
+        picasso_bluetooth_payload.build(work)
         raw_addon, trust, result, _, _ = make(work)
         out = work / 'media'
         out.mkdir(exist_ok=True)

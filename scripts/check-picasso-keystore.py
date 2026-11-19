@@ -17,6 +17,8 @@ def main():
     args = parser.parse_args()
     out = args.output.resolve(); out.mkdir(parents=True, exist_ok=False)
     (out / 'IOKit').mkdir()
+    (out/'libkern/crypto').mkdir(parents=True)
+    for header in ['aes.h','sha2.h']:(out/'libkern/crypto'/header).write_text('// Host crypto oracle supplied by fixture.\n')
     for name in ('IOService', 'IOUserClient', 'IOMemoryDescriptor', 'IOLib'):
         (out / 'IOKit' / (name + '.h')).write_text('// API supplied by the host fixture.\n')
     source = ROOT / 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp'
@@ -35,7 +37,7 @@ def main():
     spec = importlib.util.spec_from_file_location('host', ROOT / 'scripts/check-picasso-user-fault.py')
     host = importlib.util.module_from_spec(spec); spec.loader.exec_module(host)
     report = {'scope': __doc__, 'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
-              'logger_sha256': hashlib.sha256(logger.encode()).hexdigest(), 'runs': []}
+              'logger_sha256': hashlib.sha256(logger.encode()).hexdigest(), 'inputs': {str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in [source,fixture,ROOT/'package/PicassoKeyStore.cpp',Path(__file__)]}, 'runs': []}
     for asan in (False, True):
         name = 'state-asan' if asan else 'state'
         if os.name == 'nt':
@@ -44,7 +46,7 @@ def main():
             cmd = f'cl /nologo /std:c++17 /EHsc /W4 /WX /Od /Zi{flags} /I"{out}" /I"{source.parent}" /Fd:{name}.pdb /Fo:{name}.obj /Fe:{name}.exe test.cpp /link /INCREMENTAL:NO'
             result = host.batch_run(out, name, cmd + f' > {name}-compile.log 2>&1\nif not "%errorlevel%"=="0" exit /b %errorlevel%\n{name}.exe > {name}.log 2>&1\nexit /b %errorlevel%\n', vcvars)
         else:
-            cmd = ['clang++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-O1', '-g', '-I', str(out), '-I', str(source.parent), str(out / 'test.cpp'), '-o', str(out / name)]
+            cmd = ['clang++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-Wno-deprecated-declarations', '-O1', '-g', '-I', str(out), '-I', str(source.parent), str(out / 'test.cpp'), '-o', str(out / name), '-lcrypto']
             if asan: cmd += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
             result = subprocess.run(cmd, capture_output=True, text=True)
             (out / (name + '-compile.log')).write_text(result.stdout + result.stderr)

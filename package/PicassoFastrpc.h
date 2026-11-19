@@ -21,6 +21,8 @@ struct PicassoRpcDomain {
     uint64_t address;
     uint32_t pd,pid,stage,defaultHandle,sequence,requests,lastHandle,lastScalar;
     uint32_t previousCtx,previousResult,replyBytes,opens,decodeResult,wireBytes;
+    uint32_t reverseErrors,notFound,decodeErrors,firstFailure,firstFailureScalar;
+    char firstFailureName[128];
     int error;
     bool registered,initialized,stdOpen;
     char name[128];
@@ -57,7 +59,7 @@ static inline bool picasso_rpc_trace(PicassoRpcTrace &t,const PicassoRpcDomain &
     bool progress=(d.requests>>8)!=t.checkpoint;t.checkpoint=d.requests>>8;
     bool sample=t.repeated<=2 || !(t.repeated&(t.repeated-1));
     bool failure=sample && d.previousResult && t.errors<64;
-    if((sample && t.emitted<512) || failure || progress) { ++t.emitted;if(failure)++t.errors;return true; }
+    if((sample && t.emitted<64) || failure || progress) { ++t.emitted;if(failure)++t.errors;return true; }
     return false;
 }
 struct PicassoFastrpc {
@@ -184,14 +186,16 @@ static inline int rpcNext(PicassoFastrpc *f,unsigned n) {
     const uint8_t *in[2]={prim,d.reply};const uint32_t lengths[4]={16,d.replyBytes,16,PicassoRpcBlob};
     return rpcBuild(f,n,1,3,0x04020200,in,lengths);
 }
-static inline void picasso_rpc_tick(PicassoFastrpc *f) {
+// Completion pumping is separate from the regular 20 ms timeout clock.
+// A faster receive pass must never age a queued/control call or recycle ownership.
+static inline void picasso_rpc_tick(PicassoFastrpc *f,bool elapsed=true) {
     if(!f->bound || f->stopped)return;
     int error=f->io.healthy(f->io.context);if(error) { picasso_rpc_stop(f,error);return; }
     for(unsigned n=0;n<2;++n) {
         auto &d=f->domain[n];if(d.error)continue;
         for(unsigned slot=0;slot<2;++slot) { auto &c=d.call[slot];
             // next2 is a blocking listener and may remain idle indefinitely.
-            if((c.queued || (c.pending && slot==0)) && ++c.ticks>250) { d.error=-60;++f->events;break; }
+            if(elapsed && (c.queued || (c.pending && slot==0)) && ++c.ticks>250) { d.error=-60;++f->events;break; }
             if(!c.complete)continue;
             error=f->io.sync(f->io.context,n,slot,false);
             if(error) { picasso_rpc_stop(f,error);return; }
@@ -212,7 +216,15 @@ static inline void picasso_rpc_tick(PicassoFastrpc *f) {
                 d.previousResult=len>PicassoRpcBlob?77:rpcUnpack(p+c.offset[3],len,d.lastScalar,d.reply,args,&d.replyBytes);
                 d.decodeResult=d.previousResult;
                 if(!d.previousResult)d.previousResult=rpcReverse(d,args,d.lastScalar,d.lastHandle);
-                if(d.previousResult)d.replyBytes=0;
+                if(d.previousResult) {
+                    d.replyBytes=0;++d.reverseErrors;
+                    if(d.previousResult==2)++d.notFound;
+                    if(d.decodeResult)++d.decodeErrors;
+                    if(!d.firstFailure) {
+                        d.firstFailure=d.previousResult;d.firstFailureScalar=d.lastScalar;
+                        for(unsigned i=0;i<128;++i)d.firstFailureName[i]=d.name[i];
+                    }
+                }
                 ++f->events;
             }
         }

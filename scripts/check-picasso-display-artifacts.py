@@ -70,7 +70,9 @@ def check(tree, work, kernelcache, output):
         'hid-original-bindings.o', 'NativeGOPPresenter.late.o', 'NativeGOPGlue.o',
         'PicassoPr13.o', 'PicassoButtons.o', 'PicassoBacklight.o', 'PicassoBrightness.late.o',
         'PicassoSpmi.o', 'PicassoPower.o', 'PicassoBattery.o', 'PicassoAdsp.o', 'PicassoAdspFirmware.o', 'PicassoFat.o',
-        'PicassoAudioService.late.o', 'PicassoMicService.o', 'PicassoMicHardware.o', 'PicassoMicPower.o', 'PicassoQmp.o', 'PicassoAop.o', 'PicassoSmp2p.o', 'PicassoSmp2pDevice.o', 'PicassoAdspBoot.o', 'PicassoGlink.o', 'PicassoRpcDma.o', 'PicassoRpcFs.o'}, 'Wrong display/state/input archive members')
+        'PicassoAudioService.late.o', 'PicassoMicService.o', 'PicassoMicHardware.o', 'PicassoMicPower.o', 'PicassoQmp.o', 'PicassoAop.o', 'PicassoSmp2p.o', 'PicassoSmp2pDevice.o', 'PicassoAdspBoot.o', 'PicassoGlink.o', 'PicassoRpcDma.o', 'PicassoRpcFs.o',
+        'PicassoBluetooth.o', 'PicassoBluetoothPower.o', 'PicassoBtFirmware.o',
+        'qbt_core.o', 'qbt_linux.o', 'qbt_geni.o', 'qbt_transport.o', 'btqca.o'}, 'Wrong display/state/input/Bluetooth archive members')
     kernel = work / 'kernel/kernel.macho'
     plan = json.loads(kernel.with_suffix('.json').read_text())
     report = builder.verify_kernel(aes, native, original, kernel.read_bytes(), plan, audit)
@@ -97,6 +99,12 @@ def check(tree, work, kernelcache, output):
     builder.require({'_picasso_mic_service_init', '_picasso_mic_service_call', '_picasso_mic_service_close', '_picasso_mic_service_tick', '_picasso_mic_hardware',
                      '_picasso_mic_rails_acquire', '_picasso_mic_rails_release'} <= linked_names,
                     'Missing microphone capture worker, codec or power qualification')
+    builder.require({'_picasso_bluetooth_probe', '_picasso_bt_power', '_picasso_bt_runtime_result',
+                     '_picasso_bt_firmware_read', '_qbt_boot_wcn399x', '_qbt_transport_init',
+                     '_qbt_transport_tx_take', '_armcpu_spi_mask'} <= linked_names,
+                    'Missing WCN399x worker, firmware, UART.SK or interrupt mask')
+    report['bluetooth'] = {'linked': True, 'runtime_qualified': False,
+                           'firmware_checked_separately': True, 'rx_wake_qualified': False}
     report['microphone_capture'] = {'linked': True, 'automatic_capture': False,
                                     'default_enabled': False, 'os_input_published': True, 'runtime_qualified': False}
     report['audio_service'] = {'worker_linked': True, 'late_initializer_verified': True,

@@ -286,6 +286,10 @@ def main():
     hid_objects, hid_sources = hid.build(ROOT, platform, native, record, out, board)
     objects += hid_objects
     sources += hid_sources
+    bluetooth = load(ROOT / 'scripts/build-picasso-bluetooth.py')
+    bt_objects, bt_sources = bluetooth.build(ROOT, platform, record, out)
+    objects += bt_objects
+    sources += bt_sources
     sources += [ROOT / 'drivers/NativeNovatekTouch/TouchPublish.h']
     sources += [ROOT / 'kits/picasso/PicassoAudioAbi.h', ROOT / 'kits/picasso/PicassoAudioQueue.h', ROOT / 'kits/picasso/PicassoAudioInput.h']
     sources += [ROOT / 'kits/picasso' / name for name in ('PicassoCapture.h', 'PicassoCaptureApr.h',

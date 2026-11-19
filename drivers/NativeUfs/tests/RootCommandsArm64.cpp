@@ -44,6 +44,11 @@ static void IOLockUnlock(void *) {}
 static IOReturn recordTransport(IOReturn result,uint32_t ocs) {
   gRootDiagnostic.result=result; gRootDiagnostic.ocs=ocs; return result;
 }
+static bool gRuntimeSlots=false;
+static uint64_t gUtrlPhys=0;
+static IOReturn runtimeRead4k(uint8_t,uint64_t,uint32_t,void*){return kIOReturnNotReady;}
+static IOReturn runtimeWrite4k(uint8_t,uint64_t,uint32_t,const void*,bool){return kIOReturnNotReady;}
+static IOReturn runtimeSyncCache(){return kIOReturnNotReady;}
 #include "../RootCommands.h"
 #include "../RootQueue.h"
 
@@ -93,7 +98,7 @@ extern "C" void guest_main() {
   for (unsigned i=0;i<64;++i) l2[i]=(0x40000000ULL+i*0x200000ULL)|0x401|(share<<8);
   l2[128]=reinterpret_cast<uintptr_t>(l3)|3;
   constexpr uint64_t physical=TEST_DMA_PHYS;
-  for (unsigned i=0;i<kDmaBytes/4096;++i) l3[i]=(physical+i*4096)|0x403|(share<<8);
+  for (unsigned i=0;i<kDmaBytesOneSlot/4096;++i) l3[i]=(physical+i*4096)|0x403|(share<<8);
   enable_translation(reinterpret_cast<uintptr_t>(l1),tcr);
   uint64_t state;
   asm volatile("mrs %0, tcr_el1":"=r"(state)); number("TCR",state);
@@ -109,12 +114,13 @@ extern "C" void guest_main() {
   asm volatile("at s1e1r, %0; isb"::"r"(uint64_t(0x50000000)):"memory");
   asm volatile("mrs %0, par_el1":"=r"(state)); number("DMA_PAR",state);
   check(!(state&1) && (state&0x0000fffffffff000ULL)==physical,"VA to PA");
-  asm volatile("at s1e1r, %0; isb"::"r"(uint64_t(0x50000000+kDmaBytes)):"memory");
+  asm volatile("at s1e1r, %0; isb"::"r"(uint64_t(0x50000000+kDmaBytesOneSlot)):"memory");
   asm volatile("mrs %0, par_el1":"=r"(state)); check(state&1,"4K guard page");
 
+  gUtrlPhys=physical;
   gHost={reinterpret_cast<uint8_t *>(0x50000000),physical,true,false,0x10000000,&testLock};
-  for (unsigned i=0;i<kDmaBytes;++i) gHost.virt[i]=0;
-  cacheCivac(gHost.virt,kDmaBytes);
+  for (unsigned i=0;i<kDmaBytesOneSlot;++i) gHost.virt[i]=0;
+  cacheCivac(gHost.virt,kDmaBytesOneSlot);
   constexpr uintptr_t pci=0x3f008000;
   check(read32(pci,0)==0x00131b36,"QEMU UFS PCI identity");
   write32(pci,0x10,gHost.hc); write32(pci,0x14,0);

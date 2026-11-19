@@ -8,8 +8,11 @@ import hashlib
 from pathlib import Path
 import struct
 
-SOURCE_BYTES = 178958336
-SOURCE_SHA256 = 'a77ac6adc2f89300ce953d2b5e0e52d6f9263e41bb23c424aaaf9a26bf20a8be'
+from picasso_firmware import manifest
+
+PINS = manifest('adsp')['files']['NON-HLOS.bin']
+SOURCE_BYTES = PINS['bytes']
+SOURCE_SHA256 = PINS['sha256']
 BASE, SIZE = 0x89200000, 0x02800000
 MAX_FILE = SIZE
 

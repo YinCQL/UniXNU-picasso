@@ -86,7 +86,7 @@ jobs:
           test -d "$DEVELOPER_DIR"
           # lld is a separate Homebrew formula now; the llvm bottle no longer
           # ships ld.lld, which the entry-probe patcher needs.
-          brew install cmake ninja unifdef llvm lld mtools dtc ccache
+          brew install cmake ninja unifdef llvm lld mtools dtc ccache pkg-config openssl@3 libplist
           # Kernel compiles go through ccache with the SDK's own clang (not the Homebrew llvm
           # added to PATH below); MakeInc.cmd keeps CC/CXX that come from the environment.
           mkdir -p "$RUNNER_TEMP/ccache-bin"
@@ -105,14 +105,10 @@ jobs:
           python3 scripts/build-picasso-sb-inject.py \
             package/picasso-springboard/picasso-springboard-probe.m out/picasso/libpicasso-sb.dylib
 
-      - name: Prepare authenticated stock touch firmware
+      - name: Prepare bundled factory touch, GPU and Bluetooth firmware
         run: |
-          python3 scripts/fetch-picasso-touch-firmware.py --output out/picasso/novatek/firmware.bin
+          python3 -B scripts/prepare-picasso-firmware.py --work out/picasso
           echo "NOVATEK_TOUCH_FW=$PWD/out/picasso/novatek/firmware.bin" >> "$GITHUB_ENV"
-
-      - name: Prepare exact stock Adreno 620 firmware
-        run: |
-          python3 scripts/fetch-picasso-gpu-firmware.py --output out/picasso/gpu-firmware
           echo "ADRENO620_FW_DIR=$PWD/out/picasso/gpu-firmware" >> "$GITHUB_ENV"
           cp out/picasso/gpu-firmware/firmware.json out/picasso/logs/gpu-firmware.json
 
@@ -174,8 +170,8 @@ jobs:
             python3 scripts/prepare-picasso-compose-seed.py --tree "$UNIXNU_TREE" \
               --work out/picasso --output out/picasso/persistent-inputs
           else
-            python3 scripts/picasso_linux_inputs.py reuse-optional --tree "$UNIXNU_TREE" \
-              --output out/picasso/persistent-inputs "${SEED_ARGS[@]}"
+            python3 -B scripts/prepare-picasso-retained-seed.py --tree "$UNIXNU_TREE" \
+              --work out/picasso --output out/picasso/persistent-inputs
           fi
           if [ -s out/picasso/persistent-inputs/manifest.json ]; then
             echo "PICASSO_LINUX_INPUTS=$PWD/out/picasso/persistent-inputs" >> "$GITHUB_ENV"
@@ -191,13 +187,15 @@ jobs:
               2>&1 | tee out/picasso/logs/actions-ram-data.log
           fi
 
-      - name: Extract the exact stock audio route read-only
+      - name: Extract exact stock audio and Bluetooth inputs read-only
         run: |
           sudo "$(command -v python3)" -B scripts/prepare-picasso-compose-media.py stock-audio \
             --work out/picasso --source "out/ipsw/$PICASSO_IPSW_BUILD/$PICASSO_OS_MEMBER" \
             2>&1 | tee out/picasso/logs/actions-stock-audio.log
 
-      - name: Build signed audio, NativeGL and runtime UI inputs
+      - name: Build signed audio, NativeGL, runtime UI and Bluetooth inputs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 -B scripts/prepare-picasso-compose-media.py build --work out/picasso \
             2>&1 | tee out/picasso/logs/actions-media.log
@@ -314,7 +312,7 @@ jobs:
 
       - name: Export audited iOS16 inputs for Linux builds
         run: |
-          sudo env PATH="$PATH" PICASSO_LINUX_INPUTS="${PICASSO_LINUX_INPUTS:-}" \
+          sudo env PATH="$PATH" PICASSO_LINUX_INPUTS="${PICASSO_LINUX_INPUTS:-}" GITHUB_SHA="$GITHUB_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \
             "$(command -v python3)" -B scripts/export-picasso-media-inputs.py --tree out/picasso/tree \
             --work out/picasso --output out/picasso/linux-inputs
 
@@ -328,7 +326,7 @@ jobs:
             -o "$GITHUB_WORKSPACE/device/out/picasso/boot/boot.img" \
             2>&1 | tee out/picasso/logs/bootimg.log
           python3 - <<'PY'
-          import hashlib, json, struct
+          import hashlib, json, struct, tomllib
           from pathlib import Path
           boot = Path('out/picasso/boot/boot.img')
           blob = boot.read_bytes()
@@ -337,7 +335,9 @@ jobs:
           assert page >= 2048 and page & (page - 1) == 0
           offset = page + (kernel_size + page - 1) // page * page
           payload = Path('out/picasso/payload/payload.img').read_bytes()
-          assert ramdisk_size == len(payload) == 80 * 1024**2
+          capacity = tomllib.loads(Path('board.toml').read_text())['payload']['size_mib']
+          assert type(capacity) is int and capacity > 0
+          assert ramdisk_size == len(payload) == capacity * 1024**2
           assert blob[offset:offset + ramdisk_size] == payload
           files = [boot, Path('out/picasso/payload/payload.img')]
           (boot.parent / 'SHA256SUMS').write_text(''.join(
@@ -355,6 +355,14 @@ jobs:
         with:
           name: picasso-data-seed-${{ github.run_number }}
           path: device/out/picasso/linux-inputs/**
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Retain signed media for this exact revision
+        uses: actions/upload-artifact@v4
+        with:
+          name: picasso-signed-media-${{ github.run_number }}
+          path: device/out/picasso/signed-media-inputs/**
           if-no-files-found: error
           retention-days: 90
 
@@ -389,6 +397,9 @@ jobs:
             device/out/picasso/runtime-ui/*.json
             device/out/picasso/runtime-ui/*.log
             device/out/picasso/media/*.json
+            device/out/picasso/bluetooth-userland/**/*.json
+            device/out/picasso/bluetooth-userland/**/*.log
+            device/out/picasso/firmware-inputs.json
             device/out/picasso/persistent-inputs/imported-seed.json
             device/out/picasso/linux-inputs/**
             device/out/picasso/.config

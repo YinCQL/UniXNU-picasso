@@ -6,6 +6,7 @@ static int hostFirmwareGeometry(uint8_t lun, uint64_t *blocks)
 {
   *blocks = 0;
   if (lun >= 8) return -22;
+  if (gRuntimeSlots) return runtimeFirmwareGeometry (lun, blocks);
   if (!gHost.lock) return -11;
   IOLockLock(gHost.lock);
   int error = -5;

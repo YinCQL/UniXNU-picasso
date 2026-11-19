@@ -26,6 +26,8 @@ def main():
     inputs.load_script = load
     try:
         inputs.export(args.tree.resolve(), args.work.resolve(), args.output.resolve())
+        from picasso_ci_media import export
+        export(args.work.resolve(), args.tree.resolve(), args.output.resolve().parent / 'signed-media-inputs')
     finally:
         inputs.load_script = original
 

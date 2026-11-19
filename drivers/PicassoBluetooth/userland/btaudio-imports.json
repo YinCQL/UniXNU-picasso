@@ -1,0 +1,72 @@
+[
+  {
+    "name": "os_channel_advance_slot",
+    "stub": "0x57434",
+    "slot": "0x85400"
+  },
+  {
+    "name": "os_channel_attr_create",
+    "stub": "0x57440",
+    "slot": "0x85408"
+  },
+  {
+    "name": "os_channel_attr_destroy",
+    "stub": "0x5744c",
+    "slot": "0x85410"
+  },
+  {
+    "name": "os_channel_attr_set",
+    "stub": "0x57458",
+    "slot": "0x85418"
+  },
+  {
+    "name": "os_channel_attr_set_key",
+    "stub": "0x57464",
+    "slot": "0x85420"
+  },
+  {
+    "name": "os_channel_create_extended",
+    "stub": "0x57470",
+    "slot": "0x85428"
+  },
+  {
+    "name": "os_channel_destroy",
+    "stub": "0x5747c",
+    "slot": "0x85430"
+  },
+  {
+    "name": "os_channel_get_fd",
+    "stub": "0x57488",
+    "slot": "0x85438"
+  },
+  {
+    "name": "os_channel_get_next_slot",
+    "stub": "0x57494",
+    "slot": "0x85440"
+  },
+  {
+    "name": "os_channel_ring_id",
+    "stub": "0x574a0",
+    "slot": "0x85448"
+  },
+  {
+    "name": "os_channel_rx_ring",
+    "stub": "0x574ac",
+    "slot": "0x85450"
+  },
+  {
+    "name": "os_channel_set_slot_properties",
+    "stub": "0x574b8",
+    "slot": "0x85458"
+  },
+  {
+    "name": "os_channel_sync",
+    "stub": "0x574c4",
+    "slot": "0x85460"
+  },
+  {
+    "name": "os_channel_tx_ring",
+    "stub": "0x574d0",
+    "slot": "0x85468"
+  }
+]

@@ -76,6 +76,8 @@ roots = [
   "com.apple.driver.AppleARMWatchdogTimer",
   "com.apple.driver.AppleMobileFileIntegrity",
   "com.apple.driver.ApplePMGR",
+  # Original service required by the stock FairPlay daemon during lockdown startup.
+  "com.apple.driver.FairPlayIOKit",
   "com.apple.filesystems.apfs",
   "com.apple.iokit.IOHIDFamily",
   # Codeless personalities match the virtual keyboard and digitizer.
@@ -153,11 +155,21 @@ BUILDID_STRING = "picasso-research"
 [payload]
 volume = "PICASSOESP"
 # Seed baseline: keep this list stable for existing persistent Data identity.
-# runtime_enabled_jobs below is applied before launchd to both new and restored Data.
+# runtime_enabled_jobs releases Bluetooth and the stock device-name owner
+# before launchd, including Data already migrated by earlier Bluetooth images.
 # Exact 20H392 labels, selected by job label, plist name or executable name.
 # watchdogd stays disabled; wdt=0 disables its checkin policy below.
-runtime_enabled_jobs = ["com.apple.bluetoothd"]
-# bluetoothd supplies the BTAudioHALPlugin service; radio hardware is unimplemented.
+runtime_enabled_jobs = [
+  "com.apple.BTServer.avrcp",
+  "com.apple.BTServer.le",
+  "com.apple.BTServer.map",
+  "com.apple.BTServer.pbap",
+  "com.apple.BluetoothUIService",
+  "com.apple.bluetoothd",
+  "com.apple.bluetoothuserd",
+  "com.apple.mobile.lockdown",
+]
+# The addon supplies the pinned BTAudioHALPlugin ABI bridge and WCN399x UART.SK.
 offline_disabled_jobs = [
   "com.apple.BTServer.avrcp",
   "com.apple.BTServer.le",
@@ -219,8 +231,8 @@ offline_disabled_jobs = [
 skip_setup_tool = "scripts/picasso-seed-skip-setup.py"
 # Native rectangular status bar: time at left, no carrier label or date.
 skip_setup_args = ["--no-auto-dim", "--inject-lib", "out/picasso/libpicasso-sb.dylib", "--statusbar-provider", "_UIStatusBarVisualProvider_Pad_ForcedNoCell"]
-# Fits the kernel, trust caches and packed Data seed within the 95% content limit.
-size_mib = 60
+# Actual FAT payload capacity for local and CI builds; contents must fit its 95% limit.
+size_mib = 96
 loader = "firmware"
 title = "Boot"
 dram_size = "0x180000000"

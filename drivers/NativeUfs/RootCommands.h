@@ -154,7 +154,8 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
     return recordTransport (end == UfsTransferEnd::Timeout ? kIOReturnTimeout : kIOReturnIOError, *ocs);
   }
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT response invalidate=begin\n");
-  cacheInvalidate (gHost.virt, kDataOffset + dataBytes);
+  cacheInvalidate (gHost.virt + kUcdOffset + kRspOffset, 512);
+  if (dataBytes && direction == 2) cacheInvalidate (gHost.virt + kDataOffset, dataBytes);
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT response invalidate=end\n");
   gRootDiagnostic.response = loadBe32 (gHost.virt + kUcdOffset + kRspOffset);
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT response read=end word0=%08x\n", gRootDiagnostic.response);
@@ -350,6 +351,7 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   if (!dst || !blocks || blocks > kDataMax / 4096 || lba > 0xffffffffULL - (blocks - 1)) {
     return kIOReturnBadArgument;
   }
+  if (gRuntimeSlots) return runtimeRead4k (lun, lba, blocks, dst);
   if (!gHost.lock) return kIOReturnNotReady;
   IOLockLock (gHost.lock);
   // A preceding request may have quarantined the host while this reader
@@ -447,6 +449,7 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
   if (!src || !blocks || blocks > kDataMax / 4096 || lun != 0 || !hostInWindow (lba, blocks)) {
     return kIOReturnBadArgument;
   }
+  if (gRuntimeSlots) return runtimeWrite4k (lun, lba, blocks, src, fua);
   if (!gHost.lock) return kIOReturnNotReady;
   IOLockLock (gHost.lock);
   if (!gHost.ready || gHost.poisoned) {
@@ -466,7 +469,8 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
 // SYNCHRONIZE CACHE(10) for the whole LUN: everything written so far is on the medium when this returns.
 static IOReturn hostSyncCache (void)
 {
-  if (!gHost.lock || (!gStoreOpen && !gLogOpen)) return kIOReturnNotReady;
+  if (gRuntimeSlots) return runtimeSyncCache ();
+  if (!gHost.lock || (!gStoreOpen && !gLogOpen && !gAuxOpen)) return kIOReturnNotReady;
   IOLockLock (gHost.lock);
   if (!gHost.ready || gHost.poisoned) {
     IOLockUnlock (gHost.lock);

@@ -85,6 +85,8 @@ static void IOSleep(unsigned ms) {
     if(sleeps==1602)ram[(part+48+36)/4]=1; // External mutation stops service.
 }
 static void IODelay(unsigned) {}
+static uint64_t mach_absolute_time(){return uint64_t(sleeps)*20000000;}
+static void absolutetime_to_nanoseconds(uint64_t t,uint64_t *n){*n=t;}
 static bool PE_parse_boot_argn(const char *,void *,int){return false;}
 #include "PicassoSmp2pDevice-body.inc"
 extern "C" void picasso_audio_service_tick(PicassoAprProbe &,bool) {}
@@ -158,6 +160,16 @@ extern "C" void picasso_adsp_boot(const PicassoAdspEvents *e) {
     assert(g->apr.ticks==ticks && g->txHead==head);
     ipccRam[3]=0;assert(e->fast(e->context) && !ipccRam[3]);
     v.enabled=false;assert(!e->fast(e->context) && !ipccRam[3]);
+    // A finite burst follows real FastRPC traffic, even while audio is idle.
+    auto &rpc=g->fastrpc;rpc.bound=true;rpc.received=1;
+    auto &channel=g->channel[1];channel.used=channel.supported=channel.up=true;channel.local=3;
+    for(unsigned i=0;i<8;++i)assert(e->fast(e->context));
+    assert(!e->fast(e->context) && !b->rpcFastBudget && g->apr.ticks==ticks);
+    ++rpc.received;assert(e->fast(e->context) && b->rpcFastBudget==7);
+    rpc.stopped=true;assert(!e->fast(e->context) && !b->rpcFastBudget);
+    rpc.stopped=false;channel.closing=true;++rpc.received;
+    assert(!e->fast(e->context) && !b->rpcFastBudget);
+    puts("PASS finite FastRPC bursts, idle fallback, stopped/closing gates and unchanged audio clock");
     puts("PASS fast GLINK adapter uses LPASS signal 0 and leaves SMP2P signal 2 separate");
 }
 extern "C" int picasso_rpmh_adsp_plan(){assert(!preempt && !allocations);++plans;return 0;}
@@ -299,6 +311,30 @@ int main(int argc,char **argv) {
         last.completed=0xffffffc0;a.play.writeDone=0x40;
         assert(playLogKind(last,a)==PlayLogProgress);
         puts("PASS playback log rate, session/phase transitions, immediate faults and counter wrap");
+    }
+    {
+        PicassoGlink g={};BootEvents b={};b.glink=&g;
+        assert(!fastrpcLogDue(&b));
+        for(unsigned i=1;i<=8;++i) {g.fastrpc.received=i;++g.fastrpc.events;assert(fastrpcLogDue(&b));}
+        for(unsigned i=9;i<2000;++i) {g.fastrpc.received=i;++g.fastrpc.events;assert(!fastrpcLogDue(&b));}
+        g.fastrpc.bound=true;assert(fastrpcLogDue(&b));assert(!fastrpcLogDue(&b));
+        g.fastrpc.domain[1].stage=5;assert(fastrpcLogDue(&b));
+        g.fastrpc.domain[1].error=-60;assert(fastrpcLogDue(&b));assert(!fastrpcLogDue(&b));
+        ++g.fastrpc.malformed;assert(fastrpcLogDue(&b));
+        ++g.fastrpc.unclaimed;assert(fastrpcLogDue(&b));
+        g.fastrpc.stopped=true;assert(fastrpcLogDue(&b));
+        for(unsigned i=0;i<8;++i)assert(rpcDetailDue(&b,1,true,false));
+        for(unsigned i=0;i<1000;++i)assert(!rpcDetailDue(&b,1,true,false));
+        ++g.fastrpc.domain[1].reverseErrors;assert(rpcDetailDue(&b,1,false,false));
+        assert(!rpcDetailDue(&b,1,false,false));assert(rpcDetailDue(&b,1,false,true));
+        assert(rpcDetailDue(&b,0,true,false)); // independent PD quotas
+        auto &w=b.rpcWork;w.slow=~0ULL;w.fast=~0ULL;w.slowMax=w.fastMax=~0ULL;
+        w.diagnostic=~0ULL;w.slowCalls=w.fastCalls=w.diagnosticGroups=0xffffffffU;
+        g.fastrpc.domain[1].requests=g.fastrpc.domain[1].pd=0xffffffffU;
+        logRpcWork(&b,1);
+        uint64_t before=mach_absolute_time();++sleeps;accountRpcDiagnostic(&b,before);
+        assert(w.diagnostic==19999999ULL && !w.diagnosticGroups);
+        puts("PASS normal RPC log quotas, independent PDs, late lifecycle/fault/error bypass and bounded device cost records");
     }
     PicassoRpcDomain record={};record.pd=record.requests=record.lastHandle=record.lastScalar=0xffffffffU;
     record.wireBytes=record.decodeResult=record.previousResult=0xffffffffU;

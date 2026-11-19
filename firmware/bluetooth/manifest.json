@@ -1,0 +1,28 @@
+{
+  "schema": "picasso-firmware-input-v1",
+  "board": "picasso",
+  "soc": "SM7250",
+  "source": "Picasso V13.0.5.0.SGICNXM BTFM.bin",
+  "container": {
+    "name": "BTFM.bin",
+    "bytes": 225280,
+    "sha256": "0bdf00abfd26569eac7ce7e36647aa5155f846dc3557ee9945af2270d3686fd6",
+    "directory": "image"
+  },
+  "files": {
+    "crbtfw32.tlv": {
+      "bytes": 124092,
+      "sha256": "6c5b52e8bcb0d3a4f60b137f31d8e0cdec381b4118b9a955e05e61af61595d47"
+    },
+    "crnv32.bin": {
+      "bytes": 5488,
+      "sha256": "43f6ef7f73f721544069aa2d334da598d637a0cf492b3e4b9fc64a42e06adc26"
+    },
+    "crnv32u.bin": {
+      "bytes": 5488,
+      "sha256": "6a4cae1375d824a730de5f4f8999c52901e07ffb08b8b3339270c472db9fb0a9"
+    }
+  },
+  "stock_version": "V13.0.5.0.SGICNXM",
+  "authority": "picasso_images_V13.0.5.0.SGICNXM"
+}
