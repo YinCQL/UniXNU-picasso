@@ -4,10 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       data_size_gib:
-        description: Data capacity in GiB (integer, 4-20)
+        description: Data GiB (4-1024, MiB aligned); auto uses measured userdata capacity
         type: string
         default: "20"
         required: true
+      data_size_mib:
+        description: Exact Data MiB (blank uses data_size_gib)
+        type: string
+        default: ""
+      userdata_bytes:
+        description: Measured userdata bytes (required for auto capacity)
+        type: string
+        default: ""
       data_uuid:
         description: Data volume UUID (blank generates a new UUID)
         type: string
@@ -49,6 +57,8 @@ jobs:
         id: parameters
         env:
           DATA_SIZE_GIB: ${{ inputs.data_size_gib }}
+          DATA_SIZE_MIB: ${{ inputs.data_size_mib }}
+          USERDATA_BYTES: ${{ inputs.userdata_bytes }}
           DATA_UUID: ${{ inputs.data_uuid }}
           SKIP_SETUP: ${{ inputs.skip_setup }}
           RETENTION_DAYS: ${{ inputs.retention_days }}

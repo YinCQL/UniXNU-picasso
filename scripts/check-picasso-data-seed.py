@@ -27,13 +27,13 @@ def main():
 
     original = '11111111-2222-4333-8444-555555555555'
     requested = '66666666-7777-4888-8999-AAAAAAAAAAAA'
-    for size in ('4', '20'):
+    for size in ('4', '20', '46', '46.125', '110', '238', '1024'):
         for skip in ('true', 'false'):
             for identity in ('', requested.lower()):
                 value = seed.options(size, identity, skip, '90')
                 assert value['data_uuid'] == (requested if identity else '')
                 cases.append(f'parameters-{size}-{skip}-{bool(identity)}')
-    for size in ('0', '3', '21', '4.5', '04', '-4', '20\n', '$(id)'):
+    for size in ('0', '3', '1025', '4.00001', '04', '-4', '20\n', '$(id)'):
         reject('bad-size-' + repr(size), lambda: seed.options(size, '', 'true', '90'))
     for identity in ('0' * 32, '00000000-0000-0000-0000-000000000000', requested + '\n', '$(id)', '../seed'):
         reject('bad-uuid-' + repr(identity), lambda: seed.options('20', identity, 'true', '90'))

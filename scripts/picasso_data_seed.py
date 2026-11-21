@@ -40,14 +40,17 @@ def write_json(path, value):
 
 
 def options(size, identity, skip, retention):
-    require(re.fullmatch(r'(?:[4-9]|1[0-9]|20)', str(size)), 'Data capacity must be an integer from 4 to 20 GiB')
+    require(re.fullmatch(r'[1-9][0-9]{0,3}(?:[.][0-9]{1,10})?', str(size)), 'Invalid GiB capacity')
+    from picasso_storage_layout import gib_to_mib
+    mib = gib_to_mib(size)
+    require(4096 <= mib <= 1024*1024, 'Data capacity must be 4-1024 GiB, aligned to 1 MiB')
     require(re.fullmatch(r'(?:[1-9]|[1-8][0-9]|90)', str(retention)), 'Retention must be an integer from 1 to 90 days')
     require(skip in ('true', 'false'), 'skip_setup must be true or false')
     if identity:
         require(re.fullmatch(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', identity), 'Invalid Data UUID')
         require(uuid.UUID(identity).int != 0, 'Data UUID cannot be zero')
         identity = str(uuid.UUID(identity)).upper()
-    return dict(data_size_gib=int(size), data_uuid=identity, skip_setup=skip == 'true', retention_days=int(retention))
+    return dict(data_size_gib=(mib//1024 if mib%1024==0 else mib/1024), data_uuid=identity, skip_setup=skip == 'true', retention_days=int(retention))
 
 
 def checksum(block):
@@ -157,7 +160,8 @@ def generate(tree, source, original_trust, library, work, output, request):
     require(sys.platform == 'darwin' and os.geteuid() == 0, 'Seed generation requires native macOS and root')
     require(not work.exists() and not output.exists(), 'Generation requires new work and output directories')
     prepare = legacy.load_script('prepare-picasso-ram-data')
-    prepare.DATA_BYTES = request['data_size_gib'] * GIB
+    prepare.MAX_LOGICAL = 1024 * GIB
+    prepare.DATA_BYTES = int(request['data_size_gib'] * GIB)
     work.mkdir(parents=True)
     config = work / 'seed-config.txt'
     shutil.copyfile(ROOT / 'configs/picasso_defconfig', config)
@@ -300,6 +304,7 @@ def validate(directory, tree):
         require(path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= limit, 'Invalid seed member: ' + name)
         require(entry == dict(bytes=path.stat().st_size, sha256=legacy.digest(path)), 'Seed member hash differs: ' + name)
     prepare = legacy.load_script('prepare-picasso-ram-data')
+    prepare.MAX_LOGICAL = 1024 * GIB
     seed = json.loads((directory / 'seed.json').read_text())
     audit = json.loads((directory / 'data-audit.json').read_text())
     transform = json.loads((directory / 'setup.json').read_text())
@@ -384,10 +389,28 @@ def main():
     parser.add_argument('--work', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--request', type=Path)
+    parser.add_argument('--userdata-bytes', type=int, help='Measured userdata capacity; auto-select or validate Data size')
     args = parser.parse_args()
     if args.command == 'options':
-        request = options(os.environ.get('DATA_SIZE_GIB', '20'), os.environ.get('DATA_UUID', ''),
+        size = os.environ.get('DATA_SIZE_GIB', '20')
+        capacity = args.userdata_bytes
+        if capacity is None and os.environ.get('USERDATA_BYTES'):
+            require(re.fullmatch(r'[1-9][0-9]*', os.environ['USERDATA_BYTES']), 'Invalid measured userdata bytes')
+            capacity = int(os.environ['USERDATA_BYTES'])
+        if os.environ.get('DATA_SIZE_MIB'):
+            require(size in ('auto', '20'), 'Choose data_size_mib or custom data_size_gib, not both')
+            require(re.fullmatch(r'[1-9][0-9]*', os.environ['DATA_SIZE_MIB']), 'Invalid Data MiB capacity')
+            from decimal import Decimal
+            size = str(Decimal(os.environ['DATA_SIZE_MIB']) / 1024)
+        if size == 'auto':
+            require(capacity is not None, 'auto requires measured --userdata-bytes or USERDATA_BYTES')
+            from picasso_storage_layout import plan
+            size = str(plan(capacity)['data_gib'])
+        request = options(size, os.environ.get('DATA_UUID', ''),
                           os.environ.get('SKIP_SETUP', 'true'), os.environ.get('RETENTION_DAYS', '90'))
+        if capacity is not None:
+            from picasso_storage_layout import plan
+            plan(capacity, request['data_size_gib'])
         args.output.parent.mkdir(parents=True, exist_ok=True)
         write_json(args.output, request)
         if os.environ.get('GITHUB_OUTPUT'):
