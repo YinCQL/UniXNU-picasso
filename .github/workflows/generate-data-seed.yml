@@ -24,6 +24,18 @@ on:
         description: Mark Setup as complete
         type: boolean
         default: true
+      offline_launch_policy:
+        description: 'JSON object with disabled_jobs array; blank inherits board defaults, {"disabled_jobs":[]} adds no overrides'
+        type: string
+        default: ""
+      disable_jobs:
+        description: 'JSON array of extra job labels to disable (applied after offline_launch_policy)'
+        type: string
+        default: ""
+      enable_jobs:
+        description: 'JSON array of labels to remove from the selected disabled list; does not force jobs to start'
+        type: string
+        default: ""
       retention_days:
         description: Seed artifact retention in days (integer, 1-90)
         type: string
@@ -61,8 +73,16 @@ jobs:
           USERDATA_BYTES: ${{ inputs.userdata_bytes }}
           DATA_UUID: ${{ inputs.data_uuid }}
           SKIP_SETUP: ${{ inputs.skip_setup }}
+          OFFLINE_LAUNCH_POLICY: ${{ inputs.offline_launch_policy }}
+          DISABLE_JOBS: ${{ inputs.disable_jobs }}
+          ENABLE_JOBS: ${{ inputs.enable_jobs }}
           RETENTION_DAYS: ${{ inputs.retention_days }}
         run: python3 scripts/picasso_data_seed.py options --output out/seed-request.json
+
+      - name: Check seed parameter and policy boundaries
+        run: |
+          python3 scripts/check-picasso-data-seed.py --policy-only \
+            --output out/picasso/logs/seed-policy-host.json
 
       - name: Check pinned iPhone X 20H392 inputs
         run: |
@@ -105,6 +125,13 @@ jobs:
               summary.write(f"- Capacity: {data['parameters']['data_size_gib']} GiB\n")
               summary.write(f"- Data UUID: `{data['volume_uuid']}`\n")
               summary.write(f"- Skip Setup: {data['parameters']['skip_setup']}\n")
+              policy = json.loads(Path('out/picasso/data-seed/seed.json').read_text())['offline_launch_policy']
+              summary.write(f"- Disabled jobs: {len(policy['disabled_jobs'])}\n")
+              summary.write(f"- Userspace watchdogd disabled: {policy['watchdogd_disabled']}\n")
+              summary.write('- Removing a label from the disabled list does not force that service to start.\n')
+              summary.write('\n<details><summary>Effective offline launch policy</summary>\n\n```json\n')
+              summary.write(json.dumps({'disabled_jobs': policy['disabled_jobs']}, indent=2))
+              summary.write('\n```\n\n</details>\n\n')
               summary.write('- Verified: APFS filesystem, source ownership, offline policy, signed UI library, packed hashes.\n')
               summary.write('- Scope: seeds only; kernel compilation and hardware behavior are not qualified by this run.\n\n')
               summary.write('Extract the artifact, then run `python3 scripts/picasso_data_seed.py stage --tree <prepared-tree> '

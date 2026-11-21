@@ -39,7 +39,45 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 
 
-def options(size, identity, skip, retention):
+def job_list(value, field):
+    require(isinstance(value, str) and len(value) <= 16384, field + ' must be a JSON array (at most 16 KiB)')
+    try:
+        jobs = json.loads(value)
+    except ValueError as error:
+        raise ValueError(field + ' must be a JSON array of job labels') from error
+    require(isinstance(jobs, list) and len(jobs) <= 256, field + ' must contain at most 256 job labels')
+    require(all(isinstance(job, str) and len(job) <= 255 and
+                re.fullmatch(r'com[.]apple[.][A-Za-z0-9_-]+(?:[.][A-Za-z0-9_-]+)*', job)
+                for job in jobs), field + ' contains an invalid com.apple job label')
+    require(len(set(jobs)) == len(jobs), field + ' contains duplicate job labels')
+    return jobs
+
+
+def requested_jobs(policy='', disable='', enable=''):
+    prepare = legacy.load_script('prepare-picasso-ram-data')
+    payload = legacy.board()['payload']
+    jobs = list(prepare.offline_jobs(payload))
+    if policy:
+        require(isinstance(policy, str) and len(policy) <= 16384, 'offline_launch_policy must be a JSON object (at most 16 KiB)')
+        try:
+            value = json.loads(policy)
+        except ValueError as error:
+            raise ValueError('offline_launch_policy must be a JSON object with disabled_jobs') from error
+        require(isinstance(value, dict) and set(value) == {'disabled_jobs'},
+                'offline_launch_policy must contain only disabled_jobs')
+        jobs = job_list(json.dumps(value['disabled_jobs']), 'offline_launch_policy.disabled_jobs')
+        prepare.offline_jobs({**payload, 'offline_disabled_jobs': jobs})
+    added = job_list(disable, 'disable_jobs') if disable else []
+    removed = job_list(enable, 'enable_jobs') if enable else []
+    require(not set(added) & set(removed), 'A job cannot appear in both disable_jobs and enable_jobs')
+    require(set(removed) <= set(jobs), 'enable_jobs must name jobs in the selected disabled list')
+    jobs = [job for job in jobs if job not in removed]
+    jobs.extend(job for job in added if job not in jobs)
+    job_list(json.dumps(jobs), 'effective disabled_jobs')
+    return prepare.offline_jobs({**payload, 'offline_disabled_jobs': jobs})
+
+
+def options(size, identity, skip, retention, policy='', disable='', enable=''):
     require(re.fullmatch(r'[1-9][0-9]{0,3}(?:[.][0-9]{1,10})?', str(size)), 'Invalid GiB capacity')
     from picasso_storage_layout import gib_to_mib
     mib = gib_to_mib(size)
@@ -50,7 +88,59 @@ def options(size, identity, skip, retention):
         require(re.fullmatch(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', identity), 'Invalid Data UUID')
         require(uuid.UUID(identity).int != 0, 'Data UUID cannot be zero')
         identity = str(uuid.UUID(identity)).upper()
-    return dict(data_size_gib=(mib//1024 if mib%1024==0 else mib/1024), data_uuid=identity, skip_setup=skip == 'true', retention_days=int(retention))
+    request = dict(data_size_gib=(mib//1024 if mib%1024==0 else mib/1024), data_uuid=identity, skip_setup=skip == 'true', retention_days=int(retention))
+    jobs = requested_jobs(policy, disable, enable)
+    # Preserve the original request shape for retained bundles generated without overrides.
+    if policy or disable or enable:
+        request['offline_launch_policy'] = dict(disabled_jobs=jobs)
+    return request
+
+
+def validate_request(request):
+    require(isinstance(request, dict) and type(request.get('skip_setup')) is bool, 'Invalid Setup mode')
+    policy = json.dumps(request['offline_launch_policy']) if 'offline_launch_policy' in request else ''
+    require(request == options(str(request['data_size_gib']), request['data_uuid'],
+                str(request['skip_setup']).lower(), str(request['retention_days']), policy), 'Invalid seed parameters')
+    return requested_jobs(policy)
+
+
+def legacy_compatible(request, jobs):
+    return (request['data_size_gib'] == 20 and request['skip_setup'] and
+            jobs == requested_jobs())
+
+
+def prepare_base(prepare, tree, source, output, config, jobs):
+    # Configure this isolated generator module without editing the shared Compose
+    # recipe. That keeps existing bundles and their exact recipe identity valid.
+    original_jobs = prepare.offline_jobs
+    def selected_jobs(payload):
+        return original_jobs({**payload, 'offline_disabled_jobs': jobs})
+    prepare.offline_jobs = selected_jobs
+    try:
+        prepare.prepare(tree, source, output, config)
+    finally:
+        prepare.offline_jobs = original_jobs
+
+
+def expected_policy(prepare, jobs):
+    policy = dict(disabled_jobs=jobs, watchdogd_disabled='com.apple.watchdogd' in jobs, files=[])
+    for name, blob in prepare.offline_policy_contents(jobs).items():
+        policy['files'].append(dict(path=prepare.OFFLINE_POLICY_DIR + '/' + name, type='file', uid=0, gid=0,
+            mode=0o644, bytes=len(blob), sha256=hashlib.sha256(blob).hexdigest()))
+    return policy
+
+
+def verify_policy_reports(prepare, jobs, seed, audit):
+    require(seed['offline_launch_policy'] == audit['offline_launch_policy'] ==
+            audit['payload_offline_launch_policy'] == expected_policy(prepare, jobs), 'Offline policy differs')
+
+
+def verify_seed_policy(prepare, mount, jobs):
+    if not jobs:
+        for name in ('disabled.plist', 'disabled.migrated'):
+            require(not os.path.lexists(mount / prepare.OFFLINE_POLICY_DIR / name),
+                    'Empty policy must not retain launchd override files')
+    return prepare.verify_offline_policy(mount, jobs)
 
 
 def checksum(block):
@@ -157,6 +247,7 @@ def verify_settings(settings, skip, source):
 
 
 def generate(tree, source, original_trust, library, work, output, request):
+    jobs = validate_request(request)
     require(sys.platform == 'darwin' and os.geteuid() == 0, 'Seed generation requires native macOS and root')
     require(not work.exists() and not output.exists(), 'Generation requires new work and output directories')
     prepare = legacy.load_script('prepare-picasso-ram-data')
@@ -165,7 +256,7 @@ def generate(tree, source, original_trust, library, work, output, request):
     work.mkdir(parents=True)
     config = work / 'seed-config.txt'
     shutil.copyfile(ROOT / 'configs/picasso_defconfig', config)
-    prepare.prepare(tree, source, work / 'base', config)
+    prepare_base(prepare, tree, source, work / 'base', config, jobs)
     base = work / 'base'
     seed = json.loads((base / 'seed.json').read_text())
     raw, packed = base / 'data.cdr', base / 'data.dbrdisk'
@@ -181,11 +272,10 @@ def generate(tree, source, original_trust, library, work, output, request):
         write_json(base / 'seed.json', seed)
         config.write_text(prepare.configured_text(config.read_text(), identity), encoding='utf-8')
     require(packed_uuid(packed, tree) == identity, 'Packed base UUID differs')
-    jobs = prepare.offline_jobs(legacy.board()['payload'])
     with prepare.mounted(raw, work / 'base-audit', readonly=True) as info:
         require(prepare.canonical_uuid(info['VolumeUUID']) == identity, 'Mounted base UUID differs')
         subprocess.run(['diskutil', 'verifyVolume', str(work / 'base-audit')], check=True)
-        policy = prepare.verify_offline_policy(work / 'base-audit', jobs)
+        policy = verify_seed_policy(prepare, work / 'base-audit', jobs)
         prepare.verify_var(work / 'base-audit', json.loads((base / 'source-var-manifest.json').read_text()))
         source_preferences = preferences(work / 'base-audit')
     transform_tool = legacy.load_script('picasso-seed-skip-setup')
@@ -236,7 +326,7 @@ def generate(tree, source, original_trust, library, work, output, request):
     with prepare.mounted(audited_raw, work / 'payload-audit', readonly=True) as info:
         require(prepare.canonical_uuid(info['VolumeUUID']) == identity, 'Mounted payload UUID differs')
         subprocess.run(['diskutil', 'verifyVolume', str(work / 'payload-audit')], check=True)
-        payload_policy = prepare.verify_offline_policy(work / 'payload-audit', jobs)
+        payload_policy = verify_seed_policy(prepare, work / 'payload-audit', jobs)
         actual_preferences = preferences(work / 'payload-audit')
         verify_settings(actual_preferences, request['skip_setup'], source_preferences)
         if request['skip_setup']:
@@ -266,7 +356,7 @@ def generate(tree, source, original_trust, library, work, output, request):
     shutil.copyfile(config, output / 'seed-config.txt')
     (output / 'ui-trust.bundle').write_bytes(bundle)
     write_json(output / 'data-audit.json', audit)
-    compatible = request['data_size_gib'] == 20 and request['skip_setup']
+    compatible = legacy_compatible(request, jobs)
     if compatible:
         write_json(output / 'manifest.json', dict(schema=legacy.SCHEMA, recipe_sha256=legacy.recipe(tree),
                    files={name: dict(bytes=(output / name).stat().st_size, sha256=legacy.digest(output / name)) for name in legacy.FILES}))
@@ -291,10 +381,8 @@ def validate(directory, tree):
             manifest['producer']['workflow'] == WORKFLOW, 'Invalid seed producer')
     require(manifest['target'] == dict(product=target.PRODUCT, build=target.BUILD), 'Seed target differs')
     request = manifest['parameters']
-    require(type(request['skip_setup']) is bool, 'Invalid Setup mode')
-    require(request == options(str(request['data_size_gib']), request['data_uuid'],
-                str(request['skip_setup']).lower(), str(request['retention_days'])), 'Invalid seed parameters')
-    compatible = request['data_size_gib'] == 20 and request['skip_setup']
+    jobs = validate_request(request)
+    compatible = legacy_compatible(request, jobs)
     require(manifest['legacy_compatible'] is compatible, 'Wrong legacy compatibility claim')
     names = (*FILES, *(('manifest.json',) if compatible else ()))
     require(set(manifest['files']) == set(names), 'Incomplete seed bundle')
@@ -335,13 +423,7 @@ def validate(directory, tree):
     require(audit['ui_trust'] == ui, 'UI trust differs')
     require(audit['payload_setup_settings']['injected_library'] == dict(path='picasso/usr-lib/libpicasso-sb.dylib',
             sha256=ui['library']['sha256']), 'Injected library audit differs')
-    jobs = prepare.offline_jobs(legacy.board()['payload'])
-    policy = dict(disabled_jobs=jobs, watchdogd_disabled='com.apple.watchdogd' in jobs, files=[])
-    for name, blob in prepare.offline_policy_contents(jobs).items():
-        policy['files'].append(dict(path=prepare.OFFLINE_POLICY_DIR + '/' + name, type='file', uid=0, gid=0,
-            mode=0o644, bytes=len(blob), sha256=hashlib.sha256(blob).hexdigest()))
-    require(seed['offline_launch_policy'] == audit['offline_launch_policy'] == audit['payload_offline_launch_policy'] == policy,
-            'Offline policy differs')
+    verify_policy_reports(prepare, jobs, seed, audit)
     verify_settings(audit['actual_preferences'], request['skip_setup'], audit['source_preferences'])
     config = (directory / 'seed-config.txt').read_text()
     require(config == prepare.configured_text(config, identity), 'Seed configuration UUID differs')
@@ -407,7 +489,9 @@ def main():
             from picasso_storage_layout import plan
             size = str(plan(capacity)['data_gib'])
         request = options(size, os.environ.get('DATA_UUID', ''),
-                          os.environ.get('SKIP_SETUP', 'true'), os.environ.get('RETENTION_DAYS', '90'))
+                          os.environ.get('SKIP_SETUP', 'true'), os.environ.get('RETENTION_DAYS', '90'),
+                          os.environ.get('OFFLINE_LAUNCH_POLICY', ''), os.environ.get('DISABLE_JOBS', ''),
+                          os.environ.get('ENABLE_JOBS', ''))
         if capacity is not None:
             from picasso_storage_layout import plan
             plan(capacity, request['data_size_gib'])
@@ -423,8 +507,7 @@ def main():
     if args.command == 'generate':
         require(all((args.source, args.original_trust, args.work, args.request)), 'Missing generation inputs')
         request = json.loads(args.request.read_text())
-        require(type(request['skip_setup']) is bool and request == options(str(request['data_size_gib']), request['data_uuid'],
-                str(request['skip_setup']).lower(), str(request['retention_days'])), 'Invalid generation request')
+        validate_request(request)
         generate(tree, args.source.resolve(), args.original_trust.resolve(), args.library.resolve(),
                  args.work.resolve(), output, request)
     elif args.command == 'stage':
